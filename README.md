@@ -44,7 +44,14 @@ Todos os seus dados ficam nessa pasta; nada sai do seu computador.
 - **Corpus**: medidas com sistema, unidade, faixa de referência e leituras
   datadas; mapa do corpo desenhado no próprio programa e curva de tendência.
   Também gera uma página HTML para abrir no navegador.
-- **Busca** com operadores:
+- **Livro de registro**, à maneira do cartório: ao ser gravado pela primeira
+  vez, todo registro recebe um carimbo (`AAAAMMDDhhmmss`) e um número de ordem
+  no Livro Geral. Folhas de 50 números, volumes de 200 folhas, então o
+  endereço `G-1 · fl. 38 · nº 1852` nunca muda. Apagar não libera o número:
+  ele fica na folha como cancelado. Sem busca, a lista é o livro, folheado
+  com PageUp/PageDown; `Ctrl+G` aceita `1852`, `fl 38` ou o carimbo.
+- **Busca** (o "indicador": resultados em ordem alfabética, paginados, cada
+  um com seu endereço no livro) com operadores:
 
   ```
   p: v: f: c:                       só pessoas / verba / fontes / corpus
