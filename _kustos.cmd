@@ -1,7 +1,7 @@
 @echo off
 rem ------------------------------------------------------------------
 rem Duplo clique para abrir o Index.
-rem Abre _bmm_index.py desta mesma pasta, sem janela de console
+rem Abre _kustos.py desta mesma pasta, sem janela de console
 rem quando o pythonw estiver disponivel.
 rem ------------------------------------------------------------------
 cd /d "%~dp0"
@@ -18,9 +18,9 @@ pause
 exit /b 1
 
 :sem_console
-start "" pythonw "_bmm_index.py" %*
+start "" pythonw "_kustos.py" %*
 exit /b 0
 
 :com_console
-python "_bmm_index.py" %*
+python "_kustos.py" %*
 exit /b 0

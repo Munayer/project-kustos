@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-_bmm_index.py -- um índice só: pessoas (personne), conceitos e formas (verba),
+_kustos.py -- um índice só: pessoas (personne), conceitos e formas (verba),
 fontes (sources, à maneira do Zotero) e medidas do corpo (corpus).
 
 Um JSON canônico como fonte de verdade, espelho markdown gerado, busca
@@ -9,14 +9,14 @@ na mesma base e se ligam entre si: qualquer registro pode citar uma fonte
 pelo campo FONTE, e as ligações tipadas atravessam coleções.
 
 ARQUIVOS (todos lado a lado, mesmo prefixo)
-    _bmm_index.json                  FONTE DE VERDADE.
-    _bmm_index.log.<máquina>.jsonl   Diário só-de-acréscimo, um por máquina:
+    _kustos.json                  FONTE DE VERDADE.
+    _kustos.log.<máquina>.jsonl   Diário só-de-acréscimo, um por máquina:
                                      cada salvamento anexa o registro inteiro.
                                      É o histórico completo (sem .bak).
-    _bmm_index.lock.<máquina>.json   Aviso de "está aberto ali". Some ao fechar.
-    _bmm_index_mirror.md             Espelho legível (Obsidian, celular).
-    _bmm_index_conflicts/            *.sync-conflict-* já absorvidos. Nada é apagado.
-    _bmm_index_old/                  O que `migrate` aposentou.
+    _kustos.lock.<máquina>.json   Aviso de "está aberto ali". Some ao fechar.
+    _kustos_mirror.md             Espelho legível (Obsidian, celular).
+    _kustos_conflicts/            *.sync-conflict-* já absorvidos. Nada é apagado.
+    _kustos_old/                  O que `migrate` aposentou.
 
 COMO O CONFLITO É RESOLVIDO
     1. Toda gravação relê o JSON, aplica só o registro que mudou e grava.
@@ -27,22 +27,22 @@ COMO O CONFLITO É RESOLVIDO
 IDS: p_ pessoa · c_ conceito · f_ forma · s_ fonte · h_ medida.
 
 USO
-    python _bmm_index.py                 abre a janela
-    python _bmm_index.py app [id]        abre a janela, já no registro
-    python _bmm_index.py doctor          valida a estrutura, não muda nada
-    python _bmm_index.py mirror          refaz o espelho markdown
-    python _bmm_index.py corpus          refaz o mapa do corpo (HTML) e abre
-    python _bmm_index.py search <texto>  busca literal nas quatro coleções
-    python _bmm_index.py cite <id|texto> [abnt|abnt-autor-data|bibtex|csl-json|bruto]
-    python _bmm_index.py export [bibtex|csl|abnt] [arquivo]
-    python _bmm_index.py import zotero <export.json|.bib>
-    python _bmm_index.py import <notas.md>   "- Nome. Notas" -> pessoas
-    python _bmm_index.py merge           absorve *.sync-conflict-* agora
-    python _bmm_index.py history <id>    versões de um registro, pelos logs
-    python _bmm_index.py replay          reconstrói o JSON só dos logs (.replay.json)
-    python _bmm_index.py upgrade         index/2 -> index/3 (roda sozinho ao abrir)
-    python _bmm_index.py migrate         personne + verba antigos -> _bmm_index.json
-    python _bmm_index.py normalize       #tags e datas inline -> tags (pessoas)
+    python _kustos.py                 abre a janela
+    python _kustos.py app [id]        abre a janela, já no registro
+    python _kustos.py doctor          valida a estrutura, não muda nada
+    python _kustos.py mirror          refaz o espelho markdown
+    python _kustos.py corpus          refaz o mapa do corpo (HTML) e abre
+    python _kustos.py search <texto>  busca literal nas quatro coleções
+    python _kustos.py cite <id|texto> [abnt|abnt-autor-data|bibtex|csl-json|bruto]
+    python _kustos.py export [bibtex|csl|abnt] [arquivo]
+    python _kustos.py import zotero <export.json|.bib>
+    python _kustos.py import <notas.md>   "- Nome. Notas" -> pessoas
+    python _kustos.py merge           absorve *.sync-conflict-* agora
+    python _kustos.py history <id>    versões de um registro, pelos logs
+    python _kustos.py replay          reconstrói o JSON só dos logs (.replay.json)
+    python _kustos.py upgrade         index/2 -> index/3 (roda sozinho ao abrir)
+    python _kustos.py migrate         personne + verba antigos -> _kustos.json
+    python _kustos.py normalize       #tags e datas inline -> tags (pessoas)
 """
 
 import hashlib
@@ -57,10 +57,10 @@ from datetime import date, datetime
 from pathlib import Path
 
 BASE = Path(__file__).parent
-STEM = "_bmm_index"
+STEM = "_kustos"
 JSON_FILE = BASE / f"{STEM}.json"
 MIRROR_FILE = BASE / f"{STEM}_mirror.md"
-MIRROR_MARK = "<!-- gerado por _bmm_index.py -- não editar à mão -->"
+MIRROR_MARK = "<!-- gerado por _kustos.py -- não editar à mão -->"
 CONFLICT_DIR = BASE / f"{STEM}_conflicts"
 OLD_DIR = BASE / f"{STEM}_old"
 SCHEMA = "index/3"
@@ -2085,7 +2085,7 @@ def cmd_history(rid):
 
 def cmd_replay():
     """Reconstrói um vault só dos logs -- o teste de que o log basta.
-    Não toca no JSON principal: escreve _bmm_index.replay.json."""
+    Não toca no JSON principal: escreve _kustos.replay.json."""
     data = blank_vault()
     idx = {}
     for l in read_logs():
@@ -2118,13 +2118,13 @@ def cmd_replay():
 # ================================================================ migração
 
 def cmd_migrate():
-    """Funde as duas instâncias antigas em _bmm_index.json.
+    """Funde as duas instâncias antigas em _kustos.json.
 
     Entram: o JSON atual de cada instância e os *.sync-conflict-* dela (que
     são o estado da outra máquina). Os .bak entram só como fonte de
     registros que não existam em lugar nenhum, porque um .bak também guarda
     o que foi apagado de propósito. Nada é apagado: os arquivos antigos vão
-    para _bmm_index_old/."""
+    para _kustos_old/."""
     if JSON_FILE.exists():
         print(f"{JSON_FILE.name} já existe; a migração só roda numa pasta sem ele.")
         return 1
@@ -2768,7 +2768,7 @@ CORPUS_HTML = r"""<!doctype html>
   var STATUS_PT = { ok: "dentro", monitor: "perto do limite", flagged: "fora", unknown: "sem referência" };
 
   function renderSummary() {
-    document.getElementById("built").textContent = "espelho de _bmm_index.json · " + esc(data.built);
+    document.getElementById("built").textContent = "espelho de _kustos.json · " + esc(data.built);
     document.getElementById("statSystems").textContent = data.systems.length;
     var f = 0, mo = 0, ok = 0;
     data.systems.forEach(function (s) { s.metrics.forEach(function (m) {
@@ -2776,7 +2776,7 @@ CORPUS_HTML = r"""<!doctype html>
     document.getElementById("statFlags").textContent = f;
     document.getElementById("statMonitor").textContent = mo;
     document.getElementById("statOk").textContent = ok;
-    document.getElementById("foot").textContent = data.summary + " — refeito pelo _bmm_index.py; edite na janela, não aqui.";
+    document.getElementById("foot").textContent = data.summary + " — refeito pelo _kustos.py; edite na janela, não aqui.";
   }
 
   function renderSystemList() {
