@@ -26,6 +26,11 @@ COMO O CONFLITO É RESOLVIDO
 
 IDS: p_ pessoa · c_ conceito · f_ forma · s_ fonte · h_ medida.
 
+LIVRO: além do id, todo registro tem um carimbo de registro (AAAAMMDDhhmmss)
+e um número de ordem no Livro Geral (G). Folhas de 50 números, volumes de 200
+folhas: o nº 1852 mora em G-1 · fl. 38. O número nunca muda nem volta a ser
+usado; apagar deixa o número na folha como cancelado.
+
 USO
     python _kustos.py                 abre a janela
     python _kustos.py app [id]        abre a janela, já no registro
@@ -53,7 +58,7 @@ import shutil
 import socket
 import sys
 import unicodedata
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 BASE = Path(__file__).parent
@@ -63,7 +68,7 @@ MIRROR_FILE = BASE / f"{STEM}_mirror.md"
 MIRROR_MARK = "<!-- gerado por _kustos.py -- não editar à mão -->"
 CONFLICT_DIR = BASE / f"{STEM}_conflicts"
 OLD_DIR = BASE / f"{STEM}_old"
-SCHEMA = "index/3"
+SCHEMA = "index/4"
 # o corpus é de uma pessoa só: o nome vai na legenda do mapa e, se houver
 # registro de pessoa com esse nome, as medidas ficam ligadas a ele. O valor
 # de verdade mora no JSON (ui.corpus_subject); este é só o padrão inicial.
@@ -1385,7 +1390,8 @@ def haystack_metric(m, data):
 
 def blank_vault():
     return {"schema": SCHEMA, "ui": {}, "people": [], "entries": [],
-            "sources": [], "corpus": [], "edges": [], "deleted": []}
+            "sources": [], "corpus": [], "edges": [], "deleted": [],
+            "book": {"opened": NOW(), "folha": FOLHA, "folhas": FOLHAS_POR_LIVRO}}
 
 
 def fix_vault(data):
@@ -1436,7 +1442,9 @@ def load_json():
 
 def write_json(data):
     """Escrita atômica: grava ao lado e troca. Sem .bak -- a história está
-    no log."""
+    no log. Antes, todo registro que ainda não tem número no livro recebe o
+    seu: é por aqui que passa toda gravação, venha de onde vier."""
+    novos = register_new(data)
     tmp = JSON_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False),
                    encoding="utf-8")
@@ -1445,11 +1453,13 @@ def write_json(data):
     for tent in range(6):
         try:
             tmp.replace(JSON_FILE)
-            return
+            break
         except PermissionError:
             if tent == 5:
                 raise
             time.sleep(0.25 * (tent + 1))
+    if novos:
+        log_append("reg", "vault", {"regs": novos})
 
 
 def by_id(data):
@@ -1511,6 +1521,194 @@ def read_logs():
     return lines
 
 
+# ================================================================ livro
+#
+# Registro à maneira do cartório. Todo registro, ao entrar na base, recebe
+# um carimbo de registro (AAAAMMDDhhmmss, único) e um número de ordem no
+# Livro Geral. O número nunca muda nem é reaproveitado: o que é apagado
+# continua na folha, como cancelado. Volume e folha saem do número por
+# regra fixa, então o endereço de um registro não muda quando outros entram.
+#
+# FOLHA e FOLHAS_POR_LIVRO fazem parte do formato: mudá-los muda o endereço
+# de tudo que já foi registrado.
+
+BOOK = "G"
+FOLHA = 50
+FOLHAS_POR_LIVRO = 200
+STAMP_FMT = "%Y%m%d%H%M%S"
+REG_ORIGEM = {"id": "carimbo do id antigo", "log": "primeira gravação no log",
+              "atualizado": "última atualização",
+              "dia": "dia da última atualização", "abertura": "abertura do livro"}
+
+
+def stamp_now():
+    return datetime.now().strftime(STAMP_FMT)
+
+
+def stamp_from(text):
+    """'2026-09-27T23:42:59', '2026-09-27', '202609272342' ou
+    '20260927234259' -> '20260927234259'; o que não for data -> ''."""
+    digits = re.sub(r"\D", "", text or "")
+    if len(digits) == 8:
+        digits += "000000"
+    elif len(digits) == 12:
+        digits += "00"
+    if len(digits) != 14:
+        return ""
+    try:
+        datetime.strptime(digits, STAMP_FMT)
+    except ValueError:
+        return ""
+    return digits
+
+
+def stamp_label(stamp):
+    s = stamp or ""
+    if len(s) != 14:
+        return s
+    return f"{s[:4]}-{s[4:6]}-{s[6:8]} {s[8:10]}:{s[10:12]}:{s[12:]}"
+
+
+def stamp_free(stamp, taken):
+    """O carimbo pedido, ou o segundo seguinte livre."""
+    while stamp in taken:
+        stamp = (datetime.strptime(stamp, STAMP_FMT)
+                 + timedelta(seconds=1)).strftime(STAMP_FMT)
+    return stamp
+
+
+def folha_of(n):
+    """Folha corrida (1, 2, 3…) do número n, contando todos os volumes."""
+    return (n - 1) // FOLHA + 1
+
+
+def locus(n):
+    """(volume, folha dentro do volume) do número n."""
+    per_vol = FOLHA * FOLHAS_POR_LIVRO
+    return (n - 1) // per_vol + 1, ((n - 1) % per_vol) // FOLHA + 1
+
+
+def locus_label(n):
+    if not n:
+        return "sem registro"
+    vol, fl = locus(n)
+    return f"{BOOK}-{vol} · fl. {fl} · nº {n}"
+
+
+def folha_label(folha):
+    vol, fl = locus((folha - 1) * FOLHA + 1)
+    return f"LIVRO {BOOK}-{vol} · FOLHA {fl}"
+
+
+def book_rows(data):
+    """Tudo o que ocupa número no livro: registros vivos e cancelados."""
+    rows = [r for coll in COLLS for r in data.get(coll, [])]
+    return rows + list(data.get("deleted", []))
+
+
+def book_max(data):
+    return max((r.get("reg_n") or 0 for r in book_rows(data)), default=0)
+
+
+def first_seen_in_logs():
+    first = {}
+    for l in read_logs():
+        if l.get("op") == "put" and l.get("id"):
+            t = l.get("t", "")
+            if t and (l["id"] not in first or t < first[l["id"]]):
+                first[l["id"]] = t
+    return first
+
+
+def open_book(data):
+    """Termo de abertura: numera de uma vez o que já existe sem número.
+
+    Como a base antiga não guardava a data de criação, o carimbo de cada
+    registro é a melhor evidência disponível, nesta ordem: id que já é um
+    carimbo (o personne antigo), primeira gravação no log, última
+    atualização com hora, dia da última atualização, e por fim o próprio
+    momento da abertura. A evidência usada fica em `reg_origem`. Os números
+    seguem a ordem dos carimbos; empates, a ordem alfabética."""
+    first = first_seen_in_logs()
+    opened = stamp_now()
+    pend = []
+    for coll in COLLS:
+        for r in data.get(coll, []):
+            if r.get("reg_n") or r.get("id", "").startswith("__"):
+                continue
+            idstamp = stamp_from(r["id"]) if re.fullmatch(r"\d{12}|\d{14}", r["id"]) else ""
+            if idstamp:
+                st, why = idstamp, "id"
+            elif first.get(r["id"]):
+                st, why = stamp_from(first[r["id"]]), "log"
+            elif stamp_from(r.get("updated_at")):
+                st, why = stamp_from(r["updated_at"]), "atualizado"
+            elif stamp_from(r.get("updated")):
+                st, why = stamp_from(r["updated"]), "dia"
+            else:
+                st, why = opened, "abertura"
+            pend.append((st, sort_key(label_any(r, data)), r, why))
+    pend.sort(key=lambda x: (x[0], x[1]))
+    taken = {r.get("reg") for r in book_rows(data) if r.get("reg")}
+    n = book_max(data)
+    regs = {}
+    for st, _, r, why in pend:
+        n += 1
+        r["reg"] = stamp_free(st, taken)
+        taken.add(r["reg"])
+        r["reg_n"] = n
+        r["reg_origem"] = why
+        regs[r["id"]] = [r["reg"], n, why]
+    data["book"] = {"opened": NOW(), "folha": FOLHA, "folhas": FOLHAS_POR_LIVRO}
+    return regs
+
+
+def register_new(data):
+    """Dá número a quem ainda não tem e desfaz números repetidos.
+
+    Repetição só acontece quando as duas máquinas registram ao mesmo tempo
+    sem sincronizar: fica com o número quem tem o carimbo mais antigo; o
+    outro recebe o próximo livre e guarda o antigo em `reg_n_anterior`.
+    Devolve {id: [carimbo, número]} do que mudou, para o log."""
+    if "book" not in data:
+        return open_book(data)
+    regs = {}
+    owner = {}
+    for r in sorted((r for r in book_rows(data) if r.get("reg_n")),
+                    key=lambda r: (r.get("reg") or "", r.get("id", ""))):
+        owner.setdefault(r["reg_n"], r)
+    taken = {r.get("reg") for r in book_rows(data) if r.get("reg")}
+    n = book_max(data)
+    live = [r for coll in COLLS for r in data.get(coll, [])
+            if not r.get("id", "").startswith("__")]
+    clash = [r for r in live if r.get("reg_n") and owner[r["reg_n"]] is not r]
+    fresh = [r for r in live if not r.get("reg_n")]
+    for r in clash:
+        n += 1
+        r["reg_n_anterior"] = r["reg_n"]
+        r["reg_n"] = n
+        regs[r["id"]] = [r["reg"], n]
+    for r in sorted(fresh, key=lambda r: (r.get("updated_at") or "",
+                                          sort_key(label_any(r, data)))):
+        n += 1
+        r["reg"] = stamp_free(stamp_now(), taken)
+        taken.add(r["reg"])
+        r["reg_n"] = n
+        regs[r["id"]] = [r["reg"], n]
+    return regs
+
+
+def find_by_reg(data, key):
+    """Registro (ou cancelado) pelo número de ordem ou pelo carimbo."""
+    key = key.strip()
+    for r in book_rows(data):
+        if key.isdigit() and len(key) < 12 and r.get("reg_n") == int(key):
+            return r
+        if len(key) >= 12 and r.get("reg") == stamp_from(key):
+            return r
+    return None
+
+
 # ---- as operações de gravação. Todas releem o disco antes.
 
 def save_record(coll, rec, edges=None):
@@ -1528,10 +1726,17 @@ def save_record(coll, rec, edges=None):
     rows = data[coll]
     for i, old in enumerate(rows):
         if old.get("id") == rid:
+            for k in ("reg", "reg_n", "reg_origem", "reg_n_anterior"):
+                if old.get(k) and not clean.get(k):
+                    clean[k] = old[k]
             rows[i] = clean
             break
     else:
         rows.append(clean)
+    for d in data["deleted"]:
+        # o id volta a existir: retoma o número que tinha antes de apagado
+        if d.get("id") == rid and d.get("reg_n") and not clean.get("reg_n"):
+            clean["reg"], clean["reg_n"] = d.get("reg"), d["reg_n"]
     data["deleted"] = [d for d in data["deleted"] if d.get("id") != rid]
     if edges is not None:
         data["edges"] = [a for a in data["edges"] if a["from"] != rid] + edges
@@ -1544,11 +1749,16 @@ def save_record(coll, rec, edges=None):
 
 def delete_record(coll, rid, name=""):
     data = load_json()
+    gone = next((r for r in data[coll] if r.get("id") == rid), {})
     data[coll] = [r for r in data[coll] if r.get("id") != rid]
     n = len(data["edges"])
     data["edges"] = [a for a in data["edges"]
                      if a["from"] != rid and a["to"] != rid]
-    data["deleted"].append({"id": rid, "at": NOW(), "name": name})
+    tomb = {"id": rid, "at": NOW(), "name": name}
+    if gone.get("reg_n"):
+        # o número fica no livro, como cancelado
+        tomb.update(reg=gone.get("reg"), reg_n=gone["reg_n"])
+    data["deleted"].append(tomb)
     write_json(data)
     log_del(coll, rid, name)
     return data, n - len(data["edges"])
@@ -1842,7 +2052,41 @@ def check(data):
         warnings.append(f"{len(atypical)} ligação(ões) atípica(s), com rel fora "
                         "da tabela RELS (não é erro; promova ao editar o programa):")
         warnings.extend("    " + x for x in atypical)
+    check_book(data, errors, warnings)
     return errors, warnings
+
+
+def check_book(data, errors, warnings):
+    if "book" not in data:
+        warnings.append(f"livro {BOOK} ainda não aberto: abre na próxima gravação "
+                        "(ou rode `upgrade`)")
+        return
+    rows = book_rows(data)
+    by_n, by_stamp = {}, {}
+    for r in rows:
+        if not r.get("reg_n"):
+            if r in data.get("deleted", []):
+                continue
+            warnings.append(f"{r.get('id')}: sem número no livro "
+                            "(recebe na próxima gravação)")
+            continue
+        by_n.setdefault(r["reg_n"], []).append(r.get("id"))
+        if not stamp_from(r.get("reg")):
+            errors.append(f"{r.get('id')}: carimbo de registro inválido {r.get('reg')!r}")
+        by_stamp.setdefault(r.get("reg"), []).append(r.get("id"))
+    for n, ids in sorted(by_n.items()):
+        if len(ids) > 1:
+            errors.append(f"nº {n} repetido no livro: {', '.join(ids)} "
+                          "(resolve sozinho na próxima gravação)")
+    for st, ids in by_stamp.items():
+        if st and len(ids) > 1:
+            errors.append(f"carimbo {st} repetido: {', '.join(ids)}")
+    top = max(by_n, default=0)
+    gaps = [n for n in range(1, top + 1) if n not in by_n]
+    if gaps:
+        shown = ", ".join(str(n) for n in gaps[:10]) + (" …" if len(gaps) > 10 else "")
+        warnings.append(f"{len(gaps)} número(s) sem registro nem cancelamento no "
+                        f"livro: {shown}")
 
 
 def summary(data):
@@ -1878,6 +2122,12 @@ def cmd_doctor():
 
 # ================================================================ espelho
 
+def mirror_locus(r):
+    if not r.get("reg_n"):
+        return "*sem registro no livro*"
+    return f"*{locus_label(r['reg_n'])} · registrado {stamp_label(r.get('reg'))}*"
+
+
 def write_mirror(data):
     if MIRROR_FILE.exists():
         head = MIRROR_FILE.read_text(encoding="utf-8")[:400]
@@ -1892,6 +2142,7 @@ def write_mirror(data):
            "# Personne", ""]
     for p in sorted(data["people"], key=lambda x: sort_key(x["name"])):
         out.append(f"## {p['name']}")
+        out.append(mirror_locus(p))
         meta = []
         if p.get("tags"):
             meta.append("tags: " + ", ".join(p["tags"]))
@@ -1933,6 +2184,7 @@ def write_mirror(data):
     out += ["# Verba", ""]
     for e in sorted(data["entries"], key=lambda x: sort_key(x["name"])):
         out.append(f"## {label_of(e)}")
+        out.append(mirror_locus(e))
         meta = []
         if e["kind"] == "concept":
             meta.append("conceito")
@@ -1974,6 +2226,7 @@ def write_mirror(data):
     out += ["# Fontes", ""]
     for s in sorted(data["sources"], key=lambda x: sort_key(source_label(x, data))):
         out.append(f"## {source_label(s, data)}")
+        out.append(mirror_locus(s))
         out.append("  ·  ".join(x for x in (s.get("type", ""),
                                             "tags: " + ", ".join(s["tags"]) if s.get("tags") else "") if x))
         out += ["", cite(s, "abnt", data), ""]
@@ -1998,6 +2251,7 @@ def write_mirror(data):
     for m in sorted(data["corpus"], key=lambda x: (sort_key(x.get("system", "")),
                                                    sort_key(x["name"]))):
         out.append(f"## {metric_label(m)}")
+        out.append(mirror_locus(m))
         meta = []
         if m.get("unit"):
             meta.append("unidade: " + m["unit"])
@@ -2088,7 +2342,11 @@ def cmd_replay():
     Não toca no JSON principal: escreve _kustos.replay.json."""
     data = blank_vault()
     idx = {}
+    regs = {}
     for l in read_logs():
+        if l.get("op") == "reg":
+            regs.update(l.get("regs", {}))
+            continue
         op, coll, rid = l.get("op"), l.get("coll"), l.get("id")
         if op == "put" and coll in COLLS:
             rec = l.get("rec", {})
@@ -2108,6 +2366,13 @@ def cmd_replay():
         elif op == "edges":
             data["edges"] = [a for a in data["edges"] if a["from"] != rid] \
                 + l.get("edges", [])
+    # o número de quem foi gravado antes de ter número vem das linhas "reg"
+    for r in book_rows(data):
+        v = regs.get(r.get("id"))
+        if v and not r.get("reg_n"):
+            r["reg"], r["reg_n"] = v[0], v[1]
+            if len(v) > 2:
+                r["reg_origem"] = v[2]
     out = JSON_FILE.with_name(f"{STEM}.replay.json")
     out.write_text(json.dumps(fix_vault(data), indent=2, ensure_ascii=False),
                    encoding="utf-8")
@@ -2270,21 +2535,36 @@ def cmd_merge():
 
 # ================================================================ upgrade
 
-def needs_upgrade(data):
+def schema_version(data):
     try:
-        return int(str(data.get("schema", "index/2")).split("/")[1]) < 3
+        return int(str(data.get("schema", "index/2")).split("/")[1])
     except (IndexError, ValueError):
-        return True
+        return 2
+
+
+def needs_upgrade(data):
+    return schema_version(data) < 4 or "book" not in data
 
 
 def upgrade_vault(data):
     """index/2 -> index/3: cria as coleções de fontes e corpus e transforma
     cada texto distinto do campo FONTE em UMA fonte, apontada pelo id.
-
     O texto original fica em `raw` e continua a ser o que a citação 'bruto'
-    devolve, então nada do que estava escrito se perde."""
+    devolve, então nada do que estava escrito se perde.
+
+    index/3 -> index/4: abre o Livro Geral e numera o que já existe."""
     fix_vault(data)
-    report = {"sources": [], "relinked": 0}
+    report = {"sources": [], "relinked": 0, "regs": {}}
+    if schema_version(data) < 3:
+        upgrade_sources(data, report)
+    if "book" not in data:
+        report["regs"] = open_book(data)
+    data["schema"] = SCHEMA
+    data.setdefault("ui", {}).setdefault("corpus_subject", CORPUS_SUBJECT)
+    return report
+
+
+def upgrade_sources(data, report):
     taken = set(by_id(data))
     by_raw = {s.get("raw", ""): s["id"] for s in data["sources"] if s.get("raw")}
     for coll in ("people", "entries", "corpus"):
@@ -2305,9 +2585,19 @@ def upgrade_vault(data):
                 report["sources"].append(s)
             r["source"] = sid
             report["relinked"] += 1
-    data["schema"] = SCHEMA
-    data.setdefault("ui", {}).setdefault("corpus_subject", CORPUS_SUBJECT)
-    return report
+
+
+def describe_opening(data, regs):
+    if not regs:
+        return ""
+    n = max(v[1] for v in regs.values())
+    why = {}
+    for v in regs.values():
+        why[v[2]] = why.get(v[2], 0) + 1
+    bits = ", ".join(f"{k} por {REG_ORIGEM[w]}" for w, k in
+                     sorted(why.items(), key=lambda x: -x[1]))
+    return (f"Livro {BOOK} aberto: {len(regs)} registros numerados, até "
+            f"{locus_label(n)}. Carimbos inferidos: {bits}.")
 
 
 def cmd_upgrade(quiet=False):
@@ -2315,24 +2605,32 @@ def cmd_upgrade(quiet=False):
     if not needs_upgrade(data):
         if not quiet:
             print(f"{JSON_FILE.name} já está em {data.get('schema')}.")
-        return 0
+        return ""
+    v = schema_version(data)
     report = upgrade_vault(data)
     write_json(data)
     for s in report["sources"]:
         log_put("sources", s)
-    for coll in ("people", "entries", "corpus"):
-        for r in data[coll]:
-            if (r.get("source") or "").startswith("s_"):
-                log_put(coll, r)
+    if v < 3:
+        for coll in ("people", "entries", "corpus"):
+            for r in data[coll]:
+                if (r.get("source") or "").startswith("s_"):
+                    log_put(coll, r)
+    if report["regs"]:
+        log_append("reg", "vault", {"regs": report["regs"], "abertura": True})
     log_append("upgrade", "vault", {"to": SCHEMA, "sources": len(report["sources"])})
+    opening = describe_opening(data, report["regs"])
     if not quiet:
         print(f"\n{JSON_FILE.name} -> {SCHEMA}")
-        print(f"{len(report['sources'])} fonte(s) criadas a partir do campo FONTE, "
-              f"{report['relinked']} registros reapontados:")
-        for s in report["sources"]:
-            print(f"  {s['id']:40} {source_label(s, data)}")
+        if v < 3:
+            print(f"{len(report['sources'])} fonte(s) criadas a partir do campo FONTE, "
+                  f"{report['relinked']} registros reapontados:")
+            for s in report["sources"]:
+                print(f"  {s['id']:40} {source_label(s, data)}")
+        if opening:
+            print(opening)
         print()
-    return 0
+    return opening
 
 
 # ================================================================ citação
@@ -4580,6 +4878,10 @@ class App:
         self.pendings = []
         self.fits = []
         self.shown = None
+        self.mode = "livro"        # "livro" (folhas por número) | "indicador" (busca)
+        self.folha = None          # folha corrida aberta no livro; None = a última
+        self.page = 0              # página do indicador
+        self.page_sig = None       # o filtro mudou? então o indicador volta à página 1
         ui = self.data.get("ui") or {}
         self.max_rows = int(ui.get("max_rows") or 10)
         self.locked_panes = bool(ui.get("panes_locked"))
@@ -4703,19 +5005,34 @@ class App:
         pw.add(rail, weight=0)
 
         mid = tk.Frame(pw, bg=SHELL)
-        self.list = ttk.Treeview(mid, columns=("sub",), show="tree",
+        head = tk.Frame(mid, bg=SHELL)
+        head.pack(fill="x")
+        self.page_lbl = tk.Label(head, text="", bg=SHELL, fg=STAMP, font=self.f_label,
+                                 anchor="w")
+        self.page_lbl.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        ttk.Button(head, text="›", width=2, style="Quiet.TButton",
+                   command=lambda: self.turn(1)).pack(side="right", padx=(2, 4), pady=3)
+        ttk.Button(head, text="‹", width=2, style="Quiet.TButton",
+                   command=lambda: self.turn(-1)).pack(side="right", pady=3)
+        tk.Frame(mid, bg=RULE, height=1).pack(fill="x")
+        self.list = ttk.Treeview(mid, columns=("sub", "loc"), show="tree",
                                  selectmode="browse")
-        self.list.column("#0", width=235, stretch=True)
-        self.list.column("sub", width=185, stretch=True)
+        self.list.column("#0", width=215, stretch=True)
+        self.list.column("sub", width=165, stretch=True)
+        self.list.column("loc", width=96, anchor="e", stretch=False)
         sb = ttk.Scrollbar(mid, orient="vertical", command=self.list.yview)
         self.list.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.list.pack(fill="both", expand=True)
         self.list.tag_configure("sub", foreground=FAINT, font=self.f_meta)
+        self.list.tag_configure("cancel", foreground=FAINT, font=self.f_meta)
         self.list.bind("<<TreeviewSelect>>", self.on_pick)
         pw.add(mid, weight=1)
 
         self.cardbox = tk.Frame(pw, bg=PAPER)
+        self.locus = tk.Label(self.cardbox, text="", bg=PAPER, fg=FAINT,
+                              font=self.f_label, anchor="w", padx=22)
+        self.locus.pack(fill="x", pady=(8, 0))
         pw.add(self.cardbox, weight=2)
         self.pw = pw
         self.apply_pane_lock()
@@ -4957,6 +5274,11 @@ class App:
         self.list.bind("<Return>", lambda e: self.focus_card())
         self.list.bind("<Home>", lambda e: self.jump_list(0))
         self.list.bind("<End>", lambda e: self.jump_list(-1))
+        self.list.bind("<Prior>", lambda e: self.turn(-1))
+        self.list.bind("<Next>", lambda e: self.turn(1))
+        r.bind("<Control-Prior>", lambda e: self.turn(-1))
+        r.bind("<Control-Next>", lambda e: self.turn(1))
+        r.bind("<Control-l>", lambda e: self.to_book())
 
     def jump_list(self, i):
         kids = self.list.get_children()
@@ -4975,13 +5297,62 @@ class App:
         kids = self.list.get_children()
         if not kids:
             return "break"
-        if self.sel in kids:
-            i = kids.index(self.sel) + delta
+        cur = self.list.selection()
+        cur = cur[0] if cur else self.sel
+        if cur in kids:
+            i = kids.index(cur) + delta
         else:
             i = 0 if delta > 0 else len(kids) - 1
-        i = max(0, min(len(kids) - 1, i))
+        if not 0 <= i < len(kids):
+            # passou da borda: vira a folha
+            before = (self.folha, self.page)
+            self.turn(delta)
+            if (self.folha, self.page) == before:
+                return "break"
+            kids = self.list.get_children()
+            if not kids:
+                return "break"
+            i = 0 if delta > 0 else len(kids) - 1
         self.list.selection_set(kids[i])
         self.list.see(kids[i])
+        return "break"
+
+    def turn(self, delta):
+        """Vira a folha do livro, ou a página do indicador."""
+        if self.mode == "livro":
+            self.folha = max(1, (self.folha or 1) + delta)
+        else:
+            self.page = max(0, self.page + delta)
+        self.refresh_list()
+        kids = self.list.get_children()
+        if kids:
+            self.list.focus(kids[0])
+            self.list.yview_moveto(0)
+        return "break"
+
+    def to_book(self, folha=None):
+        """Ctrl+L: sai da busca e dos filtros e abre o livro na folha do
+        registro aberto (ou na folha pedida)."""
+        self.commit_if_dirty()
+        rec = self.current()
+        self.clear_filters()
+        self.scope = None
+        if folha:
+            self.folha = folha
+        elif rec and rec.get("reg_n"):
+            self.folha = folha_of(rec["reg_n"])
+        self.q.set("")
+        if self._q_job:          # a busca vazia já vai ser desenhada agora
+            try:
+                self.root.after_cancel(self._q_job)
+            except tk.TclError:
+                pass
+            self._q_job = None
+        self.refresh_rail()
+        self.refresh_list()
+        if self.sel and self.list.exists(self.sel):
+            self.list.see(self.sel)
+        self.list.focus_set()
         return "break"
 
     def set_scope(self, key):
@@ -4997,8 +5368,8 @@ class App:
     def goto_dialog(self):
         """Ctrl+G: ir para um registro pelo id ou pelo nome exato."""
         win = self.dialog("Ir para", 520, 130)
-        tk.Label(win, text="IR PARA  (id, ou nome exato)", bg=PAPER, fg=FAINT,
-                 font=self.f_label).pack(anchor="w", padx=18, pady=(14, 2))
+        tk.Label(win, text="IR PARA  (nº, fl. 37, carimbo, id ou nome)", bg=PAPER,
+                 fg=FAINT, font=self.f_label).pack(anchor="w", padx=18, pady=(14, 2))
         e = tk.Entry(win, font=self.f_body, bg=PAPER, fg=INK, insertbackground=INK,
                      relief="flat", highlightthickness=1, highlightbackground=RULE,
                      highlightcolor=STAMP)
@@ -5012,6 +5383,25 @@ class App:
             idx = by_id(self.data)
             if key in idx:
                 self.goto(key)
+                return
+            m = re.fullmatch(r"(?i)\s*(?:g-?(\d+)\s*[·,]?\s*)?(?:fl|folha|f)\.?\s*(\d+)\s*", key)
+            if m:
+                vol, fl = int(m.group(1) or 1), int(m.group(2))
+                self.to_book(folha=(vol - 1) * FOLHAS_POR_LIVRO + max(1, fl))
+                return
+            m = re.fullmatch(r"(?i)\s*(?:g|n[ºo°.]?)?\s*-?\s*(\d+)\s*", key)
+            if m:
+                r = find_by_reg(self.data, m.group(1))
+                if r and r.get("id") in idx:
+                    self.goto(r["id"])
+                elif r:
+                    self.to_book(folha=folha_of(r["reg_n"]))
+                    iid = f"x:{r['reg_n']}"
+                    if self.list.exists(iid):
+                        self.list.selection_set(iid)
+                        self.list.see(iid)
+                else:
+                    self.say(f"Nenhum registro com nº ou carimbo {m.group(1)}.")
                 return
             low = key.lower()
             hits = [r for r in idx.values() if r.get("name", "").lower() == low]
@@ -5397,8 +5787,6 @@ class App:
         return {"people": "person", "entries": "entry", "sources": "source",
                 "corpus": "metric"}[coll_of((rec or {}).get("id", ""))]
 
-    LIST_CAP = 400
-
     def refresh_list_soon(self):
         """A lista redesenha 150 ms depois da última tecla, não a cada uma."""
         if self._q_job:
@@ -5502,67 +5890,148 @@ class App:
                                         else r["name"]))
         return out
 
+    def row_text(self, r):
+        """(título, subtítulo) de um registro na lista."""
+        kind = self.rec_kind(r)
+        if kind == "entry":
+            sub = ("conceito" if r["kind"] == "concept" else "forma") \
+                + " · " + (r.get("gloss") or "")
+            return label_of(r), sub
+        if kind == "source":
+            au = author_names(r, self.data)
+            sub = (r.get("type") or "outro") + " · " + ", ".join(
+                a.split(",")[0] for a in au[:2]) + (f" · {year_of_source(r)}"
+                                                    if year_of_source(r) else "")
+            return r.get("name") or r.get("raw", ""), sub
+        if kind == "metric":
+            lr = last_reading(r)
+            sub = (r.get("system") or "") + (f" · {lr['date']} = {lr['value']} "
+                                             f"{r.get('unit', '')}" if lr else " · sem leituras")
+            if lr and out_of_range(r, lr):
+                sub += "  (!)"
+            return r["name"], sub
+        p = r
+        live = open_tasks(p)
+        dated = sorted(dated_tasks(p), key=lambda t: due_label(t))
+        if self.date:
+            live = [t for t in dated if t["due"] == self.date] or live
+        elif dated:
+            live = dated + [t for t in live if t not in dated]
+        if live:
+            when = due_label(live[0])
+            sub = "[{}] {}".format(MARK_OF.get(live[0].get("state"), " "),
+                                   live[0].get("text", ""))
+            if when:
+                sub = when + "  " + sub
+            if len(live) > 1:
+                sub += f"  (+{len(live) - 1})"
+        else:
+            plain = [t for t in p.get("tags", []) if ":" not in t]
+            sub = " · ".join(plain) or one_liner(p.get("notes_raw", ""), 70)
+        return p["name"], sub
+
+    def insert_row(self, r, loc):
+        text, sub = self.row_text(r)
+        self.list.insert("", "end", iid=r["id"], text=one_liner(text, 60),
+                         values=(one_liner(sub, 60), loc), tags=("sub",))
+
+    def filter_sig(self):
+        return (self.q.get().strip(), self.scope, self.tag, self.viewmode, self.date,
+                self.view_kind, self.view_lang, self.view_domain, self.view_stype,
+                self.view_system)
+
     def refresh_list(self):
+        """Sem busca nem filtro, a lista é o LIVRO: uma folha de FOLHA números
+        de cada vez, na ordem de registro, com os cancelados no lugar. Com
+        busca ou filtro, é o INDICADOR: o que bate, em ordem alfabética,
+        paginado do mesmo tamanho, cada linha com seu endereço no livro."""
         self._q_job = None
-        self.view = self.matches()
+        sig = self.filter_sig()
+        if sig != self.page_sig:
+            self.page_sig = sig
+            self.page = 0
+        filtered = bool(any(sig[:-1]) or self.view_system is not None)
         self.list.delete(*self.list.get_children())
-        shown = self.view[:self.LIST_CAP]
-        for r in shown:
-            kind = self.rec_kind(r)
-            if kind == "entry":
-                sub = ("conceito" if r["kind"] == "concept" else "forma") \
-                    + " · " + (r.get("gloss") or "")
-                self.list.insert("", "end", iid=r["id"], text=one_liner(label_of(r), 60),
-                                 values=(one_liner(sub, 60),), tags=("sub",))
-                continue
-            if kind == "source":
-                au = author_names(r, self.data)
-                sub = (r.get("type") or "outro") + " · " + ", ".join(
-                    a.split(",")[0] for a in au[:2]) + (f" · {year_of_source(r)}"
-                                                        if year_of_source(r) else "")
-                self.list.insert("", "end", iid=r["id"],
-                                 text=one_liner(r.get("name") or r.get("raw", ""), 60),
-                                 values=(one_liner(sub, 60),), tags=("sub",))
-                continue
-            if kind == "metric":
-                lr = last_reading(r)
-                sub = (r.get("system") or "") + (f" · {lr['date']} = {lr['value']} "
-                                                 f"{r.get('unit', '')}" if lr else " · sem leituras")
-                if lr and out_of_range(r, lr):
-                    sub += "  (!)"
-                self.list.insert("", "end", iid=r["id"], text=one_liner(r["name"], 60),
-                                 values=(one_liner(sub, 60),), tags=("sub",))
-                continue
-            p = r
-            live = open_tasks(p)
-            dated = sorted(dated_tasks(p), key=lambda t: due_label(t))
-            if self.date:
-                live = [t for t in dated if t["due"] == self.date] or live
-            elif dated:
-                live = dated + [t for t in live if t not in dated]
-            if live:
-                when = due_label(live[0])
-                sub = "[{}] {}".format(MARK_OF.get(live[0].get("state"), " "),
-                                       live[0].get("text", ""))
-                if when:
-                    sub = when + "  " + sub
-                if len(live) > 1:
-                    sub += f"  (+{len(live) - 1})"
-            else:
-                plain = [t for t in p.get("tags", []) if ":" not in t]
-                sub = " · ".join(plain) or one_liner(p.get("notes_raw", ""), 70)
-            self.list.insert("", "end", iid=p["id"], text=one_liner(p["name"], 60),
-                             values=(one_liner(sub, 60),), tags=("sub",))
         total = sum(len(self.data[c]) for c in COLLS)
-        filtered = (self.q.get().strip() or self.scope or self.tag or self.viewmode
-                    or self.date or self.view_kind or self.view_lang or self.view_domain
-                    or self.view_stype or self.view_system is not None)
-        text = f"{len(self.view)} de {total}" if filtered else f"{total} registros"
-        if len(self.view) > self.LIST_CAP:
-            text += f"  ·  mostrando {self.LIST_CAP}; refine a busca"
-        self.count.configure(text=text)
+        if filtered:
+            self.mode = "indicador"
+            self.view = self.matches()
+            pages = max(1, -(-len(self.view) // FOLHA))
+            self.page = min(self.page, pages - 1)
+            for r in self.view[self.page * FOLHA:(self.page + 1) * FOLHA]:
+                n = r.get("reg_n")
+                if n:
+                    vol, fl = locus(n)
+                    loc = (f"{BOOK}-{vol} " if vol > 1 else "") + f"fl. {fl} · nº {n}"
+                else:
+                    loc = "novo"
+                self.insert_row(r, loc)
+            self.page_lbl.configure(
+                text=f"INDICADOR · FOLHA {self.page + 1} DE {pages}")
+            self.count.configure(text=f"{len(self.view)} de {total}")
+        else:
+            self.mode = "livro"
+            book, gone, loose = {}, {}, []
+            for c in COLLS:
+                for r in self.data[c]:
+                    if r.get("reg_n"):
+                        book[r["reg_n"]] = r
+                    else:
+                        loose.append(r)
+            for d in self.data.get("deleted", []):
+                if d.get("reg_n") and d["reg_n"] not in book:
+                    gone[d["reg_n"]] = d
+            top = max(list(book) + list(gone), default=0)
+            last = folha_of(top) if top else 1
+            if loose and top and top % FOLHA == 0:
+                last += 1          # o rascunho abre a folha seguinte
+            if self.folha is None or self.folha > last:
+                self.folha = last
+            self.view = [book[n] for n in sorted(book)] + loose
+            first = (self.folha - 1) * FOLHA + 1
+            for n in range(first, first + FOLHA):
+                if n in book:
+                    self.insert_row(book[n], f"nº {n}")
+                elif n in gone:
+                    d = gone[n]
+                    self.list.insert("", "end", iid=f"x:{n}",
+                                     text=f"cancelado · {one_liner(d.get('name', ''), 40)}",
+                                     values=(f"em {(d.get('at') or '')[:10]}", f"nº {n}"),
+                                     tags=("cancel",))
+            if self.folha == last:
+                for r in loose:
+                    self.insert_row(r, "novo")
+            self.page_lbl.configure(text=f"{folha_label(self.folha)}  ·  {self.folha} / {last}")
+            self.count.configure(text=f"{total} registros")
         if self.sel and self.list.exists(self.sel):
             self.list.selection_set(self.sel)
+
+    def show_in_list(self, rid):
+        """Leva a lista à folha (ou página) onde o registro está."""
+        rec = by_id(self.data).get(rid)
+        if not rec or self.list.exists(rid):
+            return
+        if self.mode == "livro":
+            self.folha = folha_of(rec["reg_n"]) if rec.get("reg_n") else None
+            self.refresh_list()
+        elif rec in self.view:
+            self.page = self.view.index(rec) // FOLHA
+            self.refresh_list()
+
+    def set_locus(self, rec):
+        if not rec:
+            self.locus.configure(text="")
+            return
+        n = rec.get("reg_n")
+        if not n:
+            self.locus.configure(text="SEM REGISTRO · RECEBE NÚMERO NO LIVRO AO SALVAR")
+            return
+        text = f"LIVRO {locus_label(n).upper()}    REGISTRADO {stamp_label(rec.get('reg'))}"
+        if rec.get("reg_origem"):
+            text += f"  (inferido: {REG_ORIGEM.get(rec['reg_origem'], rec['reg_origem'])})"
+        if rec.get("reg_n_anterior"):
+            text += f"  · antes nº {rec['reg_n_anterior']}"
+        self.locus.configure(text=text)
 
     def refresh_rail(self):
         r = self.rail
@@ -5775,7 +6244,9 @@ class App:
         self.busy = True
         try:
             self.commit_if_dirty()
-            if self.list.exists(rid):
+            if rid.startswith("x:"):
+                self.show_cancelled(int(rid[2:]))
+            elif self.list.exists(rid):
                 self.open_record(rid)
             else:
                 self.blank_card()
@@ -5790,6 +6261,19 @@ class App:
         self.loading = False
         self.dirty = False
         self.sel = None
+        self.set_locus(None)
+
+    def show_cancelled(self, n):
+        """Linha cancelada do livro: o cartão fica vazio e o cabeçalho diz
+        o que ocupava o número."""
+        d = next((d for d in self.data.get("deleted", []) if d.get("reg_n") == n), None)
+        self.blank_card()
+        if d:
+            self.locus.configure(
+                text=f"LIVRO {locus_label(n).upper()}    CANCELADO EM "
+                     f"{(d.get('at') or '').replace('T', ' ')}  ·  "
+                     f"{d.get('name', '')}  ({d.get('id', '')})")
+            self.say("Registro cancelado: o histórico está no log (Base › Histórico).")
 
     def open_record(self, rid):
         rec = by_id(self.data).get(rid)
@@ -5800,11 +6284,13 @@ class App:
         kind = self.rec_kind(rec)
         self.show_card(kind)
         self.card.open(rec)
+        self.set_locus(rec)
         for reset in self.undo_resets:
             try:
                 reset()
             except Exception:
                 pass
+        self.show_in_list(rid)
         if self.list.exists(rid):
             self.list.selection_set(rid)
             self.list.see(rid)
@@ -6408,13 +6894,22 @@ class App:
                        "\n  Ctrl+Enter salvar e começar outro do mesmo tipo"
                        "\n  Ctrl+Z / Ctrl+Y   desfazer / refazer"
                        "\n  Ctrl+J / Ctrl+K   próximo / anterior, de qualquer lugar"
-                       "\n  Ctrl+G     ir para (id ou nome exato)"
+                       "\n  Ctrl+G     ir para: nº (1852), folha (fl 37), carimbo, id ou nome"
+                       "\n  Ctrl+L     ver no livro: sai da busca, abre a folha do registro"
                        "\n  Ctrl+1..4  escopo pessoas / verba / fontes / corpus; Ctrl+0 tudo"
                        "\n  /  na lista volta à busca;  Enter na lista vai ao cartão"
-                       "\n  Home / End na lista;  PageUp / PageDown"
+                       "\n  Home / End na folha;  PageUp / PageDown vira a folha"
+                       "\n  Ctrl+PageUp / Ctrl+PageDown vira a folha de qualquer lugar"
                        "\n  F5         recarregar do disco"
                        "\n  Esc        voltar à lista\n"
-                       "\n  Operadores da busca (a lista mostra no máximo 400):"
+                       f"\n  LIVRO {BOOK}: todo registro recebe, ao ser gravado pela"
+                       "\n  primeira vez, um carimbo (AAAAMMDDhhmmss) e um número de"
+                       f"\n  ordem. Cada folha tem {FOLHA} números; cada volume,"
+                       f"\n  {FOLHAS_POR_LIVRO} folhas. O número nunca muda: o que é apagado"
+                       "\n  fica na folha como cancelado. Sem busca, a lista é o livro;"
+                       "\n  com busca ou filtro, é o INDICADOR, em ordem alfabética,"
+                       "\n  com o endereço de cada registro.\n"
+                       "\n  Operadores da busca:"
                        "\n  p: v: f: c:   só pessoas / verba / fontes / corpus"
                        "\n  ^ab           nome que começa com ab"
                        "\n  tag:csh  lang:de  type:livro  sys:renal  dom:direito  id:c_"
@@ -6535,11 +7030,15 @@ def cmd_app(open_id=None):
 
     notices = []
     if JSON_FILE.exists() and needs_upgrade(load_json()):
-        n_before = len(load_json().get("sources", []))
-        cmd_upgrade(quiet=True)
+        old = load_json()
+        n_before = len(old.get("sources", []))
+        opening = cmd_upgrade(quiet=True)
         n_after = len(load_json()["sources"])
-        notices.append(f"Base atualizada para {SCHEMA}: {n_after - n_before} fonte(s) "
-                       "criadas a partir do campo FONTE.")
+        if schema_version(old) < 3:
+            notices.append(f"Base atualizada para {SCHEMA}: {n_after - n_before} "
+                           "fonte(s) criadas a partir do campo FONTE.")
+        if opening:
+            notices.append(opening)
     if (CORPUS_SUBJECT and JSON_FILE.exists()
             and not (load_json().get("ui") or {}).get("corpus_subject")):
         save_ui({"corpus_subject": CORPUS_SUBJECT})
@@ -6616,7 +7115,8 @@ def main():
     if cmd == "normalize":
         return cmd_normalize()
     if cmd == "upgrade":
-        return cmd_upgrade()
+        cmd_upgrade()
+        return 0
     if cmd == "cite" and rest:
         return cmd_cite(rest[0], rest[1] if len(rest) > 1 else "abnt")
     if cmd == "export":
