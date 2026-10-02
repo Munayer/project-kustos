@@ -1,0 +1,22 @@
+# Dados pessoais: nunca vão para o repositório
+_kustos.json
+_kustos.*.json
+_kustos.log.*.jsonl
+_kustos.lock.*.json
+_kustos.replay.json
+_kustos_mirror.md
+_kustos_corpus.html
+_kustos_fontes.*
+_kustos_conflicts/
+_kustos_old/
+*.sync-conflict-*
+*.tmp
+
+# Syncthing
+.stfolder/
+.stignore
+.stversions/
+
+# Python
+__pycache__/
+*.pyc
