@@ -1,14 +1,14 @@
 # Dados pessoais: nunca vão para o repositório
-_bmm_index.json
-_bmm_index.*.json
-_bmm_index.log.*.jsonl
-_bmm_index.lock.*.json
-_bmm_index.replay.json
-_bmm_index_mirror.md
-_bmm_index_corpus.html
-_bmm_index_fontes.*
-_bmm_index_conflicts/
-_bmm_index_old/
+_kustos.json
+_kustos.*.json
+_kustos.log.*.jsonl
+_kustos.lock.*.json
+_kustos.replay.json
+_kustos_mirror.md
+_kustos_corpus.html
+_kustos_fontes.*
+_kustos_conflicts/
+_kustos_old/
 *.sync-conflict-*
 *.tmp
 

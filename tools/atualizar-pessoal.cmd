@@ -13,13 +13,13 @@ if not exist "%DESTINO%\" (
     exit /b 1
 )
 
-python -m py_compile _bmm_index.py || (
-    echo _bmm_index.py tem erro de sintaxe; nada foi copiado.
+python -m py_compile _kustos.py || (
+    echo _kustos.py tem erro de sintaxe; nada foi copiado.
     pause
     exit /b 1
 )
 
-copy /y "_bmm_index.py"  "%DESTINO%\" >nul
-copy /y "_bmm_index.cmd" "%DESTINO%\" >nul
+copy /y "_kustos.py"  "%DESTINO%\" >nul
+copy /y "_kustos.cmd" "%DESTINO%\" >nul
 echo Codigo copiado para %DESTINO%
 pause

@@ -21,14 +21,14 @@ por exemplo), com fusão automática de conflitos.
 
 ## Como usar
 
-1. Baixe `_bmm_index.py` e `_bmm_index.cmd` para uma pasta vazia.
-2. No Windows, dê duplo clique em `_bmm_index.cmd`. Em outros sistemas:
+1. Baixe `_kustos.py` e `_kustos.cmd` para uma pasta vazia.
+2. No Windows, dê duplo clique em `_kustos.cmd`. Em outros sistemas:
 
    ```bash
-   python3 _bmm_index.py
+   python3 _kustos.py
    ```
 
-Na primeira gravação o programa cria `_bmm_index.json` ao lado do `.py`.
+Na primeira gravação o programa cria `_kustos.json` ao lado do `.py`.
 Todos os seus dados ficam nessa pasta; nada sai do seu computador.
 
 ## O que tem
@@ -53,19 +53,19 @@ Todos os seus dados ficam nessa pasta; nada sai do seu computador.
   ```
 
 - **Sincronização entre máquinas**: cada máquina escreve o próprio diário
-  (`_bmm_index.log.<máquina>.jsonl`); arquivos `*.sync-conflict-*` são
+  (`_kustos.log.<máquina>.jsonl`); arquivos `*.sync-conflict-*` são
   fundidos registro a registro ao abrir. O histórico completo de cada
   registro sai dos diários.
 
 ## Linha de comando (opcional)
 
 ```
-python _bmm_index.py doctor                valida a base, não muda nada
-python _bmm_index.py search <texto>
-python _bmm_index.py cite <id|texto> [abnt|abnt-autor-data|bibtex|csl-json|bruto]
-python _bmm_index.py export [bibtex|csl|abnt] [arquivo]
-python _bmm_index.py import zotero <export.json|.bib>
-python _bmm_index.py mirror | corpus | merge | history <id> | replay
+python _kustos.py doctor                valida a base, não muda nada
+python _kustos.py search <texto>
+python _kustos.py cite <id|texto> [abnt|abnt-autor-data|bibtex|csl-json|bruto]
+python _kustos.py export [bibtex|csl|abnt] [arquivo]
+python _kustos.py import zotero <export.json|.bib>
+python _kustos.py mirror | corpus | merge | history <id> | replay
 ```
 
 ## Sincronizando com Syncthing
@@ -74,8 +74,8 @@ Sugestão para o `.stignore` da pasta:
 
 ```
 *.tmp
-_bmm_index.replay.json
-_bmm_index_fontes.*
+_kustos.replay.json
+_kustos_fontes.*
 __pycache__
 ```
 
