@@ -1,0 +1,22 @@
+# Dados pessoais: nunca vão para o repositório
+_bmm_index.json
+_bmm_index.*.json
+_bmm_index.log.*.jsonl
+_bmm_index.lock.*.json
+_bmm_index.replay.json
+_bmm_index_mirror.md
+_bmm_index_corpus.html
+_bmm_index_fontes.*
+_bmm_index_conflicts/
+_bmm_index_old/
+*.sync-conflict-*
+*.tmp
+
+# Syncthing
+.stfolder/
+.stignore
+.stversions/
+
+# Python
+__pycache__/
+*.pyc
