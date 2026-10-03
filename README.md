@@ -1,83 +1,57 @@
 # Project Kustos
 
-Um índice pessoal num arquivo só: **pessoas**, **verba** (conceitos e formas),
-**fontes** (à maneira do Zotero) e **corpus** (medidas do corpo), todos na
-mesma base e ligados entre si.
+Project Kustos is a personal index of people, concepts, forms, sources, health tracking, all linked within the same base.
 
-Python puro, só biblioteca padrão, interface em Tk. Um JSON é a fonte de
-verdade; um espelho em Markdown é gerado para ler no Obsidian ou no celular.
-Pensado para rodar em mais de uma máquina com a pasta sincronizada (Syncthing,
-por exemplo), com fusão automática de conflitos.
+It's a python-based, Tk interface app, using .json files as the database set,
+mirrored in markdown files capable of giving users readibility out of the
+python ecosystem. Can be runned locally with synchronized folders, with automatic
+updating of files and conflicts if used any syncing app or cloud sync.
 
-> *English:* a single-file personal index (people, concepts/word forms,
-> bibliographic sources, body measurements) in pure-stdlib Python with a Tk
-> GUI. The UI is in Portuguese.
+## Requisites
 
-## Requisitos
+- Python 3.10 or newer with Tkinter.
 
-- Python 3.10 ou mais novo, com Tkinter (já vem no instalador oficial do
-  Windows; no Linux, pode ser preciso instalar `python3-tk`).
-- Nada mais.
+## How to use
 
-## Como usar
+1. Download `_kustos.py` and `_kustos.cmd` onto an empty folder.
+2. Open `_kustos.cmd` to start using. The empty folder will be the locus of files.
+3. Upon the first entry, the program creates the `_kustos.json` database. All files are local and don't leave your computer, unless you use a cloud or sync app.
 
-1. Baixe `_kustos.py` e `_kustos.cmd` para uma pasta vazia.
-2. No Windows, dê duplo clique em `_kustos.cmd`. Em outros sistemas:
+## Components
 
-   ```bash
-   python3 _kustos.py
-   ```
-
-Na primeira gravação o programa cria `_kustos.json` ao lado do `.py`.
-Todos os seus dados ficam nessa pasta; nada sai do seu computador.
-
-## O que tem
-
-- **Quatro acervos** no trilho lateral, cada um com id próprio:
-  `p_` pessoa · `c_` conceito · `f_` forma · `s_` fonte · `h_` medida.
-- **Ligações tipadas** entre quaisquer registros (`author_of`, `cites`,
-  `attested_in`, `defined_in`, `translates`, `measured_in`…). Rótulos fora da
-  tabela são aceitos e marcados como "atípicos".
-- **Fontes**: tipo livre (livro, artigo, tese, lei, acórdão, página web,
-  vídeo…), citação em ABNT, ABNT autor-data, BibTeX e CSL-JSON.
-  Importa do Zotero (CSL-JSON ou BibTeX) sem duplicar.
-- **Corpus**: medidas com sistema, unidade, faixa de referência e leituras
-  datadas; mapa do corpo desenhado no próprio programa e curva de tendência.
-  Também gera uma página HTML para abrir no navegador.
-- **Livro de registro**, à maneira do cartório: ao ser gravado pela primeira
-  vez, todo registro recebe um carimbo (`AAAAMMDDhhmmss`) e um número de ordem
-  no Livro Geral. Folhas de 50 números, volumes de 200 folhas, então o
-  endereço `G-1 · fl. 38 · nº 1852` nunca muda. Apagar não libera o número:
-  ele fica na folha como cancelado. Sem busca, a lista é o livro, folheado
-  com PageUp/PageDown; `Ctrl+G` aceita `1852`, `fl 38` ou o carimbo.
-- **Busca** (o "indicador": resultados em ordem alfabética, paginados, cada
-  um com seu endereço no livro) com operadores:
+- **Four collections** on the left menu, each with an unique ID:
+  `p_` people · `c_` concept · `f_` form · `s_` source · `h_` health track.
+- **Linked entries** between any registers (`author_of`, `cites`,
+  `attested_in`, `defined_in`, `translates`, `measured_in`…). Labels outside of the table are accepted and marked as atypical.
+- **Source**: free types (book, paper, thesis, law/bill, decisions, webpages, videos), citations in academic formats, BibTeX and CSL-JSON.
+  Can import from Zotero via CSL-JSON or BibTeX without duplicating entries.
+- **Health track**: trackings with each body system, units, reference margin, dated entries; minimalist vitruvian-inspired body mapping with tendency curve. Also generates an HTML to open in the web browser.
+- **Register book**, similar to notary and public registry legal systems: entries are labeled and registered with a stamp (`YYYYMMDDHHmmss`) and an order number in the General Book. Pages have 50 entries for navigations, volumes consists on 200 entries. Register is fixed and never changes; searches and filters are interchangeable, not compromising user experience. Deleting entries do not erase the data, but rather mention that the entry was cancelled.
+- **Search**, the "indexer": results come in alphabetic order, paged, one with each book and register address, with operators of search:
 
   ```
-  p: v: f: c:                       só pessoas / verba / fontes / corpus
-  ^ab                               nome que começa com "ab"
+  p: v: f: c:                       only people / verba / sources / body tracks
+  ^ab                               name that starts with "ab"
   tag:x lang:de type:livro sys:renal dom:direito id:c_
   ```
 
-- **Sincronização entre máquinas**: cada máquina escreve o próprio diário
-  (`_kustos.log.<máquina>.jsonl`); arquivos `*.sync-conflict-*` são
-  fundidos registro a registro ao abrir. O histórico completo de cada
-  registro sai dos diários.
+- **Sync between machines**: each machine that you end up using and syncing will write its own diary of usage
+  (`_kustos.log.<machine>.jsonl`); files `*.sync-conflict-*` are mixed register by register on opening. The complete history of each register comes out in the diaries.
 
-## Linha de comando (opcional)
+## Command lines (optional)
 
 ```
-python _kustos.py doctor                valida a base, não muda nada
+python _kustos.py doctor                data-health check
 python _kustos.py search <texto>
-python _kustos.py cite <id|texto> [abnt|abnt-autor-data|bibtex|csl-json|bruto]
+python _kustos.py cite <id|texto> [abnt|abnt-autor-data|bibtex|csl-json|bruto]  pulls citation from source
 python _kustos.py export [bibtex|csl|abnt] [arquivo]
 python _kustos.py import zotero <export.json|.bib>
 python _kustos.py mirror | corpus | merge | history <id> | replay
 ```
 
-## Sincronizando com Syncthing
+## Suggestion: Using Syncthing to sync
 
-Sugestão para o `.stignore` da pasta:
+Suggestion for the `.stignore` of folder, if synced with Syncthing:
 
 ```
 *.tmp
@@ -86,6 +60,6 @@ _kustos_fontes.*
 __pycache__
 ```
 
-## Licença
+## License
 
-MIT. Veja [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
