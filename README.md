@@ -26,8 +26,14 @@ updating of files and conflicts if used any syncing app or cloud sync.
 - **Source**: free types (book, paper, thesis, law/bill, decisions, webpages, videos), citations in academic formats, BibTeX and CSL-JSON.
   Can import from Zotero via CSL-JSON or BibTeX without duplicating entries.
 - **Health track**: trackings with each body system, units, reference margin, dated entries; minimalist vitruvian-inspired body mapping with tendency curve. Also generates an HTML to open in the web browser.
-- **Register book**, similar to notary and public registry legal systems: entries are labeled and registered with a stamp (`YYYYMMDDHHmmss`) and an order number in the General Book. Pages have 50 entries for navigations, volumes consists on 200 entries. Register is fixed and never changes; searches and filters are interchangeable, not compromising user experience. Deleting entries do not erase the data, but rather mention that the entry was cancelled.
-- **Search**, the "indexer": results come in alphabetic order, paged, one with each book and register address, with operators of search:
+- **Register number**, similar to notary and public registry systems: on its
+  first save, every entry gets a stamp (`YYYYMMDDHHmmss`) and a sequential
+  order number (`nº 1852`). The number never changes and is never reused;
+  deleting an entry keeps its number in the sequence, marked as cancelled.
+  Without a search, the list is the register itself, in number order.
+- **No scrolling**: the list shows exactly as many rows as fit the window and
+  pages through the rest (PageUp/PageDown or the mouse wheel turn a page).
+- **Search**, the "indexer": results come in alphabetic order, paged, each with its register number, with operators of search:
 
   ```
   p: v: f: c:                       only people / verba / sources / body tracks
