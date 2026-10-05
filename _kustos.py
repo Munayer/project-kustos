@@ -26,10 +26,9 @@ COMO O CONFLITO É RESOLVIDO
 
 IDS: p_ pessoa · c_ conceito · f_ forma · s_ fonte · h_ medida.
 
-LIVRO: além do id, todo registro tem um carimbo de registro (AAAAMMDDhhmmss)
-e um número de ordem no Livro Geral (G). Folhas de 50 números, volumes de 200
-folhas: o nº 1852 mora em G-1 · fl. 38. O número nunca muda nem volta a ser
-usado; apagar deixa o número na folha como cancelado.
+REGISTRO: além do id, todo registro tem um carimbo de registro
+(AAAAMMDDhhmmss) e um número de ordem (nº 1852). O número nunca muda nem volta
+a ser usado; apagar deixa o número na sequência, como cancelado.
 
 USO
     python _kustos.py                 abre a janela
@@ -1391,7 +1390,7 @@ def haystack_metric(m, data):
 def blank_vault():
     return {"schema": SCHEMA, "ui": {}, "people": [], "entries": [],
             "sources": [], "corpus": [], "edges": [], "deleted": [],
-            "book": {"opened": NOW(), "folha": FOLHA, "folhas": FOLHAS_POR_LIVRO}}
+            "book": {"opened": NOW()}}
 
 
 def fix_vault(data):
@@ -1442,7 +1441,7 @@ def load_json():
 
 def write_json(data):
     """Escrita atômica: grava ao lado e troca. Sem .bak -- a história está
-    no log. Antes, todo registro que ainda não tem número no livro recebe o
+    no log. Antes, todo registro que ainda não tem número de ordem recebe o
     seu: é por aqui que passa toda gravação, venha de onde vier."""
     novos = register_new(data)
     tmp = JSON_FILE.with_suffix(".tmp")
@@ -1521,24 +1520,17 @@ def read_logs():
     return lines
 
 
-# ================================================================ livro
+# ================================================================ registro
 #
-# Registro à maneira do cartório. Todo registro, ao entrar na base, recebe
-# um carimbo de registro (AAAAMMDDhhmmss, único) e um número de ordem no
-# Livro Geral. O número nunca muda nem é reaproveitado: o que é apagado
-# continua na folha, como cancelado. Volume e folha saem do número por
-# regra fixa, então o endereço de um registro não muda quando outros entram.
-#
-# FOLHA e FOLHAS_POR_LIVRO fazem parte do formato: mudá-los muda o endereço
-# de tudo que já foi registrado.
+# Todo registro, ao entrar na base, recebe um carimbo de registro
+# (AAAAMMDDhhmmss, único) e um número de ordem. O número é o endereço: nunca
+# muda nem é reaproveitado, e o que é apagado continua na sequência, como
+# cancelado. A lista sem busca é essa sequência, na ordem dos números.
 
-BOOK = "G"
-FOLHA = 50
-FOLHAS_POR_LIVRO = 200
 STAMP_FMT = "%Y%m%d%H%M%S"
 REG_ORIGEM = {"id": "carimbo do id antigo", "log": "primeira gravação no log",
               "atualizado": "última atualização",
-              "dia": "dia da última atualização", "abertura": "abertura do livro"}
+              "dia": "dia da última atualização", "abertura": "abertura do registro"}
 
 
 def stamp_now():
@@ -1577,31 +1569,12 @@ def stamp_free(stamp, taken):
     return stamp
 
 
-def folha_of(n):
-    """Folha corrida (1, 2, 3…) do número n, contando todos os volumes."""
-    return (n - 1) // FOLHA + 1
-
-
-def locus(n):
-    """(volume, folha dentro do volume) do número n."""
-    per_vol = FOLHA * FOLHAS_POR_LIVRO
-    return (n - 1) // per_vol + 1, ((n - 1) % per_vol) // FOLHA + 1
-
-
 def locus_label(n):
-    if not n:
-        return "sem registro"
-    vol, fl = locus(n)
-    return f"{BOOK}-{vol} · fl. {fl} · nº {n}"
-
-
-def folha_label(folha):
-    vol, fl = locus((folha - 1) * FOLHA + 1)
-    return f"LIVRO {BOOK}-{vol} · FOLHA {fl}"
+    return f"nº {n}" if n else "sem registro"
 
 
 def book_rows(data):
-    """Tudo o que ocupa número no livro: registros vivos e cancelados."""
+    """Tudo o que ocupa um número de ordem: registros vivos e cancelados."""
     rows = [r for coll in COLLS for r in data.get(coll, [])]
     return rows + list(data.get("deleted", []))
 
@@ -1659,7 +1632,7 @@ def open_book(data):
         r["reg_n"] = n
         r["reg_origem"] = why
         regs[r["id"]] = [r["reg"], n, why]
-    data["book"] = {"opened": NOW(), "folha": FOLHA, "folhas": FOLHAS_POR_LIVRO}
+    data["book"] = {"opened": NOW()}
     return regs
 
 
@@ -1756,7 +1729,7 @@ def delete_record(coll, rid, name=""):
                      if a["from"] != rid and a["to"] != rid]
     tomb = {"id": rid, "at": NOW(), "name": name}
     if gone.get("reg_n"):
-        # o número fica no livro, como cancelado
+        # o número fica na sequência, como cancelado
         tomb.update(reg=gone.get("reg"), reg_n=gone["reg_n"])
     data["deleted"].append(tomb)
     write_json(data)
@@ -2058,7 +2031,7 @@ def check(data):
 
 def check_book(data, errors, warnings):
     if "book" not in data:
-        warnings.append(f"livro {BOOK} ainda não aberto: abre na próxima gravação "
+        warnings.append("registro ainda não aberto: abre na próxima gravação "
                         "(ou rode `upgrade`)")
         return
     rows = book_rows(data)
@@ -2067,7 +2040,7 @@ def check_book(data, errors, warnings):
         if not r.get("reg_n"):
             if r in data.get("deleted", []):
                 continue
-            warnings.append(f"{r.get('id')}: sem número no livro "
+            warnings.append(f"{r.get('id')}: sem número de ordem "
                             "(recebe na próxima gravação)")
             continue
         by_n.setdefault(r["reg_n"], []).append(r.get("id"))
@@ -2076,7 +2049,7 @@ def check_book(data, errors, warnings):
         by_stamp.setdefault(r.get("reg"), []).append(r.get("id"))
     for n, ids in sorted(by_n.items()):
         if len(ids) > 1:
-            errors.append(f"nº {n} repetido no livro: {', '.join(ids)} "
+            errors.append(f"nº {n} repetido: {', '.join(ids)} "
                           "(resolve sozinho na próxima gravação)")
     for st, ids in by_stamp.items():
         if st and len(ids) > 1:
@@ -2085,8 +2058,8 @@ def check_book(data, errors, warnings):
     gaps = [n for n in range(1, top + 1) if n not in by_n]
     if gaps:
         shown = ", ".join(str(n) for n in gaps[:10]) + (" …" if len(gaps) > 10 else "")
-        warnings.append(f"{len(gaps)} número(s) sem registro nem cancelamento no "
-                        f"livro: {shown}")
+        warnings.append(f"{len(gaps)} número(s) sem registro nem cancelamento: "
+                        f"{shown}")
 
 
 def summary(data):
@@ -2124,7 +2097,7 @@ def cmd_doctor():
 
 def mirror_locus(r):
     if not r.get("reg_n"):
-        return "*sem registro no livro*"
+        return "*sem número de ordem*"
     return f"*{locus_label(r['reg_n'])} · registrado {stamp_label(r.get('reg'))}*"
 
 
@@ -2552,7 +2525,7 @@ def upgrade_vault(data):
     O texto original fica em `raw` e continua a ser o que a citação 'bruto'
     devolve, então nada do que estava escrito se perde.
 
-    index/3 -> index/4: abre o Livro Geral e numera o que já existe."""
+    index/3 -> index/4: abre o registro e numera o que já existe."""
     fix_vault(data)
     report = {"sources": [], "relinked": 0, "regs": {}}
     if schema_version(data) < 3:
@@ -2596,8 +2569,8 @@ def describe_opening(data, regs):
         why[v[2]] = why.get(v[2], 0) + 1
     bits = ", ".join(f"{k} por {REG_ORIGEM[w]}" for w, k in
                      sorted(why.items(), key=lambda x: -x[1]))
-    return (f"Livro {BOOK} aberto: {len(regs)} registros numerados, até "
-            f"{locus_label(n)}. Carimbos inferidos: {bits}.")
+    return (f"Registro aberto: {len(regs)} registros numerados, do nº 1 ao "
+            f"nº {n}. Carimbos inferidos: {bits}.")
 
 
 def cmd_upgrade(quiet=False):
@@ -4878,10 +4851,11 @@ class App:
         self.pendings = []
         self.fits = []
         self.shown = None
-        self.mode = "livro"        # "livro" (folhas por número) | "indicador" (busca)
-        self.folha = None          # folha corrida aberta no livro; None = a última
-        self.page = 0              # página do indicador
-        self.page_sig = None       # o filtro mudou? então o indicador volta à página 1
+        self.mode = "registro"     # "registro" (ordem dos números) | "indicador" (busca)
+        self.top = None            # primeira linha da vista; None = o fim (os mais novos)
+        self.rows = 0              # quantas linhas cabem na lista agora
+        self.page_sig = None       # o filtro mudou? então a vista volta ao começo
+        self._fit_job = None
         ui = self.data.get("ui") or {}
         self.max_rows = int(ui.get("max_rows") or 10)
         self.locked_panes = bool(ui.get("panes_locked"))
@@ -4917,8 +4891,9 @@ class App:
         st.theme_use("clam")
         st.configure("TFrame", background=SHELL)
         st.configure("TPanedwindow", background=RULE)
+        self.row_h = 24
         st.configure("Treeview", background=SHELL, fieldbackground=SHELL,
-                     foreground=INK, borderwidth=0, rowheight=24, font=self.f_row)
+                     foreground=INK, borderwidth=0, rowheight=self.row_h, font=self.f_row)
         st.map("Treeview", background=[("selected", SELBG)],
                foreground=[("selected", SELFG)])
         st.configure("TScrollbar", background=RULE, troughcolor=SHELL,
@@ -5020,13 +4995,15 @@ class App:
         self.list.column("#0", width=215, stretch=True)
         self.list.column("sub", width=165, stretch=True)
         self.list.column("loc", width=96, anchor="e", stretch=False)
-        sb = ttk.Scrollbar(mid, orient="vertical", command=self.list.yview)
-        self.list.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
         self.list.pack(fill="both", expand=True)
         self.list.tag_configure("sub", foreground=FAINT, font=self.f_meta)
         self.list.tag_configure("cancel", foreground=FAINT, font=self.f_meta)
         self.list.bind("<<TreeviewSelect>>", self.on_pick)
+        # sem rolagem: a lista mostra o que cabe, e o resto é a página seguinte
+        self.list.bind("<Configure>", self.fit_soon)
+        self.list.bind("<MouseWheel>", lambda e: self.turn(-1 if e.delta > 0 else 1))
+        self.list.bind("<Button-4>", lambda e: self.turn(-1))
+        self.list.bind("<Button-5>", lambda e: self.turn(1))
         pw.add(mid, weight=1)
 
         self.cardbox = tk.Frame(pw, bg=PAPER)
@@ -5278,7 +5255,11 @@ class App:
         self.list.bind("<Next>", lambda e: self.turn(1))
         r.bind("<Control-Prior>", lambda e: self.turn(-1))
         r.bind("<Control-Next>", lambda e: self.turn(1))
-        r.bind("<Control-l>", lambda e: self.to_book())
+        r.bind("<Control-l>", lambda e: self.to_register())
+        self.list.bind("<Control-Home>", lambda e: self.turn_to(0))
+        self.list.bind("<Control-End>", lambda e: self.turn_to(None))
+        self.list.bind("<Down>", lambda e: self.edge_step(1, e))
+        self.list.bind("<Up>", lambda e: self.edge_step(-1, e))
 
     def jump_list(self, i):
         kids = self.list.get_children()
@@ -5304,10 +5285,10 @@ class App:
         else:
             i = 0 if delta > 0 else len(kids) - 1
         if not 0 <= i < len(kids):
-            # passou da borda: vira a folha
-            before = (self.folha, self.page)
+            # passou da borda: vira a página
+            before = self.top
             self.turn(delta)
-            if (self.folha, self.page) == before:
+            if self.top == before:
                 return "break"
             kids = self.list.get_children()
             if not kids:
@@ -5317,30 +5298,61 @@ class App:
         self.list.see(kids[i])
         return "break"
 
+    def edge_step(self, delta, _event=None):
+        """Seta para baixo na última linha (ou para cima na primeira) vira a
+        página em vez de não fazer nada."""
+        kids = self.list.get_children()
+        cur = self.list.focus()
+        if kids and cur in (kids[-1] if delta > 0 else kids[0],):
+            return self.step_record(delta)
+        return None
+
     def turn(self, delta):
-        """Vira a folha do livro, ou a página do indicador."""
-        if self.mode == "livro":
-            self.folha = max(1, (self.folha or 1) + delta)
-        else:
-            self.page = max(0, self.page + delta)
+        """Vira uma página: tantas linhas quantas cabem na lista."""
+        rows = max(1, self.rows or self.rows_fit())
+        top = (self.top or 0) + delta * rows
+        if top >= len(self.view) or (delta < 0 and (self.top or 0) == 0):
+            return "break"            # já está na última (ou na primeira) página
+        self.top = max(0, top)
         self.refresh_list()
         kids = self.list.get_children()
         if kids:
-            self.list.focus(kids[0])
-            self.list.yview_moveto(0)
+            self.list.focus(kids[0] if delta >= 0 else kids[-1])
         return "break"
 
-    def to_book(self, folha=None):
-        """Ctrl+L: sai da busca e dos filtros e abre o livro na folha do
-        registro aberto (ou na folha pedida)."""
+    def turn_to(self, top):
+        """Ctrl+Home / Ctrl+End: começo ou fim da lista."""
+        self.top = top
+        self.refresh_list()
+        return "break"
+
+    def rows_fit(self):
+        h = self.list.winfo_height()
+        if h < 40:              # ainda não desenhada
+            return 20
+        return max(1, (h - 4) // self.row_h)
+
+    def fit_soon(self, _event=None):
+        """A janela mudou de tamanho: redesenha quando parar de mudar."""
+        if self._fit_job:
+            try:
+                self.root.after_cancel(self._fit_job)
+            except tk.TclError:
+                pass
+        self._fit_job = self.root.after(90, self.fit)
+
+    def fit(self):
+        self._fit_job = None
+        if self.rows_fit() != self.rows:
+            self.refresh_list()
+
+    def to_register(self, n=None):
+        """Ctrl+L: sai da busca e dos filtros e mostra o registro aberto (ou o
+        nº pedido) no seu lugar na sequência."""
         self.commit_if_dirty()
         rec = self.current()
         self.clear_filters()
         self.scope = None
-        if folha:
-            self.folha = folha
-        elif rec and rec.get("reg_n"):
-            self.folha = folha_of(rec["reg_n"])
         self.q.set("")
         if self._q_job:          # a busca vazia já vai ser desenhada agora
             try:
@@ -5350,10 +5362,22 @@ class App:
             self._q_job = None
         self.refresh_rail()
         self.refresh_list()
-        if self.sel and self.list.exists(self.sel):
-            self.list.see(self.sel)
+        target = n or (rec or {}).get("reg_n")
+        if target:
+            self.show_number(target)
         self.list.focus_set()
         return "break"
+
+    def show_number(self, n):
+        """Leva a vista até o nº n (no meio da página, se der)."""
+        i = self.view_num.get(n)
+        if i is None:
+            return
+        kids = self.list.get_children()
+        iid = self.view[i][1].get("id") if self.view[i][0] == "r" else f"x:{n}"
+        if iid not in kids:
+            self.top = max(0, i - self.rows // 2)
+            self.refresh_list()
 
     def set_scope(self, key):
         self.commit_if_dirty()
@@ -5368,7 +5392,7 @@ class App:
     def goto_dialog(self):
         """Ctrl+G: ir para um registro pelo id ou pelo nome exato."""
         win = self.dialog("Ir para", 520, 130)
-        tk.Label(win, text="IR PARA  (nº, fl. 37, carimbo, id ou nome)", bg=PAPER,
+        tk.Label(win, text="IR PARA  (nº, carimbo, id ou nome)", bg=PAPER,
                  fg=FAINT, font=self.f_label).pack(anchor="w", padx=18, pady=(14, 2))
         e = tk.Entry(win, font=self.f_body, bg=PAPER, fg=INK, insertbackground=INK,
                      relief="flat", highlightthickness=1, highlightbackground=RULE,
@@ -5384,18 +5408,13 @@ class App:
             if key in idx:
                 self.goto(key)
                 return
-            m = re.fullmatch(r"(?i)\s*(?:g-?(\d+)\s*[·,]?\s*)?(?:fl|folha|f)\.?\s*(\d+)\s*", key)
-            if m:
-                vol, fl = int(m.group(1) or 1), int(m.group(2))
-                self.to_book(folha=(vol - 1) * FOLHAS_POR_LIVRO + max(1, fl))
-                return
-            m = re.fullmatch(r"(?i)\s*(?:g|n[ºo°.]?)?\s*-?\s*(\d+)\s*", key)
+            m = re.fullmatch(r"(?i)\s*(?:n[ºo°.]?)?\s*(\d+)\s*", key)
             if m:
                 r = find_by_reg(self.data, m.group(1))
                 if r and r.get("id") in idx:
                     self.goto(r["id"])
                 elif r:
-                    self.to_book(folha=folha_of(r["reg_n"]))
+                    self.to_register(r["reg_n"])
                     iid = f"x:{r['reg_n']}"
                     if self.list.exists(iid):
                         self.list.selection_set(iid)
@@ -5941,82 +5960,79 @@ class App:
                 self.view_system)
 
     def refresh_list(self):
-        """Sem busca nem filtro, a lista é o LIVRO: uma folha de FOLHA números
-        de cada vez, na ordem de registro, com os cancelados no lugar. Com
-        busca ou filtro, é o INDICADOR: o que bate, em ordem alfabética,
-        paginado do mesmo tamanho, cada linha com seu endereço no livro."""
+        """Sem busca nem filtro, a lista é o REGISTRO: tudo na ordem dos
+        números, com os cancelados no lugar, abrindo no fim (os mais novos).
+        Com busca ou filtro, é o INDICADOR: o que bate, em ordem alfabética,
+        cada linha com seu número. Nos dois, a vista mostra só as linhas que
+        cabem na janela; o resto está nas páginas seguintes."""
         self._q_job = None
         sig = self.filter_sig()
+        filtered = bool(any(sig[:-1]) or self.view_system is not None)
         if sig != self.page_sig:
             self.page_sig = sig
-            self.page = 0
-        filtered = bool(any(sig[:-1]) or self.view_system is not None)
-        self.list.delete(*self.list.get_children())
+            self.top = 0 if filtered else None
         total = sum(len(self.data[c]) for c in COLLS)
         if filtered:
             self.mode = "indicador"
-            self.view = self.matches()
-            pages = max(1, -(-len(self.view) // FOLHA))
-            self.page = min(self.page, pages - 1)
-            for r in self.view[self.page * FOLHA:(self.page + 1) * FOLHA]:
-                n = r.get("reg_n")
-                if n:
-                    vol, fl = locus(n)
-                    loc = (f"{BOOK}-{vol} " if vol > 1 else "") + f"fl. {fl} · nº {n}"
-                else:
-                    loc = "novo"
-                self.insert_row(r, loc)
-            self.page_lbl.configure(
-                text=f"INDICADOR · FOLHA {self.page + 1} DE {pages}")
-            self.count.configure(text=f"{len(self.view)} de {total}")
+            self.view = [("r", r) for r in self.matches()]
         else:
-            self.mode = "livro"
-            book, gone, loose = {}, {}, []
+            self.mode = "registro"
+            live, loose = {}, []
             for c in COLLS:
                 for r in self.data[c]:
                     if r.get("reg_n"):
-                        book[r["reg_n"]] = r
+                        live[r["reg_n"]] = r
                     else:
                         loose.append(r)
-            for d in self.data.get("deleted", []):
-                if d.get("reg_n") and d["reg_n"] not in book:
-                    gone[d["reg_n"]] = d
-            top = max(list(book) + list(gone), default=0)
-            last = folha_of(top) if top else 1
-            if loose and top and top % FOLHA == 0:
-                last += 1          # o rascunho abre a folha seguinte
-            if self.folha is None or self.folha > last:
-                self.folha = last
-            self.view = [book[n] for n in sorted(book)] + loose
-            first = (self.folha - 1) * FOLHA + 1
-            for n in range(first, first + FOLHA):
-                if n in book:
-                    self.insert_row(book[n], f"nº {n}")
-                elif n in gone:
-                    d = gone[n]
-                    self.list.insert("", "end", iid=f"x:{n}",
-                                     text=f"cancelado · {one_liner(d.get('name', ''), 40)}",
-                                     values=(f"em {(d.get('at') or '')[:10]}", f"nº {n}"),
-                                     tags=("cancel",))
-            if self.folha == last:
-                for r in loose:
-                    self.insert_row(r, "novo")
-            self.page_lbl.configure(text=f"{folha_label(self.folha)}  ·  {self.folha} / {last}")
+            gone = {d["reg_n"]: d for d in self.data.get("deleted", [])
+                    if d.get("reg_n") and d["reg_n"] not in live}
+            self.view = [("r", live[n]) if n in live else ("x", gone[n])
+                         for n in sorted(set(live) | set(gone))]
+            self.view += [("r", r) for r in loose]       # rascunhos, no fim
+        self.view_num = {o["reg_n"]: i for i, (_, o) in enumerate(self.view)
+                         if o.get("reg_n")}
+        self.view_pos = {o["id"]: i for i, (k, o) in enumerate(self.view) if k == "r"}
+        self.rows = self.rows_fit()
+        if self.top is None:          # o fim: a última vista cheia
+            self.top = max(0, len(self.view) - self.rows)
+        self.top = max(0, min(self.top, len(self.view) - 1))
+        shown = self.view[self.top:self.top + self.rows]
+        self.list.delete(*self.list.get_children())
+        for kind, o in shown:
+            n = o.get("reg_n")
+            if kind == "x":
+                self.list.insert("", "end", iid=f"x:{n}",
+                                 text=f"cancelado · {one_liner(o.get('name', ''), 40)}",
+                                 values=(f"em {(o.get('at') or '')[:10]}", f"nº {n}"),
+                                 tags=("cancel",))
+            else:
+                self.insert_row(o, f"nº {n}" if n else "novo")
+        a, b = self.top + 1, self.top + len(shown)
+        if self.mode == "registro":
+            nums = [o.get("reg_n") for _, o in shown if o.get("reg_n")]
+            span = f"nº {nums[0]}–{nums[-1]}" if nums else "vazio"
+            self.page_lbl.configure(text=f"REGISTRO · {span}")
             self.count.configure(text=f"{total} registros")
+        else:
+            self.page_lbl.configure(
+                text=f"INDICADOR · {a}–{b} de {len(self.view)}" if shown
+                else "INDICADOR · nada encontrado")
+            self.count.configure(text=f"{len(self.view)} de {total}")
         if self.sel and self.list.exists(self.sel):
             self.list.selection_set(self.sel)
 
     def show_in_list(self, rid):
-        """Leva a lista à folha (ou página) onde o registro está."""
-        rec = by_id(self.data).get(rid)
-        if not rec or self.list.exists(rid):
+        """Leva a vista até o registro, se ele estiver fora dela."""
+        if self.list.exists(rid):
             return
-        if self.mode == "livro":
-            self.folha = folha_of(rec["reg_n"]) if rec.get("reg_n") else None
-            self.refresh_list()
-        elif rec in self.view:
-            self.page = self.view.index(rec) // FOLHA
-            self.refresh_list()
+        i = self.view_pos.get(rid)
+        if i is None:
+            if self.mode == "registro":       # rascunho novo: fica no fim
+                self.top = None
+                self.refresh_list()
+            return
+        self.top = max(0, i - self.rows // 2)
+        self.refresh_list()
 
     def set_locus(self, rec):
         if not rec:
@@ -6024,9 +6040,9 @@ class App:
             return
         n = rec.get("reg_n")
         if not n:
-            self.locus.configure(text="SEM REGISTRO · RECEBE NÚMERO NO LIVRO AO SALVAR")
+            self.locus.configure(text="SEM REGISTRO · RECEBE NÚMERO AO SALVAR")
             return
-        text = f"LIVRO {locus_label(n).upper()}    REGISTRADO {stamp_label(rec.get('reg'))}"
+        text = f"REGISTRO Nº {n}    REGISTRADO {stamp_label(rec.get('reg'))}"
         if rec.get("reg_origem"):
             text += f"  (inferido: {REG_ORIGEM.get(rec['reg_origem'], rec['reg_origem'])})"
         if rec.get("reg_n_anterior"):
@@ -6264,13 +6280,13 @@ class App:
         self.set_locus(None)
 
     def show_cancelled(self, n):
-        """Linha cancelada do livro: o cartão fica vazio e o cabeçalho diz
+        """Número cancelado: o cartão fica vazio e o cabeçalho diz
         o que ocupava o número."""
         d = next((d for d in self.data.get("deleted", []) if d.get("reg_n") == n), None)
         self.blank_card()
         if d:
             self.locus.configure(
-                text=f"LIVRO {locus_label(n).upper()}    CANCELADO EM "
+                text=f"REGISTRO Nº {n}    CANCELADO EM "
                      f"{(d.get('at') or '').replace('T', ' ')}  ·  "
                      f"{d.get('name', '')}  ({d.get('id', '')})")
             self.say("Registro cancelado: o histórico está no log (Base › Histórico).")
@@ -6894,21 +6910,22 @@ class App:
                        "\n  Ctrl+Enter salvar e começar outro do mesmo tipo"
                        "\n  Ctrl+Z / Ctrl+Y   desfazer / refazer"
                        "\n  Ctrl+J / Ctrl+K   próximo / anterior, de qualquer lugar"
-                       "\n  Ctrl+G     ir para: nº (1852), folha (fl 37), carimbo, id ou nome"
-                       "\n  Ctrl+L     ver no livro: sai da busca, abre a folha do registro"
+                       "\n  Ctrl+G     ir para: nº (1852), carimbo, id ou nome"
+                       "\n  Ctrl+L     ver no registro: sai da busca, mostra o nº do aberto"
                        "\n  Ctrl+1..4  escopo pessoas / verba / fontes / corpus; Ctrl+0 tudo"
                        "\n  /  na lista volta à busca;  Enter na lista vai ao cartão"
-                       "\n  Home / End na folha;  PageUp / PageDown vira a folha"
-                       "\n  Ctrl+PageUp / Ctrl+PageDown vira a folha de qualquer lugar"
+                       "\n  Home / End na página;  PageUp / PageDown ou a roda vira a página"
+                       "\n  Ctrl+Home / Ctrl+End  começo / fim da lista"
+                       "\n  Ctrl+PageUp / Ctrl+PageDown vira a página de qualquer lugar"
                        "\n  F5         recarregar do disco"
                        "\n  Esc        voltar à lista\n"
-                       f"\n  LIVRO {BOOK}: todo registro recebe, ao ser gravado pela"
-                       "\n  primeira vez, um carimbo (AAAAMMDDhhmmss) e um número de"
-                       f"\n  ordem. Cada folha tem {FOLHA} números; cada volume,"
-                       f"\n  {FOLHAS_POR_LIVRO} folhas. O número nunca muda: o que é apagado"
-                       "\n  fica na folha como cancelado. Sem busca, a lista é o livro;"
-                       "\n  com busca ou filtro, é o INDICADOR, em ordem alfabética,"
-                       "\n  com o endereço de cada registro.\n"
+                       "\n  REGISTRO: todo registro recebe, ao ser gravado pela primeira"
+                       "\n  vez, um carimbo (AAAAMMDDhhmmss) e um número de ordem que"
+                       "\n  nunca muda; o que é apagado fica na sequência como cancelado."
+                       "\n  Sem busca, a lista é o registro, na ordem dos números; com"
+                       "\n  busca ou filtro, é o INDICADOR, em ordem alfabética. A lista"
+                       "\n  mostra o que cabe na janela, sem rolagem: o resto está nas"
+                       "\n  páginas seguintes.\n"
                        "\n  Operadores da busca:"
                        "\n  p: v: f: c:   só pessoas / verba / fontes / corpus"
                        "\n  ^ab           nome que começa com ab"
