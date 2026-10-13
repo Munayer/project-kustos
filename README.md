@@ -14,7 +14,7 @@ updating of files and conflicts if used any syncing app or cloud sync.
 ## How to use
 
 1. Download `_kustos.py` and `_kustos.cmd` onto an empty folder.
-2. Open `_kustos.cmd` to start using. The empty folder will be the locus of files.
+2. Open `_kustos.cmd` to start using (or `_kustos_livro.cmd` to read the base as a logbook, read-only). The empty folder will be the locus of files.
 3. Upon the first entry, the program creates the `_kustos.json` database. All files are local and don't leave your computer, unless you use a cloud or sync app.
 
 ## Components

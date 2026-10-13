@@ -21,5 +21,6 @@ python -m py_compile _kustos.py || (
 
 copy /y "_kustos.py"  "%DESTINO%\" >nul
 copy /y "_kustos.cmd" "%DESTINO%\" >nul
+copy /y "_kustos_livro.cmd" "%DESTINO%\" >nul
 echo Codigo copiado para %DESTINO%
 pause
