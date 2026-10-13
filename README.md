@@ -14,7 +14,7 @@ updating of files and conflicts if used any syncing app or cloud sync.
 ## How to use
 
 1. Download `_kustos.py` and `_kustos.cmd` onto an empty folder.
-2. Open `_kustos.cmd` to start using (or `_kustos_livro.cmd` to read the base as a logbook, read-only; inside the app, `Ctrl+B` opens the logbook on the current entry and `Enter` in the logbook brings an entry back to the app). The empty folder will be the locus of files.
+2. Open `_kustos.cmd` to start using (or `_kustos_logbook.cmd` to read the base as a logbook, read-only; inside the app, `Ctrl+B` opens the logbook on the current entry and `Enter` in the logbook brings an entry back to the app). The empty folder will be the locus of files.
 3. Upon the first entry, the program creates the `_kustos.json` database. All files are local and don't leave your computer, unless you use a cloud or sync app.
 
 ## Components
@@ -38,11 +38,19 @@ updating of files and conflicts if used any syncing app or cloud sync.
   ```
   p: v: f: c:                       only people / verba / sources / body tracks
   ^ab                               name that starts with "ab"
-  tag:x lang:de type:livro sys:renal dom:direito id:c_
+  tag:x lang:de type:book sys:renal dom:law id:c_
   ```
 
 - **Sync between machines**: each machine that you end up using and syncing will write its own diary of usage
   (`_kustos.log.<machine>.jsonl`); files `*.sync-conflict-*` are mixed register by register on opening. The complete history of each register comes out in the diaries.
+
+## Language
+
+The interface is in English. Portuguese is available under **View › Language**
+(saved as `ui.lang` in `_kustos.json`); the window reopens in the chosen
+language. Your data is never translated: source types and corpus systems are
+stored under their original keys and only *shown* in the interface language.
+ABNT citations stay in Portuguese, as the standard itself is.
 
 ## Command lines (optional)
 
@@ -53,6 +61,7 @@ python _kustos.py cite <id|texto> [abnt|abnt-autor-data|bibtex|csl-json|bruto]  
 python _kustos.py export [bibtex|csl|abnt] [arquivo]
 python _kustos.py import zotero <export.json|.bib>
 python _kustos.py mirror | corpus | merge | history <id> | replay
+python _kustos.py logbook                  the base as a logbook (read-only)
 ```
 
 ## Suggestion: Using Syncthing to sync

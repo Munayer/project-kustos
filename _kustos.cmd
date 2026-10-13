@@ -1,8 +1,8 @@
 @echo off
 rem ------------------------------------------------------------------
-rem Duplo clique para abrir o Index.
-rem Abre _kustos.py desta mesma pasta, sem janela de console
-rem quando o pythonw estiver disponivel.
+rem Double-click to open Kustos.
+rem Opens _kustos.py from this same folder, without a console window
+rem when pythonw is available.
 rem ------------------------------------------------------------------
 cd /d "%~dp0"
 
@@ -10,9 +10,9 @@ where pythonw >nul 2>&1 && goto :sem_console
 where python  >nul 2>&1 && goto :com_console
 
 echo.
-echo   Python nao foi encontrado no PATH.
-echo   Instale o Python 3.10 ou mais novo marcando a opcao
-echo   "Add Python to PATH" durante a instalacao.
+echo   Python was not found on the PATH.
+echo   Install Python 3.10 or newer, ticking
+echo   "Add Python to PATH" during installation.
 echo.
 pause
 exit /b 1

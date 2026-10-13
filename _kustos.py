@@ -1,53 +1,56 @@
 #!/usr/bin/env python3
 """
-_kustos.py -- um índice só: pessoas (personne), conceitos e formas (verba),
-fontes (sources, à maneira do Zotero) e medidas do corpo (corpus).
+_kustos.py -- a single index: people (personne), concepts and word forms
+(verba), sources (Zotero-style) and body measurements (corpus).
 
-Um JSON canônico como fonte de verdade, espelho markdown gerado, busca
-literal, biblioteca padrão apenas, um arquivo só. As quatro coleções vivem
-na mesma base e se ligam entre si: qualquer registro pode citar uma fonte
-pelo campo FONTE, e as ligações tipadas atravessam coleções.
+One canonical JSON file is the source of truth, with a generated markdown
+mirror, literal search, standard library only, a single file. The four
+collections live in the same base and link to each other: any record can cite
+a source through its SOURCE field, and typed links cross collections.
 
-ARQUIVOS (todos lado a lado, mesmo prefixo)
-    _kustos.json                  FONTE DE VERDADE.
-    _kustos.log.<máquina>.jsonl   Diário só-de-acréscimo, um por máquina:
-                                     cada salvamento anexa o registro inteiro.
-                                     É o histórico completo (sem .bak).
-    _kustos.lock.<máquina>.json   Aviso de "está aberto ali". Some ao fechar.
-    _kustos_mirror.md             Espelho legível (Obsidian, celular).
-    _kustos_conflicts/            *.sync-conflict-* já absorvidos. Nada é apagado.
-    _kustos_old/                  O que `migrate` aposentou.
+FILES (all side by side, same prefix)
+    _kustos.json                  SOURCE OF TRUTH.
+    _kustos.log.<machine>.jsonl   Append-only journal, one per machine: every
+                                  save appends the whole record. It is the
+                                  complete history (no .bak files).
+    _kustos.lock.<machine>.json   "Open over there" notice. Removed on close.
+    _kustos_mirror.md             Readable mirror (Obsidian, phone).
+    _kustos_conflicts/            *.sync-conflict-* already merged. Nothing is deleted.
+    _kustos_old/                  What `migrate` retired.
 
-COMO O CONFLITO É RESOLVIDO
-    1. Toda gravação relê o JSON, aplica só o registro que mudou e grava.
-    2. Ao abrir, *.sync-conflict-* são fundidos registro a registro (o
-       `updated_at` mais novo vence; apagamento é lembrado por lápide).
-    3. Se a outra máquina deixou a trava, a barra de status avisa.
+HOW CONFLICTS ARE RESOLVED
+    1. Every save rereads the JSON, applies only the record that changed, and writes.
+    2. On opening, *.sync-conflict-* files are merged record by record (the
+       newest `updated_at` wins; deletions are remembered as tombstones).
+    3. If another machine left its lock, the status bar says so.
 
-IDS: p_ pessoa · c_ conceito · f_ forma · s_ fonte · h_ medida.
+IDS: p_ person · c_ concept · f_ form · s_ source · h_ measurement.
 
-REGISTRO: além do id, todo registro tem um carimbo de registro
-(AAAAMMDDhhmmss) e um número de ordem (nº 1852). O número nunca muda nem volta
-a ser usado; apagar deixa o número na sequência, como cancelado.
+REGISTER: besides its id, every record has a registration stamp
+(YYYYMMDDhhmmss) and an order number (nº 1852). The number never changes and
+is never reused; deleting leaves the number in the sequence, as cancelled.
 
-USO
-    python _kustos.py                 abre a janela
-    python _kustos.py app [id]        abre a janela, já no registro
-    python _kustos.py livro           a base como livro (protótipo, só leitura)
-    python _kustos.py doctor          valida a estrutura, não muda nada
-    python _kustos.py mirror          refaz o espelho markdown
-    python _kustos.py corpus          refaz o mapa do corpo (HTML) e abre
-    python _kustos.py search <texto>  busca literal nas quatro coleções
-    python _kustos.py cite <id|texto> [abnt|abnt-autor-data|bibtex|csl-json|bruto]
-    python _kustos.py export [bibtex|csl|abnt] [arquivo]
+LANGUAGE: the interface is in English; Portuguese is available under
+View › Language (stored as ui.lang in the JSON).
+
+USAGE
+    python _kustos.py                 open the window
+    python _kustos.py app [id]        open the window on a record
+    python _kustos.py logbook         the base as a logbook (read-only)
+    python _kustos.py doctor          check the structure, change nothing
+    python _kustos.py mirror          rebuild the markdown mirror
+    python _kustos.py corpus          rebuild the body map (HTML) and open it
+    python _kustos.py search <text>   literal search across the four collections
+    python _kustos.py cite <id|text> [abnt|abnt-autor-data|bibtex|csl-json|bruto]
+    python _kustos.py export [bibtex|csl|abnt] [file]
     python _kustos.py import zotero <export.json|.bib>
-    python _kustos.py import <notas.md>   "- Nome. Notas" -> pessoas
-    python _kustos.py merge           absorve *.sync-conflict-* agora
-    python _kustos.py history <id>    versões de um registro, pelos logs
-    python _kustos.py replay          reconstrói o JSON só dos logs (.replay.json)
-    python _kustos.py upgrade         index/2 -> index/3 (roda sozinho ao abrir)
-    python _kustos.py migrate         personne + verba antigos -> _kustos.json
-    python _kustos.py normalize       #tags e datas inline -> tags (pessoas)
+    python _kustos.py import <notes.md>   "- Name. Notes" -> people
+    python _kustos.py merge           merge *.sync-conflict-* now
+    python _kustos.py history <id>    versions of a record, from the logs
+    python _kustos.py replay          rebuild the JSON from the logs alone (.replay.json)
+    python _kustos.py upgrade         bring an older base up to date (runs on open)
+    python _kustos.py migrate         old personne + verba files -> _kustos.json
+    python _kustos.py normalize       inline #tags and dates -> tags (people)
 """
 
 import hashlib
@@ -67,31 +70,54 @@ BASE = Path(__file__).parent
 STEM = "_kustos"
 JSON_FILE = BASE / f"{STEM}.json"
 MIRROR_FILE = BASE / f"{STEM}_mirror.md"
-MIRROR_MARK = "<!-- gerado por _kustos.py -- não editar à mão -->"
+MIRROR_MARK = "<!-- generated by _kustos.py -- do not edit by hand -->"
+# marks written by earlier versions: a mirror carrying one is still ours
+OLD_MIRROR_MARKS = ("<!-- gerado por _kustos.py -- não editar à mão -->",)
 CONFLICT_DIR = BASE / f"{STEM}_conflicts"
 OLD_DIR = BASE / f"{STEM}_old"
 SCHEMA = "index/4"
-# o corpus é de uma pessoa só: o nome vai na legenda do mapa e, se houver
-# registro de pessoa com esse nome, as medidas ficam ligadas a ele. O valor
-# de verdade mora no JSON (ui.corpus_subject); este é só o padrão inicial.
+# the corpus belongs to one person: the name goes on the body map's legend and,
+# if a person record has that name, the measurements are linked to it. The real
+# value lives in the JSON (ui.corpus_subject); this is only the initial default.
 CORPUS_SUBJECT = ""
-# as coleções, na ordem em que aparecem em tudo. Cada uma tem um prefixo de
-# id próprio, e é pelo prefixo que o programa sabe de que tipo é um registro.
+# the collections, in the order they appear everywhere. Each has its own id
+# prefix, and the prefix is how the program knows what kind a record is.
 COLLS = ("people", "entries", "sources", "corpus")
 PREFIX = {"p_": "people", "c_": "entries", "f_": "entries",
           "s_": "sources", "h_": "corpus"}
-COLL_PT = {"people": "pessoas", "entries": "verba", "sources": "fontes",
-           "corpus": "corpus"}
+COLL_LABEL = {"people": "people", "entries": "verba", "sources": "sources",
+              "corpus": "corpus"}
 
 
-# ids sem prefixo (os mais antigos do personne eram carimbos de tempo) são
-# resolvidos por este registro, preenchido a cada leitura do vault
+# ================================================================ language
+#
+# The interface speaks English. Every string shown to the person goes through
+# tr(): in English it comes back as written; in Portuguese it is looked up in
+# PT (at the end of the file). Placeholders use str.format: tr("{n} saved",
+# n=3). The choice lives in the JSON as ui.lang ("en" or "pt").
+
+LANG = "en"
+LANGS = {"en": "English", "pt": "Português"}
+
+
+def tr(text, **kw):
+    s = PT.get(text, text) if LANG == "pt" else text
+    return s.format(**kw) if kw else s
+
+
+def set_lang(code):
+    global LANG
+    LANG = code if code in LANGS else "en"
+
+
+# ids without a prefix (the oldest personne ids were timestamps) are resolved
+# through this registry, filled in every time the vault is read
 _ID_COLL = {}
 
 
 def coll_of(rid):
-    """A coleção de um id: pelo prefixo, ou pelo registro de ids lidos.
-    Rascunhos são '__draft_<x>__'."""
+    """The collection of an id: by its prefix, or by the registry of ids read.
+    Drafts are '__draft_<x>__'."""
     rid = rid or ""
     if rid.startswith("__draft_"):
         return {"p": "people", "e": "entries", "s": "sources",
@@ -103,7 +129,7 @@ def coll_of(rid):
 
 
 def kind_of(rec):
-    """person | concept | form | source | metric -- o que as ligações checam."""
+    """person | concept | form | source | metric -- what links are checked against."""
     coll = coll_of(rec.get("id", ""))
     if coll == "entries":
         return rec.get("kind", "concept")
@@ -111,7 +137,7 @@ def kind_of(rec):
 
 
 def _host():
-    raw = socket.gethostname().split(".")[0] or "maquina"
+    raw = socket.gethostname().split(".")[0] or "machine"
     return re.sub(r"[^A-Za-z0-9_-]+", "_", raw)[:32]
 
 
@@ -128,11 +154,11 @@ def NOW():
     return datetime.now().isoformat(timespec="seconds")
 
 
-# ================================================================ comum
+# ================================================================ common
 
 def sort_key(text):
-    """Ordem alfabética que serve ao português e ao grego: sem caixa, e com
-    acentos junto da letra que acentuam em vez de depois do z."""
+    """Alphabetical order that works for Portuguese and Greek: case-insensitive,
+    with accented letters next to their base letter instead of after z."""
     folded = unicodedata.normalize("NFKD", (text or "").casefold())
     return ("".join(c for c in folded if not unicodedata.combining(c)),
             text or "")
@@ -142,7 +168,7 @@ def slug(text):
     folded = unicodedata.normalize("NFKD", (text or "").casefold())
     folded = "".join(c for c in folded if not unicodedata.combining(c))
     folded = re.sub(r"[^a-z0-9]+", "_", folded).strip("_")
-    return folded or "verbete"
+    return folded or "entry"
 
 
 def one_liner(text, limit=140):
@@ -151,12 +177,12 @@ def one_liner(text, limit=140):
 
 
 def stamp_of(rec):
-    """Carimbo comparável de um registro. `updated_at` (data e hora) vence
-    `updated` (só data); os dois são texto ISO, então comparam como texto."""
+    """A comparable timestamp for a record. `updated_at` (date and time) beats
+    `updated` (date only); both are ISO text, so they compare as text."""
     return rec.get("updated_at") or rec.get("updated") or ""
 
 
-# ================================================================ pessoas
+# ================================================================ people
 
 def make_id(name, taken):
     base = "p_" + hashlib.md5(name.encode("utf-8")).hexdigest()[:8]
@@ -168,8 +194,7 @@ def make_id(name, taken):
     return f"{base}_{n}"
 
 
-# Os caracteres de checkbox do Obsidian, para que as tarefas do espelho
-# também sejam renderizadas lá.
+# Obsidian's checkbox characters, so the mirror's tasks render there too.
 TASK_MARK = {" ": "todo", "/": "doing", ">": "waiting",
              "x": "done", "-": "cancelled"}
 MARK_OF = {"todo": " ", "doing": "/", "waiting": ">",
@@ -182,10 +207,10 @@ DUE_RE = re.compile(
 
 
 def split_due(body):
-    """Tira o prazo de uma linha de tarefa: (texto, data, hora).
+    """Splits the due date off a task line: (text, date, time).
 
-    A ÚLTIMA data da linha vence, então outras datas podem aparecer no
-    texto. Uma marcada com ~ vence sempre uma sem marca."""
+    The LAST date on the line wins, so other dates may appear in the text.
+    One marked with ~ always beats an unmarked one."""
     hits = list(DUE_RE.finditer(body))
     if not hits:
         return body.strip(), "", ""
@@ -229,7 +254,7 @@ def format_tasks(tasks):
         for t in (tasks or []))
 
 
-# Os círculos de Covey, do mais externo ao mais interno.
+# Covey's circles, from the outermost to the innermost.
 CIRCLES = ("concern", "adapt", "influence", "control")
 
 
@@ -242,8 +267,8 @@ LOG_RE = re.compile(r"^\s*(\d{4}-\d{2}-\d{2})(?:\s+(.*))?$")
 
 
 def parse_log(text):
-    """'2026-08-01   Conversa sobre o processo' -> {date, text}. Linha sem
-    data recebe a de hoje."""
+    """'2026-08-01   Talked about the process' -> {date, text}. A line with
+    no date gets today's."""
     out = []
     for line in (text or "").splitlines():
         line = line.strip()
@@ -269,7 +294,7 @@ def dated_tasks(p):
 
 
 def fold_finished_tasks(rec):
-    """Tarefa concluída sai da lista e vira linha datada no log."""
+    """A finished task leaves the list and becomes a dated line in the log."""
     keep, moved = [], 0
     for t in rec.get("tasks", []):
         state = t.get("state")
@@ -350,7 +375,7 @@ def fix_person(p):
     return p
 
 
-# ---- importação: "- Nome. Notas" ou "## Nome"
+# ---- import: "- Name. Notes" or "## Name"
 
 ABBREVS = {"st", "mr", "mrs", "ms", "dr", "prof", "fr", "sr", "jr", "ss", "rev"}
 URL_RE = re.compile(r"^(https?://|www\.)\S+$", re.IGNORECASE)
@@ -429,8 +454,8 @@ def parse_headings(text):
 
 
 def merge_into(target, rec):
-    """Dobra um registro que chega no que já existe. Texto já presente não
-    é acrescentado de novo: importar o mesmo arquivo duas vezes não muda nada."""
+    """Folds an incoming record into an existing one. Text already present is
+    not added again: importing the same file twice changes nothing."""
     changed = False
     note = (rec.get("notes_raw") or "").strip()
     if note and note not in (target.get("notes_raw") or ""):
@@ -457,8 +482,8 @@ def merge_into(target, rec):
 
 
 def ingest(text, data):
-    """Devolve (added, merged, identical, merged_names) e grava cada registro
-    tocado (com log)."""
+    """Returns (added, merged, identical, merged_names) and logs every record
+    it touched."""
     text = strip_frontmatter(text)
     people = (parse_headings(text) if re.search(r"^##\s+", text, flags=re.MULTILINE)
               else parse_bullet_list(text))
@@ -493,7 +518,7 @@ def ingest(text, data):
     return added, merged, identical, merged_names
 
 
-# ---- normalize: #tags e datas inline -> tags
+# ---- normalize: inline #tags and dates -> tags
 
 DATE_KEYWORDS = ("birthday", "funeral", "deathday", "death", "born")
 DATE_TAG_RE = re.compile(
@@ -532,10 +557,10 @@ def extract_inline(text, tags):
 
 KINDS = ("concept", "form")
 
-# As ligações TÍPICAS: que tipos de registro cada uma pode ligar. "*" é
-# qualquer tipo. Uma ligação com rel fora desta tabela não é erro: é ATÍPICA,
-# fica guardada com o rótulo que foi escrito e aparece no doctor para você
-# decidir se a promove a típica (acrescentando-a aqui).
+# The TYPICAL links: which kinds of record each one may connect. "*" is any
+# kind. A link whose rel is not in this table is not an error: it is ATYPICAL,
+# kept with the label it was written with, and listed by the doctor so you can
+# decide whether to promote it to typical (by adding it here).
 RELS = {
     # verba
     "expresses":     ("form", "concept"),
@@ -548,7 +573,7 @@ RELS = {
     "analogous_to":  ("concept", "concept"),
     "instrument_of": ("concept", "concept"),
     "requires":      ("concept", "concept"),
-    # pessoas
+    # people
     "coined_by":     ("*", "person"),
     "used_by":       ("*", "person"),
     "about":         ("*", "*"),
@@ -556,7 +581,7 @@ RELS = {
     "editor_of":     ("person", "source"),
     "translator_of": ("person", "source"),
     "knows":         ("person", "person"),
-    # fontes
+    # sources
     "cites":         ("*", "source"),
     "attested_in":   ("form", "source"),
     "defined_in":    ("concept", "source"),
@@ -570,37 +595,39 @@ RELS = {
     "affects":       ("*", "metric"),
     "correlates":    ("metric", "metric"),
 }
-REL_PT = {
-    "expresses": "exprime", "derives_from": "deriva de",
-    "cognate_of": "cognato de", "borrows_from": "empresta de",
-    "calques": "decalca", "specializes": "especializa",
-    "opposes": "opõe-se a", "analogous_to": "análogo a",
-    "instrument_of": "instrumento de", "requires": "exige",
-    "coined_by": "cunhado por", "used_by": "usado por", "about": "sobre",
-    "author_of": "autor de", "editor_of": "organizador de",
-    "translator_of": "tradutor de", "knows": "conhece",
-    "cites": "cita", "attested_in": "atestada em", "defined_in": "definido em",
-    "measured_in": "medido em", "part_of": "parte de", "edition_of": "edição de",
-    "translates": "traduz", "comments_on": "comenta", "responds_to": "responde a",
-    "affects": "afeta", "correlates": "correlaciona com",
+REL_LABEL = {
+    "expresses": "expresses", "derives_from": "derives from",
+    "cognate_of": "cognate of", "borrows_from": "borrows from",
+    "calques": "calques", "specializes": "specializes",
+    "opposes": "opposes", "analogous_to": "analogous to",
+    "instrument_of": "instrument of", "requires": "requires",
+    "coined_by": "coined by", "used_by": "used by", "about": "about",
+    "author_of": "author of", "editor_of": "editor of",
+    "translator_of": "translator of", "knows": "knows",
+    "cites": "cites", "attested_in": "attested in", "defined_in": "defined in",
+    "measured_in": "measured in", "part_of": "part of", "edition_of": "edition of",
+    "translates": "translates", "comments_on": "comments on", "responds_to": "responds to",
+    "affects": "affects", "correlates": "correlates with",
 }
 
 
 def rel_label(rel):
-    return REL_PT.get(rel, rel + " (atípica)" if rel not in RELS else rel)
+    if rel in REL_LABEL:
+        return tr(REL_LABEL[rel])
+    return tr("{rel} (atypical)", rel=rel) if rel not in RELS else rel
 
-# Campos do verbete que podem ser reordenados ou escondidos.
+# Entry card fields that can be reordered or hidden.
 CARD_FIELDS = [
-    ("gloss",    "Glosa"),
-    ("form_row", "Língua, romanização, atestada, status"),
-    ("domains",  "Domínios"),
+    ("gloss",    "Gloss"),
+    ("form_row", "Language, romanization, attested, status"),
+    ("domains",  "Domains"),
     ("tags",     "Tags"),
-    ("source",   "Fonte"),
-    ("notes",    "Notas"),
-    ("edges",    "Ligações (texto)"),
-    ("out",      "Ligações resolvidas"),
-    ("inb",      "Citado por"),
-    ("links",    "Links"),
+    ("source",   "Source"),
+    ("notes",    "Notes"),
+    ("edges",    "Links (text)"),
+    ("out",      "Resolved links"),
+    ("inb",      "Cited by"),
+    ("links",    "URLs"),
 ]
 FIELD_IDS = [f for f, _ in CARD_FIELDS]
 FIELD_TITLE = dict(CARD_FIELDS)
@@ -641,7 +668,7 @@ def new_id(kind, name, taken):
     return cand
 
 
-#   expresses c_timoneiro -800/400 — razão # fonte
+#   expresses c_timoneiro -800/400 — reason # source
 EDGE_RE = re.compile(
     r"^\s*(?P<rel>[^\s#—]+)\s+(?P<to>[A-Za-z0-9_]+(?::[A-Za-z0-9_]+)?)"
     r"(?:\s+(?P<when>-?\d{1,4}(?:/-?\d{0,4})?))?"
@@ -650,8 +677,8 @@ EDGE_RE = re.compile(
 
 
 def norm_ref(ref):
-    """'personne:p_x' era como o verba antigo apontava para o outro banco.
-    Agora é tudo um banco só: fica 'p_x'."""
+    """'personne:p_x' is how the old verba pointed at the other database.
+    Now it is all one base: it becomes 'p_x'."""
     ref = (ref or "").strip()
     if ":" in ref:
         return ref.split(":", 1)[1]
@@ -728,7 +755,7 @@ def label_of(e):
 
 
 def label_any(rec, data=None):
-    """Rótulo de qualquer registro, de qualquer coleção."""
+    """Label of any record, from any collection."""
     if not rec:
         return "?"
     coll = coll_of(rec.get("id", ""))
@@ -760,12 +787,19 @@ def haystack_entry(e, data):
     return "  ".join(parts).lower()
 
 
-# ================================================================ fontes
+# ================================================================ sources
 #
-# Uma fonte é qualquer coisa que se cita: livro, artigo, lei, acórdão, carta,
-# vídeo, aula, conversa. O tipo é texto livre com uma lista de sugestões, e
-# os campos são os do Zotero reduzidos ao que a citação precisa; o que não
-# couber vai em `extra`, uma linha "chave: valor" por vez, como no Zotero.
+# A source is anything that gets cited: a book, an article, a law, a court
+# decision, a letter, a video, a lecture, a conversation. The type is free text
+# with a list of suggestions, and the fields are Zotero's, trimmed to what a
+# citation needs; anything else goes in `extra`, one "key: value" line at a
+# time, as in Zotero.
+#
+# The type KEYS are stored in Portuguese ("livro", "acórdão"...), because that
+# is what existing bases hold and what the citation rules below switch on. The
+# interface shows them through type_label() and turns what is picked back into
+# a key with type_key(), so an English interface never writes "book" where the
+# rules expect "livro".
 
 SOURCE_TYPES = [
     "livro", "capítulo", "artigo", "tese", "dissertação", "monografia",
@@ -774,8 +808,8 @@ SOURCE_TYPES = [
     "página web", "vídeo", "áudio", "aula", "palestra", "entrevista",
     "conversa", "conjunto de dados", "obra de arte", "outro",
 ]
-# tipo -> campos que fazem sentido mostrar (os demais ficam ocultos, mas
-# nunca são apagados: mudar o tipo não perde dado)
+# type -> fields worth showing (the rest are hidden but never erased:
+# changing the type loses no data)
 SOURCE_FIELDS = {
     "*": ["authors", "date", "container", "publisher", "place", "edition",
           "volume", "issue", "pages", "doi", "isbn", "url", "accessed",
@@ -801,14 +835,40 @@ SOURCE_FIELDS = {
     "entrevista": ["authors", "date", "container", "place", "url", "extra"],
     "conversa": ["authors", "date", "place", "extra"],
 }
-SOURCE_FIELD_PT = {
-    "authors": "AUTORES  (um por linha: SOBRENOME, Nome  ·  ou p_… de uma pessoa)",
-    "date": "DATA / ANO", "container": "EM  (periódico, livro, coletânea, site, órgão)",
-    "publisher": "EDITORA / INSTITUIÇÃO / TRIBUNAL", "place": "LOCAL",
-    "edition": "EDIÇÃO", "volume": "VOLUME", "issue": "NÚMERO",
-    "pages": "PÁGINAS", "doi": "DOI", "isbn": "ISBN / ISSN", "url": "URL",
-    "accessed": "ACESSO EM", "lang": "LÍNGUA",
-    "extra": "EXTRA  (chave: valor, uma por linha — relator, ementa, número…)",
+SOURCE_TYPE_EN = {
+    "livro": "book", "capítulo": "chapter", "artigo": "article", "tese": "thesis",
+    "dissertação": "dissertation", "monografia": "monograph", "verbete": "entry",
+    "dicionário": "dictionary", "relatório": "report", "documento": "document",
+    "manuscrito": "manuscript", "carta": "letter", "lei": "law", "decreto": "decree",
+    "acórdão": "court decision", "súmula": "case-law summary", "parecer": "legal opinion",
+    "tratado": "treaty", "página web": "web page", "vídeo": "video", "áudio": "audio",
+    "aula": "lecture", "palestra": "talk", "entrevista": "interview",
+    "conversa": "conversation", "conjunto de dados": "dataset",
+    "obra de arte": "artwork", "outro": "other",
+}
+_TYPE_FROM_EN = {v: k for k, v in SOURCE_TYPE_EN.items()}
+
+
+def type_label(t):
+    """How a stored type key is shown in the current language."""
+    t = (t or "").strip()
+    return t if LANG == "pt" else SOURCE_TYPE_EN.get(t, t)
+
+
+def type_key(text):
+    """What is typed or picked in the TYPE field -> the stored key."""
+    t = (text or "").strip().lower()
+    return _TYPE_FROM_EN.get(t, t)
+
+
+SOURCE_FIELD_LABEL = {
+    "authors": "AUTHORS  (one per line: SURNAME, Name  ·  or p_… of a person)",
+    "date": "DATE / YEAR", "container": "IN  (journal, book, collection, site, body)",
+    "publisher": "PUBLISHER / INSTITUTION / COURT", "place": "PLACE",
+    "edition": "EDITION", "volume": "VOLUME", "issue": "ISSUE",
+    "pages": "PAGES", "doi": "DOI", "isbn": "ISBN / ISSN", "url": "URL",
+    "accessed": "ACCESSED", "lang": "LANGUAGE",
+    "extra": "EXTRA  (key: value, one per line — rapporteur, summary, number…)",
 }
 CITE_STYLES = ("abnt", "abnt-autor-data", "bibtex", "csl-json", "bruto")
 
@@ -833,7 +893,7 @@ def source_fields_for(stype):
 
 
 def new_source_id(s, taken):
-    """s_<sobrenome>_<ano>_<primeira palavra do título>"""
+    """s_<surname>_<year>_<first word of the title>"""
     au = author_names(s)
     head = slug(au[0].split(",")[0] if au else (s.get("container") or "anon"))[:20]
     year = year_of_source(s)
@@ -855,8 +915,8 @@ _PERSON_NAMES = {}
 
 
 def author_names(s, data=None):
-    """Autores como texto. Uma linha 'p_xxxx' aponta para uma pessoa do
-    índice; o nome dela é lido do vault quando ele é dado."""
+    """Authors as text. A 'p_xxxx' line points at a person in the index; their
+    name is read from the vault when one is given."""
     out = []
     for a in s.get("authors", []):
         a = (a or "").strip()
@@ -874,7 +934,7 @@ def author_names(s, data=None):
 
 
 def as_surname_first(name):
-    """'Norbert Wiener' -> 'WIENER, Norbert'. Já invertido, fica como está."""
+    """'Norbert Wiener' -> 'WIENER, Norbert'. Already inverted, it stays."""
     name = (name or "").strip()
     if "," in name:
         return name
@@ -885,7 +945,7 @@ def as_surname_first(name):
 
 
 def abnt_author(a):
-    """'Wiener, Norbert' -> 'WIENER, Norbert'; 'BRASIL' fica."""
+    """'Wiener, Norbert' -> 'WIENER, Norbert'; 'BRASIL' stays."""
     a = a.strip()
     if "," in a:
         sur, rest = a.split(",", 1)
@@ -911,8 +971,11 @@ def extra_dict(s):
 
 
 def cite(s, style="abnt", data=None):
-    """Citação da fonte no estilo pedido. ABNT é a NBR 6023 no que cabe em
-    metadados: o que faltar simplesmente não aparece."""
+    """The source cited in the requested style. ABNT is the Brazilian standard
+    NBR 6023, as far as metadata allows: whatever is missing simply does not
+    appear. ABNT is a Portuguese-language norm, so its wording ("Disponível
+    em", "Acesso em", month abbreviations) stays in Portuguese in any
+    interface language."""
     style = (style or "abnt").lower()
     t = (s.get("type") or "outro").lower()
     names = author_names(s, data)
@@ -936,7 +999,7 @@ def cite(s, style="abnt", data=None):
         return bibtex_of(s, names, year)
     if style == "csl-json":
         return json.dumps(csl_of(s, names), ensure_ascii=False, indent=2)
-    # ---- abnt referência
+    # ---- ABNT reference
     au = abnt_authors(names)
     bits = []
 
@@ -1030,7 +1093,7 @@ def cite(s, style="abnt", data=None):
         add(dot(title))
         add(dot(", ".join(x for x in (s.get("container", ""), place, abnt_date(date)) if x)))
         add(dot(t.capitalize()))
-    else:  # livro e o resto
+    else:  # book and everything else
         add(dot(au))
         add(dot(title))
         if s.get("edition"):
@@ -1066,8 +1129,8 @@ CSLTYPE = {"livro": "book", "capítulo": "chapter", "artigo": "article-journal",
 BIBTYPE.update({"dicionário": "book", "verbete": "inbook", "lei": "misc",
                 "decreto": "misc", "acórdão": "misc", "manuscrito": "unpublished"})
 CSL_TO_TYPE = {v: k for k, v in CSLTYPE.items()}
-# onde vários tipos nossos caem no mesmo tipo CSL/BibTeX, a volta escolhe o
-# mais comum
+# where several of our types map to the same CSL/BibTeX type, the way back
+# picks the most common one
 CSL_TO_TYPE.update({"book": "livro", "thesis": "tese", "speech": "aula",
                     "personal_communication": "conversa", "legislation": "lei",
                     "paper-conference": "artigo", "post-weblog": "página web",
@@ -1077,19 +1140,20 @@ BIB_TO_TYPE.update({"book": "livro", "mastersthesis": "dissertação",
                     "inbook": "capítulo", "inproceedings": "artigo",
                     "misc": "outro", "unpublished": "manuscrito"})
 
-MESES = ["jan.", "fev.", "mar.", "abr.", "maio", "jun.", "jul.", "ago.",
-         "set.", "out.", "nov.", "dez."]
+# ABNT month abbreviations (Portuguese by the norm itself)
+ABNT_MONTHS = ["jan.", "fev.", "mar.", "abr.", "maio", "jun.", "jul.", "ago.",
+               "set.", "out.", "nov.", "dez."]
 
 
 def abnt_date(text):
-    """'2002-01-10' -> '10 jan. 2002'; '2002-01' -> 'jan. 2002'; resto intacto."""
+    """'2002-01-10' -> '10 jan. 2002'; '2002-01' -> 'jan. 2002'; anything else untouched."""
     m = re.match(r"^\s*(\d{4})-(\d{2})(?:-(\d{2}))?\s*$", text or "")
     if not m:
         return (text or "").strip()
     y, mo, d = m.group(1), int(m.group(2)), m.group(3)
     if not 1 <= mo <= 12:
         return text.strip()
-    return (f"{int(d)} " if d else "") + f"{MESES[mo - 1]} {y}"
+    return (f"{int(d)} " if d else "") + f"{ABNT_MONTHS[mo - 1]} {y}"
 
 
 def bibkey(s, names, year):
@@ -1131,7 +1195,7 @@ def csl_of(s, names):
     y = year_of_source(s)
     if y:
         parts = [int(x) for x in re.findall(r"\d+", s.get("date", ""))[:3]]
-        if parts and parts[0] > 31:  # ano-mês-dia
+        if parts and parts[0] > 31:  # year-month-day
             item["issued"] = {"date-parts": [parts]}
         else:
             item["issued"] = {"date-parts": [[int(y)]]}
@@ -1153,7 +1217,7 @@ def csl_of(s, names):
 
 
 def source_from_csl(item):
-    """Um item CSL-JSON (export do Zotero) -> registro de fonte."""
+    """A CSL-JSON item (a Zotero export) -> a source record."""
     s = fix_source({"type": CSL_TO_TYPE.get(item.get("type", ""), "outro"),
                     "name": item.get("title", "")})
     for a in item.get("author", []) + item.get("editor", []):
@@ -1215,10 +1279,10 @@ def sources_from_bibtex(text):
 
 
 def source_from_raw(text):
-    """Um texto livre de referência ('LOCHTROP, Leonardo. Dicionário de
-    alemão-português. 8. ed. São Paulo: Globo, 2006') vira uma fonte com o
-    que der para ler: autor, título, ano. O texto inteiro fica em `raw`, e a
-    citação 'bruto' devolve-o intacto."""
+    """A free-text reference ('LOCHTROP, Leonardo. Dicionário de
+    alemão-português. 8. ed. São Paulo: Globo, 2006') becomes a source with
+    whatever can be read from it: author, title, year. The whole text is kept
+    in `raw`, and the 'bruto' (raw) citation returns it untouched."""
     raw = " ".join((text or "").split())
     s = fix_source({"type": "outro", "name": raw, "raw": raw})
     m = re.match(r"^([A-ZÀ-Ý][A-ZÀ-Ý'\- ]+,\s*[^.]+?)\.\s+(.+)$", raw)
@@ -1267,34 +1331,58 @@ def haystack_source(s, data):
 
 
 def resolve_source(text, data):
-    """O campo FONTE de qualquer registro: um id s_… ou texto livre.
-    Devolve (registro_da_fonte ou None, texto_para_mostrar)."""
+    """The SOURCE field of any record: an s_… id or free text.
+    Returns (source_record or None, text_to_show)."""
     text = (text or "").strip()
     if text.startswith("s_"):
         s = next((x for x in data["sources"] if x["id"] == text), None)
-        return s, (source_label(s, data) if s else f"{text} (fonte inexistente)")
+        return s, (source_label(s, data) if s else tr("{id} (no such source)", id=text))
     return None, text
 
 
 # ================================================================ corpus
 #
-# O corpus é o monitoramento de saúde: cada registro é uma MEDIDA (métrica)
-# de um sistema do corpo -- hemoglobina, pressão arterial, peso -- e guarda
-# as suas LEITURAS ao longo do tempo, uma por linha, como o log de pessoas.
+# The corpus is health tracking: each record is a MEASUREMENT (a metric) of a
+# body system -- hemoglobin, blood pressure, weight -- and keeps its READINGS
+# over time, one per line, like the people log.
+#
+# As with source types, the system KEYS are stored in Portuguese (that is what
+# existing bases hold, and the body map is keyed on them); the interface shows
+# them through system_label() and stores what is picked through system_key().
 
 SYSTEMS = ["cardiovascular", "hematológico", "metabólico", "renal", "hepático",
            "endócrino", "imunológico", "respiratório", "musculoesquelético",
            "nervoso", "digestivo", "dermatológico", "antropometria", "sono",
            "atividade", "outro"]
+SYSTEM_EN = {
+    "cardiovascular": "cardiovascular", "hematológico": "hematologic",
+    "metabólico": "metabolic", "renal": "renal", "hepático": "hepatic",
+    "endócrino": "endocrine", "imunológico": "immune", "respiratório": "respiratory",
+    "musculoesquelético": "musculoskeletal", "nervoso": "nervous",
+    "digestivo": "digestive", "dermatológico": "dermatologic",
+    "antropometria": "anthropometry", "sono": "sleep", "atividade": "activity",
+    "outro": "other",
+}
+_SYSTEM_FROM_EN = {v: k for k, v in SYSTEM_EN.items()}
+
+
+def system_label(key):
+    key = (key or "").strip()
+    return key if LANG == "pt" else SYSTEM_EN.get(key, key)
+
+
+def system_key(text):
+    t = (text or "").strip().lower()
+    return _SYSTEM_FROM_EN.get(t, t)
 READING_RE = re.compile(
     r"^\s*(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}))?\s+([-+]?\d+(?:[.,]\d+)?(?:/\d+(?:[.,]\d+)?)?)"
     r"(?:\s+(.*))?$")
 
 
 def parse_readings(text):
-    """'2026-09-01 13.5 jejum' -> {date, value, note}. Aceita '12/8' para
-    pares (pressão). Linha sem data ganha a de hoje; linha só com data e
-    sem valor é descartada, que é como se apaga uma leitura."""
+    """'2026-09-01 13.5 fasting' -> {date, value, note}. Accepts '12/8' for
+    pairs (blood pressure). A line with no date gets today's; a line with a
+    date and no value is dropped, which is how a reading is deleted."""
     out = []
     for line in (text or "").splitlines():
         line = line.strip()
@@ -1328,7 +1416,7 @@ def reading_number(value):
 
 
 def out_of_range(m, r):
-    """True se a leitura está fora da faixa de referência da medida."""
+    """True if the reading is outside the measurement's reference range."""
     v = reading_number(r.get("value"))
     if v is None:
         return False
@@ -1373,7 +1461,7 @@ def last_reading(m):
 
 
 def metric_label(m):
-    return f"{m.get('name', '')} ({m.get('system', '')})" if m.get("system") \
+    return f"{m.get('name', '')} ({system_label(m.get('system'))})" if m.get("system") \
         else m.get("name", "")
 
 
@@ -1388,7 +1476,7 @@ def haystack_metric(m, data):
     return "  ".join(parts).lower()
 
 
-# ================================================================ arquivo
+# ================================================================ file
 
 def blank_vault():
     return {"schema": SCHEMA, "ui": {}, "people": [], "entries": [],
@@ -1436,32 +1524,32 @@ def load_json():
         return blank_vault()
     data = read_vault(JSON_FILE)
     if data is None:
-        raise SystemExit(f"{JSON_FILE.name} não pôde ser lido. Nada foi gravado. "
-                         "Confira o arquivo, ou use `replay` para reconstruir "
-                         "a partir dos logs.")
+        raise SystemExit(tr("{name} could not be read. Nothing was written. Check "
+                            "the file, or use `replay` to rebuild it from the logs.",
+                            name=JSON_FILE.name))
     return data
 
 
 def write_json(data):
-    """Escrita atômica: grava ao lado e troca. Sem .bak -- a história está
-    no log. Antes, todo registro que ainda não tem número de ordem recebe o
-    seu: é por aqui que passa toda gravação, venha de onde vier."""
-    novos = register_new(data)
+    """Atomic write: write alongside, then swap. No .bak -- the history is in
+    the log. First, every record without an order number gets one: every
+    save, wherever it comes from, passes through here."""
+    numbered = register_new(data)
     tmp = JSON_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False),
                    encoding="utf-8")
-    # no Windows, o Syncthing pode estar com o arquivo aberto por um instante
+    # on Windows, Syncthing may hold the file open for a moment
     import time
-    for tent in range(6):
+    for attempt in range(6):
         try:
             tmp.replace(JSON_FILE)
             break
         except PermissionError:
-            if tent == 5:
+            if attempt == 5:
                 raise
-            time.sleep(0.25 * (tent + 1))
-    if novos:
-        log_append("reg", "vault", {"regs": novos})
+            time.sleep(0.25 * (attempt + 1))
+    if numbered:
+        log_append("reg", "vault", {"regs": numbered})
 
 
 def by_id(data):
@@ -1477,7 +1565,7 @@ def touch(rec):
     rec["updated_at"] = NOW()
 
 
-# ---- log só-de-acréscimo, um por máquina
+# ---- append-only log, one per machine
 
 def log_append(op, coll, payload):
     line = {"t": NOW(), "host": HOST, "op": op, "coll": coll}
@@ -1486,7 +1574,7 @@ def log_append(op, coll, payload):
         with LOG_FILE.open("a", encoding="utf-8") as f:
             f.write(json.dumps(line, ensure_ascii=False) + "\n")
     except OSError:
-        pass          # o log é histórico, nunca impede a gravação
+        pass          # the log is history; it never blocks a save
 
 
 def log_put(coll, rec):
@@ -1523,17 +1611,22 @@ def read_logs():
     return lines
 
 
-# ================================================================ registro
+# ================================================================ register
 #
-# Todo registro, ao entrar na base, recebe um carimbo de registro
-# (AAAAMMDDhhmmss, único) e um número de ordem. O número é o endereço: nunca
-# muda nem é reaproveitado, e o que é apagado continua na sequência, como
-# cancelado. A lista sem busca é essa sequência, na ordem dos números.
+# Every record, on entering the base, gets a registration stamp
+# (YYYYMMDDhhmmss, unique) and an order number. The number is the address: it
+# never changes and is never reused, and what is deleted stays in the sequence,
+# as cancelled. The list without a search is this sequence, in number order.
+#
+# Stored field names: reg (stamp), reg_n (number), reg_origem (for records
+# numbered when the register was opened, the evidence the stamp came from) and
+# reg_n_anterior (the previous number, after a clash between machines). The
+# names and the reg_origem values are Portuguese because bases already hold them.
 
 STAMP_FMT = "%Y%m%d%H%M%S"
-REG_ORIGEM = {"id": "carimbo do id antigo", "log": "primeira gravação no log",
-              "atualizado": "última atualização",
-              "dia": "dia da última atualização", "abertura": "abertura do registro"}
+REG_ORIGIN = {"id": "stamp of the old id", "log": "first save in the log",
+              "atualizado": "last update",
+              "dia": "day of the last update", "abertura": "opening of the register"}
 
 
 def stamp_now():
@@ -1541,8 +1634,8 @@ def stamp_now():
 
 
 def stamp_from(text):
-    """'2026-09-27T23:42:59', '2026-09-27', '202609272342' ou
-    '20260927234259' -> '20260927234259'; o que não for data -> ''."""
+    """'2026-09-27T23:42:59', '2026-09-27', '202609272342' or
+    '20260927234259' -> '20260927234259'; anything that is not a date -> ''."""
     digits = re.sub(r"\D", "", text or "")
     if len(digits) == 8:
         digits += "000000"
@@ -1565,7 +1658,7 @@ def stamp_label(stamp):
 
 
 def stamp_free(stamp, taken):
-    """O carimbo pedido, ou o segundo seguinte livre."""
+    """The requested stamp, or the next free second."""
     while stamp in taken:
         stamp = (datetime.strptime(stamp, STAMP_FMT)
                  + timedelta(seconds=1)).strftime(STAMP_FMT)
@@ -1573,11 +1666,11 @@ def stamp_free(stamp, taken):
 
 
 def locus_label(n):
-    return f"nº {n}" if n else "sem registro"
+    return f"nº {n}" if n else tr("not registered")
 
 
 def book_rows(data):
-    """Tudo o que ocupa um número de ordem: registros vivos e cancelados."""
+    """Everything that holds an order number: live and cancelled records."""
     rows = [r for coll in COLLS for r in data.get(coll, [])]
     return rows + list(data.get("deleted", []))
 
@@ -1597,14 +1690,15 @@ def first_seen_in_logs():
 
 
 def open_book(data):
-    """Termo de abertura: numera de uma vez o que já existe sem número.
+    """Opening of the register: numbers, in one go, everything that has no
+    number yet.
 
-    Como a base antiga não guardava a data de criação, o carimbo de cada
-    registro é a melhor evidência disponível, nesta ordem: id que já é um
-    carimbo (o personne antigo), primeira gravação no log, última
-    atualização com hora, dia da última atualização, e por fim o próprio
-    momento da abertura. A evidência usada fica em `reg_origem`. Os números
-    seguem a ordem dos carimbos; empates, a ordem alfabética."""
+    Older bases did not store a creation date, so each record's stamp is the
+    best evidence available, in this order: an id that already is a stamp (the
+    old personne), the first save in the log, the last update with a time, the
+    day of the last update, and finally the moment of opening itself. The
+    evidence used is kept in `reg_origem`. Numbers follow stamp order; ties
+    follow alphabetical order."""
     first = first_seen_in_logs()
     opened = stamp_now()
     pend = []
@@ -1640,12 +1734,12 @@ def open_book(data):
 
 
 def register_new(data):
-    """Dá número a quem ainda não tem e desfaz números repetidos.
+    """Numbers whatever has no number yet and undoes repeated numbers.
 
-    Repetição só acontece quando as duas máquinas registram ao mesmo tempo
-    sem sincronizar: fica com o número quem tem o carimbo mais antigo; o
-    outro recebe o próximo livre e guarda o antigo em `reg_n_anterior`.
-    Devolve {id: [carimbo, número]} do que mudou, para o log."""
+    A repeat only happens when two machines register at the same time without
+    syncing: the record with the older stamp keeps the number; the other gets
+    the next free one and keeps the old one in `reg_n_anterior`.
+    Returns {id: [stamp, number]} for what changed, for the log."""
     if "book" not in data:
         return open_book(data)
     regs = {}
@@ -1675,7 +1769,7 @@ def register_new(data):
 
 
 def find_by_reg(data, key):
-    """Registro (ou cancelado) pelo número de ordem ou pelo carimbo."""
+    """A record (or a cancelled number) by order number or by stamp."""
     key = key.strip()
     for r in book_rows(data):
         if key.isdigit() and len(key) < 12 and r.get("reg_n") == int(key):
@@ -1685,11 +1779,11 @@ def find_by_reg(data, key):
     return None
 
 
-# ---- as operações de gravação. Todas releem o disco antes.
+# ---- the write operations. All of them reread the disk first.
 
 def save_record(coll, rec, edges=None):
-    """Grava UM registro: relê o JSON, substitui só ele, grava, loga.
-    `edges`, se dado, substitui as ligações que saem dele. Devolve o vault."""
+    """Saves ONE record: rereads the JSON, replaces only that record, writes,
+    logs. `edges`, if given, replaces the links going out of it. Returns the vault."""
     data = load_json()
     rid = rec["id"]
     clean = {k: v for k, v in rec.items() if not k.startswith("_")}
@@ -1710,7 +1804,7 @@ def save_record(coll, rec, edges=None):
     else:
         rows.append(clean)
     for d in data["deleted"]:
-        # o id volta a existir: retoma o número que tinha antes de apagado
+        # the id exists again: it takes back the number it had before deletion
         if d.get("id") == rid and d.get("reg_n") and not clean.get("reg_n"):
             clean["reg"], clean["reg_n"] = d.get("reg"), d["reg_n"]
     data["deleted"] = [d for d in data["deleted"] if d.get("id") != rid]
@@ -1732,7 +1826,7 @@ def delete_record(coll, rid, name=""):
                      if a["from"] != rid and a["to"] != rid]
     tomb = {"id": rid, "at": NOW(), "name": name}
     if gone.get("reg_n"):
-        # o número fica na sequência, como cancelado
+        # the number stays in the sequence, as cancelled
         tomb.update(reg=gone.get("reg"), reg_n=gone["reg_n"])
     data["deleted"].append(tomb)
     write_json(data)
@@ -1741,8 +1835,8 @@ def delete_record(coll, rid, name=""):
 
 
 def rename_id(coll, old, new):
-    """Um verbete nasce com id provisório; ao ganhar nome, o id definitivo é
-    gerado e tudo que apontava para o antigo é reapontado."""
+    """An entry is born with a provisional id; once it has a name, the final id
+    is generated and everything that pointed at the old one is repointed."""
     data = load_json()
     for r in data[coll]:
         if r.get("id") == old:
@@ -1768,15 +1862,14 @@ def save_ui(patch):
     return data
 
 
-# ================================================================ conflitos
+# ================================================================ conflicts
 
 def merge_vault(base, other):
-    """Funde `other` em `base`, registro a registro. Devolve relatório.
+    """Merges `other` into `base`, record by record. Returns a report.
 
-    Regra: quem tem carimbo mais novo vence. Registro que só existe de um
-    lado entra -- a menos que o outro lado tenha uma lápide mais nova que
-    ele (foi apagado depois de criado). Ligações seguem o registro de
-    origem que venceu."""
+    Rule: the newer timestamp wins. A record that exists on one side only gets
+    in -- unless the other side has a tombstone newer than it (it was deleted
+    after being created). Links follow the source record that won."""
     report = {"added": [], "replaced": [], "kept": 0, "skipped_deleted": []}
     tomb_base = {d["id"]: d.get("at", "") for d in base.get("deleted", [])}
     tomb_other = {d["id"]: d.get("at", "") for d in other.get("deleted", [])}
@@ -1804,7 +1897,7 @@ def merge_vault(base, other):
                 base[coll].append(rec)
                 winners_from_other.add(rid)
                 report["added"].append((coll, rid, rec.get("name", "")))
-        # lápides do outro lado apagam aqui o que foi criado antes delas
+        # tombstones from the other side delete here what was created before them
         for rid, at in tomb_other.items():
             if rid in idx and rid not in winners_from_other:
                 mine = base[coll][idx[rid]]
@@ -1816,7 +1909,7 @@ def merge_vault(base, other):
                          if a["from"] not in winners_from_other]
         base["edges"] += [a for a in other.get("edges", [])
                           if a["from"] in winners_from_other]
-    # lápides: união, a mais nova por id
+    # tombstones: union, the newest per id
     tombs = {}
     for d in base.get("deleted", []) + other.get("deleted", []):
         if d.get("id") and d.get("at", "") >= tombs.get(d["id"], {}).get("at", ""):
@@ -1827,9 +1920,9 @@ def merge_vault(base, other):
 
 
 def relink_sources(data):
-    """Campo FONTE em texto que coincide com o `raw` de uma fonte existente
-    passa a apontar para ela. Roda depois de toda fusão, porque a outra
-    máquina pode ter gravado o texto enquanto esta já tinha a fonte."""
+    """A free-text SOURCE field that matches an existing source's `raw` is
+    repointed to that source. Runs after every merge, because the other machine
+    may have saved the text while this one already had the source."""
     by_raw = {" ".join(s["raw"].split()): s["id"] for s in data.get("sources", [])
               if s.get("raw")}
     n = 0
@@ -1847,8 +1940,8 @@ def conflict_files():
 
 
 def absorb_conflicts():
-    """Funde todo *.sync-conflict-* na base e move o arquivo para a pasta de
-    conflitos. Devolve lista de (arquivo, relatório)."""
+    """Merges every *.sync-conflict-* into the base and moves the file to the
+    conflicts folder. Returns a list of (file, report)."""
     done = []
     for path in conflict_files():
         other = read_vault(path)
@@ -1861,8 +1954,8 @@ def absorb_conflicts():
         log_append("merge", "vault", {"file": path.name,
                                        "added": len(report["added"]),
                                        "replaced": len(report["replaced"])})
-        # o que a fusão mudou entra no log como se tivesse sido digitado aqui,
-        # para que `replay` reconstrua o mesmo estado
+        # what the merge changed goes into the log as if typed here, so that
+        # `replay` rebuilds the same state
         idx = by_id(data)
         for coll, rid, _ in report["added"] + report["replaced"]:
             if rid in idx:
@@ -1877,7 +1970,7 @@ def absorb_conflicts():
         except OSError:
             pass
         done.append((path.name, report))
-    # espelho em conflito é lixo regenerável, mas não se apaga: só se guarda
+    # a conflicted mirror is regenerable, but it is not deleted, only stored
     for path in BASE.glob(f"{STEM}_mirror.sync-conflict-*.md"):
         CONFLICT_DIR.mkdir(exist_ok=True)
         try:
@@ -1892,14 +1985,15 @@ def describe_merge(reports):
         return ""
     bits = []
     for name, r in reports:
-        b = f"{name}: {len(r['added'])} entraram, {len(r['replaced'])} atualizados"
+        b = tr("{file}: {added} added, {replaced} updated", file=name,
+               added=len(r["added"]), replaced=len(r["replaced"]))
         if r["skipped_deleted"]:
-            b += f", {len(r['skipped_deleted'])} apagados"
+            b += tr(", {n} deleted", n=len(r["skipped_deleted"]))
         bits.append(b)
     return " · ".join(bits)
 
 
-# ================================================================ trava
+# ================================================================ lock
 
 def other_locks():
     out = []
@@ -1914,7 +2008,7 @@ def other_locks():
         try:
             age = datetime.now() - datetime.fromisoformat(since)
             if age.total_seconds() > 24 * 3600:
-                continue        # trava velha: a máquina não fechou direito
+                continue        # stale lock: that machine did not close cleanly
         except ValueError:
             pass
         out.append(info)
@@ -1944,70 +2038,72 @@ def check(data):
     seen = set()
     for p in data["people"]:
         if p["id"] in seen:
-            errors.append(f"id repetido: {p['id']}")
+            errors.append(tr("repeated id: {id}", id=p["id"]))
         seen.add(p["id"])
         if not p.get("name"):
-            errors.append(f"{p['id']}: pessoa sem nome")
+            errors.append(tr("{id}: person without a name", id=p["id"]))
     names = {}
     for p in data["people"]:
         names.setdefault(p["name"].strip().lower(), []).append(p["id"])
     for n, ids in names.items():
         if len(ids) > 1:
-            warnings.append(f"nome repetido entre pessoas: {n} ({', '.join(ids)})")
+            warnings.append(tr("name repeated among people: {name} ({ids})",
+                               name=n, ids=", ".join(ids)))
     for e in data["entries"]:
         if e["id"] in seen:
-            errors.append(f"id repetido: {e['id']}")
+            errors.append(tr("repeated id: {id}", id=e["id"]))
         seen.add(e["id"])
         if e["kind"] not in KINDS:
-            errors.append(f"{e['id']}: tipo desconhecido {e['kind']!r}")
+            errors.append(tr("{id}: unknown kind {kind}", id=e["id"], kind=repr(e["kind"])))
         if not e.get("name"):
-            errors.append(f"{e['id']}: sem nome")
+            errors.append(tr("{id}: no name", id=e["id"]))
         if e["kind"] == "concept" and not (e.get("gloss") or "").strip():
-            errors.append(f"{e['id']}: conceito sem glosa")
+            errors.append(tr("{id}: concept without a gloss", id=e["id"]))
         if e["kind"] == "form":
             if not e.get("lang"):
-                errors.append(f"{e['id']}: forma sem língua")
+                errors.append(tr("{id}: form without a language", id=e["id"]))
             recon = e.get("status") == "reconstructed"
             star = e.get("name", "").startswith("*")
             if recon and not star:
-                warnings.append(f"{e['id']}: reconstruída sem asterisco")
+                warnings.append(tr("{id}: reconstructed without an asterisk", id=e["id"]))
             if star and not recon:
-                errors.append(f"{e['id']}: asterisco mas status não é reconstructed")
+                errors.append(tr("{id}: asterisk but status is not reconstructed", id=e["id"]))
     for s in data["sources"]:
         if s["id"] in seen:
-            errors.append(f"id repetido: {s['id']}")
+            errors.append(tr("repeated id: {id}", id=s["id"]))
         seen.add(s["id"])
         if not (s.get("name") or s.get("raw")):
-            errors.append(f"{s['id']}: fonte sem título")
+            errors.append(tr("{id}: source without a title", id=s["id"]))
         if not s.get("authors") and not s.get("raw"):
-            warnings.append(f"{s['id']}: fonte sem autor")
+            warnings.append(tr("{id}: source without an author", id=s["id"]))
     for m in data["corpus"]:
         if m["id"] in seen:
-            errors.append(f"id repetido: {m['id']}")
+            errors.append(tr("repeated id: {id}", id=m["id"]))
         seen.add(m["id"])
         if not m.get("name"):
-            errors.append(f"{m['id']}: medida sem nome")
+            errors.append(tr("{id}: measurement without a name", id=m["id"]))
         if not m.get("system"):
-            warnings.append(f"{m['id']}: medida sem sistema")
+            warnings.append(tr("{id}: measurement without a system", id=m["id"]))
         for r in m.get("readings", []):
             if out_of_range(m, r):
-                warnings.append(f"{metric_label(m)}: {r['date']} = {r['value']} "
-                                f"fora da referência")
+                warnings.append(tr("{label}: {date} = {value} outside the reference range",
+                                   label=metric_label(m), date=r["date"], value=r["value"]))
     for coll in ("people", "entries", "corpus"):
         for r in data[coll]:
             src = (r.get("source") or "").strip()
             if src.startswith("s_") and src not in idx:
-                errors.append(f"{r['id']}: FONTE aponta para {src}, que não existe")
+                errors.append(tr("{id}: SOURCE points to {src}, which does not exist",
+                                 id=r["id"], src=src))
     atypical = []
     for i, a in enumerate(data["edges"]):
         src = idx.get(a["from"])
         if not src:
-            errors.append(f"ligação {i}: origem inexistente {a['from']}")
+            errors.append(tr("link {i}: missing origin {id}", i=i, id=a["from"]))
             continue
         dst = idx.get(a["to"])
         if not dst:
-            errors.append(f"ligação {i}: alvo inexistente {a['to']} "
-                          f"(em {label_any(src)})")
+            errors.append(tr("link {i}: missing target {id} (in {label})",
+                             i=i, id=a["to"], label=label_any(src)))
             continue
         rule = RELS.get(a["rel"])
         if not rule:
@@ -2016,17 +2112,18 @@ def check(data):
         sk = kind_of(src)
         dk = kind_of(dst)
         if (rule[0] not in ("*", sk)) or (rule[1] not in ("*", dk)):
-            errors.append(
-                f"ligação {i}: {a['rel']} liga {rule[0]}->{rule[1]}, "
-                f"mas recebeu {sk}->{dk} ({label_any(src)} -> {label_any(dst)})")
+            errors.append(tr("link {i}: {rel} connects {a}->{b}, but got {c}->{d} "
+                             "({src} -> {dst})", i=i, rel=a["rel"], a=rule[0], b=rule[1],
+                             c=sk, d=dk, src=label_any(src), dst=label_any(dst)))
         if a["from"] == a["to"]:
-            errors.append(f"ligação {i}: liga {label_any(src)} a si mesmo")
+            errors.append(tr("link {i}: links {label} to itself", i=i, label=label_any(src)))
         if not (a.get("why") or "").strip() and not (a.get("source") or "").strip():
-            warnings.append(f"sem razão nem fonte: {label_any(src)} "
-                            f"-{a['rel']}-> {label_any(dst)}")
+            warnings.append(tr("no reason or source: {src} -{rel}-> {dst}",
+                               src=label_any(src), rel=a["rel"], dst=label_any(dst)))
     if atypical:
-        warnings.append(f"{len(atypical)} ligação(ões) atípica(s), com rel fora "
-                        "da tabela RELS (não é erro; promova ao editar o programa):")
+        warnings.append(tr("{n} atypical link(s), with a rel outside the RELS table "
+                           "(not an error; promote it by editing the program):",
+                           n=len(atypical)))
         warnings.extend("    " + x for x in atypical)
     check_book(data, errors, warnings)
     return errors, warnings
@@ -2034,8 +2131,8 @@ def check(data):
 
 def check_book(data, errors, warnings):
     if "book" not in data:
-        warnings.append("registro ainda não aberto: abre na próxima gravação "
-                        "(ou rode `upgrade`)")
+        warnings.append(tr("register not opened yet: it opens on the next save "
+                           "(or run `upgrade`)"))
         return
     rows = book_rows(data)
     by_n, by_stamp = {}, {}
@@ -2043,79 +2140,83 @@ def check_book(data, errors, warnings):
         if not r.get("reg_n"):
             if r in data.get("deleted", []):
                 continue
-            warnings.append(f"{r.get('id')}: sem número de ordem "
-                            "(recebe na próxima gravação)")
+            warnings.append(tr("{id}: no order number (gets one on the next save)",
+                               id=r.get("id")))
             continue
         by_n.setdefault(r["reg_n"], []).append(r.get("id"))
         if not stamp_from(r.get("reg")):
-            errors.append(f"{r.get('id')}: carimbo de registro inválido {r.get('reg')!r}")
+            errors.append(tr("{id}: invalid registration stamp {stamp}",
+                             id=r.get("id"), stamp=repr(r.get("reg"))))
         by_stamp.setdefault(r.get("reg"), []).append(r.get("id"))
     for n, ids in sorted(by_n.items()):
         if len(ids) > 1:
-            errors.append(f"nº {n} repetido: {', '.join(ids)} "
-                          "(resolve sozinho na próxima gravação)")
+            errors.append(tr("nº {n} repeated: {ids} (resolves itself on the next save)",
+                             n=n, ids=", ".join(ids)))
     for st, ids in by_stamp.items():
         if st and len(ids) > 1:
-            errors.append(f"carimbo {st} repetido: {', '.join(ids)}")
+            errors.append(tr("stamp {stamp} repeated: {ids}", stamp=st, ids=", ".join(ids)))
     top = max(by_n, default=0)
     gaps = [n for n in range(1, top + 1) if n not in by_n]
     if gaps:
         shown = ", ".join(str(n) for n in gaps[:10]) + (" …" if len(gaps) > 10 else "")
-        warnings.append(f"{len(gaps)} número(s) sem registro nem cancelamento: "
-                        f"{shown}")
+        warnings.append(tr("{n} number(s) with neither a record nor a cancellation: "
+                           "{shown}", n=len(gaps), shown=shown))
 
 
 def summary(data):
     n_c = sum(1 for e in data["entries"] if e["kind"] == "concept")
     n_f = sum(1 for e in data["entries"] if e["kind"] == "form")
     n_r = sum(len(m.get("readings", [])) for m in data.get("corpus", []))
-    return (f"{len(data['people'])} pessoas · {len(data['entries'])} verbetes "
-            f"({n_c} conceitos, {n_f} formas) · {len(data.get('sources', []))} fontes · "
-            f"{len(data.get('corpus', []))} medidas ({n_r} leituras) · "
-            f"{len(data['edges'])} ligações")
+    return tr("{people} people · {entries} entries ({concepts} concepts, {forms} forms) · "
+              "{sources} sources · {metrics} measurements ({readings} readings) · "
+              "{links} links", people=len(data["people"]), entries=len(data["entries"]),
+              concepts=n_c, forms=n_f, sources=len(data.get("sources", [])),
+              metrics=len(data.get("corpus", [])), readings=n_r, links=len(data["edges"]))
 
 
 def cmd_doctor():
     data = load_json()
     errors, warnings = check(data)
     print("\n" + summary(data))
-    print(f"{len(errors)} erros, {len(warnings)} avisos\n")
+    print(tr("{e} errors, {w} warnings", e=len(errors), w=len(warnings)) + "\n")
     for x in errors:
-        print("  ERRO  ", x)
+        print("  " + tr("ERROR") + "  ", x)
     for x in warnings:
-        print("  aviso ", x)
+        print("  " + tr("warning") + " ", x)
     others = other_locks()
     if others:
-        print("\n  travas de outras máquinas:")
+        print("\n  " + tr("locks from other machines:"))
         for o in others:
-            print(f"    {o.get('host')} desde {o.get('since')}")
+            print("    " + tr("{host} since {since}", host=o.get("host"), since=o.get("since")))
     pend = conflict_files()
     if pend:
-        print(f"\n  {len(pend)} arquivo(s) de conflito à espera: rode `merge`.")
+        print("\n  " + tr("{n} conflict file(s) waiting: run `merge`.", n=len(pend)))
     print()
     return 1 if errors else 0
 
 
-# ================================================================ espelho
+# ================================================================ mirror
 
 def mirror_locus(r):
     if not r.get("reg_n"):
-        return "*sem número de ordem*"
-    return f"*{locus_label(r['reg_n'])} · registrado {stamp_label(r.get('reg'))}*"
+        return "*" + tr("no order number") + "*"
+    return "*" + tr("{locus} · registered {stamp}", locus=locus_label(r["reg_n"]),
+                    stamp=stamp_label(r.get("reg"))) + "*"
 
 
 def write_mirror(data):
     if MIRROR_FILE.exists():
         head = MIRROR_FILE.read_text(encoding="utf-8")[:400]
-        if MIRROR_MARK not in head:
-            raise SystemExit(
-                f"Não sobrescrevo {MIRROR_FILE.name}: não tem a marca de "
-                "arquivo gerado, pode ter sido escrito à mão. Renomeie-o.")
+        if not any(mark in head for mark in (MIRROR_MARK,) + OLD_MIRROR_MARKS):
+            raise SystemExit(tr(
+                "Not overwriting {name}: it lacks the generated-file mark, so it may "
+                "have been written by hand. Rename it.", name=MIRROR_FILE.name))
     idx = by_id(data)
     out = [MIRROR_MARK, "", "# Index", "",
-           f"*Espelho de {JSON_FILE.name}. {summary(data)}. "
-           f"Refeito em {TODAY()}. Edite o app, não este arquivo.*", "",
-           "# Personne", ""]
+           "*" + tr("Mirror of {file}. {summary}. Rebuilt on {date}. Edit in the app, "
+                    "not in this file.", file=JSON_FILE.name, summary=summary(data),
+                    date=TODAY()) + "*", "",
+           "# " + tr("People"), ""]
     for p in sorted(data["people"], key=lambda x: sort_key(x["name"])):
         out.append(f"## {p['name']}")
         out.append(mirror_locus(p))
@@ -2127,7 +2228,7 @@ def write_mirror(data):
         if p.get("met"):
             meta.append("met: " + p["met"])
         if p.get("source"):
-            meta.append("fonte: " + resolve_source(p["source"], data)[1])
+            meta.append(tr("source: ") + resolve_source(p["source"], data)[1])
         if meta:
             out.append("  ·  ".join(meta))
         if p.get("aliases"):
@@ -2163,31 +2264,31 @@ def write_mirror(data):
         out.append(mirror_locus(e))
         meta = []
         if e["kind"] == "concept":
-            meta.append("conceito")
+            meta.append(tr("concept"))
             if e.get("domains"):
-                meta.append("domínios: " + ", ".join(e["domains"]))
+                meta.append(tr("domains: ") + ", ".join(e["domains"]))
         else:
-            meta.append("forma")
+            meta.append(tr("form"))
             if e.get("attested"):
-                meta.append(f"atestada: {e['attested']}")
+                meta.append(tr("attested: ") + e["attested"])
             if e.get("status") != "attested":
                 meta.append(e.get("status", ""))
         if e.get("tags"):
             meta.append("tags: " + ", ".join(e["tags"]))
         if e.get("source"):
-            meta.append("fonte: " + resolve_source(e["source"], data)[1])
+            meta.append(tr("source: ") + resolve_source(e["source"], data)[1])
         out.append("  ·  ".join(m for m in meta if m))
         out.append("")
         if e.get("gloss"):
             out += [f"**{e['gloss']}**", ""]
         if e.get("notes"):
             out += [e["notes"], ""]
-        saindo = edges_from(data, e["id"])
-        if saindo:
-            for a in sorted(saindo, key=lambda x: year_of(x.get("when"))):
-                alvo = idx.get(a["to"])
+        outgoing = edges_from(data, e["id"])
+        if outgoing:
+            for a in sorted(outgoing, key=lambda x: year_of(x.get("when"))):
+                target = idx.get(a["to"])
                 line = f"- {rel_label(a['rel'])} " \
-                       f"[[{label_any(alvo, data) if alvo else a['to']}]]"
+                       f"[[{label_any(target, data) if target else a['to']}]]"
                 if a.get("when"):
                     line += f"  ({a['when']})"
                 if a.get("why"):
@@ -2199,11 +2300,11 @@ def write_mirror(data):
         if e.get("links"):
             out += list(e["links"]) + [""]
         out += [f"`{e['id']}`", ""]
-    out += ["# Fontes", ""]
+    out += ["# " + tr("Sources"), ""]
     for s in sorted(data["sources"], key=lambda x: sort_key(source_label(x, data))):
         out.append(f"## {source_label(s, data)}")
         out.append(mirror_locus(s))
-        out.append("  ·  ".join(x for x in (s.get("type", ""),
+        out.append("  ·  ".join(x for x in (type_label(s.get("type", "")),
                                             "tags: " + ", ".join(s["tags"]) if s.get("tags") else "") if x))
         out += ["", cite(s, "abnt", data), ""]
         if s.get("notes"):
@@ -2216,7 +2317,8 @@ def write_mirror(data):
         for coll in ("people", "entries", "corpus"):
             users = [r for r in data[coll] if r.get("source") == s["id"]]
             if users:
-                out.append(f"- fonte de {len(users)} {COLL_PT[coll]}: "
+                out.append("- " + tr("source of {n} {coll}: ", n=len(users),
+                                     coll=tr(COLL_LABEL[coll]))
                            + ", ".join(label_any(r, data) for r in users[:12])
                            + (" …" if len(users) > 12 else ""))
                 out.append("")
@@ -2230,11 +2332,11 @@ def write_mirror(data):
         out.append(mirror_locus(m))
         meta = []
         if m.get("unit"):
-            meta.append("unidade: " + m["unit"])
+            meta.append(tr("unit: ") + m["unit"])
         if m.get("ref_low") or m.get("ref_high"):
-            meta.append(f"referência: {m.get('ref_low', '')}–{m.get('ref_high', '')}")
+            meta.append(tr("reference: ") + f"{m.get('ref_low', '')}–{m.get('ref_high', '')}")
         if m.get("source"):
-            meta.append("fonte: " + resolve_source(m["source"], data)[1])
+            meta.append(tr("source: ") + resolve_source(m["source"], data)[1])
         if meta:
             out.append("  ·  ".join(meta))
         out.append("")
@@ -2257,7 +2359,7 @@ def cmd_mirror():
     return 0
 
 
-# ================================================================ busca
+# ================================================================ search
 
 def cmd_search(query):
     data = load_json()
@@ -2266,37 +2368,37 @@ def cmd_search(query):
     for p in data["people"]:
         low = haystack_person(p)
         if all(t in low for t in terms):
-            hits.append((sum(low.count(t) for t in terms), "pessoa", p))
+            hits.append((sum(low.count(t) for t in terms), tr("person"), p))
     for e in data["entries"]:
         low = haystack_entry(e, data)
         if all(t in low for t in terms):
-            hits.append((sum(low.count(t) for t in terms), e["kind"], e))
+            hits.append((sum(low.count(t) for t in terms), tr(e["kind"]), e))
     for s in data["sources"]:
         low = haystack_source(s, data)
         if all(t in low for t in terms):
-            hits.append((sum(low.count(t) for t in terms), "fonte", s))
+            hits.append((sum(low.count(t) for t in terms), tr("source"), s))
     for m in data["corpus"]:
         low = haystack_metric(m, data)
         if all(t in low for t in terms):
-            hits.append((sum(low.count(t) for t in terms), "medida", m))
+            hits.append((sum(low.count(t) for t in terms), tr("measurement"), m))
     hits.sort(key=lambda x: -x[0])
-    print(f'\nResultados para "{query}"  ({len(hits)} encontrados)\n')
+    print("\n" + tr('Results for "{query}"  ({n} found)', query=query, n=len(hits)) + "\n")
     for _, kind, r in hits[:24]:
         sub = r.get("gloss") or one_liner(r.get("notes_raw") or r.get("notes", ""), 60)
         print(f"  {kind:8} {label_any(r, data):34} {sub[:60]}")
         print(f"  {'':8} {r['id']}")
     if not hits:
-        print("  (nada encontrado)")
+        print("  " + tr("(nothing found)"))
     print()
     return 0
 
 
-# ================================================================ histórico
+# ================================================================ history
 
 def cmd_history(rid):
     lines = [l for l in read_logs() if l.get("id") == rid]
     if not lines:
-        print(f"nenhuma linha de log para {rid}")
+        print(tr("no log lines for {id}", id=rid))
         return 1
     for l in lines:
         op = l.get("op")
@@ -2309,13 +2411,14 @@ def cmd_history(rid):
         elif op == "del":
             print(f"{l['t']}  {l.get('host'):12} del   {l.get('name','')}")
         elif op == "edges":
-            print(f"{l['t']}  {l.get('host'):12} edges {len(l.get('edges', []))} ligações")
+            print(f"{l['t']}  {l.get('host'):12} edges "
+                  + tr("{n} links", n=len(l.get("edges", []))))
     return 0
 
 
 def cmd_replay():
-    """Reconstrói um vault só dos logs -- o teste de que o log basta.
-    Não toca no JSON principal: escreve _kustos.replay.json."""
+    """Rebuilds a vault from the logs alone -- the test that the log is enough.
+    Does not touch the main JSON: it writes _kustos.replay.json."""
     data = blank_vault()
     idx = {}
     regs = {}
@@ -2342,7 +2445,7 @@ def cmd_replay():
         elif op == "edges":
             data["edges"] = [a for a in data["edges"] if a["from"] != rid] \
                 + l.get("edges", [])
-    # o número de quem foi gravado antes de ter número vem das linhas "reg"
+    # records saved before they had a number get it from the "reg" lines
     for r in book_rows(data):
         v = regs.get(r.get("id"))
         if v and not r.get("reg_n"):
@@ -2356,18 +2459,18 @@ def cmd_replay():
     return 0
 
 
-# ================================================================ migração
+# ================================================================ migration
 
 def cmd_migrate():
-    """Funde as duas instâncias antigas em _kustos.json.
+    """Merges the two old instances (personne and verba) into _kustos.json.
 
-    Entram: o JSON atual de cada instância e os *.sync-conflict-* dela (que
-    são o estado da outra máquina). Os .bak entram só como fonte de
-    registros que não existam em lugar nenhum, porque um .bak também guarda
-    o que foi apagado de propósito. Nada é apagado: os arquivos antigos vão
-    para _kustos_old/."""
+    In go: each instance's current JSON and its *.sync-conflict-* files (which
+    are the other machine's state). .bak files only contribute records that
+    exist nowhere else, because a .bak also keeps what was deleted on purpose.
+    Nothing is deleted: the old files go to _kustos_old/."""
     if JSON_FILE.exists():
-        print(f"{JSON_FILE.name} já existe; a migração só roda numa pasta sem ele.")
+        print(tr("{name} already exists; migration only runs in a folder without it.",
+                 name=JSON_FILE.name))
         return 1
     data = blank_vault()
     moved = []
@@ -2375,7 +2478,7 @@ def cmd_migrate():
     def take(coll_name, key, path, tag):
         raw = read_any(path)
         if raw is None:
-            print(f"  ignorado (ilegível): {path.name}")
+            print("  " + tr("skipped (unreadable): {name}", name=path.name))
             return
         other = blank_vault()
         other[coll_name] = raw.get(key, [])
@@ -2385,38 +2488,41 @@ def cmd_migrate():
             data["ui"] = raw["ui"]
         fix_vault(other)
         rep = merge_vault(data, other)
-        print(f"  {tag:10} {path.name}: {len(other[coll_name])} registros, "
-              f"{len(rep['added'])} novos, {len(rep['replaced'])} mais novos")
+        print(f"  {tag:10} " + tr("{name}: {n} records, {added} new, {newer} newer",
+                                  name=path.name, n=len(other[coll_name]),
+                                  added=len(rep["added"]), newer=len(rep["replaced"])))
         moved.append(path)
 
     for inst, key in (("personne", "people"), ("verba", "entries")):
         main = BASE / f"{STEM}_{inst}.json"
         print(f"\n{inst}:")
         if main.exists():
-            take(key, key, main, "atual")
+            take(key, key, main, tr("current"))
         for p in sorted(BASE.glob(f"{STEM}_{inst}.sync-conflict-*.json")):
-            take(key, key, p, "conflito")
+            take(key, key, p, tr("conflict"))
         for p in sorted(BASE.glob(f"{STEM}_{inst}.bak*.json")):
-            # .bak: só o que não existe em lugar nenhum (nem em lápide)
+            # .bak: only what exists nowhere else (not even as a tombstone)
             raw = read_any(p)
             if raw is None:
                 continue
             have = set(by_id(data))
-            novos = [r for r in raw.get(key, []) if r.get("id") and r["id"] not in have]
-            for r in novos:
+            only_here = [r for r in raw.get(key, []) if r.get("id") and r["id"] not in have]
+            for r in only_here:
                 data[key].append(r)
             if key == "entries":
-                ids = {r["id"] for r in novos}
+                ids = {r["id"] for r in only_here}
                 data["edges"] += [a for a in raw.get("edges", []) if a["from"] in ids]
-            print(f"  {'bak':10} {p.name}: {len(novos)} registros que só existiam ali")
+            print(f"  {'bak':10} " + tr("{name}: {n} records that only existed there",
+                                        name=p.name, n=len(only_here)))
             moved.append(p)
-    # verbetes sem nome eram provisórios que nunca foram salvos com nome
-    vazios = [e["id"] for e in data["entries"] if not (e.get("name") or "").strip()]
-    data["entries"] = [e for e in data["entries"] if e["id"] not in vazios]
+    # nameless entries were provisional ones never saved with a name
+    empty = [e["id"] for e in data["entries"] if not (e.get("name") or "").strip()]
+    data["entries"] = [e for e in data["entries"] if e["id"] not in empty]
     data["edges"] = [a for a in data["edges"]
-                     if a["from"] not in vazios and a["to"] not in vazios]
-    if vazios:
-        print(f"\n  {len(vazios)} verbete(s) sem nome descartados: {', '.join(vazios)}")
+                     if a["from"] not in empty and a["to"] not in empty]
+    if empty:
+        print("\n  " + tr("{n} nameless entry(ies) discarded: {ids}",
+                          n=len(empty), ids=", ".join(empty)))
     fix_vault(data)
     ui = data.setdefault("ui", {})
     for k in ("panes", "panes_locked"):
@@ -2435,12 +2541,13 @@ def cmd_migrate():
                 try:
                     shutil.move(str(p), str(OLD_DIR / p.name))
                 except OSError as err:
-                    print(f"  não movi {p.name}: {err}")
+                    print("  " + tr("did not move {name}: {err}", name=p.name, err=err))
     launcher = BASE / f"{STEM}_launcher.json"
     if launcher.exists():
         shutil.move(str(launcher), str(OLD_DIR / launcher.name))
     print(f"\n{summary(data)} -> {JSON_FILE.name}")
-    print(f"Arquivos antigos em {OLD_DIR.name}/. Espelho em {MIRROR_FILE.name}.\n")
+    print(tr("Old files in {old}/. Mirror in {mirror}.", old=OLD_DIR.name,
+             mirror=MIRROR_FILE.name) + "\n")
     return 0
 
 
@@ -2454,18 +2561,18 @@ def read_any(path):
 def cmd_import(path_str):
     path = Path(path_str)
     if not path.exists():
-        raise SystemExit(f"Arquivo não existe: {path}")
+        raise SystemExit(tr("File does not exist: {path}", path=path))
     data = load_json()
     added, merged, identical, names = ingest(path.read_text(encoding="utf-8"), data)
     write_json(data)
     write_mirror(data)
-    print(f"{added} pessoas novas de {path.name}.")
+    print(tr("{n} new people from {name}.", n=added, name=path.name))
     if merged:
-        print(f"{merged} receberam addendum [addendum {TODAY()}]:")
+        print(tr("{n} got an addendum [addendum {date}]:", n=merged, date=TODAY()))
         for n in names[:12]:
             print("    · " + one_liner(n, 60))
     if identical:
-        print(f"{identical} já tinham tudo; intocadas.")
+        print(tr("{n} already had everything; untouched.", n=identical))
     return 0
 
 
@@ -2486,14 +2593,14 @@ def cmd_normalize():
             touched += 1
     write_json(data)
     write_mirror(data)
-    print(f"{touched} pessoas normalizadas. Espelho refeito.")
+    print(tr("{n} people normalized. Mirror rebuilt.", n=touched))
     return 0
 
 
 def cmd_merge():
     reports = absorb_conflicts()
     if not reports:
-        print("nenhum arquivo de conflito na pasta")
+        print(tr("no conflict files in the folder"))
         return 0
     for name, r in reports:
         print(f"\n{name}")
@@ -2502,10 +2609,10 @@ def cmd_merge():
         for coll, rid, nm in r["replaced"]:
             print(f"  ~ {nm}  ({rid})")
         for coll, rid, nm in r["skipped_deleted"]:
-            print(f"  - {nm}  ({rid}, apagado)")
-        print(f"  {r['kept']} mantidos como estavam")
+            print(f"  - {nm}  ({rid}, " + tr("deleted") + ")")
+        print("  " + tr("{n} kept as they were", n=r["kept"]))
     write_mirror(load_json())
-    print(f"\nconflitos guardados em {CONFLICT_DIR.name}/\n")
+    print("\n" + tr("conflicts stored in {dir}/", dir=CONFLICT_DIR.name) + "\n")
     return 0
 
 
@@ -2523,12 +2630,12 @@ def needs_upgrade(data):
 
 
 def upgrade_vault(data):
-    """index/2 -> index/3: cria as coleções de fontes e corpus e transforma
-    cada texto distinto do campo FONTE em UMA fonte, apontada pelo id.
-    O texto original fica em `raw` e continua a ser o que a citação 'bruto'
-    devolve, então nada do que estava escrito se perde.
+    """index/2 -> index/3: creates the sources and corpus collections and turns
+    each distinct text in the SOURCE field into ONE source, pointed at by id.
+    The original text is kept in `raw` and is still what the 'bruto' (raw)
+    citation returns, so nothing that was written is lost.
 
-    index/3 -> index/4: abre o registro e numera o que já existe."""
+    index/3 -> index/4: opens the register and numbers what already exists."""
     fix_vault(data)
     report = {"sources": [], "relinked": 0, "regs": {}}
     if schema_version(data) < 3:
@@ -2570,17 +2677,18 @@ def describe_opening(data, regs):
     why = {}
     for v in regs.values():
         why[v[2]] = why.get(v[2], 0) + 1
-    bits = ", ".join(f"{k} por {REG_ORIGEM[w]}" for w, k in
+    bits = ", ".join(tr("{n} from {origin}", n=k, origin=tr(REG_ORIGIN[w])) for w, k in
                      sorted(why.items(), key=lambda x: -x[1]))
-    return (f"Registro aberto: {len(regs)} registros numerados, do nº 1 ao "
-            f"nº {n}. Carimbos inferidos: {bits}.")
+    return tr("Register opened: {count} records numbered, from nº 1 to nº {n}. "
+              "Inferred stamps: {bits}.", count=len(regs), n=n, bits=bits)
 
 
 def cmd_upgrade(quiet=False):
     data = load_json()
     if not needs_upgrade(data):
         if not quiet:
-            print(f"{JSON_FILE.name} já está em {data.get('schema')}.")
+            print(tr("{name} is already at {schema}.", name=JSON_FILE.name,
+                     schema=data.get("schema")))
         return ""
     v = schema_version(data)
     report = upgrade_vault(data)
@@ -2599,8 +2707,8 @@ def cmd_upgrade(quiet=False):
     if not quiet:
         print(f"\n{JSON_FILE.name} -> {SCHEMA}")
         if v < 3:
-            print(f"{len(report['sources'])} fonte(s) criadas a partir do campo FONTE, "
-                  f"{report['relinked']} registros reapontados:")
+            print(tr("{n} source(s) created from the SOURCE field, {m} records repointed:",
+                     n=len(report["sources"]), m=report["relinked"]))
             for s in report["sources"]:
                 print(f"  {s['id']:40} {source_label(s, data)}")
         if opening:
@@ -2609,7 +2717,7 @@ def cmd_upgrade(quiet=False):
     return opening
 
 
-# ================================================================ citação
+# ================================================================ citation
 
 def find_source(data, key):
     if key in by_id(data):
@@ -2623,10 +2731,10 @@ def cmd_cite(key, style="abnt"):
     data = load_json()
     s = find_source(data, key)
     if not s:
-        print(f"fonte não encontrada (ou ambígua): {key}")
+        print(tr("source not found (or ambiguous): {key}", key=key))
         return 1
     if style not in CITE_STYLES:
-        print(f"estilo desconhecido; use um de: {', '.join(CITE_STYLES)}")
+        print(tr("unknown style; use one of: {styles}", styles=", ".join(CITE_STYLES)))
         return 1
     print(cite(s, style, data))
     return 0
@@ -2647,17 +2755,18 @@ def cmd_export(fmt, path_str=None):
                                   key=sort_key))
         ext = ".txt"
     else:
-        print("formato: bibtex | csl | abnt")
+        print(tr("format: bibtex | csl | abnt"))
         return 1
+    # default name kept as _kustos_fontes.* so existing sync-ignore rules still match
     out = Path(path_str) if path_str else BASE / f"{STEM}_fontes{ext}"
     out.write_text(body, encoding="utf-8")
-    print(f"{len(data['sources'])} fontes -> {out.name}")
+    print(tr("{n} sources -> {name}", n=len(data["sources"]), name=out.name))
     return 0
 
 
 def import_sources(items, data):
-    """Fontes vindas de fora entram sem duplicar: mesmo DOI, mesma URL ou
-    mesmo (primeiro autor, ano, título) é a mesma fonte."""
+    """Sources from outside come in without duplicates: the same DOI, the same
+    URL or the same (first author, year, title) is the same source."""
     def key_of(s):
         if s.get("doi"):
             return "doi:" + s["doi"].lower()
@@ -2686,7 +2795,7 @@ def import_sources(items, data):
 def cmd_import_zotero(path_str):
     path = Path(path_str)
     if not path.exists():
-        raise SystemExit(f"Arquivo não existe: {path}")
+        raise SystemExit(tr("File does not exist: {path}", path=path))
     text = path.read_text(encoding="utf-8")
     if path.suffix.lower() == ".bib" or text.lstrip().startswith("@"):
         items = sources_from_bibtex(text)
@@ -2699,21 +2808,25 @@ def cmd_import_zotero(path_str):
     added, skipped = import_sources(items, data)
     write_json(data)
     write_mirror(data)
-    print(f"{added} fontes importadas de {path.name}, {skipped} já existiam.")
+    print(tr("{added} sources imported from {name}, {skipped} already existed.",
+             added=added, name=path.name, skipped=skipped))
     return 0
 
 
-# ================================================================ mapa do corpo
+# ================================================================ body map
 #
-# O corpus tem um segundo espelho, em HTML: o mapa do corpo do protótipo
-# "Corpus" (o Homem Vitruviano com uma lâmina anatômica por sistema), agora
-# alimentado pelos dados reais. É só leitura -- a digitação é na janela --
-# e é refeito a cada gravação de medida, como o espelho markdown.
+# The corpus has a second mirror, in HTML: the body map from the "Corpus"
+# prototype (the Vitruvian Man with one anatomical plate per system), fed with
+# the real data. It is read-only -- typing happens in the window -- and it is
+# rebuilt on every measurement save, like the markdown mirror.
+#
+# Text in the page template is written as @@English text@@; write_corpus_html()
+# replaces each mark with tr() of it, so the page follows the interface language.
 
 CORPUS_HTML_FILE = BASE / f"{STEM}_corpus.html"
 
-# de que lâmina anatômica cada sistema do corpus se serve, e onde fica o
-# marcador na figura. Sistemas fora desta tabela ficam numa fila à parte.
+# which anatomical plate each corpus system uses, and where its marker sits on
+# the figure. Systems not in this table go in a separate row.
 PLATE_OF = {
     "nervoso": "neuro", "sono": "neuro",
     "cardiovascular": "cardio", "respiratório": "cardio",
@@ -2728,11 +2841,11 @@ MARKER_OF = {"neuro": (100, 38), "cardio": (100, 110), "metabolic": (100, 160),
 
 
 def corpus_payload(data):
-    """Agrupa as medidas por sistema no formato que a página espera."""
+    """Groups the measurements by system in the shape the page expects."""
     systems = {}
     for m in data.get("corpus", []):
         sname = m.get("system") or "outro"
-        sys_ = systems.setdefault(sname, {"id": slug(sname), "name": sname,
+        sys_ = systems.setdefault(sname, {"id": slug(sname), "name": system_label(sname),
                                           "plate": PLATE_OF.get(sname), "metrics": []})
         hist = []
         for r in m.get("readings", []):
@@ -2753,7 +2866,7 @@ def corpus_payload(data):
         s = systems[sname]
         if s["plate"] in MARKER_OF:
             x, y = MARKER_OF[s["plate"]]
-            # dois sistemas na mesma lâmina ficam lado a lado, não em cima
+            # two systems on the same plate sit side by side, not on top of each other
             n = used.get(s["plate"], 0)
             used[s["plate"]] = n + 1
             s["marker"] = [x + 16 * n, y]
@@ -2765,13 +2878,19 @@ def write_corpus_html(data):
     payload = json.dumps({"systems": corpus_payload(data), "built": TODAY(),
                           "summary": summary(data)}, ensure_ascii=False)
     html = CORPUS_HTML.replace("/*__DATA__*/null", payload)
+    html = html.replace("@@LANG@@", "pt-BR" if LANG == "pt" else "en")
+    html = html.replace("@@MONTHS@@", json.dumps(
+        ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
+        if LANG == "pt" else
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]))
+    html = re.sub(r"@@(.+?)@@", lambda m: tr(m.group(1)), html)
     CORPUS_HTML_FILE.write_text(html, encoding="utf-8")
 
 
 def cmd_corpus(open_it=True):
     data = load_json()
     write_corpus_html(data)
-    print(f"{len(data['corpus'])} medidas -> {CORPUS_HTML_FILE.name}")
+    print(tr("{n} measurements -> {name}", n=len(data["corpus"]), name=CORPUS_HTML_FILE.name))
     if open_it:
         import webbrowser
         webbrowser.open(CORPUS_HTML_FILE.as_uri())
@@ -2779,7 +2898,7 @@ def cmd_corpus(open_it=True):
 
 
 CORPUS_HTML = r"""<!doctype html>
-<html lang="pt-BR">
+<html lang="@@LANG@@">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2928,30 +3047,30 @@ CORPUS_HTML = r"""<!doctype html>
   <header class="masthead">
     <div>
       <h1>Corpus</h1>
-      <span class="subtitle"># registro pessoal por sistemas</span>
+      <span class="subtitle"># @@personal record by body system@@</span>
     </div>
     <span class="built" id="built"></span>
   </header>
   <div class="summary-strip">
-    <div class="stat"><div class="k">Sistemas</div><div class="v mono" id="statSystems">—</div></div>
-    <div class="stat"><div class="k">Fora da referência</div><div class="v mono flagged" id="statFlags">—</div></div>
-    <div class="stat"><div class="k">Perto do limite</div><div class="v mono" id="statMonitor">—</div></div>
-    <div class="stat"><div class="k">Dentro</div><div class="v mono ok" id="statOk">—</div></div>
+    <div class="stat"><div class="k">@@Systems@@</div><div class="v mono" id="statSystems">—</div></div>
+    <div class="stat"><div class="k">@@Out of range@@</div><div class="v mono flagged" id="statFlags">—</div></div>
+    <div class="stat"><div class="k">@@Near the limit@@</div><div class="v mono" id="statMonitor">—</div></div>
+    <div class="stat"><div class="k">@@In range@@</div><div class="v mono ok" id="statOk">—</div></div>
   </div>
   <nav class="tabs" role="tablist">
-    <button class="tab" role="tab" aria-selected="true" data-panel="overview">visão geral</button>
-    <button class="tab" role="tab" aria-selected="false" data-panel="full">painel completo</button>
-    <button class="tab" role="tab" aria-selected="false" data-panel="timeline">linha do tempo</button>
+    <button class="tab" role="tab" aria-selected="true" data-panel="overview">@@overview@@</button>
+    <button class="tab" role="tab" aria-selected="false" data-panel="full">@@full panel@@</button>
+    <button class="tab" role="tab" aria-selected="false" data-panel="timeline">@@timeline@@</button>
   </nav>
   <section class="panel active" id="panel-overview">
     <div class="overview-grid" id="overviewGrid">
       <div class="col">
-        <div class="col-title">Sistemas</div>
+        <div class="col-title">@@Systems@@</div>
         <ul class="system-list" id="systemList"></ul>
       </div>
       <div class="col figure-wrap">
-        <div class="col-title" style="align-self:flex-start;">Mapa</div>
-        <svg viewBox="-140 -20 480 500" width="240" role="img" aria-label="Figura inscrita em círculo e quadrado, à maneira vitruviana, com uma lâmina anatômica por sistema">
+        <div class="col-title" style="align-self:flex-start;">@@Map@@</div>
+        <svg viewBox="-140 -20 480 500" width="240" role="img" aria-label="@@Figure inscribed in a circle and a square, in the Vitruvian manner, with one anatomical plate per system@@">
           <rect class="vitruvian" x="-100" y="28" width="400" height="400" />
           <circle class="vitruvian" cx="100" cy="228" r="235" />
           <path class="body-line-echo" d="M60,92 C10,72 -30,55 -51,48" />
@@ -2968,14 +3087,14 @@ CORPUS_HTML = r"""<!doctype html>
           <g id="anatomyLayer"></g>
           <g id="markers"></g>
         </svg>
-        <p class="figure-caption">Segundo o cânone de proporções de Leonardo; a pose de membros abertos, mais tênue, é a segunda exposição. Escolha um sistema para trocar a lâmina.</p>
+        <p class="figure-caption">@@After Leonardo's canon of proportions; the fainter open-limbed pose is the second exposure. Pick a system to change the plate.@@</p>
       </div>
       <div class="col" id="detailCol"></div>
     </div>
   </section>
   <section class="panel" id="panel-full">
     <div class="table-scroll"><table class="full">
-      <thead><tr><th>Sistema</th><th>Medida</th><th>Última</th><th>Referência</th><th>Data</th><th>Estado</th></tr></thead>
+      <thead><tr><th>@@System@@</th><th>@@Measurement@@</th><th>@@Latest@@</th><th>@@Reference@@</th><th>@@Date@@</th><th>@@Status@@</th></tr></thead>
       <tbody id="fullTableBody"></tbody>
     </table></div>
   </section>
@@ -2995,8 +3114,8 @@ CORPUS_HTML = r"""<!doctype html>
   function fmtDate(iso) {
     var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || "");
     if (!m) return iso || "";
-    var meses = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"];
-    return m[3] + " " + meses[+m[2] - 1] + " " + m[1];
+    var months = @@MONTHS@@;
+    return m[3] + " " + months[+m[2] - 1] + " " + m[1];
   }
   function fmtNum(v) { if (Math.abs(v - Math.round(v)) < 0.001) return String(Math.round(v)); return String(Math.round(v * 100) / 100); }
   function rangeText(m) {
@@ -3039,10 +3158,10 @@ CORPUS_HTML = r"""<!doctype html>
     out.sort(function (a, b) { return a.date < b.date ? 1 : -1; });
     return out;
   }
-  var STATUS_PT = { ok: "dentro", monitor: "perto do limite", flagged: "fora", unknown: "sem referência" };
+  var STATUS_LABEL = { ok: "@@in range@@", monitor: "@@near the limit@@", flagged: "@@out@@", unknown: "@@no reference@@" };
 
   function renderSummary() {
-    document.getElementById("built").textContent = "espelho de _kustos.json · " + esc(data.built);
+    document.getElementById("built").textContent = "@@mirror of _kustos.json@@ · " + esc(data.built);
     document.getElementById("statSystems").textContent = data.systems.length;
     var f = 0, mo = 0, ok = 0;
     data.systems.forEach(function (s) { s.metrics.forEach(function (m) {
@@ -3050,7 +3169,7 @@ CORPUS_HTML = r"""<!doctype html>
     document.getElementById("statFlags").textContent = f;
     document.getElementById("statMonitor").textContent = mo;
     document.getElementById("statOk").textContent = ok;
-    document.getElementById("foot").textContent = data.summary + " — refeito pelo _kustos.py; edite na janela, não aqui.";
+    document.getElementById("foot").textContent = data.summary + " — @@rebuilt by _kustos.py; edit in the window, not here.@@";
   }
 
   function renderSystemList() {
@@ -3064,7 +3183,7 @@ CORPUS_HTML = r"""<!doctype html>
       btn.className = "system-row";
       btn.setAttribute("aria-current", sys.id === selectedSystemId ? "true" : "false");
       btn.innerHTML = '<span class="name">' + esc(sys.name) + '</span>' +
-        '<span class="meta"><span class="status-dot ' + st + '"></span>' + STATUS_PT[st] + ' · ' + sys.metrics.length + ' medida' + (sys.metrics.length === 1 ? '' : 's') + '</span>';
+        '<span class="meta"><span class="status-dot ' + st + '"></span>' + STATUS_LABEL[st] + ' · ' + sys.metrics.length + ' medida' + (sys.metrics.length === 1 ? '' : 's') + '</span>';
       btn.addEventListener("click", function () { selectSystem(sys.id); });
       li.appendChild(btn);
       list.appendChild(li);
@@ -3200,7 +3319,7 @@ CORPUS_HTML = r"""<!doctype html>
   function renderDetail() {
     var col = document.getElementById("detailCol");
     var sys = data.systems.filter(function (s) { return s.id === selectedSystemId; })[0];
-    if (!sys) { col.innerHTML = '<div class="col-title">Registro</div><p class="notes">Escolha um sistema para ver as leituras e a tendência.</p>'; return; }
+    if (!sys) { col.innerHTML = '<div class="col-title">@@Record@@</div><p class="notes">@@Pick a system to see its readings and trend.@@</p>'; return; }
     var st = systemStatus(sys);
     var primary = sys.metrics.filter(function (m) { return m.id === selectedMetricId; })[0] || sys.metrics[0];
     var rows = sys.metrics.map(function (m) {
@@ -3209,13 +3328,13 @@ CORPUS_HTML = r"""<!doctype html>
       return '<tr class="pick ' + mst + (m === primary ? ' current' : '') + '" data-m="' + esc(m.id) + '"><td class="name">' + esc(m.label) + '</td>' +
         '<td class="value">' + (last ? esc(last[2]) + " " + esc(m.unit) : "—") + '</td><td>' + esc(rangeText(m)) + '</td></tr>';
     }).join("");
-    col.innerHTML = '<div class="col-title">Registro</div>' +
-      '<div class="detail-head"><h3>' + esc(sys.name) + '</h3><span class="status-tag bracket ' + st + '">' + STATUS_PT[st] + '</span></div>' +
-      '<div class="detail-sub">' + sys.metrics.length + ' medida' + (sys.metrics.length === 1 ? "" : "s") + ' — última leitura ' + (lastDateOf(sys) ? fmtDate(lastDateOf(sys)) : "nenhuma") + '</div>' +
+    col.innerHTML = '<div class="col-title">@@Record@@</div>' +
+      '<div class="detail-head"><h3>' + esc(sys.name) + '</h3><span class="status-tag bracket ' + st + '">' + STATUS_LABEL[st] + '</span></div>' +
+      '<div class="detail-sub">' + sys.metrics.length + ' ' + (sys.metrics.length === 1 ? "@@measurement@@" : "@@measurements@@") + ' — @@last reading@@ ' + (lastDateOf(sys) ? fmtDate(lastDateOf(sys)) : "@@none@@") + '</div>' +
       '<div class="trend"><div class="trend-label"><span>' + esc(primary.label) + '</span><span>' + esc(primary.unit) + '</span></div>' + buildTrendSvg(primary) + '</div>' +
-      '<table class="metric-table"><thead><tr><th>Medida</th><th>Última</th><th>Referência</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+      '<table class="metric-table"><thead><tr><th>@@Measurement@@</th><th>@@Latest@@</th><th>@@Reference@@</th></tr></thead><tbody>' + rows + '</tbody></table>' +
       (primary.notes ? '<p class="notes">' + esc(primary.notes) + '</p>' : '') +
-      (primary.source ? '<p class="quote">fonte: ' + esc(primary.source) + '</p>' : '') +
+      (primary.source ? '<p class="quote">@@source: @@' + esc(primary.source) + '</p>' : '') +
       '<p class="notes" style="color:var(--ink-muted)">' + esc(primary.id) + '</p>';
     col.querySelectorAll("tr.pick").forEach(function (tr) {
       tr.addEventListener("click", function () { selectedMetricId = tr.dataset.m; renderDetail(); });
@@ -3230,19 +3349,19 @@ CORPUS_HTML = r"""<!doctype html>
       rows.push('<tr class="' + st + '"><td>' + esc(sys.name) + '</td><td>' + esc(m.label) + '</td>' +
         '<td class="mono value">' + (last ? esc(last[2]) + " " + esc(m.unit) : "—") + '</td>' +
         '<td class="mono">' + esc(rangeText(m)) + '</td><td class="mono">' + (last ? fmtDate(last[0]) : "—") + '</td>' +
-        '<td><span class="status-tag bracket ' + st + '">' + STATUS_PT[st] + '</span></td></tr>');
+        '<td><span class="status-tag bracket ' + st + '">' + STATUS_LABEL[st] + '</span></td></tr>');
     }); });
-    document.getElementById("fullTableBody").innerHTML = rows.join("") || '<tr><td colspan="6" class="empty">Nenhuma medida.</td></tr>';
+    document.getElementById("fullTableBody").innerHTML = rows.join("") || '<tr><td colspan="6" class="empty">@@No measurements.@@</td></tr>';
   }
 
   function renderTimeline() {
     var rows = allEntries().map(function (e) {
       var st = valueStatus(e.metric, e.value);
       return '<li><span class="mono">' + fmtDate(e.date) + '</span><span class="sys">' + esc(e.system.name) + '</span><span>' + esc(e.metric.label) + '</span>' +
-        '<span class="mono value ' + st + '">' + esc(e.shown) + ' ' + esc(e.metric.unit) + '</span><span class="note">' + esc(e.note) + '</span><span class="st">' + STATUS_PT[st] + '</span></li>';
+        '<span class="mono value ' + st + '">' + esc(e.shown) + ' ' + esc(e.metric.unit) + '</span><span class="note">' + esc(e.note) + '</span><span class="st">' + STATUS_LABEL[st] + '</span></li>';
     });
     document.getElementById("timelineList").innerHTML =
-      '<li class="head"><span>Data</span><span class="sys">Sistema</span><span>Medida</span><span>Valor</span><span class="note">Obs.</span><span class="st">Estado</span></li>' + rows.join("");
+      '<li class="head"><span>@@Date@@</span><span class="sys">@@System@@</span><span>@@Measurement@@</span><span>@@Value@@</span><span class="note">@@Note@@</span><span class="st">@@Status@@</span></li>' + rows.join("");
   }
 
   function selectSystem(id) { selectedSystemId = id; selectedMetricId = null; renderSystemList(); renderMarkers(); renderAnatomyLayer(); renderDetail(); }
@@ -3264,7 +3383,7 @@ CORPUS_HTML = r"""<!doctype html>
 """
 
 
-# ================================================================ temas
+# ================================================================ themes
 
 THEMES = {
     "paper": dict(dark=False, label="Paper", mono_only=False,
@@ -3305,8 +3424,8 @@ def load_palette(name):
 
 
 def paint_frame(win):
-    """No Windows a barra de título é do sistema; pede ao DWM para combinar
-    com o tema. Silencioso em qualquer outra plataforma."""
+    """On Windows the title bar belongs to the system; ask DWM to match the
+    theme. Silent on any other platform."""
     if sys.platform != "win32":
         return
     try:
@@ -3332,10 +3451,10 @@ def paint_frame(win):
         pass
 
 
-# ================================================================ cartões
+# ================================================================ cards
 
 class PersonCard:
-    """O cartão de pessoa: campos, tarefas, log, círculos."""
+    """The person card: fields, tasks, log, circles."""
 
     def __init__(self, app, parent):
         self.app = app
@@ -3347,12 +3466,12 @@ class PersonCard:
         pad = dict(padx=22)
         foot = tk.Frame(shell, bg=PAPER)
         foot.pack(fill="x", side="bottom", pady=12, **pad)
-        ttk.Button(foot, text="Salvar", command=app.save).pack(side="left")
-        ttk.Button(foot, text="Salvar e nova", style="Quiet.TButton",
+        ttk.Button(foot, text=tr("Save"), command=app.save).pack(side="left")
+        ttk.Button(foot, text=tr("Save and new"), style="Quiet.TButton",
                    command=app.save_and_new).pack(side="left", padx=(8, 0))
         self.msg = tk.Label(foot, text="", bg=PAPER, fg=OXIDE, font=app.f_meta)
         self.msg.pack(side="left", padx=14)
-        ttk.Button(foot, text="Apagar", style="Quiet.TButton",
+        ttk.Button(foot, text=tr("Delete"), style="Quiet.TButton",
                    command=app.delete).pack(side="right")
         tk.Frame(shell, bg=RULE, height=1).pack(fill="x", side="bottom")
 
@@ -3369,19 +3488,19 @@ class PersonCard:
         self.stamp.pack(side="right")
         tk.Frame(c, bg=STAMP, height=2).pack(fill="x", pady=(6, 0), **pad)
 
-        self.e_tags = app.field(c, "TAGS", app.f_meta, pad)
-        self.t_notes = app.textfield(c, "NOTAS", 3, app.f_body, pad)
-        self.e_place = app.field(c, "DOMICILIUM", app.f_body, pad)
+        self.e_tags = app.field(c, tr("TAGS"), app.f_meta, pad)
+        self.t_notes = app.textfield(c, tr("NOTES"), 3, app.f_body, pad)
+        self.e_place = app.field(c, tr("DOMICILIUM"), app.f_body, pad)
         self.e_source = app.source_field(c, pad)
         self.circles = self.circle_panel(c, pad)
-        self.t_alias = app.textfield(c, "TAMBÉM CONHECIDO COMO", 2, app.f_meta, pad)
-        self.t_links = app.textfield(c, "LINKS", 2, app.f_meta, pad)
-        self.t_tasks = app.textfield(c, "TAREFAS", 3, app.f_meta, pad)
+        self.t_alias = app.textfield(c, tr("ALSO KNOWN AS"), 2, app.f_meta, pad)
+        self.t_links = app.textfield(c, tr("URLS"), 2, app.f_meta, pad)
+        self.t_tasks = app.textfield(c, tr("TASKS"), 3, app.f_meta, pad)
         self.t_tasks.bind("<space>", self.space_cycle)
         self.t_tasks.bind("<Control-space>", self.cycle_task_state)
         self.t_tasks.bind("<Return>", self.new_task_line)
 
-        app.label(c, "CITADO POR  (duplo clique abre)", pad)
+        app.label(c, tr("CITED BY  (double-click opens)"), pad)
         self.inbox = tk.Listbox(c, height=2, width=1, font=app.f_meta,
                                 bg=PAPER, fg=INK, relief="flat",
                                 highlightthickness=0, selectbackground=SELBG,
@@ -3421,9 +3540,9 @@ class PersonCard:
                 w.bind(ev, app.mark_dirty, add="+")
 
     def circle_panel(self, parent, pad, height=172):
-        """Os quatro círculos de Covey, encaixados, clicáveis."""
+        """Covey's four circles, nested and clickable."""
         app = self.app
-        tk.Label(parent, text="CÍRCULOS", bg=PAPER, fg=FAINT,
+        tk.Label(parent, text=tr("CIRCLES"), bg=PAPER, fg=FAINT,
                  font=app.f_label, anchor="w").pack(fill="x", pady=(6, 2), **pad)
         cv = tk.Canvas(parent, height=height, bg=PAPER, highlightthickness=0, bd=0)
         cv.pack(fill="x", **pad)
@@ -3460,7 +3579,7 @@ class PersonCard:
                 chosen = name in state["on"]
                 hot = (state["hot"] == name and state["enabled"])
                 cv.create_text(lx, ly, anchor="w",
-                               text=("[x] " if chosen else "[ ] ") + name,
+                               text=("[x] " if chosen else "[ ] ") + tr(name),
                                font=app.f_meta,
                                fill=INK if (chosen or hot) else FAINT)
 
@@ -3485,8 +3604,8 @@ class PersonCard:
             state["on"].symmetric_difference_update({name})
             draw()
             app.mark_dirty()
-            self.msg.configure(text=", ".join(parse_circles(state["on"]))
-                               or "nenhum círculo")
+            self.msg.configure(text=", ".join(tr(c) for c in parse_circles(state["on"]))
+                               or tr("no circle"))
 
         def moved(e):
             if not state["enabled"]:
@@ -3522,7 +3641,7 @@ class PersonCard:
         cv.set_circles, cv.enable_circles = set_value, enable
         return cv
 
-    # ---- tarefas
+    # ---- tasks
     def cycle_task_state(self, _event=None):
         t = self.t_tasks
         line = t.index("insert").split(".")[0]
@@ -3541,8 +3660,8 @@ class PersonCard:
         t.insert(f"{line}.0", f"[{MARK_OF[nxt]}] {rest}")
         t.mark_set("insert", f"{line}.1")
         self.app.mark_dirty()
-        self.msg.configure(text=nxt + (" — vai para o log ao salvar"
-                                       if nxt == "done" else ""))
+        self.msg.configure(text=tr(nxt) + (tr(" — goes to the log on save")
+                                           if nxt == "done" else ""))
         return "break"
 
     def space_cycle(self, event):
@@ -3558,7 +3677,7 @@ class PersonCard:
         self.app.mark_dirty()
         return "break"
 
-    # ---- estado
+    # ---- state
     def enable(self, on):
         state = "normal" if on else "disabled"
         for w in (self.e_name, self.e_tags, self.e_place, self.e_log, self.e_source):
@@ -3603,11 +3722,11 @@ class PersonCard:
         self.t_log.delete("1.0", "end")
         self.t_log.insert("1.0", format_log(p.get("interactions", [])))
         self.refresh_citing(p)
-        bits = [p["id"] if not p["id"].startswith("__") else "rascunho"]
+        bits = [p["id"] if not p["id"].startswith("__") else tr("draft")]
         if p.get("met"):
-            bits.append("met " + p["met"])
+            bits.append(tr("met {date}", date=p["met"]))
         if p.get("updated"):
-            bits.append("edit " + p["updated"])
+            bits.append(tr("edit {date}", date=p["updated"]))
         self.stamp.configure(text="\n".join(bits))
         self.msg.configure(text="")
 
@@ -3660,7 +3779,7 @@ class PersonCard:
 
 
 class EntryCard:
-    """O cartão de verbete: glosa, linha de forma, domínios, ligações."""
+    """The entry card: gloss, form row, domains, links."""
 
     def __init__(self, app, parent):
         self.app = app
@@ -3674,10 +3793,10 @@ class EntryCard:
         pad = dict(padx=22)
         foot = tk.Frame(shell, bg=PAPER)
         foot.pack(fill="x", side="bottom", pady=12, **pad)
-        ttk.Button(foot, text="Salvar", command=app.save).pack(side="left")
+        ttk.Button(foot, text=tr("Save"), command=app.save).pack(side="left")
         self.msg = tk.Label(foot, text="", bg=PAPER, fg=OXIDE, font=app.f_meta)
         self.msg.pack(side="left", padx=14)
-        ttk.Button(foot, text="Apagar", style="Quiet.TButton",
+        ttk.Button(foot, text=tr("Delete"), style="Quiet.TButton",
                    command=app.delete).pack(side="right")
         tk.Frame(shell, bg=RULE, height=1).pack(fill="x", side="bottom")
 
@@ -3694,8 +3813,8 @@ class EntryCard:
         self.stamp.pack(side="right")
         tk.Frame(c, bg=STAMP, height=2).pack(fill="x", pady=(6, 0), **pad)
 
-        # Cada campo vive no seu quadro; apply_layout empacota na ordem
-        # guardada, o que permite reordenar e ocultar sem refazer a janela.
+        # Each field lives in its own frame; apply_layout packs them in the saved
+        # order, which allows reordering and hiding without rebuilding the window.
         self.blocks = {}
 
         def block(fid):
@@ -3703,12 +3822,12 @@ class EntryCard:
             self.blocks[fid] = f
             return f
 
-        self.t_gloss = app.textfield(block("gloss"), "GLOSA", 2, app.f_body, pad)
+        self.t_gloss = app.textfield(block("gloss"), tr("GLOSS"), 2, app.f_body, pad)
 
         self.form_row = block("form_row")
-        for title, width, attr in (("LÍNGUA", 8, "e_lang"),
-                                   ("ROMANIZAÇÃO", 16, "e_roman"),
-                                   ("ATESTADA", 12, "e_attested")):
+        for title, width, attr in ((tr("LANGUAGE"), 8, "e_lang"),
+                                   (tr("ROMANIZATION"), 16, "e_roman"),
+                                   (tr("ATTESTED"), 12, "e_attested")):
             col = tk.Frame(self.form_row, bg=PAPER)
             col.pack(side="left", fill="x", expand=True)
             tk.Label(col, text=title, bg=PAPER, fg=FAINT, font=app.f_label,
@@ -3722,7 +3841,7 @@ class EntryCard:
             setattr(self, attr, ent)
         statf = tk.Frame(self.form_row, bg=PAPER)
         statf.pack(side="left", fill="x", expand=True)
-        tk.Label(statf, text="STATUS", bg=PAPER, fg=FAINT, font=app.f_label,
+        tk.Label(statf, text=tr("STATUS"), bg=PAPER, fg=FAINT, font=app.f_label,
                  anchor="w").pack(fill="x", pady=(8, 2))
         self.v_status = tk.StringVar(value="attested")
         self.e_status = ttk.Combobox(statf, textvariable=self.v_status,
@@ -3731,15 +3850,15 @@ class EntryCard:
         self.e_status.pack(anchor="w")
         self.e_status.bind("<<ComboboxSelected>>", app.mark_dirty)
 
-        self.e_domains = app.field(block("domains"), "DOMÍNIOS", app.f_meta, pad)
-        self.e_tags = app.field(block("tags"), "TAGS", app.f_meta, pad)
+        self.e_domains = app.field(block("domains"), tr("DOMAINS"), app.f_meta, pad)
+        self.e_tags = app.field(block("tags"), tr("TAGS"), app.f_meta, pad)
         self.e_source = app.source_field(block("source"), pad)
-        self.t_notes = app.textfield(block("notes"), "NOTAS", 3, app.f_body, pad)
+        self.t_notes = app.textfield(block("notes"), tr("NOTES"), 3, app.f_body, pad)
 
         b = block("edges")
-        app.label(b, "LIGAÇÕES", pad)
-        tk.Label(b, text="rel  alvo  [intervalo]  — razão  # fonte     "
-                         "(alvo pode ser p_… de uma pessoa)",
+        app.label(b, tr("LINKS"), pad)
+        tk.Label(b, text=tr("rel  target  [span]  — reason  # source     "
+                            "(the target can be a person's p_…)"),
                  bg=PAPER, fg=FAINT, font=app.f_label, anchor="w"
                  ).pack(fill="x", pady=(0, 3), **pad)
         self.t_edges = tk.Text(b, height=3, width=1, font=app.f_meta,
@@ -3754,15 +3873,15 @@ class EntryCard:
         tk.Frame(b, bg=RULE, height=1).pack(fill="x", pady=(4, 0), **pad)
 
         b = block("out")
-        app.label(b, "LIGAÇÕES RESOLVIDAS  (duplo clique abre)", pad)
+        app.label(b, tr("RESOLVED LINKS  (double-click opens)"), pad)
         self.outbox = self._listbox(b, pad)
         self.outbox.bind("<Double-Button-1>", self.jump_out)
         b = block("inb")
-        app.label(b, "CITADO POR  (duplo clique abre)", pad)
+        app.label(b, tr("CITED BY  (double-click opens)"), pad)
         self.inbox = self._listbox(b, pad)
         self.inbox.bind("<Double-Button-1>", self.jump_in)
 
-        self.t_links = app.textfield(block("links"), "LINKS", 2, app.f_meta, pad)
+        self.t_links = app.textfield(block("links"), tr("URLS"), 2, app.f_meta, pad)
         self.tail = tk.Frame(c, bg=PAPER, height=12)
 
         for w in (self.e_name, self.e_lang, self.e_roman, self.e_attested,
@@ -3844,12 +3963,12 @@ class EntryCard:
         self.t_links.delete("1.0", "end")
         self.t_links.insert("1.0", "\n".join(e.get("links", [])))
         self.t_edges.delete("1.0", "end")
-        texto = format_edges(edges_from(self.app.data, e["id"]))
+        text = format_edges(edges_from(self.app.data, e["id"]))
         if e.get("edge_drafts"):
-            texto = "\n".join(filter(None, [texto] + e["edge_drafts"]))
-        self.t_edges.insert("1.0", texto)
-        rid = e["id"] if not e["id"].startswith("__") else "rascunho"
-        self.stamp.configure(text=f"{rid}\n{self.kind}  {e.get('updated', '')}")
+            text = "\n".join(filter(None, [text] + e["edge_drafts"]))
+        self.t_edges.insert("1.0", text)
+        rid = e["id"] if not e["id"].startswith("__") else tr("draft")
+        self.stamp.configure(text=f"{rid}\n{tr(self.kind)}  {e.get('updated', '')}")
         self.msg.configure(text="")
         self.apply_layout()
         self.refresh_neighbours(e["id"])
@@ -3859,8 +3978,8 @@ class EntryCard:
         self.outbox.delete(0, "end")
         self.out_ids = []
         for a in sorted(edges_from(data, eid), key=lambda x: year_of(x.get("when"))):
-            alvo = idx.get(a["to"])
-            shown = label_any(alvo, data) if alvo else f"{a['to']}  (alvo inexistente)"
+            target = idx.get(a["to"])
+            shown = label_any(target, data) if target else tr("{id}  (missing target)", id=a["to"])
             when = f"  {a['when']}" if a.get("when") else ""
             self.outbox.insert("end", f"{rel_label(a['rel']):16} {shown}{when}")
             self.out_ids.append(a["to"])
@@ -3911,16 +4030,15 @@ class EntryCard:
         return self.t_edges.get("1.0", "end-1c")
 
 
-# ================================================================ mapa do corpo (Tk)
+# ================================================================ body map (Tk)
 #
-# O mesmo Vitruviano e as mesmas lâminas do espelho HTML, desenhados no
-# Canvas do Tk: monocromáticos, no tom do tema, sem preenchimento além de um
-# tramado leve. Os caminhos SVG são convertidos em polilinhas por um
-# interpretador mínimo (M, L, C, Q, Z, absolutos), que é tudo que as lâminas
-# usam.
+# The same Vitruvian figure and plates as the HTML mirror, drawn on the Tk
+# Canvas: monochrome, in the theme's tone, with no fill beyond a light hatch.
+# SVG paths are turned into polylines by a minimal interpreter (absolute M, L,
+# C, Q, Z), which is all the plates use.
 
-# (id da lâmina, título) -> lista de primitivas ("path", d) | ("circle", cx, cy, r)
-#   | ("ellipse", cx, cy, rx, ry, ângulo) | ("line", x1, y1, x2, y2, dash) | ("organ", d)
+# plate id -> list of primitives ("path", d) | ("circle", cx, cy, r)
+#   | ("ellipse", cx, cy, rx, ry, angle) | ("line", x1, y1, x2, y2, dash) | ("organ", d)
 PLATES = {
     "neuro": [
         ("path", "M82,30 Q100,20 118,30"), ("path", "M80,44 Q100,54 120,44"),
@@ -3972,8 +4090,8 @@ PLATES = {
          ((60, 92), (-15, 93), (-90, 96), (140, 92), (215, 93), (290, 96), (76, 262),
           (66, 352), (58, 440), (124, 262), (132, 352), (142, 440))],
 }
-# a figura de base: o quadrado e o círculo, a pose aberta em tracejado, o
-# corpo em traço cheio
+# the base figure: the square and the circle, the open pose dashed, the body
+# in a solid line
 FIGURE = [
     ("rect", -100, 28, 400, 400), ("circle", 100, 228, 235),
     ("echo", "M60,92 C10,72 -30,55 -51,48"), ("echo", "M140,92 C190,72 230,55 251,48"),
@@ -3988,7 +4106,7 @@ VIEWBOX = (-140, -20, 480, 500)
 
 
 def svg_path_points(d, steps=10):
-    """Caminho SVG (M/L/C/Q/Z absolutos) -> lista de polilinhas [(x,y),...]."""
+    """SVG path (absolute M/L/C/Q/Z) -> list of polylines [(x,y),...]."""
     tokens = re.findall(r"[MLCQZ]|-?\d*\.?\d+", d)
     polys, cur, pos, start = [], [], (0.0, 0.0), (0.0, 0.0)
     i = 0
@@ -4049,18 +4167,18 @@ def ellipse_points(cx, cy, rx, ry, angle=0, n=24):
 
 
 class BodyMap:
-    """O Vitruviano no cartão de medida. Marcadores por sistema presente no
-    corpus; clique filtra a lista por aquele sistema; a lâmina do sistema
-    da medida aberta é desenhada por cima do contorno."""
+    """The Vitruvian figure on the measurement card. One marker per system
+    present in the corpus; a click filters the list by that system; the plate
+    of the open measurement's system is drawn over the outline."""
 
     def __init__(self, app, parent, pad, height=360):
         self.app = app
         self.height = height
         self.scale = height / VIEWBOX[3]
         self.width = int(VIEWBOX[2] * self.scale)
-        self.current = None          # sistema em destaque
+        self.current = None          # highlighted system
         self.hot = None
-        self.hits = []               # (x, y, sistema)
+        self.hits = []               # (x, y, system)
         self.toggle = tk.Label(parent, text="", bg=PAPER, fg=FAINT, font=app.f_label,
                                anchor="w", cursor="hand2")
         self.toggle.pack(fill="x", pady=(6, 0), **pad)
@@ -4081,7 +4199,7 @@ class BodyMap:
 
     def set_open(self, on, save=True):
         self.open = on
-        self.toggle.configure(text=("[−] mapa do corpo" if on else "[+] mapa do corpo"))
+        self.toggle.configure(text=("[−] " if on else "[+] ") + tr("body map"))
         if on:
             self.wrap.pack(fill="x", after=self.toggle, **self.pad)
             self.redraw()
@@ -4090,7 +4208,7 @@ class BodyMap:
         if save:
             self.app.data = save_ui({"map_open": on})
 
-    # ---- geometria
+    # ---- geometry
     def P(self, x, y):
         return ((x - VIEWBOX[0]) * self.scale, (y - VIEWBOX[1]) * self.scale)
 
@@ -4131,9 +4249,9 @@ class BodyMap:
                 cv.create_rectangle(*self.P(x, y), *self.P(x + w, y + h), outline=color,
                                     width=width)
 
-    # ---- dados
+    # ---- data
     def systems(self):
-        """{sistema: (n medidas, alguma fora da referência?)}"""
+        """{system: (n measurements, any out of range?)}"""
         out = {}
         for m in self.app.data.get("corpus", []):
             s = m.get("system") or "outro"
@@ -4148,17 +4266,17 @@ class BodyMap:
             return
         cv.delete("all")
         self.hits = []
-        # a moldura em tom apagado, a pose aberta tracejada, o corpo em traço
+        # the frame in a faded tone, the open pose dashed, the body in a line
         self.draw_prims([p for p in FIGURE if p[0] in ("rect", "circle")], RULE, 1.0)
         self.draw_prims([p for p in FIGURE if p[0] == "echo"], FAINT, 1.0, (3, 3))
         self.draw_prims([p for p in FIGURE if p[0] in ("body", "bodycircle")], SOFT, 1.4)
         systems = self.systems()
-        # lâmina do sistema em destaque
+        # plate of the highlighted system
         plate = PLATE_OF.get(self.current or "")
         if plate in PLATES:
             self.draw_prims(PLATES[plate], INK, 1.2)
-        # marcadores: um quadrado por sistema presente, deslocado se a lâmina é
-        # partilhada; cheio quando a última leitura está fora da referência
+        # markers: one square per system present, shifted if the plate is shared;
+        # filled when the latest reading is out of range
         used, unplaced = {}, 0
         for sname in sorted(systems, key=sort_key):
             n, bad = systems[sname]
@@ -4180,31 +4298,32 @@ class BodyMap:
                                (px, py - half - 3, px, py - half), (px, py + half, px, py + half + 3)):
                 cv.create_line(a, b, c, d, fill=INK)
             if pl not in MARKER_OF:
-                cv.create_text(px + 10, py, text=sname, anchor="w", fill=FAINT,
+                cv.create_text(px + 10, py, text=system_label(sname), anchor="w", fill=FAINT,
                                font=self.app.f_label)
             self.hits.append((px, py, sname))
-        # legenda
+        # legend
         ui = self.app.data.get("ui") or {}
         subject = ui.get("corpus_subject") or ""
         cv.create_text(6, 6, text=("corpus · " + subject) if subject else "corpus",
                        anchor="nw", fill=FAINT, font=self.app.f_label)
         for w in self.legend.winfo_children():
             w.destroy()
-        tk.Label(self.legend, text="SISTEMAS", bg=PAPER, fg=FAINT, font=self.app.f_label,
+        tk.Label(self.legend, text=tr("SYSTEMS"), bg=PAPER, fg=FAINT, font=self.app.f_label,
                  anchor="w").pack(fill="x", pady=(2, 4))
         if not systems:
-            tk.Label(self.legend, text="nenhuma medida ainda", bg=PAPER, fg=FAINT,
+            tk.Label(self.legend, text=tr("no measurements yet"), bg=PAPER, fg=FAINT,
                      font=self.app.f_meta, anchor="w").pack(fill="x")
         for sname in sorted(systems, key=sort_key):
             n, bad = systems[sname]
             on = sname == self.current
             mark = "[x]" if on else "[ ]"
-            row = tk.Label(self.legend, text=f"{mark} {sname}  {n}" + ("  (!)" if bad else ""),
+            row = tk.Label(self.legend, text=f"{mark} {system_label(sname)}  {n}"
+                           + ("  (!)" if bad else ""),
                            bg=PAPER, fg=INK if on else SOFT, font=self.app.f_meta,
                            anchor="w", cursor="hand2")
             row.pack(fill="x")
             row.bind("<Button-1>", lambda e, s=sname: self.pick(s))
-        tk.Label(self.legend, text="clique filtra a lista; (!) fora da referência",
+        tk.Label(self.legend, text=tr("a click filters the list; (!) out of range"),
                  bg=PAPER, fg=FAINT, font=self.app.f_label, anchor="w",
                  justify="left").pack(fill="x", pady=(8, 0))
 
@@ -4234,7 +4353,7 @@ class BodyMap:
 
 
 class SourceCard:
-    """O cartão de fonte: os campos do tipo, a citação pronta para copiar."""
+    """The source card: the type's fields, and the citation ready to copy."""
 
     def __init__(self, app, parent):
         self.app = app
@@ -4248,12 +4367,12 @@ class SourceCard:
         pad = dict(padx=22)
         foot = tk.Frame(shell, bg=PAPER)
         foot.pack(fill="x", side="bottom", pady=12, **pad)
-        ttk.Button(foot, text="Salvar", command=app.save).pack(side="left")
-        ttk.Button(foot, text="Salvar e nova", style="Quiet.TButton",
+        ttk.Button(foot, text=tr("Save"), command=app.save).pack(side="left")
+        ttk.Button(foot, text=tr("Save and new"), style="Quiet.TButton",
                    command=app.save_and_new).pack(side="left", padx=(8, 0))
         self.msg = tk.Label(foot, text="", bg=PAPER, fg=OXIDE, font=app.f_meta)
         self.msg.pack(side="left", padx=14)
-        ttk.Button(foot, text="Apagar", style="Quiet.TButton",
+        ttk.Button(foot, text=tr("Delete"), style="Quiet.TButton",
                    command=app.delete).pack(side="right")
         tk.Frame(shell, bg=RULE, height=1).pack(fill="x", side="bottom")
 
@@ -4270,20 +4389,22 @@ class SourceCard:
         self.stamp.pack(side="right")
         tk.Frame(c, bg=STAMP, height=2).pack(fill="x", pady=(6, 0), **pad)
 
-        # tipo: combobox editável -- a lista sugere, você decide
+        # type: an editable combobox -- the list suggests, you decide
         trow = tk.Frame(c, bg=PAPER)
         trow.pack(fill="x", **pad)
         tcol = tk.Frame(trow, bg=PAPER)
         tcol.pack(side="left")
-        tk.Label(tcol, text="TIPO", bg=PAPER, fg=FAINT, font=app.f_label,
+        tk.Label(tcol, text=tr("TYPE"), bg=PAPER, fg=FAINT, font=app.f_label,
                  anchor="w").pack(fill="x", pady=(8, 2))
-        self.v_type = tk.StringVar(value="outro")
-        self.e_type = ttk.Combobox(tcol, textvariable=self.v_type, values=SOURCE_TYPES,
+        self.v_type = tk.StringVar(value=type_label("outro"))
+        self.e_type = ttk.Combobox(tcol, textvariable=self.v_type,
+                                   values=[type_label(t) for t in SOURCE_TYPES],
                                    width=18, font=app.f_meta)
         self.e_type.pack(anchor="w")
         self.e_type.bind("<<ComboboxSelected>>", self.type_changed)
         self.e_type.bind("<KeyRelease>", self.type_changed)
-        tk.Label(trow, text="  mudar o tipo só muda os campos visíveis; nada se perde",
+        tk.Label(trow, text="  " + tr("changing the type only changes the visible fields; "
+                                      "nothing is lost"),
                  bg=PAPER, fg=FAINT, font=app.f_label).pack(side="left", pady=(22, 0))
 
         self.blocks = {}
@@ -4294,20 +4415,21 @@ class SourceCard:
             self.blocks[fid] = f
             return f
 
-        self.widgets["authors"] = app.textfield(block("authors"), SOURCE_FIELD_PT["authors"],
+        label = lambda fid: tr(SOURCE_FIELD_LABEL[fid])
+        self.widgets["authors"] = app.textfield(block("authors"), label("authors"),
                                                 2, app.f_meta, pad)
-        self.widgets["date"] = app.field(block("date"), SOURCE_FIELD_PT["date"], app.f_meta, pad)
-        self.widgets["container"] = app.field(block("container"), SOURCE_FIELD_PT["container"],
+        self.widgets["date"] = app.field(block("date"), label("date"), app.f_meta, pad)
+        self.widgets["container"] = app.field(block("container"), label("container"),
                                               app.f_body, pad)
-        self.widgets["publisher"] = app.field(block("publisher"), SOURCE_FIELD_PT["publisher"],
+        self.widgets["publisher"] = app.field(block("publisher"), label("publisher"),
                                               app.f_meta, pad)
-        self.widgets["place"] = app.field(block("place"), SOURCE_FIELD_PT["place"], app.f_meta, pad)
-        # edição · volume · número · páginas numa linha só
+        self.widgets["place"] = app.field(block("place"), label("place"), app.f_meta, pad)
+        # edition · volume · issue · pages on a single row
         row = block("numbers")
         for fid in ("edition", "volume", "issue", "pages"):
             col = tk.Frame(row, bg=PAPER)
             col.pack(side="left", fill="x", expand=True, padx=(0, 10))
-            tk.Label(col, text=SOURCE_FIELD_PT[fid], bg=PAPER, fg=FAINT, font=app.f_label,
+            tk.Label(col, text=label(fid), bg=PAPER, fg=FAINT, font=app.f_label,
                      anchor="w").pack(fill="x", pady=(8, 2))
             ent = tk.Entry(col, width=8, font=app.f_meta, bg=PAPER, fg=INK,
                            insertbackground=INK, relief="flat", highlightthickness=0,
@@ -4320,7 +4442,7 @@ class SourceCard:
         for fid in ("doi", "isbn", "accessed", "lang"):
             col = tk.Frame(row2, bg=PAPER)
             col.pack(side="left", fill="x", expand=True, padx=(0, 10))
-            tk.Label(col, text=SOURCE_FIELD_PT[fid], bg=PAPER, fg=FAINT, font=app.f_label,
+            tk.Label(col, text=label(fid), bg=PAPER, fg=FAINT, font=app.f_label,
                      anchor="w").pack(fill="x", pady=(8, 2))
             ent = tk.Entry(col, width=10, font=app.f_meta, bg=PAPER, fg=INK,
                            insertbackground=INK, relief="flat", highlightthickness=0,
@@ -4329,23 +4451,23 @@ class SourceCard:
             tk.Frame(col, bg=RULE, height=1).pack(fill="x", pady=(4, 0))
             app.bind_undo(ent)
             self.widgets[fid] = ent
-        self.widgets["url"] = app.field(block("url"), SOURCE_FIELD_PT["url"], app.f_meta, pad)
-        self.widgets["extra"] = app.textfield(block("extra"), SOURCE_FIELD_PT["extra"], 2,
+        self.widgets["url"] = app.field(block("url"), label("url"), app.f_meta, pad)
+        self.widgets["extra"] = app.textfield(block("extra"), label("extra"), 2,
                                               app.f_meta, pad)
-        self.e_tags = app.field(block("tags"), "TAGS", app.f_meta, pad)
-        self.t_notes = app.textfield(block("notes"), "NOTAS", 3, app.f_body, pad)
+        self.e_tags = app.field(block("tags"), tr("TAGS"), app.f_meta, pad)
+        self.t_notes = app.textfield(block("notes"), tr("NOTES"), 3, app.f_body, pad)
 
         b = block("cite")
         crow = tk.Frame(b, bg=PAPER)
         crow.pack(fill="x", pady=(6, 2), **pad)
-        tk.Label(crow, text="CITAÇÃO", bg=PAPER, fg=FAINT, font=app.f_label,
+        tk.Label(crow, text=tr("CITATION"), bg=PAPER, fg=FAINT, font=app.f_label,
                  anchor="w").pack(side="left")
         self.v_style = tk.StringVar(value=(app.data.get("ui") or {}).get("cite_style", "abnt"))
         sb = ttk.Combobox(crow, textvariable=self.v_style, values=list(CITE_STYLES),
                           state="readonly", width=15, font=app.f_meta)
         sb.pack(side="left", padx=(10, 0))
         sb.bind("<<ComboboxSelected>>", lambda e: self.refresh_cite())
-        ttk.Button(crow, text="copiar", style="Quiet.TButton",
+        ttk.Button(crow, text=tr("copy"), style="Quiet.TButton",
                    command=self.copy_cite).pack(side="left", padx=(8, 0))
         self.t_cite = tk.Text(b, height=3, width=1, font=app.f_meta, bg=SHELL, fg=INK,
                               relief="flat", wrap="word", highlightthickness=0,
@@ -4354,7 +4476,7 @@ class SourceCard:
         app.autogrow(self.t_cite, minrows=2)
 
         b = block("edges")
-        app.label(b, "LIGAÇÕES  (rel  alvo  [intervalo]  — razão  # fonte)", pad)
+        app.label(b, tr("LINKS  (rel  target  [span]  — reason  # source)"), pad)
         self.t_edges = tk.Text(b, height=2, width=1, font=app.f_meta, bg=PAPER, fg=INK,
                                insertbackground=INK, relief="flat", wrap="word",
                                highlightthickness=0, padx=0, spacing1=1, spacing3=3,
@@ -4366,18 +4488,18 @@ class SourceCard:
         tk.Frame(b, bg=RULE, height=1).pack(fill="x", pady=(4, 0), **pad)
 
         b = block("out")
-        app.label(b, "LIGAÇÕES RESOLVIDAS  (duplo clique abre)", pad)
+        app.label(b, tr("RESOLVED LINKS  (double-click opens)"), pad)
         self.outbox = app.listbox(b, pad)
         self.outbox.bind("<Double-Button-1>", lambda e: app.jump(self.outbox, self.out_ids))
         b = block("inb")
-        app.label(b, "CITADO POR  (duplo clique abre)", pad)
+        app.label(b, tr("CITED BY  (double-click opens)"), pad)
         self.inbox = app.listbox(b, pad)
         self.inbox.bind("<Double-Button-1>", lambda e: app.jump(self.inbox, self.in_ids))
         b = block("uses")
-        app.label(b, "FONTE DE  (registros cujo campo FONTE aponta para cá; duplo clique abre)", pad)
+        app.label(b, tr("SOURCE OF  (records whose SOURCE field points here; double-click opens)"), pad)
         self.usebox = app.listbox(b, pad)
         self.usebox.bind("<Double-Button-1>", lambda e: app.jump(self.usebox, self.use_ids))
-        self.t_links = app.textfield(block("links"), "LINKS", 2, app.f_meta, pad)
+        self.t_links = app.textfield(block("links"), tr("URLS"), 2, app.f_meta, pad)
         self.tail = tk.Frame(c, bg=PAPER, height=12)
 
         self.entries = [self.e_name, self.e_tags] + [w for k, w in self.widgets.items()
@@ -4404,13 +4526,13 @@ class SourceCard:
                 continue
             if fid == "ids" and not show & {"doi", "isbn", "accessed", "lang"}:
                 continue
-            if fid in SOURCE_FIELD_PT and fid not in show:
+            if fid in SOURCE_FIELD_LABEL and fid not in show:
                 continue
             self.blocks[fid].pack(fill="x", padx=22 if fid in ("numbers", "ids") else 0)
         self.tail.pack(fill="x")
 
     def type_changed(self, _e=None):
-        self.stype = self.v_type.get().strip().lower() or "outro"
+        self.stype = type_key(self.v_type.get()) or "outro"
         self.apply_layout()
         self.app.mark_dirty()
         self.refresh_cite()
@@ -4437,7 +4559,7 @@ class SourceCard:
     def open(self, s):
         self.enable(True)
         self.stype = (s.get("type") or "outro").lower()
-        self.v_type.set(s.get("type") or "outro")
+        self.v_type.set(type_label(s.get("type") or "outro"))
         self.e_name.delete(0, "end")
         self.e_name.insert(0, s.get("name", ""))
         for k, w in self.widgets.items():
@@ -4454,13 +4576,13 @@ class SourceCard:
         self.t_links.delete("1.0", "end")
         self.t_links.insert("1.0", "\n".join(s.get("links", [])))
         self.t_edges.delete("1.0", "end")
-        texto = format_edges(edges_from(self.app.data, s["id"]))
+        text = format_edges(edges_from(self.app.data, s["id"]))
         if s.get("edge_drafts"):
-            texto = "\n".join(filter(None, [texto] + s["edge_drafts"]))
-        self.t_edges.insert("1.0", texto)
-        rid = s["id"] if not s["id"].startswith("__") else "rascunho"
+            text = "\n".join(filter(None, [text] + s["edge_drafts"]))
+        self.t_edges.insert("1.0", text)
+        rid = s["id"] if not s["id"].startswith("__") else tr("draft")
         self.stamp.configure(text=f"{rid}\n{s.get('updated', '')}"
-                             + ("\n[texto bruto guardado]" if s.get("raw") else ""))
+                             + ("\n" + tr("[raw text kept]") if s.get("raw") else ""))
         self.msg.configure(text="")
         self.apply_layout()
         self.refresh_neighbours(s["id"])
@@ -4472,9 +4594,9 @@ class SourceCard:
         self.outbox.delete(0, "end")
         self.out_ids = []
         for a in edges_from(data, sid):
-            alvo = idx.get(a["to"])
-            self.outbox.insert("end", f"{rel_label(a['rel']):18} "
-                                      f"{label_any(alvo, data) if alvo else a['to'] + '  (inexistente)'}")
+            target = idx.get(a["to"])
+            shown = label_any(target, data) if target else tr("{id}  (missing target)", id=a["to"])
+            self.outbox.insert("end", f"{rel_label(a['rel']):18} {shown}")
             self.out_ids.append(a["to"])
         self.inbox.delete(0, "end")
         self.in_ids = []
@@ -4487,14 +4609,14 @@ class SourceCard:
         for coll in ("people", "entries", "corpus"):
             for r in data[coll]:
                 if r.get("source") == sid:
-                    self.usebox.insert("end", f"{COLL_PT[coll]:8} {label_any(r, data)}")
+                    self.usebox.insert("end", f"{tr(COLL_LABEL[coll]):8} {label_any(r, data)}")
                     self.use_ids.append(r["id"])
         for lb in (self.outbox, self.inbox, self.usebox):
             lb.configure(height=max(2, min(10, lb.size())))
 
     def gather(self, s):
         out = {k: v for k, v in s.items() if not k.startswith("_")}
-        out["type"] = self.v_type.get().strip().lower() or "outro"
+        out["type"] = type_key(self.v_type.get()) or "outro"
         out["name"] = self.e_name.get().strip()
         for k, w in self.widgets.items():
             if k in ("authors", "extra"):
@@ -4516,8 +4638,8 @@ class SourceCard:
         try:
             s = self.gather(self.app.current() or {})
             text = cite(s, self.v_style.get(), self.app.data)
-        except Exception as err:      # a citação nunca pode derrubar o cartão
-            text = f"(não consegui montar a citação: {err})"
+        except Exception as err:      # the citation must never bring the card down
+            text = tr("(could not build the citation: {err})", err=err)
         self.t_cite.configure(state="normal")
         self.t_cite.delete("1.0", "end")
         self.t_cite.insert("1.0", text)
@@ -4528,11 +4650,11 @@ class SourceCard:
         self.app.root.clipboard_clear()
         self.app.root.clipboard_append(text)
         save_ui({"cite_style": self.v_style.get()})
-        self.msg.configure(text="Citação copiada.")
+        self.msg.configure(text=tr("Citation copied."))
 
 
 class MetricCard:
-    """O cartão de medida: unidade, referência, leituras ao longo do tempo."""
+    """The measurement card: unit, reference range, readings over time."""
 
     def __init__(self, app, parent):
         self.app = app
@@ -4545,14 +4667,14 @@ class MetricCard:
         pad = dict(padx=22)
         foot = tk.Frame(shell, bg=PAPER)
         foot.pack(fill="x", side="bottom", pady=12, **pad)
-        ttk.Button(foot, text="Salvar", command=app.save).pack(side="left")
-        ttk.Button(foot, text="Salvar e nova", style="Quiet.TButton",
+        ttk.Button(foot, text=tr("Save"), command=app.save).pack(side="left")
+        ttk.Button(foot, text=tr("Save and new"), style="Quiet.TButton",
                    command=app.save_and_new).pack(side="left", padx=(8, 0))
-        ttk.Button(foot, text="mapa do corpo", style="Quiet.TButton",
+        ttk.Button(foot, text=tr("body map"), style="Quiet.TButton",
                    command=app.do_corpus).pack(side="left", padx=(8, 0))
         self.msg = tk.Label(foot, text="", bg=PAPER, fg=OXIDE, font=app.f_meta)
         self.msg.pack(side="left", padx=14)
-        ttk.Button(foot, text="Apagar", style="Quiet.TButton",
+        ttk.Button(foot, text=tr("Delete"), style="Quiet.TButton",
                    command=app.delete).pack(side="right")
         tk.Frame(shell, bg=RULE, height=1).pack(fill="x", side="bottom")
 
@@ -4575,15 +4697,16 @@ class MetricCard:
         row.pack(fill="x", **pad)
         scol = tk.Frame(row, bg=PAPER)
         scol.pack(side="left", padx=(0, 14))
-        tk.Label(scol, text="SISTEMA", bg=PAPER, fg=FAINT, font=app.f_label,
+        tk.Label(scol, text=tr("SYSTEM"), bg=PAPER, fg=FAINT, font=app.f_label,
                  anchor="w").pack(fill="x", pady=(8, 2))
         self.v_system = tk.StringVar()
-        self.e_system = ttk.Combobox(scol, textvariable=self.v_system, values=SYSTEMS,
+        self.e_system = ttk.Combobox(scol, textvariable=self.v_system,
+                                     values=[system_label(s) for s in SYSTEMS],
                                      width=20, font=app.f_meta)
         self.e_system.pack(anchor="w")
         self.e_system.bind("<<ComboboxSelected>>", app.mark_dirty)
-        for title, attr in (("UNIDADE", "e_unit"), ("REF. MÍN.", "e_lo"),
-                            ("REF. MÁX.", "e_hi")):
+        for title, attr in ((tr("UNIT"), "e_unit"), (tr("REF. MIN."), "e_lo"),
+                            (tr("REF. MAX."), "e_hi")):
             col = tk.Frame(row, bg=PAPER)
             col.pack(side="left", fill="x", expand=True, padx=(0, 10))
             tk.Label(col, text=title, bg=PAPER, fg=FAINT, font=app.f_label,
@@ -4597,10 +4720,10 @@ class MetricCard:
             setattr(self, attr, ent)
 
         self.e_source = app.source_field(c, pad)
-        self.e_tags = app.field(c, "TAGS", app.f_meta, pad)
-        self.t_notes = app.textfield(c, "NOTAS", 2, app.f_body, pad)
+        self.e_tags = app.field(c, tr("TAGS"), app.f_meta, pad)
+        self.t_notes = app.textfield(c, tr("NOTES"), 2, app.f_body, pad)
 
-        app.label(c, "LEITURAS  (uma por linha:  2026-09-01 [10:30]  valor  observação)", pad)
+        app.label(c, tr("READINGS  (one per line:  2026-09-01 [10:30]  value  note)"), pad)
         self.t_read = app.textfield_bare(c, 3, pad)
         self.summary = tk.Label(c, text="", bg=PAPER, fg=SOFT, font=app.f_meta, anchor="w")
         self.summary.pack(fill="x", pady=(2, 0), **pad)
@@ -4615,12 +4738,12 @@ class MetricCard:
                               disabledbackground=PAPER, disabledforeground=FAINT)
         self.e_new.pack(side="left", fill="x", expand=True, ipady=2)
         self.e_new.bind("<Return>", lambda e: self.add_reading())
-        ttk.Button(addrow, text="+ leitura de hoje", command=self.add_reading
+        ttk.Button(addrow, text=tr("+ today's reading"), command=self.add_reading
                    ).pack(side="left", padx=(8, 0))
 
         b = tk.Frame(c, bg=PAPER)
         b.pack(fill="x")
-        app.label(b, "LIGAÇÕES  (rel  alvo  — razão)", pad)
+        app.label(b, tr("LINKS  (rel  target  — reason)"), pad)
         self.t_edges = tk.Text(b, height=2, width=1, font=app.f_meta, bg=PAPER, fg=INK,
                                insertbackground=INK, relief="flat", wrap="word",
                                highlightthickness=0, padx=0, spacing1=1, spacing3=3,
@@ -4630,13 +4753,13 @@ class MetricCard:
         self.t_edges.pack(fill="x", **pad)
         app.autogrow(self.t_edges, minrows=2)
         tk.Frame(b, bg=RULE, height=1).pack(fill="x", pady=(4, 0), **pad)
-        app.label(c, "LIGAÇÕES RESOLVIDAS  (duplo clique abre)", pad)
+        app.label(c, tr("RESOLVED LINKS  (double-click opens)"), pad)
         self.outbox = app.listbox(c, pad)
         self.outbox.bind("<Double-Button-1>", lambda e: app.jump(self.outbox, self.out_ids))
-        app.label(c, "CITADO POR  (duplo clique abre)", pad)
+        app.label(c, tr("CITED BY  (double-click opens)"), pad)
         self.inbox = app.listbox(c, pad)
         self.inbox.bind("<Double-Button-1>", lambda e: app.jump(self.inbox, self.in_ids))
-        self.t_links = app.textfield(c, "LINKS", 2, app.f_meta, pad)
+        self.t_links = app.textfield(c, tr("URLS"), 2, app.f_meta, pad)
         tk.Frame(c, bg=PAPER, height=12).pack(fill="x")
 
         self.entries = [self.e_name, self.e_unit, self.e_lo, self.e_hi, self.e_source,
@@ -4673,7 +4796,7 @@ class MetricCard:
         self.enable(True)
         self.e_name.delete(0, "end")
         self.e_name.insert(0, m.get("name", ""))
-        self.v_system.set(m.get("system", ""))
+        self.v_system.set(system_label(m.get("system", "")))
         for w, k in ((self.e_unit, "unit"), (self.e_lo, "ref_low"), (self.e_hi, "ref_high"),
                      (self.e_source, "source")):
             w.delete(0, "end")
@@ -4688,11 +4811,11 @@ class MetricCard:
         self.t_links.delete("1.0", "end")
         self.t_links.insert("1.0", "\n".join(m.get("links", [])))
         self.t_edges.delete("1.0", "end")
-        texto = format_edges(edges_from(self.app.data, m["id"]))
+        text = format_edges(edges_from(self.app.data, m["id"]))
         if m.get("edge_drafts"):
-            texto = "\n".join(filter(None, [texto] + m["edge_drafts"]))
-        self.t_edges.insert("1.0", texto)
-        rid = m["id"] if not m["id"].startswith("__") else "rascunho"
+            text = "\n".join(filter(None, [text] + m["edge_drafts"]))
+        self.t_edges.insert("1.0", text)
+        rid = m["id"] if not m["id"].startswith("__") else tr("draft")
         self.stamp.configure(text=f"{rid}\n{m.get('updated', '')}")
         self.msg.configure(text="")
         self.refresh_summary()
@@ -4700,8 +4823,8 @@ class MetricCard:
         self.map.set_current(m.get("system") or "outro")
 
     def draw_trend(self):
-        """A curva das leituras, em traço, com a faixa de referência tramada.
-        Mede a partir do que está digitado, então acompanha a edição."""
+        """The readings' curve, as a line, with the reference range hatched.
+        It is measured from what is typed, so it follows the editing."""
         cv = self.trend
         if not cv.winfo_exists():
             return
@@ -4713,7 +4836,7 @@ class MetricCard:
         rs = [r for r in parse_readings(self.t_read.get("1.0", "end-1c"))
               if reading_number(r["value"]) is not None]
         if not rs:
-            cv.create_text(0, H // 2, text="(sem leituras numéricas)", anchor="w",
+            cv.create_text(0, H // 2, text=tr("(no numeric readings)"), anchor="w",
                            fill=FAINT, font=self.app.f_label)
             return
         vals = [reading_number(r["value"]) for r in rs]
@@ -4743,9 +4866,9 @@ class MetricCard:
         if len(rs) > 1:
             cv.create_line(*pts, fill=INK, width=1.6, joinstyle="round", capstyle="round")
         for i, (r, v) in enumerate(zip(rs, vals)):
-            fora = out_of_range(m, r)
+            out = out_of_range(m, r)
             cv.create_oval(X(i) - 3, Y(v) - 3, X(i) + 3, Y(v) + 3, outline=INK,
-                           fill=INK if fora else PAPER, width=1.4)
+                           fill=INK if out else PAPER, width=1.4)
         cv.create_text(X(len(rs) - 1) + 8, Y(vals[-1]), text=rs[-1]["value"], anchor="w",
                        fill=INK, font=self.app.f_label)
         cv.create_text(padL, H - 2, text=rs[0]["date"][:10], anchor="sw", fill=FAINT,
@@ -4765,16 +4888,18 @@ class MetricCard:
         m = {"ref_low": self.e_lo.get().strip(), "ref_high": self.e_hi.get().strip()}
         rs = parse_readings(self.t_read.get("1.0", "end-1c"))
         if not rs:
-            self.summary.configure(text="sem leituras")
+            self.summary.configure(text=tr("no readings"))
             return
         nums = [reading_number(r["value"]) for r in rs]
         nums = [n for n in nums if n is not None]
-        fora = sum(1 for r in rs if out_of_range(m, r))
-        txt = f"{len(rs)} leituras · última {rs[-1]['date']} = {rs[-1]['value']}"
+        out = sum(1 for r in rs if out_of_range(m, r))
+        txt = tr("{n} readings · latest {date} = {value}", n=len(rs),
+                 date=rs[-1]["date"], value=rs[-1]["value"])
         if nums:
-            txt += f" · mín {min(nums):g} · máx {max(nums):g} · média {sum(nums)/len(nums):.2f}"
-        if fora:
-            txt += f" · {fora} fora da referência"
+            txt += tr(" · min {lo} · max {hi} · mean {mean}", lo=f"{min(nums):g}",
+                      hi=f"{max(nums):g}", mean=f"{sum(nums)/len(nums):.2f}")
+        if out:
+            txt += tr(" · {n} out of range", n=out)
         self.summary.configure(text=txt)
 
     def refresh_neighbours(self, mid):
@@ -4783,9 +4908,9 @@ class MetricCard:
         self.outbox.delete(0, "end")
         self.out_ids = []
         for a in edges_from(data, mid):
-            alvo = idx.get(a["to"])
+            target = idx.get(a["to"])
             self.outbox.insert("end", f"{rel_label(a['rel']):18} "
-                                      f"{label_any(alvo, data) if alvo else a['to']}")
+                                      f"{label_any(target, data) if target else a['to']}")
             self.out_ids.append(a["to"])
         self.inbox.delete(0, "end")
         self.in_ids = []
@@ -4800,7 +4925,7 @@ class MetricCard:
         out = {k: v for k, v in m.items() if not k.startswith("_")}
         out.update({
             "name": self.e_name.get().strip(),
-            "system": self.v_system.get().strip().lower(),
+            "system": system_key(self.v_system.get()),
             "unit": self.e_unit.get().strip(),
             "ref_low": self.e_lo.get().strip().replace(",", "."),
             "ref_high": self.e_hi.get().strip().replace(",", "."),
@@ -4830,7 +4955,83 @@ class MetricCard:
         self.app.save()
 
 
-# ================================================================ janela
+# the Help › Shortcuts text; {conflicts} and {stem} are filled in when shown
+HELP_TEXT = (
+    "\n  Ctrl+F     go to the search"
+    "\n  ↓ / Enter  from the search to the list"
+    "\n  Ctrl+N     new person"
+    "\n  Ctrl+Q     quick entry (people, forms or concepts)"
+    "\n  Ctrl+S     save the open record"
+    "\n  Ctrl+Enter save and start another of the same kind"
+    "\n  Ctrl+Z / Ctrl+Y   undo / redo"
+    "\n  Ctrl+J / Ctrl+K   next / previous, from anywhere"
+    "\n  Ctrl+G     go to: nº (1852), stamp, id or name"
+    "\n  Ctrl+L     show in the register: leaves the search, shows the open record's nº"
+    "\n  Ctrl+B     open as logbook (second window, read-only;"
+    "\n             Enter in the logbook brings the record to the card)"
+    "\n  Ctrl+1..4  scope people / verba / sources / corpus; Ctrl+0 everything"
+    "\n  /  in the list goes back to the search;  Enter in the list goes to the card"
+    "\n  Home / End within the page;  PageUp / PageDown or the wheel turns the page"
+    "\n  Ctrl+Home / Ctrl+End  start / end of the list"
+    "\n  Ctrl+PageUp / Ctrl+PageDown turns the page from anywhere"
+    "\n  F5         reload from disk"
+    "\n  Esc        back to the list"
+    "\n"
+    "\n  REGISTER: every record gets, on its first save, a stamp"
+    "\n  (YYYYMMDDhhmmss) and an order number that never changes;"
+    "\n  what is deleted stays in the sequence as cancelled."
+    "\n  Without a search, the list is the register, in number order;"
+    "\n  with a search or filter, it is the INDEX, in alphabetical order."
+    "\n  The list shows what fits the window, without scrolling: the rest"
+    "\n  is on the following pages."
+    "\n"
+    "\n  Search operators:"
+    "\n  p: v: f: c:   only people / verba / sources / corpus"
+    "\n  ^ab           name starting with ab"
+    "\n  tag:csh  lang:de  type:book  sys:renal  dom:law  id:c_"
+    "\n  e.g.:  v: lang:de ^ab   ·   f: type:article luhmann"
+    "\n"
+    "\n  Text fields grow up to 10 lines and then scroll inside"
+    "\n  (ui.max_rows in the JSON changes the limit). The body map"
+    "\n  folds with [−] and remembers its state."
+    "\n"
+    "\n  In the rail, COLLECTIONS limits to people or verba;"
+    "\n  any filter below picks the collection by itself."
+    "\n"
+    "\n  Tasks (people):"
+    "\n  Enter       new line already with [ ]"
+    "\n  Space       on the [ ] changes the state"
+    "\n  Ctrl+Space  changes it from anywhere on the line"
+    "\n  [ ] to do   [/] in progress  [>] waiting on"
+    "\n  [x] done    [-] cancelled  (they go to the log on save)"
+    "\n  A date at the end is the deadline: 2026-09-10, 2026-09-10-1000,"
+    "\n  ~2026-09-10 10:00. The LAST date on the line wins."
+    "\n"
+    "\n  Links, one per line, on any card:"
+    "\n  rel target [span] — reason # source"
+    "\n  e.g.: expresses c_timoneiro -800/400 — literal sense"
+    "\n  e.g.: author_of s_wiener_1948_cybernetics"
+    "\n  e.g.: cites s_lochtrop_2006 — entry p. 12"
+    "\n  The target is the id: c_ concept, f_ form, p_ person,"
+    "\n  s_ source, h_ measurement. A rel outside the table is not"
+    "\n  an error: it is an ATYPICAL link, with the label you gave;"
+    "\n  the doctor lists the atypical ones for you to promote."
+    "\n"
+    "\n  SOURCE (on people, entries and measurements): a source's"
+    "\n  s_…, or free text. Sources cite in ABNT, author-date,"
+    "\n  BibTeX or CSL-JSON (picker on the card, copy button)."
+    "\n  Corpus: readings '2026-09-01 13.5 fasting', one per line;"
+    "\n  out of range shows with (!)."
+    "\n"
+    "\n  Sync: every save rereads the disk; on opening,"
+    "\n  *.sync-conflict-* files are merged and stored in"
+    "\n  {conflicts}/. The full history is in"
+    "\n  {stem}.log.<machine>.jsonl (Base › History)."
+    "\n"
+)
+
+
+# ================================================================ window
 
 class App:
     def __init__(self, root, theme, notices):
@@ -4840,10 +5041,10 @@ class App:
         self.data = load_json()
         self.sel = None
         self.scope = None          # None | "people" | "entries"
-        self.tag = self.viewmode = self.date = None           # filtros pessoa
-        self.view_kind = self.view_lang = self.view_domain = None  # filtros verba
-        self.view_stype = None                                # filtro fonte
-        self.view_system = None                               # filtro corpus
+        self.tag = self.viewmode = self.date = None           # people filters
+        self.view_kind = self.view_lang = self.view_domain = None  # verba filters
+        self.view_stype = None                                # source filter
+        self.view_system = None                               # corpus filter
         self.source_hints = []
         self.draft = None
         self.dirty = False
@@ -4854,10 +5055,10 @@ class App:
         self.pendings = []
         self.fits = []
         self.shown = None
-        self.mode = "registro"     # "registro" (ordem dos números) | "indicador" (busca)
-        self.top = None            # primeira linha da vista; None = o fim (os mais novos)
-        self.rows = 0              # quantas linhas cabem na lista agora
-        self.page_sig = None       # o filtro mudou? então a vista volta ao começo
+        self.mode = "register"     # "register" (number order) | "index" (search)
+        self.top = None            # first row of the view; None = the end (the newest)
+        self.rows = 0              # how many rows fit in the list right now
+        self.page_sig = None       # did the filter change? then the view goes back to the start
         self._fit_job = None
         ui = self.data.get("ui") or {}
         self.max_rows = int(ui.get("max_rows") or 10)
@@ -4875,7 +5076,8 @@ class App:
             if ok:
                 mono = wanted
             else:
-                self.font_warning = f'Tipo "{wanted}" {why}; usando {mono}.'
+                self.font_warning = tr('Typeface "{name}" {why}; using {mono}.',
+                                       name=wanted, why=why, mono=mono)
         body = mono if PAL["mono_only"] else serif
         self.f_name = (body, 15 if PAL["mono_only"] else 17)
         self.f_body = (body, 11)
@@ -4949,17 +5151,17 @@ class App:
         self.entry.pack(side="left", fill="x", expand=True, ipady=4)
         self.count = tk.Label(bar, text="", bg=PAPER, fg=OXIDE, font=self.f_meta)
         self.count.pack(side="left", padx=14)
-        ttk.Button(bar, text="entrada rápida", command=self.quick_add
+        ttk.Button(bar, text=tr("quick entry"), command=self.quick_add
                    ).pack(side="right", padx=(4, 12))
-        ttk.Button(bar, text="+ medida", command=self.new_metric
+        ttk.Button(bar, text=tr("+ measurement"), command=self.new_metric
                    ).pack(side="right", padx=(4, 0))
-        ttk.Button(bar, text="+ fonte", command=self.new_source
+        ttk.Button(bar, text=tr("+ source"), command=self.new_source
                    ).pack(side="right", padx=(4, 0))
-        ttk.Button(bar, text="+ forma", command=lambda: self.new_entry("form")
+        ttk.Button(bar, text=tr("+ form"), command=lambda: self.new_entry("form")
                    ).pack(side="right", padx=(4, 0))
-        ttk.Button(bar, text="+ conceito", command=lambda: self.new_entry("concept")
+        ttk.Button(bar, text=tr("+ concept"), command=lambda: self.new_entry("concept")
                    ).pack(side="right", padx=(4, 0))
-        ttk.Button(bar, text="+ pessoa", command=self.new_person).pack(side="right")
+        ttk.Button(bar, text=tr("+ person"), command=self.new_person).pack(side="right")
 
     def build_body(self):
         pw = ttk.Panedwindow(self.root, orient="horizontal")
@@ -5002,7 +5204,7 @@ class App:
         self.list.tag_configure("sub", foreground=FAINT, font=self.f_meta)
         self.list.tag_configure("cancel", foreground=FAINT, font=self.f_meta)
         self.list.bind("<<TreeviewSelect>>", self.on_pick)
-        # sem rolagem: a lista mostra o que cabe, e o resto é a página seguinte
+        # no scrolling: the list shows what fits, and the rest is the next page
         self.list.bind("<Configure>", self.fit_soon)
         self.list.bind("<MouseWheel>", lambda e: self.turn(-1 if e.delta > 0 else 1))
         self.list.bind("<Button-4>", lambda e: self.turn(-1))
@@ -5040,7 +5242,7 @@ class App:
     def card(self):
         return self.cards[self.shown or "person"]
 
-    # ---- pedaços compartilhados pelos cartões
+    # ---- pieces shared by the cards
     def listbox(self, parent, pad):
         lb = tk.Listbox(parent, height=2, width=1, font=self.f_meta, bg=PAPER, fg=INK,
                         relief="flat", highlightthickness=0, selectbackground=SELBG,
@@ -5066,16 +5268,16 @@ class App:
         return t
 
     def source_field(self, parent, pad):
-        """O campo FONTE comum a todos os cartões: aceita o id de uma fonte
-        (s_…) ou texto livre. Abaixo, o nome resolvido e um botão que abre."""
-        self.label(parent, "FONTE  (s_… de uma fonte, ou texto livre)", pad)
+        """The SOURCE field shared by every card: takes a source's id (s_…) or
+        free text. Below it, the resolved name and a button that opens it."""
+        self.label(parent, tr("SOURCE  (a source's s_…, or free text)"), pad)
         row = tk.Frame(parent, bg=PAPER)
         row.pack(fill="x", **pad)
         e = tk.Entry(row, width=1, font=self.f_meta, bg=PAPER, fg=INK, relief="flat",
                      insertbackground=INK, highlightthickness=0,
                      disabledbackground=PAPER, disabledforeground=FAINT)
         e.pack(side="left", fill="x", expand=True)
-        btn = ttk.Button(row, text="abrir", style="Quiet.TButton", width=6,
+        btn = ttk.Button(row, text=tr("open"), style="Quiet.TButton", width=6,
                          command=lambda: self.goto(e.get().strip()))
         btn.pack(side="right")
         hint = tk.Label(parent, text="", bg=PAPER, fg=SOFT, font=self.f_label, anchor="w")
@@ -5097,7 +5299,7 @@ class App:
                                fg=SOFT if s else OXIDE)
                 btn.configure(state="normal" if s else "disabled")
             else:
-                hint.configure(text="texto livre (use + fonte para virar registro)"
+                hint.configure(text=tr("free text (use + source to make it a record)")
                                if text else "", fg=FAINT)
                 btn.configure(state="disabled")
 
@@ -5147,7 +5349,7 @@ class App:
         self.locked_panes = bool(self.locked_var.get())
         self.data = save_ui({"panes_locked": self.locked_panes})
         self.apply_pane_lock()
-        self.say("Larguras travadas." if self.locked_panes else "Larguras livres.")
+        self.say(tr("Widths locked.") if self.locked_panes else tr("Widths free."))
 
     def apply_pane_lock(self):
         for seq in ("<Button-1>", "<B1-Motion>", "<ButtonRelease-1>"):
@@ -5185,52 +5387,58 @@ class App:
     def build_menu(self):
         m = self.menu(self.root)
         f = self.menu(m)
-        f.add_command(label="Nova pessoa", accelerator="Ctrl+N", command=self.new_person)
-        f.add_command(label="Novo conceito", command=lambda: self.new_entry("concept"))
-        f.add_command(label="Nova forma", command=lambda: self.new_entry("form"))
-        f.add_command(label="Nova fonte", command=self.new_source)
-        f.add_command(label="Nova medida (corpus)", command=self.new_metric)
-        f.add_command(label="Entrada rápida…", accelerator="Ctrl+Q", command=self.quick_add)
+        f.add_command(label=tr("New person"), accelerator="Ctrl+N", command=self.new_person)
+        f.add_command(label=tr("New concept"), command=lambda: self.new_entry("concept"))
+        f.add_command(label=tr("New form"), command=lambda: self.new_entry("form"))
+        f.add_command(label=tr("New source"), command=self.new_source)
+        f.add_command(label=tr("New measurement (corpus)"), command=self.new_metric)
+        f.add_command(label=tr("Quick entry…"), accelerator="Ctrl+Q", command=self.quick_add)
         f.add_separator()
-        f.add_command(label="Salvar", accelerator="Ctrl+S", command=self.save)
-        f.add_command(label="Recarregar do disco", accelerator="F5", command=self.reload)
+        f.add_command(label=tr("Save"), accelerator="Ctrl+S", command=self.save)
+        f.add_command(label=tr("Reload from disk"), accelerator="F5", command=self.reload)
         f.add_separator()
-        f.add_command(label="Sair", command=self.on_close)
-        m.add_cascade(label="Arquivo", menu=f)
+        f.add_command(label=tr("Quit"), command=self.on_close)
+        m.add_cascade(label=tr("File"), menu=f)
 
         b = self.menu(m)
-        b.add_command(label="Refazer espelho markdown", command=self.do_mirror)
-        b.add_command(label="Abrir mapa do corpo (corpus, HTML)", command=self.do_corpus)
-        b.add_command(label="Verificar estrutura", command=self.do_doctor)
-        b.add_command(label="Normalizar #tags inline (pessoas)", command=self.do_normalize)
+        b.add_command(label=tr("Rebuild markdown mirror"), command=self.do_mirror)
+        b.add_command(label=tr("Open body map (corpus, HTML)"), command=self.do_corpus)
+        b.add_command(label=tr("Check structure"), command=self.do_doctor)
+        b.add_command(label=tr("Normalize inline #tags (people)"), command=self.do_normalize)
         b.add_separator()
-        b.add_command(label="Absorver conflitos de sincronização", command=self.do_merge)
-        b.add_command(label="Histórico do registro aberto", command=self.do_history)
+        b.add_command(label=tr("Merge sync conflicts"), command=self.do_merge)
+        b.add_command(label=tr("History of the open record"), command=self.do_history)
         b.add_separator()
-        b.add_command(label="Importar fontes do Zotero (CSL-JSON ou BibTeX)…",
+        b.add_command(label=tr("Import sources from Zotero (CSL-JSON or BibTeX)…"),
                       command=self.do_import_zotero)
-        b.add_command(label="Exportar fontes (BibTeX)", command=lambda: self.do_export("bibtex"))
-        b.add_command(label="Exportar fontes (CSL-JSON)", command=lambda: self.do_export("csl"))
-        b.add_command(label="Exportar fontes (ABNT, texto)", command=lambda: self.do_export("abnt"))
-        m.add_cascade(label="Base", menu=b)
+        b.add_command(label=tr("Export sources (BibTeX)"), command=lambda: self.do_export("bibtex"))
+        b.add_command(label=tr("Export sources (CSL-JSON)"), command=lambda: self.do_export("csl"))
+        b.add_command(label=tr("Export sources (ABNT, text)"), command=lambda: self.do_export("abnt"))
+        m.add_cascade(label=tr("Base"), menu=b)
 
         v = self.menu(m)
-        v.add_command(label="Tipo de letra do terminal…", command=self.choose_typeface)
-        v.add_command(label="Campos do verbete…", command=self.card_layout_dialog)
-        v.add_command(label="Abrir como livro", accelerator="Ctrl+B", command=self.open_book)
+        v.add_command(label=tr("Terminal typeface…"), command=self.choose_typeface)
+        v.add_command(label=tr("Entry card fields…"), command=self.card_layout_dialog)
+        v.add_command(label=tr("Open as logbook"), accelerator="Ctrl+B", command=self.open_book)
         v.add_separator()
-        v.add_command(label="Redefinir larguras", command=self.reset_layout)
-        v.add_checkbutton(label="Travar larguras", onvalue=True, offvalue=False,
+        v.add_command(label=tr("Reset widths"), command=self.reset_layout)
+        v.add_checkbutton(label=tr("Lock widths"), onvalue=True, offvalue=False,
                           variable=self.locked_var, command=self.lock_panes)
         v.add_separator()
         for key, spec in THEMES.items():
             v.add_command(label=("• " if key == self.theme else "   ") + spec["label"],
                           command=lambda k=key: self.switch_theme(k))
-        m.add_cascade(label="Ver", menu=v)
+        v.add_separator()
+        lang = self.menu(v)
+        for code, name in LANGS.items():
+            lang.add_command(label=("• " if code == LANG else "   ") + name,
+                             command=lambda c=code: self.switch_language(c))
+        v.add_cascade(label=tr("Language"), menu=lang)
+        m.add_cascade(label=tr("View"), menu=v)
 
         h = self.menu(m)
-        h.add_command(label="Atalhos", command=self.do_help)
-        m.add_cascade(label="Ajuda", menu=h)
+        h.add_command(label=tr("Shortcuts"), command=self.do_help)
+        m.add_cascade(label=tr("Help"), menu=h)
         self.root.config(menu=m)
 
     def bind_keys(self):
@@ -5280,7 +5488,7 @@ class App:
         return "break"
 
     def step_record(self, delta):
-        """Ctrl+J / Ctrl+K: próximo / anterior na lista, de qualquer lugar."""
+        """Ctrl+J / Ctrl+K: next / previous in the list, from anywhere."""
         kids = self.list.get_children()
         if not kids:
             return "break"
@@ -5291,7 +5499,7 @@ class App:
         else:
             i = 0 if delta > 0 else len(kids) - 1
         if not 0 <= i < len(kids):
-            # passou da borda: vira a página
+            # past the edge: turn the page
             before = self.top
             self.turn(delta)
             if self.top == before:
@@ -5305,8 +5513,8 @@ class App:
         return "break"
 
     def edge_step(self, delta, _event=None):
-        """Seta para baixo na última linha (ou para cima na primeira) vira a
-        página em vez de não fazer nada."""
+        """Down arrow on the last row (or up on the first) turns the page
+        instead of doing nothing."""
         kids = self.list.get_children()
         cur = self.list.focus()
         if kids and cur in (kids[-1] if delta > 0 else kids[0],):
@@ -5314,11 +5522,11 @@ class App:
         return None
 
     def turn(self, delta):
-        """Vira uma página: tantas linhas quantas cabem na lista."""
+        """Turns a page: as many rows as fit in the list."""
         rows = max(1, self.rows or self.rows_fit())
         top = (self.top or 0) + delta * rows
         if top >= len(self.view) or (delta < 0 and (self.top or 0) == 0):
-            return "break"            # já está na última (ou na primeira) página
+            return "break"            # already on the last (or the first) page
         self.top = max(0, top)
         self.refresh_list()
         kids = self.list.get_children()
@@ -5327,19 +5535,19 @@ class App:
         return "break"
 
     def turn_to(self, top):
-        """Ctrl+Home / Ctrl+End: começo ou fim da lista."""
+        """Ctrl+Home / Ctrl+End: start or end of the list."""
         self.top = top
         self.refresh_list()
         return "break"
 
     def rows_fit(self):
         h = self.list.winfo_height()
-        if h < 40:              # ainda não desenhada
+        if h < 40:              # not drawn yet
             return 20
         return max(1, (h - 4) // self.row_h)
 
     def fit_soon(self, _event=None):
-        """A janela mudou de tamanho: redesenha quando parar de mudar."""
+        """The window changed size: redraw once it stops changing."""
         if self._fit_job:
             try:
                 self.root.after_cancel(self._fit_job)
@@ -5353,8 +5561,8 @@ class App:
             self.refresh_list()
 
     def open_book(self):
-        """Ctrl+B: a base como livro, numa segunda janela, aberto na página
-        do registro atual. Só lê; Enter no livro traz o registro para cá."""
+        """Ctrl+B: the base as a logbook, in a second window, open on the
+        current record's page. Read-only; Enter in the logbook brings a record here."""
         self.commit_if_dirty()
         rec = self.current()
         win = tk.Toplevel(self.root)
@@ -5364,21 +5572,22 @@ class App:
 
     def open_from_book(self, rid):
         if rid not in by_id(self.data):
-            self.say(f"{rid} não existe mais (o livro mostra a base de quando abriu).")
+            self.say(tr("{id} no longer exists (the logbook shows the base as it was "
+                        "when opened).", id=rid))
             return
         self.goto(rid)
         self.root.lift()
         self.root.focus_force()
 
     def to_register(self, n=None):
-        """Ctrl+L: sai da busca e dos filtros e mostra o registro aberto (ou o
-        nº pedido) no seu lugar na sequência."""
+        """Ctrl+L: leaves the search and the filters and shows the open record
+        (or the requested nº) in its place in the sequence."""
         self.commit_if_dirty()
         rec = self.current()
         self.clear_filters()
         self.scope = None
         self.q.set("")
-        if self._q_job:          # a busca vazia já vai ser desenhada agora
+        if self._q_job:          # the empty search is drawn right now instead
             try:
                 self.root.after_cancel(self._q_job)
             except tk.TclError:
@@ -5393,7 +5602,7 @@ class App:
         return "break"
 
     def show_number(self, n):
-        """Leva a vista até o nº n (no meio da página, se der)."""
+        """Moves the view to nº n (mid-page, if possible)."""
         i = self.view_num.get(n)
         if i is None:
             return
@@ -5414,9 +5623,9 @@ class App:
         return "break"
 
     def goto_dialog(self):
-        """Ctrl+G: ir para um registro pelo id ou pelo nome exato."""
-        win = self.dialog("Ir para", 520, 130)
-        tk.Label(win, text="IR PARA  (nº, carimbo, id ou nome)", bg=PAPER,
+        """Ctrl+G: go to a record by number, stamp, id or name."""
+        win = self.dialog(tr("Go to"), 520, 130)
+        tk.Label(win, text=tr("GO TO  (nº, stamp, id or name)"), bg=PAPER,
                  fg=FAINT, font=self.f_label).pack(anchor="w", padx=18, pady=(14, 2))
         e = tk.Entry(win, font=self.f_body, bg=PAPER, fg=INK, insertbackground=INK,
                      relief="flat", highlightthickness=1, highlightbackground=RULE,
@@ -5444,7 +5653,7 @@ class App:
                         self.list.selection_set(iid)
                         self.list.see(iid)
                 else:
-                    self.say(f"Nenhum registro com nº ou carimbo {m.group(1)}.")
+                    self.say(tr("No record with nº or stamp {key}.", key=m.group(1)))
                 return
             low = key.lower()
             hits = [r for r in idx.values() if r.get("name", "").lower() == low]
@@ -5454,9 +5663,9 @@ class App:
                 self.goto(hits[0]["id"])
             elif hits:
                 self.q.set(key)
-                self.say(f"{len(hits)} registros com esse nome; escolha na lista.")
+                self.say(tr("{n} records with that name; pick one in the list.", n=len(hits)))
             else:
-                self.say(f"Nada chamado {key}.")
+                self.say(tr("Nothing called {key}.", key=key))
 
         e.bind("<Return>", go)
         win.bind("<Escape>", lambda ev: win.destroy())
@@ -5494,7 +5703,7 @@ class App:
         return t
 
     def scroll_area(self, parent):
-        """O cartão inteiro rola; os campos dentro dele não."""
+        """The whole card scrolls; the fields inside it do not."""
         canvas = tk.Canvas(parent, bg=PAPER, highlightthickness=0, bd=0)
         bar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
         inner = tk.Frame(canvas, bg=PAPER)
@@ -5550,9 +5759,8 @@ class App:
         return inner
 
     def autogrow(self, t, minrows=2):
-        """Tantas linhas quantas o texto precisar, medindo a quebra na fonte
-        do próprio widget (perguntar ao Tk não funciona: ele só conta até a
-        altura atual)."""
+        """As many rows as the text needs, measuring the wrap in the widget's own
+        font (asking Tk does not work: it only counts up to the current height)."""
         last = {"n": None, "w": None, "job": None}
         CAP = self.max_rows
 
@@ -5561,7 +5769,7 @@ class App:
             if width <= 1:
                 return None
             if len(t.get("1.0", "end-1c")) > 3000:
-                return None        # texto longo: contar linhas basta, e não trava
+                return None        # long text: counting lines is enough, and never hangs
             try:
                 f = tkfont.Font(font=t.cget("font"))
             except tk.TclError:
@@ -5628,7 +5836,7 @@ class App:
                 canvas.yview_moveto(0)
 
     def bind_undo(self, widget, text=False):
-        """Ctrl+Z / Ctrl+Y em tudo. Text tem pilha própria; Entry ganha uma."""
+        """Ctrl+Z / Ctrl+Y everywhere. Text has its own stack; Entry gets one."""
         if text:
             def undo(_e=None):
                 try:
@@ -5713,7 +5921,7 @@ class App:
             return 8
 
     def stop_carets(self):
-        """Cancela todo temporizador antes de a janela ser destruída."""
+        """Cancels every timer before the window is destroyed."""
         for t, state in self.carets + self.pendings:
             try:
                 if state.get("job"):
@@ -5724,7 +5932,7 @@ class App:
         self.carets = []
 
     def block_caret(self, t, font):
-        """Cursor em bloco, invertendo o caractere sob ele."""
+        """A block cursor, inverting the character under it."""
         cw = self.char_width(font)
         t.configure(insertwidth=0, insertbackground=INK)
         t.tag_configure("caret", background=INK, foreground=PAPER)
@@ -5778,15 +5986,15 @@ class App:
     def usable_mono(self, family):
         try:
             if family not in tkfont.families(self.root):
-                return False, "não instalado"
+                return False, tr("is not installed")
             f = tkfont.Font(family=family, size=11)
             widths = {f.measure(ch) for ch in "imMW1."}
             if len(widths) != 1:
-                return False, "não é monoespaçado"
+                return False, tr("is not monospaced")
             if f.measure("M") < 3:
-                return False, "sem métricas"
+                return False, tr("has no metrics")
         except tk.TclError:
-            return False, "ilegível"
+            return False, tr("is unreadable")
         return True, ""
 
     def mono_families(self):
@@ -5831,7 +6039,7 @@ class App:
                 "corpus": "metric"}[coll_of((rec or {}).get("id", ""))]
 
     def refresh_list_soon(self):
-        """A lista redesenha 150 ms depois da última tecla, não a cada uma."""
+        """The list redraws 150 ms after the last keystroke, not on every one."""
         if self._q_job:
             try:
                 self.root.after_cancel(self._q_job)
@@ -5840,11 +6048,12 @@ class App:
         self._q_job = self.root.after(150, self.refresh_list)
 
     def parse_query(self):
-        """Operadores da busca:
-             p: v: f: c:      restringe ao acervo (pessoas, verba, fontes, corpus)
-             ^texto           só o começo do nome
-             tag:x lang:de type:livro sys:renal dom:direito id:c_medida
-           O resto são termos literais, todos obrigatórios."""
+        """Search operators:
+             p: v: f: c:      limit to a collection (people, verba, sources, corpus)
+             ^text            only the start of the name
+             tag:x lang:de type:book sys:renal dom:law id:c_measure
+           The rest are literal terms, all required. type: and sys: match the
+           stored key or its label in the current language."""
         q = self.q.get().strip().lower()
         scope, prefix, fields, terms = None, None, {}, []
         for tok in q.split():
@@ -5867,9 +6076,11 @@ class App:
                 return False
             if k == "lang" and (r.get("lang") or "").lower() != v:
                 return False
-            if k == "type" and v not in (r.get("type") or "").lower():
+            if k == "type" and not any(v in x.lower() for x in
+                                       ((r.get("type") or ""), type_label(r.get("type")))):
                 return False
-            if k == "sys" and v not in (r.get("system") or "").lower():
+            if k == "sys" and not any(v in x.lower() for x in
+                                      ((r.get("system") or ""), system_label(r.get("system")))):
                 return False
             if k == "dom" and not any(v in d.lower() for d in r.get("domains", [])):
                 return False
@@ -5934,22 +6145,22 @@ class App:
         return out
 
     def row_text(self, r):
-        """(título, subtítulo) de um registro na lista."""
+        """(title, subtitle) of a record in the list."""
         kind = self.rec_kind(r)
         if kind == "entry":
-            sub = ("conceito" if r["kind"] == "concept" else "forma") \
-                + " · " + (r.get("gloss") or "")
+            sub = tr(r["kind"]) + " · " + (r.get("gloss") or "")
             return label_of(r), sub
         if kind == "source":
             au = author_names(r, self.data)
-            sub = (r.get("type") or "outro") + " · " + ", ".join(
+            sub = type_label(r.get("type") or "outro") + " · " + ", ".join(
                 a.split(",")[0] for a in au[:2]) + (f" · {year_of_source(r)}"
                                                     if year_of_source(r) else "")
             return r.get("name") or r.get("raw", ""), sub
         if kind == "metric":
             lr = last_reading(r)
-            sub = (r.get("system") or "") + (f" · {lr['date']} = {lr['value']} "
-                                             f"{r.get('unit', '')}" if lr else " · sem leituras")
+            sub = system_label(r.get("system") or "") + (
+                f" · {lr['date']} = {lr['value']} {r.get('unit', '')}" if lr
+                else " · " + tr("no readings"))
             if lr and out_of_range(r, lr):
                 sub += "  (!)"
             return r["name"], sub
@@ -5984,11 +6195,11 @@ class App:
                 self.view_system)
 
     def refresh_list(self):
-        """Sem busca nem filtro, a lista é o REGISTRO: tudo na ordem dos
-        números, com os cancelados no lugar, abrindo no fim (os mais novos).
-        Com busca ou filtro, é o INDICADOR: o que bate, em ordem alfabética,
-        cada linha com seu número. Nos dois, a vista mostra só as linhas que
-        cabem na janela; o resto está nas páginas seguintes."""
+        """Without a search or filter, the list is the REGISTER: everything in
+        number order, cancelled numbers in place, opening at the end (the newest).
+        With a search or filter, it is the INDEX: what matches, alphabetically,
+        each row with its number. Either way, the view only shows the rows that
+        fit the window; the rest is on the following pages."""
         self._q_job = None
         sig = self.filter_sig()
         filtered = bool(any(sig[:-1]) or self.view_system is not None)
@@ -5997,10 +6208,10 @@ class App:
             self.top = 0 if filtered else None
         total = sum(len(self.data[c]) for c in COLLS)
         if filtered:
-            self.mode = "indicador"
+            self.mode = "index"
             self.view = [("r", r) for r in self.matches()]
         else:
-            self.mode = "registro"
+            self.mode = "register"
             live, loose = {}, []
             for c in COLLS:
                 for r in self.data[c]:
@@ -6012,12 +6223,12 @@ class App:
                     if d.get("reg_n") and d["reg_n"] not in live}
             self.view = [("r", live[n]) if n in live else ("x", gone[n])
                          for n in sorted(set(live) | set(gone))]
-            self.view += [("r", r) for r in loose]       # rascunhos, no fim
+            self.view += [("r", r) for r in loose]       # drafts, at the end
         self.view_num = {o["reg_n"]: i for i, (_, o) in enumerate(self.view)
                          if o.get("reg_n")}
         self.view_pos = {o["id"]: i for i, (k, o) in enumerate(self.view) if k == "r"}
         self.rows = self.rows_fit()
-        if self.top is None:          # o fim: a última vista cheia
+        if self.top is None:          # the end: the last full view
             self.top = max(0, len(self.view) - self.rows)
         self.top = max(0, min(self.top, len(self.view) - 1))
         shown = self.view[self.top:self.top + self.rows]
@@ -6026,32 +6237,32 @@ class App:
             n = o.get("reg_n")
             if kind == "x":
                 self.list.insert("", "end", iid=f"x:{n}",
-                                 text=f"cancelado · {one_liner(o.get('name', ''), 40)}",
-                                 values=(f"em {(o.get('at') or '')[:10]}", f"nº {n}"),
+                                 text=tr("cancelled · {name}", name=one_liner(o.get("name", ""), 40)),
+                                 values=(tr("on {date}", date=(o.get("at") or "")[:10]), f"nº {n}"),
                                  tags=("cancel",))
             else:
-                self.insert_row(o, f"nº {n}" if n else "novo")
+                self.insert_row(o, f"nº {n}" if n else tr("new"))
         a, b = self.top + 1, self.top + len(shown)
-        if self.mode == "registro":
+        if self.mode == "register":
             nums = [o.get("reg_n") for _, o in shown if o.get("reg_n")]
-            span = f"nº {nums[0]}–{nums[-1]}" if nums else "vazio"
-            self.page_lbl.configure(text=f"REGISTRO · {span}")
-            self.count.configure(text=f"{total} registros")
+            span = f"nº {nums[0]}–{nums[-1]}" if nums else tr("empty")
+            self.page_lbl.configure(text=tr("REGISTER · {span}", span=span))
+            self.count.configure(text=tr("{n} records", n=total))
         else:
             self.page_lbl.configure(
-                text=f"INDICADOR · {a}–{b} de {len(self.view)}" if shown
-                else "INDICADOR · nada encontrado")
-            self.count.configure(text=f"{len(self.view)} de {total}")
+                text=tr("INDEX · {a}–{b} of {n}", a=a, b=b, n=len(self.view)) if shown
+                else tr("INDEX · nothing found"))
+            self.count.configure(text=tr("{n} of {total}", n=len(self.view), total=total))
         if self.sel and self.list.exists(self.sel):
             self.list.selection_set(self.sel)
 
     def show_in_list(self, rid):
-        """Leva a vista até o registro, se ele estiver fora dela."""
+        """Moves the view to the record, if it is outside it."""
         if self.list.exists(rid):
             return
         i = self.view_pos.get(rid)
         if i is None:
-            if self.mode == "registro":       # rascunho novo: fica no fim
+            if self.mode == "register":       # a new draft: it sits at the end
                 self.top = None
                 self.refresh_list()
             return
@@ -6064,27 +6275,30 @@ class App:
             return
         n = rec.get("reg_n")
         if not n:
-            self.locus.configure(text="SEM REGISTRO · RECEBE NÚMERO AO SALVAR")
+            self.locus.configure(text=tr("NOT REGISTERED · GETS A NUMBER ON SAVE"))
             return
-        text = f"REGISTRO Nº {n}    REGISTRADO {stamp_label(rec.get('reg'))}"
+        text = tr("REGISTER Nº {n}    REGISTERED {stamp}", n=n, stamp=stamp_label(rec.get("reg")))
         if rec.get("reg_origem"):
-            text += f"  (inferido: {REG_ORIGEM.get(rec['reg_origem'], rec['reg_origem'])})"
+            text += "  " + tr("(inferred: {origin})", origin=tr(
+                REG_ORIGIN.get(rec["reg_origem"], rec["reg_origem"])))
         if rec.get("reg_n_anterior"):
-            text += f"  · antes nº {rec['reg_n_anterior']}"
+            text += "  · " + tr("formerly nº {n}", n=rec["reg_n_anterior"])
         self.locus.configure(text=text)
 
     def refresh_rail(self):
         r = self.rail
         r.delete(*r.get_children())
         people, entries = self.data["people"], self.data["entries"]
-        r.insert("", "end", iid="h0", text="ACERVO", tags=("head",))
-        r.insert("", "end", iid="s:people", text="  pessoas", values=(len(people),),
+        r.insert("", "end", iid="h0", text=tr("COLLECTIONS"), tags=("head",))
+        r.insert("", "end", iid="s:people", text="  " + tr("people"), values=(len(people),),
                  tags=("on",) if self.scope == "people" else ("scope",))
-        r.insert("", "end", iid="s:entries", text="  verba", values=(len(entries),),
+        r.insert("", "end", iid="s:entries", text="  " + tr("verba"), values=(len(entries),),
                  tags=("on",) if self.scope == "entries" else ("scope",))
-        r.insert("", "end", iid="s:sources", text="  fontes", values=(len(self.data["sources"]),),
+        r.insert("", "end", iid="s:sources", text="  " + tr("sources"),
+                 values=(len(self.data["sources"]),),
                  tags=("on",) if self.scope == "sources" else ("scope",))
-        r.insert("", "end", iid="s:corpus", text="  corpus", values=(len(self.data["corpus"]),),
+        r.insert("", "end", iid="s:corpus", text="  " + tr("corpus"),
+                 values=(len(self.data["corpus"]),),
                  tags=("on",) if self.scope == "corpus" else ("scope",))
 
         if self.scope in (None, "people"):
@@ -6092,11 +6306,11 @@ class App:
                       for k in ("todo", "doing", "waiting")}
             untag = sum(1 for p in people if not p.get("tags"))
             r.insert("", "end", iid="h1", text="", tags=("head",))
-            r.insert("", "end", iid="h1b", text="TRABALHO", tags=("head",))
-            for key, lab, n in (("todo", "a fazer", counts["todo"]),
-                                ("doing", "em curso", counts["doing"]),
-                                ("waiting", "esperando", counts["waiting"]),
-                                ("untagged", "sem tag", untag)):
+            r.insert("", "end", iid="h1b", text=tr("WORK"), tags=("head",))
+            for key, lab, n in (("todo", tr("to do"), counts["todo"]),
+                                ("doing", tr("in progress"), counts["doing"]),
+                                ("waiting", tr("waiting on"), counts["waiting"]),
+                                ("untagged", tr("untagged"), untag)):
                 r.insert("", "end", iid="v:" + key, text="  " + lab, values=(n,),
                          tags=("on",) if self.viewmode == key else ())
             tags = {}
@@ -6106,7 +6320,7 @@ class App:
                         tags[t] = tags.get(t, 0) + 1
             if tags:
                 r.insert("", "end", iid="h2", text="", tags=("head",))
-                r.insert("", "end", iid="h2b", text="TAGS", tags=("head",))
+                r.insert("", "end", iid="h2b", text=tr("TAGS"), tags=("head",))
                 for t in sorted(tags, key=sort_key):
                     r.insert("", "end", iid="t:" + t, text="  " + t, values=(tags[t],),
                              tags=("on",) if self.tag == t else ())
@@ -6116,7 +6330,7 @@ class App:
                     days[t["due"]] = days.get(t["due"], 0) + 1
             if days:
                 r.insert("", "end", iid="h3", text="", tags=("head",))
-                r.insert("", "end", iid="h3b", text="CALENDÁRIO", tags=("head",))
+                r.insert("", "end", iid="h3b", text=tr("CALENDAR"), tags=("head",))
                 today = TODAY()
                 for day in sorted(days):
                     if day < today:
@@ -6134,8 +6348,8 @@ class App:
             n_c = sum(1 for e in entries if e["kind"] == "concept")
             n_f = sum(1 for e in entries if e["kind"] == "form")
             r.insert("", "end", iid="h4", text="", tags=("head",))
-            r.insert("", "end", iid="h4b", text="TIPO", tags=("head",))
-            for key, lab, n in (("concept", "conceitos", n_c), ("form", "formas", n_f)):
+            r.insert("", "end", iid="h4b", text=tr("KIND"), tags=("head",))
+            for key, lab, n in (("concept", tr("concepts"), n_c), ("form", tr("forms"), n_f)):
                 r.insert("", "end", iid="k:" + key, text="  " + lab, values=(n,),
                          tags=("on",) if self.view_kind == key else ())
             langs = {}
@@ -6144,7 +6358,7 @@ class App:
                     langs[e["lang"]] = langs.get(e["lang"], 0) + 1
             if langs:
                 r.insert("", "end", iid="h5", text="", tags=("head",))
-                r.insert("", "end", iid="h5b", text="LÍNGUA", tags=("head",))
+                r.insert("", "end", iid="h5b", text=tr("LANGUAGE"), tags=("head",))
                 for lang in sorted(langs, key=sort_key):
                     r.insert("", "end", iid="l:" + lang, text="  " + lang,
                              values=(langs[lang],),
@@ -6155,7 +6369,7 @@ class App:
                     doms[d] = doms.get(d, 0) + 1
             if doms:
                 r.insert("", "end", iid="h6", text="", tags=("head",))
-                r.insert("", "end", iid="h6b", text="DOMÍNIO", tags=("head",))
+                r.insert("", "end", iid="h6b", text=tr("DOMAIN"), tags=("head",))
                 for d in sorted(doms, key=sort_key):
                     r.insert("", "end", iid="m:" + d, text="  " + d, values=(doms[d],),
                              tags=("on",) if self.view_domain == d else ())
@@ -6166,9 +6380,9 @@ class App:
                 t = s.get("type") or "outro"
                 types[t] = types.get(t, 0) + 1
             r.insert("", "end", iid="h7", text="", tags=("head",))
-            r.insert("", "end", iid="h7b", text="TIPO DE FONTE", tags=("head",))
-            for t in sorted(types, key=sort_key):
-                r.insert("", "end", iid="y:" + t, text="  " + t, values=(types[t],),
+            r.insert("", "end", iid="h7b", text=tr("SOURCE TYPE"), tags=("head",))
+            for t in sorted(types, key=lambda t: sort_key(type_label(t))):
+                r.insert("", "end", iid="y:" + t, text="  " + type_label(t), values=(types[t],),
                          tags=("on",) if self.view_stype == t else ())
         if self.scope in (None, "corpus") and self.data["corpus"]:
             systems = {}
@@ -6176,14 +6390,15 @@ class App:
                 sname = m.get("system") or ""
                 systems[sname] = systems.get(sname, 0) + 1
             r.insert("", "end", iid="h8", text="", tags=("head",))
-            r.insert("", "end", iid="h8b", text="SISTEMA", tags=("head",))
-            for sname in sorted(systems, key=sort_key):
-                r.insert("", "end", iid="z:" + sname, text="  " + (sname or "(sem sistema)"),
+            r.insert("", "end", iid="h8b", text=tr("SYSTEM"), tags=("head",))
+            for sname in sorted(systems, key=lambda s: sort_key(system_label(s))):
+                r.insert("", "end", iid="z:" + sname,
+                         text="  " + (system_label(sname) or tr("(no system)")),
                          values=(systems[sname],),
                          tags=("on",) if self.view_system == sname else ())
 
     def filter_system(self, sname):
-        """Clique no mapa: filtra a lista pelo sistema (de novo, tira o filtro)."""
+        """A click on the map: filters the list by that system (again, removes the filter)."""
         self.commit_if_dirty()
         was = self.view_system
         self.clear_filters()
@@ -6197,7 +6412,7 @@ class App:
             self.mc.map.set_current(self.view_system)
 
     def show_corpus_blank(self):
-        """Sem medida aberta, o cartão de corpus mostra só o mapa."""
+        """With no measurement open, the corpus card shows only the map."""
         self.blank_card()
         self.show_card("metric")
         self.mc.map.set_current(self.view_system)
@@ -6304,16 +6519,16 @@ class App:
         self.set_locus(None)
 
     def show_cancelled(self, n):
-        """Número cancelado: o cartão fica vazio e o cabeçalho diz
-        o que ocupava o número."""
+        """A cancelled number: the card stays empty and the header says what
+        used to hold the number."""
         d = next((d for d in self.data.get("deleted", []) if d.get("reg_n") == n), None)
         self.blank_card()
         if d:
             self.locus.configure(
-                text=f"REGISTRO Nº {n}    CANCELADO EM "
-                     f"{(d.get('at') or '').replace('T', ' ')}  ·  "
-                     f"{d.get('name', '')}  ({d.get('id', '')})")
-            self.say("Registro cancelado: o histórico está no log (Base › Histórico).")
+                text=tr("REGISTER Nº {n}    CANCELLED ON {at}  ·  {name}  ({id})", n=n,
+                        at=(d.get("at") or "").replace("T", " "), name=d.get("name", ""),
+                        id=d.get("id", "")))
+            self.say(tr("Cancelled record: its history is in the log (Base › History)."))
 
     def open_record(self, rid):
         rec = by_id(self.data).get(rid)
@@ -6340,7 +6555,7 @@ class App:
 
     def goto(self, rid):
         if rid not in by_id(self.data):
-            self.say(f"{rid} não existe.")
+            self.say(tr("{id} does not exist.", id=rid))
             return
         self.commit_if_dirty()
         self.busy = True
@@ -6354,7 +6569,7 @@ class App:
             self.dirty = True
             self.flash("")
 
-    # ------------------------------------------------------------ escrita
+    # ------------------------------------------------------------ writing
     def new_person(self):
         self.commit_if_dirty()
         self.draft = blank_person(self.q.get().strip())
@@ -6364,7 +6579,7 @@ class App:
         self.refresh_list()
         self.open_record("__draft_p__")
         self.pc.e_name.focus_set()
-        self.say("Pessoa nova. Só vai ao disco quando salvar.")
+        self.say(tr("New person. It only reaches the disk when saved."))
 
     def new_entry(self, kind):
         self.commit_if_dirty()
@@ -6378,7 +6593,7 @@ class App:
         self.refresh_list()
         self.open_record("__draft_e__")
         self.vc.e_name.focus_set()
-        self.say("Verbete novo. O id é gerado ao salvar com nome.")
+        self.say(tr("New entry. The id is generated when saved with a name."))
 
     def new_source(self):
         self.commit_if_dirty()
@@ -6390,7 +6605,7 @@ class App:
         self.refresh_list()
         self.open_record("__draft_s__")
         self.sc.e_name.focus_set()
-        self.say("Fonte nova. O id é gerado ao salvar com título.")
+        self.say(tr("New source. The id is generated when saved with a title."))
 
     def new_metric(self):
         self.commit_if_dirty()
@@ -6401,31 +6616,32 @@ class App:
         self.refresh_list()
         self.open_record("__draft_h__")
         self.mc.e_name.focus_set()
-        self.say("Medida nova. O id é gerado ao salvar com nome.")
+        self.say(tr("New measurement. The id is generated when saved with a name."))
 
-    def _save_linked(self, coll, card, rec, auto, make_id_fn, what):
-        """Fontes e medidas: registro + ligações que saem dele, como verba."""
+    def _save_linked(self, coll, card, rec, auto, make_id_fn, needs_name):
+        """Sources and measurements: the record plus the links going out of it,
+        as with verba."""
         out = card.gather(rec)
         if not out["name"]:
             if not auto:
-                self.flash(f"{what} precisa de nome.")
+                self.flash(needs_name)
             return None
         if out["id"].startswith("__"):
             out["id"] = make_id_fn(out, set(by_id(load_json())))
-        novas = parse_edges(card.edges_text(), out["id"])
-        ruins = [a["to"] for a in novas if a.get("_bad")]
-        novas = [a for a in novas if not a.get("_bad")]
-        if ruins:
-            out["edge_drafts"] = ruins
+        links = parse_edges(card.edges_text(), out["id"])
+        unparsed = [a["to"] for a in links if a.get("_bad")]
+        links = [a for a in links if not a.get("_bad")]
+        if unparsed:
+            out["edge_drafts"] = unparsed
         else:
             out.pop("edge_drafts", None)
         touch(out)
-        self.data = save_record(coll, out, edges=novas)
+        self.data = save_record(coll, out, edges=links)
         self.safe_mirror(self.data)
-        if ruins:
-            self.say(f"{len(ruins)} linha(s) de ligação não entendidas ficaram como rascunho.")
+        if unparsed:
+            self.say(tr("{n} link line(s) not understood were kept as drafts.", n=len(unparsed)))
         elif auto:
-            self.say(f'Salvo "{one_liner(out["name"], 40)}" automaticamente.')
+            self.say(tr('Saved "{name}" automatically.', name=one_liner(out["name"], 40)))
         return out["id"]
 
     def save(self, reopen=True, auto=False):
@@ -6441,13 +6657,13 @@ class App:
             elif kind == "entry":
                 new_id = self._save_entry(rec, auto)
             elif kind == "source":
-                new_id = self._save_linked("sources", self.sc, rec, auto,
-                                           new_source_id, "Uma fonte")
+                new_id = self._save_linked("sources", self.sc, rec, auto, new_source_id,
+                                           tr("A source needs a name."))
             else:
-                new_id = self._save_linked("corpus", self.mc, rec, auto,
-                                           new_metric_id, "Uma medida")
+                new_id = self._save_linked("corpus", self.mc, rec, auto, new_metric_id,
+                                           tr("A measurement needs a name."))
         except SystemExit as exc:
-            self.notify("Não salvo", str(exc))
+            self.notify(tr("Not saved"), str(exc))
             return None
         if new_id is None:
             return None
@@ -6457,14 +6673,14 @@ class App:
         self.reload()
         if reopen:
             self.open_record(new_id)
-            self.flash("Salvo " + TODAY())
+            self.flash(tr("Saved {date}", date=TODAY()))
         return new_id
 
     def _save_person(self, p, auto):
         rec = self.pc.gather(p)
         if not rec["name"]:
             if not auto:
-                self.flash("Uma pessoa precisa de nome.")
+                self.flash(tr("A person needs a name."))
             return None
         filed = fold_finished_tasks(rec)
         if rec["id"].startswith("__"):
@@ -6474,35 +6690,34 @@ class App:
         self.data = save_record("people", rec)
         self.safe_mirror(self.data)
         if filed:
-            self.say(f"{filed} tarefa(s) concluída(s) foram para o log.")
+            self.say(tr("{n} finished task(s) went to the log.", n=filed))
         elif auto:
-            self.say(f'Salvo "{one_liner(rec["name"], 40)}" automaticamente.')
+            self.say(tr('Saved "{name}" automatically.', name=one_liner(rec["name"], 40)))
         return rec["id"]
 
     def _save_entry(self, e, auto):
         rec = self.vc.gather(e)
         if not rec["name"]:
             if not auto:
-                self.flash("Um verbete precisa de nome.")
+                self.flash(tr("An entry needs a name."))
             return None
         old = rec["id"]
         if old.startswith("__"):
             rec["id"] = new_id(rec["kind"], rec["name"], set(by_id(load_json())))
-        novas = parse_edges(self.vc.edges_text(), rec["id"])
-        ruins = [a["to"] for a in novas if a.get("_bad")]
-        novas = [a for a in novas if not a.get("_bad")]
-        if ruins:
-            rec["edge_drafts"] = ruins
+        links = parse_edges(self.vc.edges_text(), rec["id"])
+        unparsed = [a["to"] for a in links if a.get("_bad")]
+        links = [a for a in links if not a.get("_bad")]
+        if unparsed:
+            rec["edge_drafts"] = unparsed
         else:
             rec.pop("edge_drafts", None)
         touch(rec)
-        self.data = save_record("entries", rec, edges=novas)
+        self.data = save_record("entries", rec, edges=links)
         self.safe_mirror(self.data)
-        if ruins:
-            self.say(f"{len(ruins)} linha(s) de ligação não entendidas ficaram "
-                     "como rascunho.")
+        if unparsed:
+            self.say(tr("{n} link line(s) not understood were kept as drafts.", n=len(unparsed)))
         elif auto:
-            self.say(f'Salvo "{one_liner(rec["name"], 40)}" automaticamente.')
+            self.say(tr('Saved "{name}" automatically.', name=one_liner(rec["name"], 40)))
         return rec["id"]
 
     def commit_if_dirty(self):
@@ -6535,11 +6750,11 @@ class App:
             self.blank_card()
             return
         n = len(edges_from(self.data, rec["id"])) + len(edges_to(self.data, rec["id"]))
-        msg = f'Apagar "{label_any(rec, self.data)}"?'
+        msg = tr('Delete "{label}"?', label=label_any(rec, self.data))
         if n:
-            msg += f"\n\n{n} ligação(ões) envolvendo este registro também somem."
-        msg += "\n\nO log guarda a versão anterior (menu Base › Histórico)."
-        if not self.confirm("Apagar", msg, yes="Apagar"):
+            msg += "\n\n" + tr("{n} link(s) involving this record go too.", n=n)
+        msg += "\n\n" + tr("The log keeps the previous version (Base › History).")
+        if not self.confirm(tr("Delete"), msg, yes=tr("Delete")):
             return
         coll = coll_of(rec["id"])
         self.data, _ = delete_record(coll, rec["id"], rec.get("name", ""))
@@ -6547,7 +6762,7 @@ class App:
         self.sel = None
         self.reload()
         self.blank_card()
-        self.say("Apagado. A versão anterior está no log.")
+        self.say(tr("Deleted. The previous version is in the log."))
 
     def known_langs(self):
         langs = {e.get("lang") for e in self.data["entries"]
@@ -6555,10 +6770,10 @@ class App:
         return sorted(langs, key=sort_key)
 
     def quick_add(self):
-        """Várias entradas de uma vez, uma por linha."""
+        """Several entries at once, one per line."""
         self.commit_if_dirty()
-        win = self.dialog("Entrada rápida", 640, 520)
-        tk.Label(win, text="ENTRADA RÁPIDA", bg=PAPER, fg=FAINT,
+        win = self.dialog(tr("Quick entry"), 640, 520)
+        tk.Label(win, text=tr("QUICK ENTRY"), bg=PAPER, fg=FAINT,
                  font=self.f_label).pack(anchor="w", padx=20, pady=(16, 2))
         hint = tk.Label(win, text="", bg=PAPER, fg=SOFT, font=self.f_meta,
                         justify="left")
@@ -6574,29 +6789,29 @@ class App:
                      anchor="w").pack(fill="x", pady=(0, 2))
             return c
 
-        v_kind = tk.StringVar(value="person")
-        kb = ttk.Combobox(col("TIPO", 10, 0), textvariable=v_kind, state="readonly",
-                          values=["person", "form", "concept", "source"], width=10,
-                          font=self.f_meta)
+        kinds = {tr(k): k for k in ("person", "form", "concept", "source")}
+        v_kind = tk.StringVar(value=tr("person"))
+        kb = ttk.Combobox(col(tr("KIND"), 10, 0), textvariable=v_kind, state="readonly",
+                          values=list(kinds), width=10, font=self.f_meta)
         kb.pack()
         v_lang = tk.StringVar(value="")
-        lang_box = ttk.Combobox(col("LÍNGUA", 12, (14, 0)), textvariable=v_lang,
+        lang_box = ttk.Combobox(col(tr("LANGUAGE"), 12, (14, 0)), textvariable=v_lang,
                                 values=self.known_langs(), width=12, font=self.f_meta)
         lang_box.pack()
-        e_source = tk.Entry(col("FONTE", None, (14, 0)), font=self.f_meta, bg=PAPER,
+        e_source = tk.Entry(col(tr("SOURCE"), None, (14, 0)), font=self.f_meta, bg=PAPER,
                             fg=INK, insertbackground=INK, relief="flat",
                             highlightthickness=1, highlightbackground=RULE,
                             highlightcolor=STAMP)
         e_source.pack(fill="x", ipady=2)
 
         def toggle(*_a):
-            k = v_kind.get()
+            k = kinds.get(v_kind.get(), "person")
             lang_box.configure(state="normal" if k == "form" else "disabled")
             e_source.configure(state="normal" if k != "person" else "disabled")
-            hint.configure(text={"person": "Uma por linha:  - Nome. Notas sobre a pessoa.",
-                                 "source": "Uma referência por linha, como você a escreveria "
-                                           "(SOBRENOME, Nome. Título. Local: Editora, ano)."
-                                 }.get(k, "Uma por linha:  nome. glosa"))
+            hint.configure(text={"person": tr("One per line:  - Name. Notes about the person."),
+                                 "source": tr("One reference per line, as you would write it "
+                                              "(SURNAME, Name. Title. Place: Publisher, year)."),
+                                 }.get(k, tr("One per line:  name. gloss")))
 
         v_kind.trace_add("write", toggle)
         toggle()
@@ -6609,7 +6824,7 @@ class App:
         box.pack(fill="both", expand=True, padx=20)
 
         def add():
-            kind = v_kind.get()
+            kind = kinds.get(v_kind.get(), "person")
             text = box.get("1.0", "end-1c")
             if not text.strip():
                 win.destroy()
@@ -6626,13 +6841,13 @@ class App:
                 self.reload()
                 bits = []
                 if added:
-                    bits.append(f"{added} adicionadas")
+                    bits.append(tr("{n} added", n=added))
                 if merged:
-                    bits.append(f"{merged} receberam addendum: "
+                    bits.append(tr("{n} got an addendum: ", n=merged)
                                 + ", ".join(one_liner(n, 28) for n in names[:3]))
                 if identical:
-                    bits.append(f"{identical} já constavam")
-                self.say(" · ".join(bits) or "Nada a adicionar.")
+                    bits.append(tr("{n} were already there", n=identical))
+                self.say(" · ".join(bits) or tr("Nothing to add."))
                 return
             if kind == "source":
                 items = [source_from_raw(l) for l in text.splitlines() if l.strip()]
@@ -6642,16 +6857,17 @@ class App:
                 self.safe_mirror(data)
                 win.destroy()
                 self.reload()
-                self.say(f"{added} fonte(s) adicionadas, {skipped} já existiam.")
+                self.say(tr("{added} source(s) added, {skipped} already existed.",
+                            added=added, skipped=skipped))
                 return
             lang = v_lang.get().strip()
             src = e_source.get().strip()
             if kind == "form" and not lang:
-                hint.configure(text="Uma forma precisa de língua.")
+                hint.configure(text=tr("A form needs a language."))
                 return
             data = load_json()
             taken = set(by_id(data))
-            feitos = 0
+            made = 0
             for line in text.splitlines():
                 line = line.strip()
                 if line[:2] in ("- ", "* "):
@@ -6673,20 +6889,20 @@ class App:
                 touch(rec)
                 data["entries"].append(rec)
                 log_put("entries", rec)
-                feitos += 1
-            if feitos:
+                made += 1
+            if made:
                 write_json(data)
                 self.safe_mirror(data)
             win.destroy()
             self.reload()
-            self.say(f"{feitos} verbete(s) adicionados."
-                     + (" Conceitos sem glosa aparecem em Verificar estrutura."
-                        if kind == "concept" and feitos else ""))
+            self.say(tr("{n} entry(ies) added.", n=made)
+                     + (tr(" Concepts without a gloss show up in Check structure.")
+                        if kind == "concept" and made else ""))
 
         foot = tk.Frame(win, bg=PAPER)
         foot.pack(fill="x", padx=20, pady=14)
-        ttk.Button(foot, text="Adicionar", command=add).pack(side="left")
-        ttk.Button(foot, text="Cancelar", style="Quiet.TButton",
+        ttk.Button(foot, text=tr("Add"), command=add).pack(side="left")
+        ttk.Button(foot, text=tr("Cancel"), style="Quiet.TButton",
                    command=win.destroy).pack(side="left", padx=(8, 0))
         win.bind("<Escape>", lambda e: win.destroy())
         box.focus_set()
@@ -6696,7 +6912,7 @@ class App:
         try:
             write_mirror(data)
         except SystemExit as exc:
-            self.notify("Espelho não refeito", str(exc))
+            self.notify(tr("Mirror not rebuilt"), str(exc))
         try:
             write_corpus_html(data)
         except OSError:
@@ -6708,44 +6924,46 @@ class App:
         import contextlib
         with contextlib.redirect_stdout(io.StringIO()):
             cmd_corpus(open_it=True)
-        self.say(f"Mapa do corpo refeito e aberto: {CORPUS_HTML_FILE.name}")
+        self.say(tr("Body map rebuilt and opened: {name}", name=CORPUS_HTML_FILE.name))
 
     def do_mirror(self):
         self.commit_if_dirty()
         self.safe_mirror(load_json())
-        self.say(f"Espelho refeito: {MIRROR_FILE.name}")
+        self.say(tr("Mirror rebuilt: {name}", name=MIRROR_FILE.name))
 
     def do_doctor(self):
         self.commit_if_dirty()
         errors, warnings = check(self.data)
-        body = summary(self.data) + f"\n{len(errors)} erros, {len(warnings)} avisos.\n\n"
-        body += "\n".join(errors[:20]) if errors else "Nenhum erro de estrutura."
+        body = summary(self.data) + "\n" + tr("{e} errors, {w} warnings", e=len(errors),
+                                              w=len(warnings)) + ".\n\n"
+        body += "\n".join(errors[:20]) if errors else tr("No structural errors.")
         if warnings:
             body += "\n\n" + "\n".join(warnings[:20])
         others = other_locks()
         if others:
-            body += "\n\nAberto também em: " + ", ".join(
-                f"{o.get('host')} desde {o.get('since')}" for o in others)
-        self.show_text("Estrutura", body)
+            body += "\n\n" + tr("Also open on: ") + ", ".join(
+                tr("{host} since {since}", host=o.get("host"), since=o.get("since"))
+                for o in others)
+        self.show_text(tr("Structure"), body)
 
     def do_normalize(self):
         self.commit_if_dirty()
-        if not self.confirm("Normalizar tags inline",
-                            "Mover #hashtags e datas escritas nos nomes e notas das "
-                            "pessoas para o campo de tags?", yes="Normalizar"):
+        if not self.confirm(tr("Normalize inline tags"),
+                            tr("Move #hashtags and dates written in people's names and "
+                               "notes into the tags field?"), yes=tr("Normalize")):
             return
         import io
         import contextlib
         with contextlib.redirect_stdout(io.StringIO()):
             cmd_normalize()
         self.reload()
-        self.say("Normalizado.")
+        self.say(tr("Normalized."))
 
     def do_merge(self):
         self.commit_if_dirty()
         reports = absorb_conflicts()
         if not reports:
-            self.say("Nenhum arquivo de conflito na pasta.")
+            self.say(tr("No conflict files in the folder."))
             return
         self.safe_mirror(load_json())
         self.reload()
@@ -6757,27 +6975,27 @@ class App:
             for coll, rid, nm in r["replaced"]:
                 body.append(f"  ~ {nm}  ({rid})")
             for coll, rid, nm in r["skipped_deleted"]:
-                body.append(f"  - {nm}  ({rid}, apagado)")
-            body.append(f"  {r['kept']} mantidos\n")
-        self.show_text("Conflitos absorvidos", "\n".join(body))
+                body.append(f"  - {nm}  ({rid}, " + tr("deleted") + ")")
+            body.append("  " + tr("{n} kept", n=r["kept"]) + "\n")
+        self.show_text(tr("Conflicts merged"), "\n".join(body))
 
     def do_history(self):
         rec = self.current()
         if not rec or rec["id"].startswith("__"):
-            self.say("Abra um registro salvo primeiro.")
+            self.say(tr("Open a saved record first."))
             return
         import io
         import contextlib
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             cmd_history(rec["id"])
-        self.show_text(f"Histórico · {label_any(rec)}", buf.getvalue())
+        self.show_text(tr("History · {label}", label=label_any(rec)), buf.getvalue())
 
     def do_import_zotero(self):
         from tkinter import filedialog
         path = filedialog.askopenfilename(
-            title="Export do Zotero (CSL-JSON ou BibTeX)",
-            filetypes=[("CSL-JSON / BibTeX", "*.json *.bib"), ("Todos", "*.*")])
+            title=tr("Zotero export (CSL-JSON or BibTeX)"),
+            filetypes=[("CSL-JSON / BibTeX", "*.json *.bib"), (tr("All files"), "*.*")])
         if not path:
             return
         import io
@@ -6787,7 +7005,7 @@ class App:
             with contextlib.redirect_stdout(buf):
                 cmd_import_zotero(path)
         except (SystemExit, ValueError, json.JSONDecodeError) as exc:
-            self.notify("Importação", str(exc))
+            self.notify(tr("Import"), str(exc))
             return
         self.reload()
         self.say(buf.getvalue().strip())
@@ -6798,13 +7016,13 @@ class App:
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             cmd_export(fmt)
-        self.say(buf.getvalue().strip() + f"  (em {BASE})")
+        self.say(buf.getvalue().strip() + "  " + tr("(in {dir})", dir=BASE))
 
     def card_layout_dialog(self):
-        win = self.dialog("Campos do verbete", 460, 480)
-        tk.Label(win, text="CAMPOS DO VERBETE", bg=PAPER, fg=FAINT,
+        win = self.dialog(tr("Entry card fields"), 460, 480)
+        tk.Label(win, text=tr("ENTRY CARD FIELDS"), bg=PAPER, fg=FAINT,
                  font=self.f_label).pack(anchor="w", padx=18, pady=(16, 2))
-        tk.Label(win, text="Espaço mostra ou esconde. As setas movem.",
+        tk.Label(win, text=tr("Space shows or hides. The arrows move."),
                  bg=PAPER, fg=SOFT, font=self.f_meta).pack(anchor="w", padx=18,
                                                           pady=(0, 8))
         box = tk.Listbox(win, height=11, font=self.f_meta, bg=PAPER, fg=INK,
@@ -6816,7 +7034,7 @@ class App:
         def redraw(keep=0):
             box.delete(0, "end")
             for fid, on in work:
-                box.insert("end", f"[{'x' if on else ' '}]  {FIELD_TITLE[fid]}")
+                box.insert("end", f"[{'x' if on else ' '}]  {tr(FIELD_TITLE[fid])}")
             if work:
                 box.selection_clear(0, "end")
                 box.selection_set(min(keep, len(work) - 1))
@@ -6849,7 +7067,7 @@ class App:
         ttk.Button(row, text="↑", width=3, command=lambda: move(-1)).pack(side="left")
         ttk.Button(row, text="↓", width=3, command=lambda: move(1)).pack(side="left",
                                                                         padx=(4, 0))
-        ttk.Button(row, text="mostrar / ocultar", style="Quiet.TButton",
+        ttk.Button(row, text=tr("show / hide"), style="Quiet.TButton",
                    command=toggle).pack(side="left", padx=(10, 0))
 
         def restore():
@@ -6861,14 +7079,14 @@ class App:
             self.data = save_ui({"card_fields": [{"id": f, "on": on} for f, on in work]})
             self.vc.apply_layout()
             win.destroy()
-            self.say("Campos reorganizados.")
+            self.say(tr("Fields rearranged."))
 
         row2 = tk.Frame(win, bg=PAPER)
         row2.pack(fill="x", padx=18, pady=(0, 14))
-        ttk.Button(row2, text="Usar", command=apply_now).pack(side="left")
-        ttk.Button(row2, text="Padrão", style="Quiet.TButton",
+        ttk.Button(row2, text=tr("Use"), command=apply_now).pack(side="left")
+        ttk.Button(row2, text=tr("Default"), style="Quiet.TButton",
                    command=restore).pack(side="left", padx=(8, 0))
-        ttk.Button(row2, text="Cancelar", style="Quiet.TButton",
+        ttk.Button(row2, text=tr("Cancel"), style="Quiet.TButton",
                    command=win.destroy).pack(side="left", padx=(8, 0))
         win.bind("<Escape>", lambda e: win.destroy())
         redraw(0)
@@ -6876,18 +7094,18 @@ class App:
 
     def choose_typeface(self):
         fams = self.mono_families()
-        win = self.dialog("Tipo de letra do terminal", 420, 460)
-        tk.Label(win, text="TIPO DE LETRA DO TERMINAL", bg=PAPER, fg=FAINT,
+        win = self.dialog(tr("Terminal typeface"), 420, 460)
+        tk.Label(win, text=tr("TERMINAL TYPEFACE"), bg=PAPER, fg=FAINT,
                  font=self.f_label).pack(anchor="w", padx=18, pady=(14, 2))
-        tk.Label(win, text="Só faces monoespaçadas: qualquer outra desalinha\n"
-                           "as colunas e o cursor em bloco.",
+        tk.Label(win, text=tr("Monospaced faces only: any other misaligns\n"
+                              "the columns and the block cursor."),
                  bg=PAPER, fg=SOFT, font=self.f_meta, justify="left"
                  ).pack(anchor="w", padx=18, pady=(0, 8))
         box = tk.Listbox(win, height=12, width=34, font=self.f_meta, bg=PAPER, fg=INK,
                          relief="flat", highlightthickness=0, selectbackground=SELBG,
                          selectforeground=SELFG, activestyle="none")
         box.pack(fill="both", expand=True, padx=18)
-        box.insert("end", "(padrão)")
+        box.insert("end", tr("(default)"))
         for fam in fams:
             box.insert("end", fam)
         current = (self.data.get("ui") or {}).get("font_mono")
@@ -6910,8 +7128,8 @@ class App:
             self.stop_carets()
             self.root.destroy()
 
-        ttk.Button(row, text="Usar", command=apply).pack(side="left")
-        ttk.Button(row, text="Cancelar", style="Quiet.TButton",
+        ttk.Button(row, text=tr("Use"), command=apply).pack(side="left")
+        ttk.Button(row, text=tr("Cancel"), style="Quiet.TButton",
                    command=win.destroy).pack(side="left", padx=(8, 0))
         win.bind("<Escape>", lambda e: win.destroy())
 
@@ -6924,72 +7142,21 @@ class App:
         self.stop_carets()
         self.root.destroy()
 
-    def do_help(self):
-        self.show_text("Atalhos",
-                       "\n  Ctrl+F     ir para a busca"
-                       "\n  ↓ / Enter  da busca para a lista"
-                       "\n  Ctrl+N     nova pessoa"
-                       "\n  Ctrl+Q     entrada rápida (pessoas, formas ou conceitos)"
-                       "\n  Ctrl+S     salvar o registro aberto"
-                       "\n  Ctrl+Enter salvar e começar outro do mesmo tipo"
-                       "\n  Ctrl+Z / Ctrl+Y   desfazer / refazer"
-                       "\n  Ctrl+J / Ctrl+K   próximo / anterior, de qualquer lugar"
-                       "\n  Ctrl+G     ir para: nº (1852), carimbo, id ou nome"
-                       "\n  Ctrl+L     ver no registro: sai da busca, mostra o nº do aberto"
-                       "\n  Ctrl+B     abrir como livro (segunda janela, só leitura;"
-                       "\n             Enter no livro traz o registro para o cartão)"
-                       "\n  Ctrl+1..4  escopo pessoas / verba / fontes / corpus; Ctrl+0 tudo"
-                       "\n  /  na lista volta à busca;  Enter na lista vai ao cartão"
-                       "\n  Home / End na página;  PageUp / PageDown ou a roda vira a página"
-                       "\n  Ctrl+Home / Ctrl+End  começo / fim da lista"
-                       "\n  Ctrl+PageUp / Ctrl+PageDown vira a página de qualquer lugar"
-                       "\n  F5         recarregar do disco"
-                       "\n  Esc        voltar à lista\n"
-                       "\n  REGISTRO: todo registro recebe, ao ser gravado pela primeira"
-                       "\n  vez, um carimbo (AAAAMMDDhhmmss) e um número de ordem que"
-                       "\n  nunca muda; o que é apagado fica na sequência como cancelado."
-                       "\n  Sem busca, a lista é o registro, na ordem dos números; com"
-                       "\n  busca ou filtro, é o INDICADOR, em ordem alfabética. A lista"
-                       "\n  mostra o que cabe na janela, sem rolagem: o resto está nas"
-                       "\n  páginas seguintes.\n"
-                       "\n  Operadores da busca:"
-                       "\n  p: v: f: c:   só pessoas / verba / fontes / corpus"
-                       "\n  ^ab           nome que começa com ab"
-                       "\n  tag:csh  lang:de  type:livro  sys:renal  dom:direito  id:c_"
-                       "\n  ex.:  v: lang:de ^ab   ·   f: type:artigo luhmann\n"
-                       "\n  Campos de texto crescem até 10 linhas e depois rolam por"
-                       "\n  dentro (ui.max_rows no JSON muda o teto). O mapa do corpo"
-                       "\n  recolhe pelo [−] e lembra o estado.\n"
-                       "\n  No trilho, ACERVO limita a pessoas ou a verba;"
-                       "\n  qualquer filtro abaixo escolhe o acervo sozinho.\n"
-                       "\n  Tarefas (pessoas):"
-                       "\n  Enter       nova linha já com [ ]"
-                       "\n  Espaço      sobre o [ ] muda o estado"
-                       "\n  Ctrl+Espaço muda de qualquer ponto da linha"
-                       "\n  [ ] a fazer  [/] em curso  [>] esperando"
-                       "\n  [x] feito    [-] cancelado  (vão para o log ao salvar)"
-                       "\n  Data no fim é o prazo: 2026-09-10, 2026-09-10-1000,"
-                       "\n  ~2026-09-10 10:00. A ÚLTIMA data da linha vence.\n"
-                       "\n  Ligações, uma por linha, em qualquer cartão:"
-                       "\n  rel alvo [intervalo] — razão # fonte"
-                       "\n  ex.: expresses c_timoneiro -800/400 — sentido próprio"
-                       "\n  ex.: author_of s_wiener_1948_cybernetics"
-                       "\n  ex.: cites s_lochtrop_2006 — verbete p. 12"
-                       "\n  Alvo é o id: c_ conceito, f_ forma, p_ pessoa,"
-                       "\n  s_ fonte, h_ medida. Um rel fora da tabela não é"
-                       "\n  erro: é ligação ATÍPICA, com o rótulo que você deu;"
-                       "\n  o doctor lista as atípicas para você promover.\n"
-                       "\n  FONTE (em pessoas, verbetes e medidas): s_… de uma"
-                       "\n  fonte, ou texto livre. Fontes citam em ABNT, autor-data,"
-                       "\n  BibTeX ou CSL-JSON (seletor no cartão, botão copiar)."
-                       "\n  Corpus: leituras '2026-09-01 13.5 jejum', uma por linha;"
-                       "\n  fora da referência aparece com (!).\n"
-                       "\n  Sincronização: cada gravação relê o disco; ao abrir,"
-                       "\n  *.sync-conflict-* são fundidos e guardados em"
-                       f"\n  {CONFLICT_DIR.name}/. O histórico completo está em"
-                       f"\n  {STEM}.log.<máquina>.jsonl (menu Base › Histórico).\n")
+    def switch_language(self, code):
+        """View › Language: stored in ui.lang; the window is rebuilt in it."""
+        if code == LANG:
+            return
+        self.commit_if_dirty()
+        save_ui({"lang": code})
+        set_lang(code)
+        self.restart_theme = self.theme
+        self.stop_carets()
+        self.root.destroy()
 
-    # ------------------------------------------------------------ diálogos
+    def do_help(self):
+        self.show_text(tr("Shortcuts"), tr(HELP_TEXT, conflicts=CONFLICT_DIR.name, stem=STEM))
+
+    # ------------------------------------------------------------ dialogs
     def dialog(self, title, width=520, height=None):
         win = tk.Toplevel(self.root)
         win.title(title)
@@ -7002,7 +7169,8 @@ class App:
         paint_frame(win)
         return win
 
-    def confirm(self, title, message, yes="Sim", no="Cancelar"):
+    def confirm(self, title, message, yes=None, no=None):
+        yes, no = yes or tr("Yes"), no or tr("Cancel")
         win = self.dialog(title, 560, 230)
         answer = {"v": False}
         tk.Label(win, text=title, bg=PAPER, fg=INK,
@@ -7032,7 +7200,7 @@ class App:
                  font=(self.f_body[0], 14)).pack(anchor="w", padx=20, pady=(18, 6))
         tk.Label(win, text=message, bg=PAPER, fg=INK, font=self.f_meta,
                  justify="left", wraplength=510).pack(anchor="w", padx=20)
-        ttk.Button(win, text="OK", command=win.destroy).pack(side="bottom", anchor="w",
+        ttk.Button(win, text=tr("OK"), command=win.destroy).pack(side="bottom", anchor="w",
                                                              padx=20, pady=16)
         win.bind("<Escape>", lambda e: win.destroy())
         win.bind("<Return>", lambda e: win.destroy())
@@ -7062,24 +7230,23 @@ class App:
 
 # ================================================================ livro
 #
-# Protótipo, SÓ LEITURA: a base vista como um diário de bordo, em páginas
-# duplas que se viram. Página da esquerda, o rol (registros numerados);
-# página da direita, o fólio do registro escolhido. Tudo desenhado num
-# Canvas, em duas tintas, com o pontilhado (stipple) do próprio Tk fazendo
-# as vezes de meio-tom. Lê o JSON uma vez e não grava nada: nem base, nem
-# log, nem trava.
+# READ-ONLY: the base seen as a logbook, in two-page spreads that turn. The
+# left page is the roll (numbered records); the right page is the folio of the
+# chosen record. Everything is drawn on a Canvas, in two inks, with Tk's own
+# stipple standing in for halftone. It reads the JSON once and writes nothing:
+# no base, no log, no lock.
 
 BOOK_PALETTES = {
-    "papel": {"desk": "#2e2b25", "paper": "#e9e3d1", "ink": "#26241f", "hint": "#a59f8d"},
-    "noite": {"desk": "#0b0a08", "paper": "#18160f", "ink": "#e3b45f", "hint": "#8a6d3a"},
-    "mar":   {"desk": "#1b2422", "paper": "#d9e0d6", "ink": "#1f3a35", "hint": "#8fa39c"},
+    "paper": {"desk": "#2e2b25", "paper": "#e9e3d1", "ink": "#26241f", "hint": "#a59f8d"},
+    "night": {"desk": "#0b0a08", "paper": "#18160f", "ink": "#e3b45f", "hint": "#8a6d3a"},
+    "sea":   {"desk": "#1b2422", "paper": "#d9e0d6", "ink": "#1f3a35", "hint": "#8fa39c"},
 }
-BOOK_CHAPTERS = [("registro", "Registro"), ("people", "Pessoas"),
-                 ("entries", "Verba"), ("sources", "Fontes"), ("corpus", "Corpus")]
-KIND_TAG = {"person": "pessoa", "concept": "conceito", "form": "forma",
-            "source": "fonte", "metric": "medida"}
-KIND_SHORT = {"person": "pes", "concept": "con", "form": "for",
-              "source": "fon", "metric": "med"}
+BOOK_CHAPTERS = [("register", "Register"), ("people", "People"),
+                 ("entries", "Verba"), ("sources", "Sources"), ("corpus", "Corpus")]
+KIND_TAG = {"person": "person", "concept": "concept", "form": "form",
+            "source": "source", "metric": "measurement"}
+KIND_SHORT = {"person": "per", "concept": "con", "form": "frm",
+              "source": "src", "metric": "msr"}
 
 
 class BookView:
@@ -7088,13 +7255,13 @@ class BookView:
 
     def __init__(self, root, data, start_id=None, on_open=None):
         self.root, self.data = root, data
-        self.on_open = on_open     # da janela principal: abrir o registro no cartão
+        self.on_open = on_open     # from the main window: open the record on the card
         self.idx = by_id(data)
-        self.pal_name = "papel"
+        self.pal_name = "paper"
         self.animate = True
-        self.spreads = []          # [("front",)] + [("list", capítulo, página)]
-        self.cur = 0               # página dupla aberta
-        self.sel = 0               # linha escolhida no rol
+        self.spreads = []          # [("front",)] + [("list", chapter, page)]
+        self.cur = 0               # open spread
+        self.sel = 0               # chosen line in the roll
         self.busy = False
         self._job = None
         fams = set(tkfont.families(root))
@@ -7110,7 +7277,7 @@ class BookView:
         self.cw = self.f_body.measure("0")
         self.lh = self.f_body.metrics("linespace") + 7
 
-        root.title("Kustos · livro (só leitura)")
+        root.title(tr("Kustos · logbook (read-only)"))
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         w, h = min(1240, sw - 80), min(780, sh - 120)
         root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
@@ -7118,10 +7285,10 @@ class BookView:
         self.cv = tk.Canvas(root, highlightthickness=0, bd=0)
         self.cv.pack(fill="both", expand=True)
         self.chapters = self.build_chapters()
-        self.pending = None        # registro onde o livro abre
-        for i, (_, o) in enumerate(self.chapters["registro"]):
+        self.pending = None        # record the logbook opens on
+        for i, (_, o) in enumerate(self.chapters["register"]):
             if start_id and o.get("id") == start_id:
-                self.pending = ("registro", i)
+                self.pending = ("register", i)
 
         b = root.bind
         for k in ("<Next>", "<Right>", "<space>"):
@@ -7146,15 +7313,15 @@ class BookView:
         self.cv.bind("<Button-1>", self.click)
         self.cv.bind("<Configure>", self.resized)
 
-    # ---------------------------------------------------------- conteúdo
+    # ---------------------------------------------------------- content
     def build_chapters(self):
-        """Cada capítulo é uma lista ordenada de (tipo, objeto): "r" registro
-        vivo, "x" número cancelado."""
+        """Each chapter is an ordered list of (kind, object): "r" a live record,
+        "x" a cancelled number."""
         data = self.data
         live = {r["reg_n"]: r for c in COLLS for r in data[c] if r.get("reg_n")}
         gone = {d["reg_n"]: d for d in data.get("deleted", [])
                 if d.get("reg_n") and d["reg_n"] not in live}
-        out = {"registro": [("r", live[n]) if n in live else ("x", gone[n])
+        out = {"register": [("r", live[n]) if n in live else ("x", gone[n])
                             for n in sorted(set(live) | set(gone))]}
         for coll in ("people", "entries", "sources", "corpus"):
             rows = sorted((r for r in data[coll] if not r["id"].startswith("__")),
@@ -7163,8 +7330,8 @@ class BookView:
         return out
 
     def paginate(self):
-        """Refaz as páginas para o tamanho atual da janela, mantendo aberto o
-        registro que estava aberto."""
+        """Rebuilds the pages for the current window size, keeping open the
+        record that was open."""
         keep = self.current_rec() or self.pending
         self.pending = None
         self.spreads = [("front",)]
@@ -7179,7 +7346,7 @@ class BookView:
             self.reveal(keep)
 
     def reveal(self, target):
-        """Abre a página dupla onde `target` (chave, índice) está."""
+        """Opens the spread where `target` (key, index) is."""
         key, i = target
         for n, s in enumerate(self.spreads):
             if s[0] == "list" and s[1] == key and s[2] == i // self.per:
@@ -7199,7 +7366,7 @@ class BookView:
             return None
         return (s[1], s[2] * self.per + self.sel)
 
-    # ---------------------------------------------------------- geometria
+    # ---------------------------------------------------------- geometry
     def geometry(self):
         W, H = max(self.cv.winfo_width(), 200), max(self.cv.winfo_height(), 200)
         aw, ah = W - 56, H - 56 - 22
@@ -7222,7 +7389,7 @@ class BookView:
         usable = (y1 - y0) - 2 * self.pad - 70
         return int(usable // self.lh)
 
-    # ---------------------------------------------------------- desenho
+    # ---------------------------------------------------------- drawing
     def ink(self):
         return BOOK_PALETTES[self.pal_name]
 
@@ -7231,14 +7398,14 @@ class BookView:
         cv.delete("all")
         cv.configure(bg=P["desk"])
         x0, y0, x1, y1 = self.book
-        # sombra da capa e as folhas empilhadas na borda
+        # the cover's shadow and the stacked leaves at the edge
         cv.create_rectangle(x0 + 6, y0 + 8, x1 + 6, y1 + 8, fill=P["ink"], outline="",
                             stipple="gray50")
         for k in (3, 2, 1):
             cv.create_rectangle(x0 - k * 2, y0 + k, x1 + k * 2, y1 + k,
                                 fill=P["paper"], outline=P["ink"], width=1)
         cv.create_rectangle(x0, y0, x1, y1, fill=P["paper"], outline=P["ink"], width=1)
-        # lombada: meio-tom que escurece até o vinco
+        # spine: a halftone that darkens toward the fold
         for w, st in ((26, "gray12"), (14, "gray25"), (5, "gray50")):
             cv.create_rectangle(self.spine - w, y0, self.spine + w, y1,
                                 fill=P["ink"], outline="", stipple=st)
@@ -7285,62 +7452,64 @@ class BookView:
         t = self.text(cx, cy + 84, "KUSTOS", self.f_big, "n")
         y = self.cv.bbox(t)[3] + 6
         subject = (self.data.get("ui") or {}).get("corpus_subject") or ""
-        t = self.text(cx, y, "registro de " + subject if subject else "registro",
+        t = self.text(cx, y, tr("register of {name}", name=subject) if subject else tr("register"),
                       self.f_head, "n", width=bx1 - bx0 - 40)
         self.cv.itemconfigure(t, justify="center")
         y = self.cv.bbox(t)[3] + 8
         opened = ((self.data.get("book") or {}).get("opened") or "")[:10]
         if opened:
-            self.text(cx, y, f"aberto em {opened}", self.f_small, "n")
+            self.text(cx, y, tr("opened on {date}", date=opened), self.f_small, "n")
         self.text(cx, by1 - 28, summary(self.data), self.f_small, "s",
                   width=bx1 - bx0 - 40)
 
     def draw_contents_page(self):
         bx0, by0, bx1, by1 = self.page_box("right")
-        self.text((bx0 + bx1) / 2, by0 + 6, "Índice", self.f_title, "n")
+        self.text((bx0 + bx1) / 2, by0 + 6, tr("Contents"), self.f_title, "n")
         self.rule(bx0, bx1, by0 + 52, double=True)
         y = by0 + 78
         cols = int((bx1 - bx0) // self.cw)
         for n, (key, title) in enumerate(BOOK_CHAPTERS, 1):
             first = next(i for i, s in enumerate(self.spreads)
                          if s[0] == "list" and s[1] == key)
-            label = f"{n}  {title}  ({len(self.chapters[key])})"
+            label = f"{n}  {tr(title)}  ({len(self.chapters[key])})"
             page = str(first * 2 + 1)
             dots = "." * max(2, cols - len(label) - len(page) - 2)
             self.text(bx0, y, f"{label} {dots} {page}", tags=("toc", f"toc:{key}"))
             y += self.lh + 6
-        self.text(bx0, by1 - 4, "teclas 1–5 abrem os capítulos · t muda a tinta · "
-                  "a liga e desliga a animação", self.f_small, "sw", width=bx1 - bx0)
+        self.text(bx0, by1 - 4, tr("keys 1–5 open the chapters · t changes the ink · "
+                                   "a turns the animation on and off"),
+                  self.f_small, "sw", width=bx1 - bx0)
 
     def draw_list_page(self, s):
         P = self.ink()
         _, key, page = s
         bx0, by0, bx1, by1 = self.page_box("left")
-        title = dict(BOOK_CHAPTERS)[key]
+        title = tr(dict(BOOK_CHAPTERS)[key])
         items = self.page_items()
         self.sel = max(0, min(self.sel, len(items) - 1))
         self.text(bx0, by0, title.upper(), self.f_small)
         nums = [o.get("reg_n") for _, o in items if o.get("reg_n")]
-        if key == "registro" and nums:
+        if key == "register" and nums:
             self.text(bx1, by0, f"nº {nums[0]}–{nums[-1]}", self.f_small, "ne")
         else:
             total = len(self.chapters[key])
             a = page * self.per + 1
-            self.text(bx1, by0, f"{a}–{a + len(items) - 1} de {total}", self.f_small, "ne")
+            self.text(bx1, by0, tr("{a}–{b} of {n}", a=a, b=a + len(items) - 1, n=total),
+                      self.f_small, "ne")
         self.rule(bx0, bx1, by0 + 18, double=True)
         cols = int((bx1 - bx0) // self.cw)
-        tags = KIND_TAG if cols >= 42 else KIND_SHORT      # página estreita: rótulo curto
+        tags = KIND_TAG if cols >= 42 else KIND_SHORT      # narrow page: short label
         y = by0 + 32
         self.rows_y = []
         for i, (kind, o) in enumerate(items):
             n = o.get("reg_n")
             num = f"{n:>5}" if n else "    —"
             if kind == "x":
-                tag = "cancel." if tags is KIND_TAG else "×"
+                tag = tr("cancel.") if tags is KIND_TAG else "×"
                 name = o.get("name", "")
             else:
                 rk = kind_of(o)
-                tag = tags.get(rk, rk)
+                tag = tr(tags.get(rk, rk))
                 name = label_any(o, self.data)
             room = cols - len(num) - len(tag) - 4
             name = " ".join(name.split())
@@ -7361,7 +7530,7 @@ class BookView:
             y += self.lh
 
     def draw_folio(self):
-        """A página da direita: o registro escolhido, inteiro como cabe."""
+        """The right page: the chosen record, as much of it as fits."""
         P = self.ink()
         bx0, by0, bx1, by1 = self.page_box("right")
         items = self.page_items()
@@ -7369,17 +7538,17 @@ class BookView:
             return
         kind, o = items[min(self.sel, len(items) - 1)]
         n = o.get("reg_n")
-        self.text(bx0, by0, f"Nº {n}" if n else "SEM NÚMERO", self.f_small)
+        self.text(bx0, by0, f"Nº {n}" if n else tr("NO NUMBER"), self.f_small)
         if o.get("reg"):
             self.text(bx1, by0, stamp_label(o["reg"]), self.f_small, "ne")
         self.rule(bx0, bx1, by0 + 18, double=True)
         y = by0 + 30
         width = bx1 - bx0
         if kind == "x":
-            self.text(bx0, y, "Cancelado", self.f_title)
+            self.text(bx0, y, tr("Cancelled"), self.f_title)
             y += 46
-            for line in (f"era: {o.get('name', '')}", f"id: {o.get('id', '')}",
-                         f"em: {(o.get('at') or '').replace('T', ' ')}"):
+            for line in (tr("was: {name}", name=o.get("name", "")), f"id: {o.get('id', '')}",
+                         tr("on: {at}", at=(o.get("at") or "").replace("T", " "))):
                 self.text(bx0, y, line)
                 y += self.lh
             for k in range(6):
@@ -7387,7 +7556,7 @@ class BookView:
                                     fill=P["ink"], stipple="gray50")
             return
         rk = kind_of(o)
-        kicker = KIND_TAG.get(rk, rk).upper()
+        kicker = tr(KIND_TAG.get(rk, rk)).upper()
         if rk == "form" and o.get("lang"):
             kicker += " · " + o["lang"]
         if rk == "source" and o.get("type"):
@@ -7414,7 +7583,7 @@ class BookView:
                 lines += textwrap.wrap(para, cols) or [""]
             room = int((bottom - y) // (self.lh - 4))
             if len(lines) > room:
-                lines = lines[:max(0, room - 1)] + ["… (continua no cartão)"]
+                lines = lines[:max(0, room - 1)] + [tr("… (continued on the card)")]
             for line in lines:
                 self.text(bx0, y, line)
                 y += self.lh - 4
@@ -7424,47 +7593,47 @@ class BookView:
         d = self.data
         out = []
         if rk == "concept":
-            out.append(("glosa", o.get("gloss")))
+            out.append((tr("gloss"), o.get("gloss")))
         if rk == "form":
             bits = [o.get("roman"), o.get("attested"), o.get("status")]
-            out.append(("forma", "  ·  ".join(b for b in bits if b)))
+            out.append((tr("form"), "  ·  ".join(b for b in bits if b)))
         if rk == "person":
             bits = [", ".join(o.get("tags", [])), o.get("place") or "",
-                    ("desde " + o["met"]) if o.get("met") else ""]
+                    tr("since {date}", date=o["met"]) if o.get("met") else ""]
             out.append(("", "  ·  ".join(b for b in bits if b)))
             live = open_tasks(o)
             if live:
-                out.append(("tarefas", "\n".join(
+                out.append((tr("tasks"), "\n".join(
                     f"[{MARK_OF.get(t.get('state'), ' ')}] {t.get('text', '')}"
                     for t in live[:5])))
-            out.append(("notas", o.get("notes_raw")))
+            out.append((tr("notes"), o.get("notes_raw")))
         if rk == "source":
-            out.append(("citação (ABNT)", cite(o, "abnt", d)))
+            out.append((tr("citation (ABNT)"), cite(o, "abnt", d)))
             users = [r for c in ("people", "entries", "corpus") for r in d[c]
                      if r.get("source") == o["id"]]
             if users:
-                out.append((f"fonte de {len(users)}",
+                out.append((tr("source of {n}", n=len(users)),
                             ", ".join(label_any(r, d) for r in users[:12])))
         if rk == "metric":
             ref = " – ".join(str(x) for x in (o.get("ref_low"), o.get("ref_high")) if x)
-            out.append(("", f"{o.get('unit', '')}" + (f"  ·  referência {ref}" if ref else "")))
+            out.append(("", f"{o.get('unit', '')}" + ("  ·  " + tr("reference: ") + ref if ref else "")))
             reads = o.get("readings", [])[-8:]
             if reads:
-                out.append(("leituras", "\n".join(
+                out.append((tr("readings"), "\n".join(
                     f"{r.get('date', '')}  {r.get('value', '')}"
                     + ("  (!)" if out_of_range(o, r) else "") for r in reads)))
         if o.get("source") and rk != "source":
-            out.append(("fonte", resolve_source(o["source"], d)[1]))
+            out.append((tr("source"), resolve_source(o["source"], d)[1]))
         if rk in ("concept", "form", "metric"):
-            out.append(("notas", o.get("notes")))
+            out.append((tr("notes"), o.get("notes")))
         outs = [f"{rel_label(a['rel'])} → {label_any(self.idx[a['to']], d)}"
                 for a in edges_from(d, o["id"]) if a["to"] in self.idx]
         ins = [f"{label_any(self.idx[a['from']], d)} → {rel_label(a['rel'])}"
                for a in edges_to(d, o["id"]) if a["from"] in self.idx]
         if outs:
-            out.append(("ligações", "\n".join(outs)))
+            out.append((tr("links"), "\n".join(outs)))
         if ins:
-            out.append(("citado por", "\n".join(ins)))
+            out.append((tr("cited by"), "\n".join(ins)))
         return [(h, b) for h, b in out if (b or "").strip()]
 
     def draw_footer(self):
@@ -7472,12 +7641,12 @@ class BookView:
         n = self.cur * 2 + 1
         self.text(x0 + self.pad, y1 - 10, str(n), self.f_small, "sw")
         self.text(x1 - self.pad, y1 - 10, str(n + 1), self.f_small, "se")
-        card = "Enter: abrir no cartão · " if self.on_open else ""
-        hint = ("PageUp / PageDown, ← →, roda: virar · ↑ ↓: rol · 1–5: capítulos · "
-                f"{card}t: tinta · a: animação · Esc: fechar · só leitura")
+        card = tr("Enter: open on the card · ") if self.on_open else ""
+        hint = (tr("PageUp / PageDown, ← →, wheel: turn · ↑ ↓: roll · 1–5: chapters · ")
+                + card + tr("t: ink · a: animation · Esc: close · read-only"))
         if self.f_small.measure(hint) > self.W - 20:
-            hint = ("PgUp/PgDn ← → roda · ↑ ↓ · 1–5 · " + ("Enter · " if card else "")
-                    + "t · a · Esc · só leitura")
+            hint = (tr("PgUp/PgDn ← → wheel · ↑ ↓ · 1–5 · ") + ("Enter · " if card else "")
+                    + tr("t · a · Esc · read-only"))
         self.text(self.W / 2, self.H - 6, hint, self.f_small, "s", fill=self.ink()["hint"])
 
     # ---------------------------------------------------------- virar
@@ -7501,9 +7670,9 @@ class BookView:
         return "break"
 
     def page_turn(self, direction):
-        """A folha vira: desenha a página dupla nova por baixo e passa por
-        cima uma folha em branco que dobra na lombada, com o verso em
-        meio-tom e a sombra que ela projeta."""
+        """The leaf turns: draws the new spread underneath and passes a blank
+        leaf over it that folds at the spine, with its back in halftone and
+        the shadow it casts."""
         self.busy = True
         self.draw()
         P = self.ink()
@@ -7525,8 +7694,8 @@ class BookView:
         frame(0)
 
     def leaf_at(self, parts, t, direction):
-        """A folha no instante t (0 a 1): presa na lombada, a borda solta vai
-        de um lado ao outro; a meio caminho levanta, e o verso aparece."""
+        """The leaf at instant t (0 to 1): held at the spine, its free edge goes
+        from one side to the other; halfway it lifts, and its back shows."""
         leaf, back, shadow = parts
         x0, y0, x1, y1 = self.book
         pw = self.spine - x0
@@ -7582,7 +7751,7 @@ class BookView:
             self.turn(-1)
 
     def open_in_card(self):
-        """Leva a janela principal ao registro escolhido (o livro só lê)."""
+        """Takes the main window to the chosen record (the logbook only reads)."""
         if not self.on_open or self.busy:
             return "break"
         items = self.page_items()
@@ -7618,18 +7787,18 @@ class BookView:
 
 
 def cmd_book():
-    """Abre a base como livro, só para ler."""
+    """Opens the base as a logbook, for reading only."""
     global tk, tkfont, ttk
     try:
         import tkinter as _tk
         from tkinter import font as _tkfont, ttk as _ttk
     except ImportError:
-        raise SystemExit("Este Python veio sem Tkinter. Reinstale marcando tcl/tk.")
+        raise SystemExit(tr("This Python came without Tkinter. Reinstall it with tcl/tk."))
     tk, tkfont, ttk = _tk, _tkfont, _ttk
     data = load_json()
     if needs_upgrade(data):
-        print("A base ainda não tem números de registro: abra o programa normal "
-              "uma vez antes (o livro não grava nada).")
+        print(tr("The base has no register numbers yet: open the main program once "
+                 "first (the logbook writes nothing)."))
     root = tk.Tk()
     BookView(root, data)
     root.mainloop()
@@ -7644,7 +7813,7 @@ def cmd_app(open_id=None):
         import tkinter as _tk
         from tkinter import font as _tkfont, ttk as _ttk
     except ImportError:
-        raise SystemExit("Este Python veio sem Tkinter. Reinstale marcando tcl/tk.")
+        raise SystemExit(tr("This Python came without Tkinter. Reinstall it with tcl/tk."))
     tk, tkfont, ttk = _tk, _tkfont, _ttk
 
     notices = []
@@ -7654,8 +7823,8 @@ def cmd_app(open_id=None):
         opening = cmd_upgrade(quiet=True)
         n_after = len(load_json()["sources"])
         if schema_version(old) < 3:
-            notices.append(f"Base atualizada para {SCHEMA}: {n_after - n_before} "
-                           "fonte(s) criadas a partir do campo FONTE.")
+            notices.append(tr("Base updated to {schema}: {n} source(s) created from the "
+                              "SOURCE field.", schema=SCHEMA, n=n_after - n_before))
         if opening:
             notices.append(opening)
     if (CORPUS_SUBJECT and JSON_FILE.exists()
@@ -7663,14 +7832,14 @@ def cmd_app(open_id=None):
         save_ui({"corpus_subject": CORPUS_SUBJECT})
     reports = absorb_conflicts()
     if reports:
-        notices.append("Conflitos absorvidos: " + describe_merge(reports))
+        notices.append(tr("Conflicts merged: ") + describe_merge(reports))
         try:
             write_mirror(load_json())
         except SystemExit:
             pass
     for o in other_locks():
-        notices.append(f"Aberto também em {o.get('host')} desde {o.get('since')}: "
-                       "editar nas duas máquinas ao mesmo tempo gera conflito.")
+        notices.append(tr("Also open on {host} since {since}: editing on both machines "
+                          "at once causes conflicts.", host=o.get("host"), since=o.get("since")))
     take_lock()
 
     theme = (load_json().get("ui") or {}).get("theme", "paper")
@@ -7687,7 +7856,7 @@ def cmd_app(open_id=None):
                         if rid in by_id(u.data):
                             u.open_record(rid)
                         else:
-                            u.say(f"O registro {rid} não existe.")
+                            u.say(tr("The record {id} does not exist.", id=rid))
                     except Exception:
                         pass
                 root.after(260, jump)
@@ -7703,13 +7872,15 @@ def cmd_app(open_id=None):
 
 
 def main():
+    if JSON_FILE.exists():
+        set_lang(((read_vault(JSON_FILE) or {}).get("ui") or {}).get("lang", "en"))
     args = sys.argv[1:]
     if not args:
         return cmd_app()
     cmd, rest = args[0], args[1:]
     if cmd == "app":
         return cmd_app(rest[0] if rest else None)
-    if cmd == "livro":
+    if cmd in ("logbook", "livro"):       # "livro" kept for older shortcuts
         return cmd_book()
     if cmd == "migrate":
         return cmd_migrate()
@@ -7745,6 +7916,871 @@ def main():
     print(__doc__)
     return 0
 
+
+# ================================================================ Portuguese
+#
+# The Portuguese interface: English text as written in tr() -> its Portuguese.
+# A string missing here simply shows in English. Placeholders ({n}, {name}...)
+# must match on both sides.
+
+PT = {
+    "{rel} (atypical)":
+        "{rel} (atípica)",
+    "expresses":
+        "exprime",
+    "derives from":
+        "deriva de",
+    "cognate of":
+        "cognato de",
+    "borrows from":
+        "empresta de",
+    "calques":
+        "decalca",
+    "specializes":
+        "especializa",
+    "opposes":
+        "opõe-se a",
+    "analogous to":
+        "análogo a",
+    "instrument of":
+        "instrumento de",
+    "requires":
+        "exige",
+    "coined by":
+        "cunhado por",
+    "used by":
+        "usado por",
+    "about":
+        "sobre",
+    "author of":
+        "autor de",
+    "editor of":
+        "organizador de",
+    "translator of":
+        "tradutor de",
+    "knows":
+        "conhece",
+    "cites":
+        "cita",
+    "attested in":
+        "atestada em",
+    "defined in":
+        "definido em",
+    "measured in":
+        "medido em",
+    "part of":
+        "parte de",
+    "edition of":
+        "edição de",
+    "translates":
+        "traduz",
+    "comments on":
+        "comenta",
+    "responds to":
+        "responde a",
+    "affects":
+        "afeta",
+    "correlates with":
+        "correlaciona com",
+    "Gloss":
+        "Glosa",
+    "Language, romanization, attested, status":
+        "Língua, romanização, atestada, status",
+    "Domains":
+        "Domínios",
+    "Tags":
+        "Tags",
+    "Source":
+        "Fonte",
+    "Notes":
+        "Notas",
+    "Links (text)":
+        "Ligações (texto)",
+    "Resolved links":
+        "Ligações resolvidas",
+    "Cited by":
+        "Citado por",
+    "AUTHORS  (one per line: SURNAME, Name  ·  or p_… of a person)":
+        "AUTORES  (um por linha: SOBRENOME, Nome  ·  ou p_… de uma pessoa)",
+    "DATE / YEAR":
+        "DATA / ANO",
+    "IN  (journal, book, collection, site, body)":
+        "EM  (periódico, livro, coletânea, site, órgão)",
+    "PUBLISHER / INSTITUTION / COURT":
+        "EDITORA / INSTITUIÇÃO / TRIBUNAL",
+    "PLACE":
+        "LOCAL",
+    "EDITION":
+        "EDIÇÃO",
+    "VOLUME":
+        "VOLUME",
+    "ISSUE":
+        "NÚMERO",
+    "PAGES":
+        "PÁGINAS",
+    "DOI":
+        "DOI",
+    "ISBN / ISSN":
+        "ISBN / ISSN",
+    "URL":
+        "URL",
+    "ACCESSED":
+        "ACESSO EM",
+    "LANGUAGE":
+        "LÍNGUA",
+    "EXTRA  (key: value, one per line — rapporteur, summary, number…)":
+        "EXTRA  (chave: valor, uma por linha — relator, ementa, número…)",
+    "{id} (no such source)":
+        "{id} (fonte inexistente)",
+    "{name} could not be read. Nothing was written. Check the file, or use `replay` to rebuild it from the logs.":
+        "{name} não pôde ser lido. Nada foi gravado. Confira o arquivo, ou use `replay` para reconstruir a partir dos logs.",
+    "not registered":
+        "sem registro",
+    "stamp of the old id":
+        "carimbo do id antigo",
+    "first save in the log":
+        "primeira gravação no log",
+    "last update":
+        "última atualização",
+    "day of the last update":
+        "dia da última atualização",
+    "opening of the register":
+        "abertura do registro",
+    "{file}: {added} added, {replaced} updated":
+        "{file}: {added} entraram, {replaced} atualizados",
+    ", {n} deleted":
+        ", {n} apagados",
+    "repeated id: {id}":
+        "id repetido: {id}",
+    "{id}: person without a name":
+        "{id}: pessoa sem nome",
+    "name repeated among people: {name} ({ids})":
+        "nome repetido entre pessoas: {name} ({ids})",
+    "{id}: unknown kind {kind}":
+        "{id}: tipo desconhecido {kind}",
+    "{id}: no name":
+        "{id}: sem nome",
+    "{id}: concept without a gloss":
+        "{id}: conceito sem glosa",
+    "{id}: form without a language":
+        "{id}: forma sem língua",
+    "{id}: reconstructed without an asterisk":
+        "{id}: reconstruída sem asterisco",
+    "{id}: asterisk but status is not reconstructed":
+        "{id}: asterisco mas status não é reconstructed",
+    "{id}: source without a title":
+        "{id}: fonte sem título",
+    "{id}: source without an author":
+        "{id}: fonte sem autor",
+    "{id}: measurement without a name":
+        "{id}: medida sem nome",
+    "{id}: measurement without a system":
+        "{id}: medida sem sistema",
+    "{label}: {date} = {value} outside the reference range":
+        "{label}: {date} = {value} fora da referência",
+    "{id}: SOURCE points to {src}, which does not exist":
+        "{id}: FONTE aponta para {src}, que não existe",
+    "link {i}: missing origin {id}":
+        "ligação {i}: origem inexistente {id}",
+    "link {i}: missing target {id} (in {label})":
+        "ligação {i}: alvo inexistente {id} (em {label})",
+    "link {i}: {rel} connects {a}->{b}, but got {c}->{d} ({src} -> {dst})":
+        "ligação {i}: {rel} liga {a}->{b}, mas recebeu {c}->{d} ({src} -> {dst})",
+    "link {i}: links {label} to itself":
+        "ligação {i}: liga {label} a si mesmo",
+    "no reason or source: {src} -{rel}-> {dst}":
+        "sem razão nem fonte: {src} -{rel}-> {dst}",
+    "{n} atypical link(s), with a rel outside the RELS table (not an error; promote it by editing the program):":
+        "{n} ligação(ões) atípica(s), com rel fora da tabela RELS (não é erro; promova ao editar o programa):",
+    "register not opened yet: it opens on the next save (or run `upgrade`)":
+        "registro ainda não aberto: abre na próxima gravação (ou rode `upgrade`)",
+    "{id}: no order number (gets one on the next save)":
+        "{id}: sem número de ordem (recebe na próxima gravação)",
+    "{id}: invalid registration stamp {stamp}":
+        "{id}: carimbo de registro inválido {stamp}",
+    "nº {n} repeated: {ids} (resolves itself on the next save)":
+        "nº {n} repetido: {ids} (resolve sozinho na próxima gravação)",
+    "stamp {stamp} repeated: {ids}":
+        "carimbo {stamp} repetido: {ids}",
+    "{n} number(s) with neither a record nor a cancellation: {shown}":
+        "{n} número(s) sem registro nem cancelamento: {shown}",
+    "{people} people · {entries} entries ({concepts} concepts, {forms} forms) · {sources} sources · {metrics} measurements ({readings} readings) · {links} links":
+        "{people} pessoas · {entries} verbetes ({concepts} conceitos, {forms} formas) · {sources} fontes · {metrics} medidas ({readings} leituras) · {links} ligações",
+    "{e} errors, {w} warnings":
+        "{e} erros, {w} avisos",
+    "ERROR":
+        "ERRO",
+    "warning":
+        "aviso",
+    "locks from other machines:":
+        "travas de outras máquinas:",
+    "{host} since {since}":
+        "{host} desde {since}",
+    "{n} conflict file(s) waiting: run `merge`.":
+        "{n} arquivo(s) de conflito à espera: rode `merge`.",
+    "no order number":
+        "sem número de ordem",
+    "{locus} · registered {stamp}":
+        "{locus} · registrado {stamp}",
+    "Not overwriting {name}: it lacks the generated-file mark, so it may have been written by hand. Rename it.":
+        "Não sobrescrevo {name}: não tem a marca de arquivo gerado, pode ter sido escrito à mão. Renomeie-o.",
+    "Mirror of {file}. {summary}. Rebuilt on {date}. Edit in the app, not in this file.":
+        "Espelho de {file}. {summary}. Refeito em {date}. Edite o app, não este arquivo.",
+    "People":
+        "Pessoas",
+    "Sources":
+        "Fontes",
+    "source: ":
+        "fonte: ",
+    "concept":
+        "conceito",
+    "form":
+        "forma",
+    "domains: ":
+        "domínios: ",
+    "attested: ":
+        "atestada: ",
+    "source of {n} {coll}: ":
+        "fonte de {n} {coll}: ",
+    "people":
+        "pessoas",
+    "verba":
+        "verba",
+    "sources":
+        "fontes",
+    "corpus":
+        "corpus",
+    "unit: ":
+        "unidade: ",
+    "reference: ":
+        "referência: ",
+    "person":
+        "pessoa",
+    "source":
+        "fonte",
+    "measurement":
+        "medida",
+    "Results for \"{query}\"  ({n} found)":
+        "Resultados para \"{query}\"  ({n} encontrados)",
+    "(nothing found)":
+        "(nada encontrado)",
+    "no log lines for {id}":
+        "nenhuma linha de log para {id}",
+    "{n} links":
+        "{n} ligações",
+    "{name} already exists; migration only runs in a folder without it.":
+        "{name} já existe; a migração só roda numa pasta sem ele.",
+    "skipped (unreadable): {name}":
+        "ignorado (ilegível): {name}",
+    "{name}: {n} records, {added} new, {newer} newer":
+        "{name}: {n} registros, {added} novos, {newer} mais novos",
+    "current":
+        "atual",
+    "conflict":
+        "conflito",
+    "{name}: {n} records that only existed there":
+        "{name}: {n} registros que só existiam ali",
+    "{n} nameless entry(ies) discarded: {ids}":
+        "{n} verbete(s) sem nome descartados: {ids}",
+    "did not move {name}: {err}":
+        "não movi {name}: {err}",
+    "Old files in {old}/. Mirror in {mirror}.":
+        "Arquivos antigos em {old}/. Espelho em {mirror}.",
+    "File does not exist: {path}":
+        "Arquivo não existe: {path}",
+    "{n} new people from {name}.":
+        "{n} pessoas novas de {name}.",
+    "{n} got an addendum [addendum {date}]:":
+        "{n} receberam addendum [addendum {date}]:",
+    "{n} already had everything; untouched.":
+        "{n} já tinham tudo; intocadas.",
+    "{n} people normalized. Mirror rebuilt.":
+        "{n} pessoas normalizadas. Espelho refeito.",
+    "no conflict files in the folder":
+        "nenhum arquivo de conflito na pasta",
+    "deleted":
+        "apagado",
+    "{n} kept as they were":
+        "{n} mantidos como estavam",
+    "conflicts stored in {dir}/":
+        "conflitos guardados em {dir}/",
+    "{n} from {origin}":
+        "{n} por {origin}",
+    "Register opened: {count} records numbered, from nº 1 to nº {n}. Inferred stamps: {bits}.":
+        "Registro aberto: {count} registros numerados, do nº 1 ao nº {n}. Carimbos inferidos: {bits}.",
+    "{name} is already at {schema}.":
+        "{name} já está em {schema}.",
+    "{n} source(s) created from the SOURCE field, {m} records repointed:":
+        "{n} fonte(s) criadas a partir do campo FONTE, {m} registros reapontados:",
+    "source not found (or ambiguous): {key}":
+        "fonte não encontrada (ou ambígua): {key}",
+    "unknown style; use one of: {styles}":
+        "estilo desconhecido; use um de: {styles}",
+    "format: bibtex | csl | abnt":
+        "formato: bibtex | csl | abnt",
+    "{n} sources -> {name}":
+        "{n} fontes -> {name}",
+    "{added} sources imported from {name}, {skipped} already existed.":
+        "{added} fontes importadas de {name}, {skipped} já existiam.",
+    "{n} measurements -> {name}":
+        "{n} medidas -> {name}",
+    "personal record by body system":
+        "registro pessoal por sistemas",
+    "Systems":
+        "Sistemas",
+    "Out of range":
+        "Fora da referência",
+    "Near the limit":
+        "Perto do limite",
+    "In range":
+        "Dentro",
+    "overview":
+        "visão geral",
+    "full panel":
+        "painel completo",
+    "timeline":
+        "linha do tempo",
+    "Map":
+        "Mapa",
+    "Figure inscribed in a circle and a square, in the Vitruvian manner, with one anatomical plate per system":
+        "Figura inscrita em círculo e quadrado, à maneira vitruviana, com uma lâmina anatômica por sistema",
+    "After Leonardo's canon of proportions; the fainter open-limbed pose is the second exposure. Pick a system to change the plate.":
+        "Segundo o cânone de proporções de Leonardo; a pose de membros abertos, mais tênue, é a segunda exposição. Escolha um sistema para trocar a lâmina.",
+    "System":
+        "Sistema",
+    "Measurement":
+        "Medida",
+    "Latest":
+        "Última",
+    "Reference":
+        "Referência",
+    "Date":
+        "Data",
+    "Status":
+        "Estado",
+    "in range":
+        "dentro",
+    "near the limit":
+        "perto do limite",
+    "out":
+        "fora",
+    "no reference":
+        "sem referência",
+    "mirror of _kustos.json":
+        "espelho de _kustos.json",
+    "rebuilt by _kustos.py; edit in the window, not here.":
+        "refeito pelo _kustos.py; edite na janela, não aqui.",
+    "Record":
+        "Registro",
+    "Pick a system to see its readings and trend.":
+        "Escolha um sistema para ver as leituras e a tendência.",
+    "measurements":
+        "medidas",
+    "last reading":
+        "última leitura",
+    "none":
+        "nenhuma",
+    "No measurements.":
+        "Nenhuma medida.",
+    "Value":
+        "Valor",
+    "Note":
+        "Obs.",
+    "Save":
+        "Salvar",
+    "Save and new":
+        "Salvar e nova",
+    "Delete":
+        "Apagar",
+    "TAGS":
+        "TAGS",
+    "NOTES":
+        "NOTAS",
+    "DOMICILIUM":
+        "DOMICILIUM",
+    "ALSO KNOWN AS":
+        "TAMBÉM CONHECIDO COMO",
+    "LINKS":
+        "LIGAÇÕES",
+    "TASKS":
+        "TAREFAS",
+    "CITED BY  (double-click opens)":
+        "CITADO POR  (duplo clique abre)",
+    "CIRCLES":
+        "CÍRCULOS",
+    "concern":
+        "concern",
+    "adapt":
+        "adapt",
+    "influence":
+        "influence",
+    "control":
+        "control",
+    "no circle":
+        "nenhum círculo",
+    "todo":
+        "todo",
+    "doing":
+        "doing",
+    "waiting":
+        "waiting",
+    "done":
+        "done",
+    "cancelled":
+        "cancelled",
+    " — goes to the log on save":
+        " — vai para o log ao salvar",
+    "draft":
+        "rascunho",
+    "met {date}":
+        "met {date}",
+    "edit {date}":
+        "edit {date}",
+    "GLOSS":
+        "GLOSA",
+    "ROMANIZATION":
+        "ROMANIZAÇÃO",
+    "ATTESTED":
+        "ATESTADA",
+    "STATUS":
+        "STATUS",
+    "DOMAINS":
+        "DOMÍNIOS",
+    "rel  target  [span]  — reason  # source     (the target can be a person's p_…)":
+        "rel  alvo  [intervalo]  — razão  # fonte     (alvo pode ser p_… de uma pessoa)",
+    "RESOLVED LINKS  (double-click opens)":
+        "LIGAÇÕES RESOLVIDAS  (duplo clique abre)",
+    "URLS":
+        "LINKS",
+    "URLs":
+        "Links",
+    "{id}  (missing target)":
+        "{id}  (alvo inexistente)",
+    "body map":
+        "mapa do corpo",
+    "SYSTEMS":
+        "SISTEMAS",
+    "no measurements yet":
+        "nenhuma medida ainda",
+    "a click filters the list; (!) out of range":
+        "clique filtra a lista; (!) fora da referência",
+    "TYPE":
+        "TIPO",
+    "changing the type only changes the visible fields; nothing is lost":
+        "mudar o tipo só muda os campos visíveis; nada se perde",
+    "CITATION":
+        "CITAÇÃO",
+    "copy":
+        "copiar",
+    "LINKS  (rel  target  [span]  — reason  # source)":
+        "LIGAÇÕES  (rel  alvo  [intervalo]  — razão  # fonte)",
+    "SOURCE OF  (records whose SOURCE field points here; double-click opens)":
+        "FONTE DE  (registros cujo campo FONTE aponta para cá; duplo clique abre)",
+    "[raw text kept]":
+        "[texto bruto guardado]",
+    "(could not build the citation: {err})":
+        "(não consegui montar a citação: {err})",
+    "Citation copied.":
+        "Citação copiada.",
+    "SYSTEM":
+        "SISTEMA",
+    "UNIT":
+        "UNIDADE",
+    "REF. MIN.":
+        "REF. MÍN.",
+    "REF. MAX.":
+        "REF. MÁX.",
+    "READINGS  (one per line:  2026-09-01 [10:30]  value  note)":
+        "LEITURAS  (uma por linha:  2026-09-01 [10:30]  valor  observação)",
+    "+ today's reading":
+        "+ leitura de hoje",
+    "LINKS  (rel  target  — reason)":
+        "LIGAÇÕES  (rel  alvo  — razão)",
+    "(no numeric readings)":
+        "(sem leituras numéricas)",
+    "no readings":
+        "sem leituras",
+    "{n} readings · latest {date} = {value}":
+        "{n} leituras · última {date} = {value}",
+    " · min {lo} · max {hi} · mean {mean}":
+        " · mín {lo} · máx {hi} · média {mean}",
+    " · {n} out of range":
+        " · {n} fora da referência",
+    "Typeface \"{name}\" {why}; using {mono}.":
+        "Tipo \"{name}\" {why}; usando {mono}.",
+    "quick entry":
+        "entrada rápida",
+    "+ measurement":
+        "+ medida",
+    "+ source":
+        "+ fonte",
+    "+ form":
+        "+ forma",
+    "+ concept":
+        "+ conceito",
+    "+ person":
+        "+ pessoa",
+    "SOURCE  (a source's s_…, or free text)":
+        "FONTE  (s_… de uma fonte, ou texto livre)",
+    "open":
+        "abrir",
+    "free text (use + source to make it a record)":
+        "texto livre (use + fonte para virar registro)",
+    "Widths locked.":
+        "Larguras travadas.",
+    "Widths free.":
+        "Larguras livres.",
+    "New person":
+        "Nova pessoa",
+    "New concept":
+        "Novo conceito",
+    "New form":
+        "Nova forma",
+    "New source":
+        "Nova fonte",
+    "New measurement (corpus)":
+        "Nova medida (corpus)",
+    "Quick entry…":
+        "Entrada rápida…",
+    "Reload from disk":
+        "Recarregar do disco",
+    "Quit":
+        "Sair",
+    "File":
+        "Arquivo",
+    "Rebuild markdown mirror":
+        "Refazer espelho markdown",
+    "Open body map (corpus, HTML)":
+        "Abrir mapa do corpo (corpus, HTML)",
+    "Check structure":
+        "Verificar estrutura",
+    "Normalize inline #tags (people)":
+        "Normalizar #tags inline (pessoas)",
+    "Merge sync conflicts":
+        "Absorver conflitos de sincronização",
+    "History of the open record":
+        "Histórico do registro aberto",
+    "Import sources from Zotero (CSL-JSON or BibTeX)…":
+        "Importar fontes do Zotero (CSL-JSON ou BibTeX)…",
+    "Export sources (BibTeX)":
+        "Exportar fontes (BibTeX)",
+    "Export sources (CSL-JSON)":
+        "Exportar fontes (CSL-JSON)",
+    "Export sources (ABNT, text)":
+        "Exportar fontes (ABNT, texto)",
+    "Base":
+        "Base",
+    "Terminal typeface…":
+        "Tipo de letra do terminal…",
+    "Entry card fields…":
+        "Campos do verbete…",
+    "Open as logbook":
+        "Abrir como livro",
+    "Reset widths":
+        "Redefinir larguras",
+    "Lock widths":
+        "Travar larguras",
+    "Language":
+        "Idioma",
+    "View":
+        "Ver",
+    "Shortcuts":
+        "Atalhos",
+    "Help":
+        "Ajuda",
+    "{id} no longer exists (the logbook shows the base as it was when opened).":
+        "{id} não existe mais (o livro mostra a base de quando abriu).",
+    "Go to":
+        "Ir para",
+    "GO TO  (nº, stamp, id or name)":
+        "IR PARA  (nº, carimbo, id ou nome)",
+    "No record with nº or stamp {key}.":
+        "Nenhum registro com nº ou carimbo {key}.",
+    "{n} records with that name; pick one in the list.":
+        "{n} registros com esse nome; escolha na lista.",
+    "Nothing called {key}.":
+        "Nada chamado {key}.",
+    "is not installed":
+        "não instalado",
+    "is not monospaced":
+        "não é monoespaçado",
+    "has no metrics":
+        "sem métricas",
+    "is unreadable":
+        "ilegível",
+    "cancelled · {name}":
+        "cancelado · {name}",
+    "on {date}":
+        "em {date}",
+    "new":
+        "novo",
+    "empty":
+        "vazio",
+    "REGISTER · {span}":
+        "REGISTRO · {span}",
+    "{n} records":
+        "{n} registros",
+    "INDEX · {a}–{b} of {n}":
+        "INDICADOR · {a}–{b} de {n}",
+    "INDEX · nothing found":
+        "INDICADOR · nada encontrado",
+    "{n} of {total}":
+        "{n} de {total}",
+    "NOT REGISTERED · GETS A NUMBER ON SAVE":
+        "SEM REGISTRO · RECEBE NÚMERO AO SALVAR",
+    "REGISTER Nº {n}    REGISTERED {stamp}":
+        "REGISTRO Nº {n}    REGISTRADO {stamp}",
+    "(inferred: {origin})":
+        "(inferido: {origin})",
+    "formerly nº {n}":
+        "antes nº {n}",
+    "COLLECTIONS":
+        "ACERVO",
+    "WORK":
+        "TRABALHO",
+    "to do":
+        "a fazer",
+    "in progress":
+        "em curso",
+    "waiting on":
+        "esperando",
+    "untagged":
+        "sem tag",
+    "CALENDAR":
+        "CALENDÁRIO",
+    "KIND":
+        "TIPO",
+    "concepts":
+        "conceitos",
+    "forms":
+        "formas",
+    "DOMAIN":
+        "DOMÍNIO",
+    "SOURCE TYPE":
+        "TIPO DE FONTE",
+    "(no system)":
+        "(sem sistema)",
+    "REGISTER Nº {n}    CANCELLED ON {at}  ·  {name}  ({id})":
+        "REGISTRO Nº {n}    CANCELADO EM {at}  ·  {name}  ({id})",
+    "Cancelled record: its history is in the log (Base › History).":
+        "Registro cancelado: o histórico está no log (Base › Histórico).",
+    "{id} does not exist.":
+        "{id} não existe.",
+    "New person. It only reaches the disk when saved.":
+        "Pessoa nova. Só vai ao disco quando salvar.",
+    "New entry. The id is generated when saved with a name.":
+        "Verbete novo. O id é gerado ao salvar com nome.",
+    "New source. The id is generated when saved with a title.":
+        "Fonte nova. O id é gerado ao salvar com título.",
+    "New measurement. The id is generated when saved with a name.":
+        "Medida nova. O id é gerado ao salvar com nome.",
+    "{n} link line(s) not understood were kept as drafts.":
+        "{n} linha(s) de ligação não entendidas ficaram como rascunho.",
+    "Saved \"{name}\" automatically.":
+        "Salvo \"{name}\" automaticamente.",
+    "A source needs a name.":
+        "Uma fonte precisa de nome.",
+    "A measurement needs a name.":
+        "Uma medida precisa de nome.",
+    "Not saved":
+        "Não salvo",
+    "Saved {date}":
+        "Salvo {date}",
+    "A person needs a name.":
+        "Uma pessoa precisa de nome.",
+    "{n} finished task(s) went to the log.":
+        "{n} tarefa(s) concluída(s) foram para o log.",
+    "An entry needs a name.":
+        "Um verbete precisa de nome.",
+    "Delete \"{label}\"?":
+        "Apagar \"{label}\"?",
+    "{n} link(s) involving this record go too.":
+        "{n} ligação(ões) envolvendo este registro também somem.",
+    "The log keeps the previous version (Base › History).":
+        "O log guarda a versão anterior (menu Base › Histórico).",
+    "Deleted. The previous version is in the log.":
+        "Apagado. A versão anterior está no log.",
+    "Quick entry":
+        "Entrada rápida",
+    "QUICK ENTRY":
+        "ENTRADA RÁPIDA",
+    "SOURCE":
+        "FONTE",
+    "One per line:  - Name. Notes about the person.":
+        "Uma por linha:  - Nome. Notas sobre a pessoa.",
+    "One reference per line, as you would write it (SURNAME, Name. Title. Place: Publisher, year).":
+        "Uma referência por linha, como você a escreveria (SOBRENOME, Nome. Título. Local: Editora, ano).",
+    "One per line:  name. gloss":
+        "Uma por linha:  nome. glosa",
+    "{n} added":
+        "{n} adicionadas",
+    "{n} got an addendum: ":
+        "{n} receberam addendum: ",
+    "{n} were already there":
+        "{n} já constavam",
+    "Nothing to add.":
+        "Nada a adicionar.",
+    "{added} source(s) added, {skipped} already existed.":
+        "{added} fonte(s) adicionadas, {skipped} já existiam.",
+    "A form needs a language.":
+        "Uma forma precisa de língua.",
+    "{n} entry(ies) added.":
+        "{n} verbete(s) adicionados.",
+    " Concepts without a gloss show up in Check structure.":
+        " Conceitos sem glosa aparecem em Verificar estrutura.",
+    "Add":
+        "Adicionar",
+    "Cancel":
+        "Cancelar",
+    "Mirror not rebuilt":
+        "Espelho não refeito",
+    "Body map rebuilt and opened: {name}":
+        "Mapa do corpo refeito e aberto: {name}",
+    "Mirror rebuilt: {name}":
+        "Espelho refeito: {name}",
+    "No structural errors.":
+        "Nenhum erro de estrutura.",
+    "Also open on: ":
+        "Aberto também em: ",
+    "Structure":
+        "Estrutura",
+    "Normalize inline tags":
+        "Normalizar tags inline",
+    "Move #hashtags and dates written in people's names and notes into the tags field?":
+        "Mover #hashtags e datas escritas nos nomes e notas das pessoas para o campo de tags?",
+    "Normalize":
+        "Normalizar",
+    "Normalized.":
+        "Normalizado.",
+    "No conflict files in the folder.":
+        "Nenhum arquivo de conflito na pasta.",
+    "{n} kept":
+        "{n} mantidos",
+    "Conflicts merged":
+        "Conflitos absorvidos",
+    "Open a saved record first.":
+        "Abra um registro salvo primeiro.",
+    "History · {label}":
+        "Histórico · {label}",
+    "Zotero export (CSL-JSON or BibTeX)":
+        "Export do Zotero (CSL-JSON ou BibTeX)",
+    "All files":
+        "Todos",
+    "Import":
+        "Importação",
+    "(in {dir})":
+        "(em {dir})",
+    "Entry card fields":
+        "Campos do verbete",
+    "ENTRY CARD FIELDS":
+        "CAMPOS DO VERBETE",
+    "Space shows or hides. The arrows move.":
+        "Espaço mostra ou esconde. As setas movem.",
+    "show / hide":
+        "mostrar / ocultar",
+    "Fields rearranged.":
+        "Campos reorganizados.",
+    "Use":
+        "Usar",
+    "Default":
+        "Padrão",
+    "Terminal typeface":
+        "Tipo de letra do terminal",
+    "TERMINAL TYPEFACE":
+        "TIPO DE LETRA DO TERMINAL",
+    "Monospaced faces only: any other misaligns\nthe columns and the block cursor.":
+        "Só faces monoespaçadas: qualquer outra desalinha\nas colunas e o cursor em bloco.",
+    "(default)":
+        "(padrão)",
+    "Yes":
+        "Sim",
+    "\n  Ctrl+F     go to the search\n  ↓ / Enter  from the search to the list\n  Ctrl+N     new person\n  Ctrl+Q     quick entry (people, forms or concepts)\n  Ctrl+S     save the open record\n  Ctrl+Enter save and start another of the same kind\n  Ctrl+Z / Ctrl+Y   undo / redo\n  Ctrl+J / Ctrl+K   next / previous, from anywhere\n  Ctrl+G     go to: nº (1852), stamp, id or name\n  Ctrl+L     show in the register: leaves the search, shows the open record's nº\n  Ctrl+B     open as logbook (second window, read-only;\n             Enter in the logbook brings the record to the card)\n  Ctrl+1..4  scope people / verba / sources / corpus; Ctrl+0 everything\n  /  in the list goes back to the search;  Enter in the list goes to the card\n  Home / End within the page;  PageUp / PageDown or the wheel turns the page\n  Ctrl+Home / Ctrl+End  start / end of the list\n  Ctrl+PageUp / Ctrl+PageDown turns the page from anywhere\n  F5         reload from disk\n  Esc        back to the list\n\n  REGISTER: every record gets, on its first save, a stamp\n  (YYYYMMDDhhmmss) and an order number that never changes;\n  what is deleted stays in the sequence as cancelled.\n  Without a search, the list is the register, in number order;\n  with a search or filter, it is the INDEX, in alphabetical order.\n  The list shows what fits the window, without scrolling: the rest\n  is on the following pages.\n\n  Search operators:\n  p: v: f: c:   only people / verba / sources / corpus\n  ^ab           name starting with ab\n  tag:csh  lang:de  type:book  sys:renal  dom:law  id:c_\n  e.g.:  v: lang:de ^ab   ·   f: type:article luhmann\n\n  Text fields grow up to 10 lines and then scroll inside\n  (ui.max_rows in the JSON changes the limit). The body map\n  folds with [−] and remembers its state.\n\n  In the rail, COLLECTIONS limits to people or verba;\n  any filter below picks the collection by itself.\n\n  Tasks (people):\n  Enter       new line already with [ ]\n  Space       on the [ ] changes the state\n  Ctrl+Space  changes it from anywhere on the line\n  [ ] to do   [/] in progress  [>] waiting on\n  [x] done    [-] cancelled  (they go to the log on save)\n  A date at the end is the deadline: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. The LAST date on the line wins.\n\n  Links, one per line, on any card:\n  rel target [span] — reason # source\n  e.g.: expresses c_timoneiro -800/400 — literal sense\n  e.g.: author_of s_wiener_1948_cybernetics\n  e.g.: cites s_lochtrop_2006 — entry p. 12\n  The target is the id: c_ concept, f_ form, p_ person,\n  s_ source, h_ measurement. A rel outside the table is not\n  an error: it is an ATYPICAL link, with the label you gave;\n  the doctor lists the atypical ones for you to promote.\n\n  SOURCE (on people, entries and measurements): a source's\n  s_…, or free text. Sources cite in ABNT, author-date,\n  BibTeX or CSL-JSON (picker on the card, copy button).\n  Corpus: readings '2026-09-01 13.5 fasting', one per line;\n  out of range shows with (!).\n\n  Sync: every save rereads the disk; on opening,\n  *.sync-conflict-* files are merged and stored in\n  {conflicts}/. The full history is in\n  {stem}.log.<machine>.jsonl (Base › History).\n":
+        "\n  Ctrl+F     ir para a busca\n  ↓ / Enter  da busca para a lista\n  Ctrl+N     nova pessoa\n  Ctrl+Q     entrada rápida (pessoas, formas ou conceitos)\n  Ctrl+S     salvar o registro aberto\n  Ctrl+Enter salvar e começar outro do mesmo tipo\n  Ctrl+Z / Ctrl+Y   desfazer / refazer\n  Ctrl+J / Ctrl+K   próximo / anterior, de qualquer lugar\n  Ctrl+G     ir para: nº (1852), carimbo, id ou nome\n  Ctrl+L     ver no registro: sai da busca, mostra o nº do aberto\n  Ctrl+B     abrir como livro (segunda janela, só leitura;\n             Enter no livro traz o registro para o cartão)\n  Ctrl+1..4  escopo pessoas / verba / fontes / corpus; Ctrl+0 tudo\n  /  na lista volta à busca;  Enter na lista vai ao cartão\n  Home / End na página;  PageUp / PageDown ou a roda vira a página\n  Ctrl+Home / Ctrl+End  começo / fim da lista\n  Ctrl+PageUp / Ctrl+PageDown vira a página de qualquer lugar\n  F5         recarregar do disco\n  Esc        voltar à lista\n\n  REGISTRO: todo registro recebe, ao ser gravado pela primeira\n  vez, um carimbo (AAAAMMDDhhmmss) e um número de ordem que\n  nunca muda; o que é apagado fica na sequência como cancelado.\n  Sem busca, a lista é o registro, na ordem dos números; com\n  busca ou filtro, é o INDICADOR, em ordem alfabética. A lista\n  mostra o que cabe na janela, sem rolagem: o resto está nas\n  páginas seguintes.\n\n  Operadores da busca:\n  p: v: f: c:   só pessoas / verba / fontes / corpus\n  ^ab           nome que começa com ab\n  tag:csh  lang:de  type:livro  sys:renal  dom:direito  id:c_\n  ex.:  v: lang:de ^ab   ·   f: type:artigo luhmann\n\n  Campos de texto crescem até 10 linhas e depois rolam por\n  dentro (ui.max_rows no JSON muda o teto). O mapa do corpo\n  recolhe pelo [−] e lembra o estado.\n\n  No trilho, ACERVO limita a pessoas ou a verba;\n  qualquer filtro abaixo escolhe o acervo sozinho.\n\n  Tarefas (pessoas):\n  Enter       nova linha já com [ ]\n  Espaço      sobre o [ ] muda o estado\n  Ctrl+Espaço muda de qualquer ponto da linha\n  [ ] a fazer  [/] em curso  [>] esperando\n  [x] feito    [-] cancelado  (vão para o log ao salvar)\n  Data no fim é o prazo: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. A ÚLTIMA data da linha vence.\n\n  Ligações, uma por linha, em qualquer cartão:\n  rel alvo [intervalo] — razão # fonte\n  ex.: expresses c_timoneiro -800/400 — sentido próprio\n  ex.: author_of s_wiener_1948_cybernetics\n  ex.: cites s_lochtrop_2006 — verbete p. 12\n  Alvo é o id: c_ conceito, f_ forma, p_ pessoa,\n  s_ fonte, h_ medida. Um rel fora da tabela não é\n  erro: é ligação ATÍPICA, com o rótulo que você deu;\n  o doctor lista as atípicas para você promover.\n\n  FONTE (em pessoas, verbetes e medidas): s_… de uma\n  fonte, ou texto livre. Fontes citam em ABNT, autor-data,\n  BibTeX ou CSL-JSON (seletor no cartão, botão copiar).\n  Corpus: leituras '2026-09-01 13.5 jejum', uma por linha;\n  fora da referência aparece com (!).\n\n  Sincronização: cada gravação relê o disco; ao abrir,\n  *.sync-conflict-* são fundidos e guardados em\n  {conflicts}/. O histórico completo está em\n  {stem}.log.<máquina>.jsonl (menu Base › Histórico).\n",
+    "OK":
+        "OK",
+    "Kustos · logbook (read-only)":
+        "Kustos · livro (só leitura)",
+    "Register":
+        "Registro",
+    "Verba":
+        "Verba",
+    "Corpus":
+        "Corpus",
+    "per":
+        "pes",
+    "con":
+        "con",
+    "frm":
+        "for",
+    "src":
+        "fon",
+    "msr":
+        "med",
+    "register of {name}":
+        "registro de {name}",
+    "register":
+        "registro",
+    "opened on {date}":
+        "aberto em {date}",
+    "Contents":
+        "Índice",
+    "keys 1–5 open the chapters · t changes the ink · a turns the animation on and off":
+        "teclas 1–5 abrem os capítulos · t muda a tinta · a liga e desliga a animação",
+    "{a}–{b} of {n}":
+        "{a}–{b} de {n}",
+    "cancel.":
+        "cancel.",
+    "NO NUMBER":
+        "SEM NÚMERO",
+    "Cancelled":
+        "Cancelado",
+    "was: {name}":
+        "era: {name}",
+    "on: {at}":
+        "em: {at}",
+    "… (continued on the card)":
+        "… (continua no cartão)",
+    "gloss":
+        "glosa",
+    "since {date}":
+        "desde {date}",
+    "tasks":
+        "tarefas",
+    "notes":
+        "notas",
+    "citation (ABNT)":
+        "citação (ABNT)",
+    "source of {n}":
+        "fonte de {n}",
+    "readings":
+        "leituras",
+    "links":
+        "ligações",
+    "cited by":
+        "citado por",
+    "Enter: open on the card · ":
+        "Enter: abrir no cartão · ",
+    "PageUp / PageDown, ← →, wheel: turn · ↑ ↓: roll · 1–5: chapters · ":
+        "PageUp / PageDown, ← →, roda: virar · ↑ ↓: rol · 1–5: capítulos · ",
+    "t: ink · a: animation · Esc: close · read-only":
+        "t: tinta · a: animação · Esc: fechar · só leitura",
+    "PgUp/PgDn ← → wheel · ↑ ↓ · 1–5 · ":
+        "PgUp/PgDn ← → roda · ↑ ↓ · 1–5 · ",
+    "t · a · Esc · read-only":
+        "t · a · Esc · só leitura",
+    "This Python came without Tkinter. Reinstall it with tcl/tk.":
+        "Este Python veio sem Tkinter. Reinstale marcando tcl/tk.",
+    "The base has no register numbers yet: open the main program once first (the logbook writes nothing).":
+        "A base ainda não tem números de registro: abra o programa normal uma vez antes (o livro não grava nada).",
+    "Base updated to {schema}: {n} source(s) created from the SOURCE field.":
+        "Base atualizada para {schema}: {n} fonte(s) criadas a partir do campo FONTE.",
+    "Conflicts merged: ":
+        "Conflitos absorvidos: ",
+    "Also open on {host} since {since}: editing on both machines at once causes conflicts.":
+        "Aberto também em {host} desde {since}: editar nas duas máquinas ao mesmo tempo gera conflito.",
+    "The record {id} does not exist.":
+        "O registro {id} não existe.",
+}
 
 if __name__ == "__main__":
     sys.exit(main() or 0)

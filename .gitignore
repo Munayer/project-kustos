@@ -1,4 +1,4 @@
-# Dados pessoais: nunca vão para o repositório
+# Personal data: never goes into the repository
 _kustos.json
 _kustos.*.json
 _kustos.log.*.jsonl
