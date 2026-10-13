@@ -33,6 +33,7 @@ a ser usado; apagar deixa o número na sequência, como cancelado.
 USO
     python _kustos.py                 abre a janela
     python _kustos.py app [id]        abre a janela, já no registro
+    python _kustos.py livro           a base como livro (protótipo, só leitura)
     python _kustos.py doctor          valida a estrutura, não muda nada
     python _kustos.py mirror          refaz o espelho markdown
     python _kustos.py corpus          refaz o mapa do corpo (HTML) e abre
@@ -51,11 +52,13 @@ USO
 
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
 import socket
 import sys
+import textwrap
 import unicodedata
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -7034,6 +7037,560 @@ class App:
         self.root.destroy()
 
 
+# ================================================================ livro
+#
+# Protótipo, SÓ LEITURA: a base vista como um diário de bordo, em páginas
+# duplas que se viram. Página da esquerda, o rol (registros numerados);
+# página da direita, o fólio do registro escolhido. Tudo desenhado num
+# Canvas, em duas tintas, com o pontilhado (stipple) do próprio Tk fazendo
+# as vezes de meio-tom. Lê o JSON uma vez e não grava nada: nem base, nem
+# log, nem trava.
+
+BOOK_PALETTES = {
+    "papel": {"desk": "#2e2b25", "paper": "#e9e3d1", "ink": "#26241f", "hint": "#a59f8d"},
+    "noite": {"desk": "#0b0a08", "paper": "#18160f", "ink": "#e3b45f", "hint": "#8a6d3a"},
+    "mar":   {"desk": "#1b2422", "paper": "#d9e0d6", "ink": "#1f3a35", "hint": "#8fa39c"},
+}
+BOOK_CHAPTERS = [("registro", "Registro"), ("people", "Pessoas"),
+                 ("entries", "Verba"), ("sources", "Fontes"), ("corpus", "Corpus")]
+KIND_TAG = {"person": "pessoa", "concept": "conceito", "form": "forma",
+            "source": "fonte", "metric": "medida"}
+KIND_SHORT = {"person": "pes", "concept": "con", "form": "for",
+              "source": "fon", "metric": "med"}
+
+
+class BookView:
+    TURN_FRAMES = 14
+    TURN_MS = 15
+
+    def __init__(self, root, data):
+        self.root, self.data = root, data
+        self.idx = by_id(data)
+        self.pal_name = "papel"
+        self.animate = True
+        self.spreads = []          # [("front",)] + [("list", capítulo, página)]
+        self.cur = 0               # página dupla aberta
+        self.sel = 0               # linha escolhida no rol
+        self.busy = False
+        self._job = None
+        fams = set(tkfont.families(root))
+        mono = next((f for f in ("Cascadia Mono", "Consolas", "Lucida Console",
+                                 "DejaVu Sans Mono", "Courier New") if f in fams), "Courier")
+        serif = next((f for f in ("Georgia", "Times New Roman", "Liberation Serif",
+                                  "DejaVu Serif") if f in fams), "Times")
+        self.f_body = tkfont.Font(root, family=mono, size=10)
+        self.f_small = tkfont.Font(root, family=mono, size=8)
+        self.f_title = tkfont.Font(root, family=serif, size=22)
+        self.f_big = tkfont.Font(root, family=serif, size=40)
+        self.f_head = tkfont.Font(root, family=serif, size=13, slant="italic")
+        self.cw = self.f_body.measure("0")
+        self.lh = self.f_body.metrics("linespace") + 7
+
+        root.title("Kustos · livro (só leitura)")
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = min(1240, sw - 80), min(780, sh - 120)
+        root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
+        root.minsize(820, 520)
+        self.cv = tk.Canvas(root, highlightthickness=0, bd=0)
+        self.cv.pack(fill="both", expand=True)
+        self.chapters = self.build_chapters()
+
+        b = root.bind
+        for k in ("<Next>", "<Right>", "<space>"):
+            b(k, lambda e: self.turn(1))
+        for k in ("<Prior>", "<Left>", "<BackSpace>"):
+            b(k, lambda e: self.turn(-1))
+        b("<Down>", lambda e: self.step(1))
+        b("<Up>", lambda e: self.step(-1))
+        b("<Home>", lambda e: self.open_spread(0, -1))
+        b("<End>", lambda e: self.open_spread(len(self.spreads) - 1, 1))
+        b("<MouseWheel>", lambda e: self.turn(-1 if e.delta > 0 else 1))
+        b("<Button-4>", lambda e: self.turn(-1))
+        b("<Button-5>", lambda e: self.turn(1))
+        for n, (key, _) in enumerate(BOOK_CHAPTERS, 1):
+            b(str(n), lambda e, k=key: self.open_chapter(k))
+        b("<t>", lambda e: self.cycle_palette())
+        b("<a>", lambda e: self.toggle_animation())
+        b("<Escape>", lambda e: root.destroy())
+        b("<q>", lambda e: root.destroy())
+        self.cv.bind("<Button-1>", self.click)
+        self.cv.bind("<Configure>", self.resized)
+
+    # ---------------------------------------------------------- conteúdo
+    def build_chapters(self):
+        """Cada capítulo é uma lista ordenada de (tipo, objeto): "r" registro
+        vivo, "x" número cancelado."""
+        data = self.data
+        live = {r["reg_n"]: r for c in COLLS for r in data[c] if r.get("reg_n")}
+        gone = {d["reg_n"]: d for d in data.get("deleted", [])
+                if d.get("reg_n") and d["reg_n"] not in live}
+        out = {"registro": [("r", live[n]) if n in live else ("x", gone[n])
+                            for n in sorted(set(live) | set(gone))]}
+        for coll in ("people", "entries", "sources", "corpus"):
+            rows = sorted(data[coll], key=lambda r: sort_key(label_any(r, data)))
+            out[coll] = [("r", r) for r in rows]
+        return out
+
+    def paginate(self):
+        """Refaz as páginas para o tamanho atual da janela, mantendo aberto o
+        registro que estava aberto."""
+        keep = self.current_rec()
+        self.spreads = [("front",)]
+        per = max(4, self.list_rows())
+        for key, _ in BOOK_CHAPTERS:
+            items = self.chapters[key]
+            for p in range(max(1, -(-len(items) // per))):
+                self.spreads.append(("list", key, p))
+        self.per = per
+        self.cur = min(self.cur, len(self.spreads) - 1)
+        if keep:
+            self.reveal(keep)
+
+    def reveal(self, target):
+        """Abre a página dupla onde `target` (chave, índice) está."""
+        key, i = target
+        for n, s in enumerate(self.spreads):
+            if s[0] == "list" and s[1] == key and s[2] == i // self.per:
+                self.cur, self.sel = n, i % self.per
+                return
+
+    def page_items(self, n=None):
+        s = self.spreads[self.cur if n is None else n]
+        if s[0] != "list":
+            return []
+        items = self.chapters[s[1]]
+        return items[s[2] * self.per:(s[2] + 1) * self.per]
+
+    def current_rec(self):
+        s = self.spreads[self.cur] if self.spreads else ("front",)
+        if s[0] != "list":
+            return None
+        return (s[1], s[2] * self.per + self.sel)
+
+    # ---------------------------------------------------------- geometria
+    def geometry(self):
+        W, H = max(self.cv.winfo_width(), 200), max(self.cv.winfo_height(), 200)
+        aw, ah = W - 56, H - 56 - 22
+        ratio = 1.46
+        if aw / ah > ratio:
+            bh = ah
+            bw = bh * ratio
+        else:
+            bw = aw
+            bh = bw / ratio
+        x0, y0 = (W - bw) / 2, (H - 22 - bh) / 2
+        self.W, self.H = W, H
+        self.book = (x0, y0, x0 + bw, y0 + bh)
+        self.spine = x0 + bw / 2
+        self.pad = max(22, bw * 0.04)
+
+    def list_rows(self):
+        self.geometry()
+        x0, y0, x1, y1 = self.book
+        usable = (y1 - y0) - 2 * self.pad - 70
+        return int(usable // self.lh)
+
+    # ---------------------------------------------------------- desenho
+    def ink(self):
+        return BOOK_PALETTES[self.pal_name]
+
+    def draw(self):
+        cv, P = self.cv, self.ink()
+        cv.delete("all")
+        cv.configure(bg=P["desk"])
+        x0, y0, x1, y1 = self.book
+        # sombra da capa e as folhas empilhadas na borda
+        cv.create_rectangle(x0 + 6, y0 + 8, x1 + 6, y1 + 8, fill=P["ink"], outline="",
+                            stipple="gray50")
+        for k in (3, 2, 1):
+            cv.create_rectangle(x0 - k * 2, y0 + k, x1 + k * 2, y1 + k,
+                                fill=P["paper"], outline=P["ink"], width=1)
+        cv.create_rectangle(x0, y0, x1, y1, fill=P["paper"], outline=P["ink"], width=1)
+        # lombada: meio-tom que escurece até o vinco
+        for w, st in ((26, "gray12"), (14, "gray25"), (5, "gray50")):
+            cv.create_rectangle(self.spine - w, y0, self.spine + w, y1,
+                                fill=P["ink"], outline="", stipple=st)
+        cv.create_line(self.spine, y0, self.spine, y1, fill=P["ink"])
+        s = self.spreads[self.cur]
+        if s[0] == "front":
+            self.draw_title_page()
+            self.draw_contents_page()
+        else:
+            self.draw_list_page(s)
+            self.draw_folio()
+        self.draw_footer()
+
+    def page_box(self, side):
+        x0, y0, x1, y1 = self.book
+        p = self.pad
+        if side == "left":
+            return x0 + p, y0 + p, self.spine - p, y1 - p
+        return self.spine + p, y0 + p, x1 - p, y1 - p
+
+    def rule(self, x0, x1, y, double=False):
+        P = self.ink()
+        self.cv.create_line(x0, y, x1, y, fill=P["ink"])
+        if double:
+            self.cv.create_line(x0, y + 3, x1, y + 3, fill=P["ink"])
+
+    def text(self, x, y, s, font=None, anchor="nw", fill=None, width=None, tags=()):
+        kw = {"width": width} if width else {}
+        return self.cv.create_text(x, y, text=s, font=font or self.f_body, anchor=anchor,
+                                   fill=fill or self.ink()["ink"], tags=tags, **kw)
+
+    def draw_title_page(self):
+        P = self.ink()
+        bx0, by0, bx1, by1 = self.page_box("left")
+        cx = (bx0 + bx1) / 2
+        self.cv.create_rectangle(bx0, by0, bx1, by1, outline=P["ink"])
+        self.cv.create_rectangle(bx0 + 5, by0 + 5, bx1 - 5, by1 - 5, outline=P["ink"])
+        cy = by0 + (by1 - by0) * 0.28
+        for r, st in ((62, "gray12"), (46, "gray25"), (30, "gray50")):
+            pts = [c for xy in ellipse_points(cx, cy, r, r, n=48) for c in xy]
+            self.cv.create_polygon(*pts, fill=P["ink"], outline=P["ink"], stipple=st)
+        pts = [c for xy in ellipse_points(cx, cy, 14, 14, n=32) for c in xy]
+        self.cv.create_polygon(*pts, fill=P["paper"], outline=P["ink"])
+        t = self.text(cx, cy + 84, "KUSTOS", self.f_big, "n")
+        y = self.cv.bbox(t)[3] + 6
+        subject = (self.data.get("ui") or {}).get("corpus_subject") or ""
+        t = self.text(cx, y, "registro de " + subject if subject else "registro",
+                      self.f_head, "n", width=bx1 - bx0 - 40)
+        self.cv.itemconfigure(t, justify="center")
+        y = self.cv.bbox(t)[3] + 8
+        opened = ((self.data.get("book") or {}).get("opened") or "")[:10]
+        if opened:
+            self.text(cx, y, f"aberto em {opened}", self.f_small, "n")
+        self.text(cx, by1 - 28, summary(self.data), self.f_small, "s",
+                  width=bx1 - bx0 - 40)
+
+    def draw_contents_page(self):
+        bx0, by0, bx1, by1 = self.page_box("right")
+        self.text((bx0 + bx1) / 2, by0 + 6, "Índice", self.f_title, "n")
+        self.rule(bx0, bx1, by0 + 52, double=True)
+        y = by0 + 78
+        cols = int((bx1 - bx0) // self.cw)
+        for n, (key, title) in enumerate(BOOK_CHAPTERS, 1):
+            first = next(i for i, s in enumerate(self.spreads)
+                         if s[0] == "list" and s[1] == key)
+            label = f"{n}  {title}  ({len(self.chapters[key])})"
+            page = str(first * 2 + 1)
+            dots = "." * max(2, cols - len(label) - len(page) - 2)
+            self.text(bx0, y, f"{label} {dots} {page}", tags=("toc", f"toc:{key}"))
+            y += self.lh + 6
+        self.text(bx0, by1 - 4, "teclas 1–5 abrem os capítulos · t muda a tinta · "
+                  "a liga e desliga a animação", self.f_small, "sw", width=bx1 - bx0)
+
+    def draw_list_page(self, s):
+        P = self.ink()
+        _, key, page = s
+        bx0, by0, bx1, by1 = self.page_box("left")
+        title = dict(BOOK_CHAPTERS)[key]
+        items = self.page_items()
+        self.sel = max(0, min(self.sel, len(items) - 1))
+        self.text(bx0, by0, title.upper(), self.f_small)
+        nums = [o.get("reg_n") for _, o in items if o.get("reg_n")]
+        if key == "registro" and nums:
+            self.text(bx1, by0, f"nº {nums[0]}–{nums[-1]}", self.f_small, "ne")
+        else:
+            total = len(self.chapters[key])
+            a = page * self.per + 1
+            self.text(bx1, by0, f"{a}–{a + len(items) - 1} de {total}", self.f_small, "ne")
+        self.rule(bx0, bx1, by0 + 18, double=True)
+        cols = int((bx1 - bx0) // self.cw)
+        tags = KIND_TAG if cols >= 46 else KIND_SHORT      # página estreita: rótulo curto
+        y = by0 + 32
+        self.rows_y = []
+        for i, (kind, o) in enumerate(items):
+            n = o.get("reg_n")
+            num = f"{n:>5}" if n else "    —"
+            if kind == "x":
+                tag = "cancel." if tags is KIND_TAG else "×"
+                name = o.get("name", "")
+            else:
+                rk = kind_of(o)
+                tag = tags.get(rk, rk)
+                name = label_any(o, self.data)
+            room = cols - len(num) - len(tag) - 4
+            name = " ".join(name.split())
+            name = name if len(name) <= room else name[:room - 1] + "…"
+            dots = "." * max(1, room - len(name))
+            line = f"{num}  {name} {dots} {tag}"
+            top = y - 3
+            if i == self.sel:
+                self.cv.create_rectangle(bx0 - 4, top, bx1 + 4, top + self.lh - 1,
+                                         fill=P["ink"], outline="")
+                self.text(bx0, y, line, fill=P["paper"])
+            else:
+                self.text(bx0, y, line)
+                if kind == "x":
+                    self.cv.create_line(bx0 + 7 * self.cw, y + self.lh / 2 - 3, bx1,
+                                        y + self.lh / 2 - 3, fill=P["ink"])
+            self.rows_y.append((top, top + self.lh, i))
+            y += self.lh
+
+    def draw_folio(self):
+        """A página da direita: o registro escolhido, inteiro como cabe."""
+        P = self.ink()
+        bx0, by0, bx1, by1 = self.page_box("right")
+        items = self.page_items()
+        if not items:
+            return
+        kind, o = items[min(self.sel, len(items) - 1)]
+        n = o.get("reg_n")
+        self.text(bx0, by0, f"Nº {n}" if n else "SEM NÚMERO", self.f_small)
+        if o.get("reg"):
+            self.text(bx1, by0, stamp_label(o["reg"]), self.f_small, "ne")
+        self.rule(bx0, bx1, by0 + 18, double=True)
+        y = by0 + 30
+        width = bx1 - bx0
+        if kind == "x":
+            self.text(bx0, y, "Cancelado", self.f_title)
+            y += 46
+            for line in (f"era: {o.get('name', '')}", f"id: {o.get('id', '')}",
+                         f"em: {(o.get('at') or '').replace('T', ' ')}"):
+                self.text(bx0, y, line)
+                y += self.lh
+            for k in range(6):
+                self.cv.create_line(bx0, by0 + 120 + k * 40, bx1, by0 + 80 + k * 40,
+                                    fill=P["ink"], stipple="gray50")
+            return
+        rk = kind_of(o)
+        kicker = KIND_TAG.get(rk, rk).upper()
+        if rk == "form" and o.get("lang"):
+            kicker += " · " + o["lang"]
+        if rk == "source" and o.get("type"):
+            kicker += " · " + o["type"]
+        if rk == "metric" and o.get("system"):
+            kicker += " · " + o["system"]
+        self.text(bx0, y, kicker, self.f_small)
+        y += 18
+        t = self.text(bx0, y, label_any(o, self.data), self.f_title, width=width)
+        y = self.cv.bbox(t)[3] + 10
+        self.rule(bx0, bx1, y)
+        y += 12
+        cols = max(10, int(width // self.cw))
+        bottom = by1 - 6
+        blocks = self.folio_blocks(o, rk)
+        for head, body in blocks:
+            if y > bottom - 2 * self.lh:
+                break
+            if head:
+                self.text(bx0, y, head.upper(), self.f_small)
+                y += 16
+            lines = []
+            for para in (body or "").splitlines() or [""]:
+                lines += textwrap.wrap(para, cols) or [""]
+            room = int((bottom - y) // (self.lh - 4))
+            if len(lines) > room:
+                lines = lines[:max(0, room - 1)] + ["… (continua no cartão)"]
+            for line in lines:
+                self.text(bx0, y, line)
+                y += self.lh - 4
+            y += 10
+
+    def folio_blocks(self, o, rk):
+        d = self.data
+        out = []
+        if rk == "concept":
+            out.append(("glosa", o.get("gloss")))
+        if rk == "form":
+            bits = [o.get("roman"), o.get("attested"), o.get("status")]
+            out.append(("forma", "  ·  ".join(b for b in bits if b)))
+        if rk == "person":
+            bits = [", ".join(o.get("tags", [])), o.get("place") or "",
+                    ("desde " + o["met"]) if o.get("met") else ""]
+            out.append(("", "  ·  ".join(b for b in bits if b)))
+            live = open_tasks(o)
+            if live:
+                out.append(("tarefas", "\n".join(
+                    f"[{MARK_OF.get(t.get('state'), ' ')}] {t.get('text', '')}"
+                    for t in live[:5])))
+            out.append(("notas", o.get("notes_raw")))
+        if rk == "source":
+            out.append(("citação (ABNT)", cite(o, "abnt", d)))
+            users = [r for c in ("people", "entries", "corpus") for r in d[c]
+                     if r.get("source") == o["id"]]
+            if users:
+                out.append((f"fonte de {len(users)}",
+                            ", ".join(label_any(r, d) for r in users[:12])))
+        if rk == "metric":
+            ref = " – ".join(str(x) for x in (o.get("ref_low"), o.get("ref_high")) if x)
+            out.append(("", f"{o.get('unit', '')}" + (f"  ·  referência {ref}" if ref else "")))
+            reads = o.get("readings", [])[-8:]
+            if reads:
+                out.append(("leituras", "\n".join(
+                    f"{r.get('date', '')}  {r.get('value', '')}"
+                    + ("  (!)" if out_of_range(o, r) else "") for r in reads)))
+        if o.get("source") and rk != "source":
+            out.append(("fonte", resolve_source(o["source"], d)[1]))
+        if rk in ("concept", "form", "metric"):
+            out.append(("notas", o.get("notes")))
+        outs = [f"{rel_label(a['rel'])} → {label_any(self.idx[a['to']], d)}"
+                for a in edges_from(d, o["id"]) if a["to"] in self.idx]
+        ins = [f"{label_any(self.idx[a['from']], d)} → {rel_label(a['rel'])}"
+               for a in edges_to(d, o["id"]) if a["from"] in self.idx]
+        if outs:
+            out.append(("ligações", "\n".join(outs)))
+        if ins:
+            out.append(("citado por", "\n".join(ins)))
+        return [(h, b) for h, b in out if (b or "").strip()]
+
+    def draw_footer(self):
+        x0, y0, x1, y1 = self.book
+        n = self.cur * 2 + 1
+        self.text(x0 + self.pad, y1 - 10, str(n), self.f_small, "sw")
+        self.text(x1 - self.pad, y1 - 10, str(n + 1), self.f_small, "se")
+        hint = ("PageUp / PageDown, ← →, roda: virar · ↑ ↓: rol · 1–5: capítulos · "
+                "t: tinta · a: animação · Esc: fechar · só leitura")
+        if self.f_small.measure(hint) > self.W - 20:
+            hint = "PgUp/PgDn ← → roda · ↑ ↓ · 1–5 · t · a · Esc · só leitura"
+        self.text(self.W / 2, self.H - 6, hint, self.f_small, "s", fill=self.ink()["hint"])
+
+    # ---------------------------------------------------------- virar
+    def turn(self, delta, sel=None):
+        target = self.cur + delta
+        if self.busy or not 0 <= target < len(self.spreads):
+            return "break"
+        self.open_spread(target, delta, sel)
+        return "break"
+
+    def open_spread(self, target, delta, sel=None):
+        if self.busy:
+            return "break"
+        self.cur = target
+        n = len(self.page_items())
+        self.sel = 0 if sel is None else max(0, min(n - 1, sel))
+        if self.animate and delta:
+            self.page_turn(1 if delta > 0 else -1)
+        else:
+            self.draw()
+        return "break"
+
+    def page_turn(self, direction):
+        """A folha vira: desenha a página dupla nova por baixo e passa por
+        cima uma folha em branco que dobra na lombada, com o verso em
+        meio-tom e a sombra que ela projeta."""
+        self.busy = True
+        self.draw()
+        P = self.ink()
+        shadow = self.cv.create_polygon(0, 0, 0, 0, fill=P["ink"], stipple="gray25",
+                                        outline="")
+        leaf = self.cv.create_polygon(0, 0, 0, 0, fill=P["paper"], outline=P["ink"])
+        back = self.cv.create_polygon(0, 0, 0, 0, fill=P["ink"], stipple="gray12",
+                                      outline="")
+        parts = (leaf, back, shadow)
+
+        def frame(k):
+            self.leaf_at(parts, k / self.TURN_FRAMES, direction)
+            if k < self.TURN_FRAMES:
+                self._job = self.root.after(self.TURN_MS, frame, k + 1)
+            else:
+                self.cv.delete(*parts)
+                self.busy = False
+
+        frame(0)
+
+    def leaf_at(self, parts, t, direction):
+        """A folha no instante t (0 a 1): presa na lombada, a borda solta vai
+        de um lado ao outro; a meio caminho levanta, e o verso aparece."""
+        leaf, back, shadow = parts
+        x0, y0, x1, y1 = self.book
+        pw = self.spine - x0
+        lift = (y1 - y0) * 0.035
+        c, s = math.cos(math.pi * t), math.sin(math.pi * t)
+        reach = self.spine + direction * c * pw
+        up = lift * s
+        pts = (self.spine, y0, reach, y0 - up, reach, y1 + up, self.spine, y1)
+        self.cv.coords(leaf, *pts)
+        self.cv.coords(back, *(pts if t > 0.5 else (0,) * 8))
+        sx = reach + direction * (-1 if t < 0.5 else 1) * 18 * s
+        self.cv.coords(shadow, reach, y0, sx, y0, sx, y1, reach, y1)
+
+    def step(self, delta):
+        if self.busy:
+            return "break"
+        n = len(self.page_items())
+        if not n:
+            return self.turn(delta)
+        i = self.sel + delta
+        if i < 0:
+            return self.turn(-1, sel=10 ** 6)
+        if i >= n:
+            return self.turn(1, sel=0)
+        self.sel = i
+        self.draw()
+        return "break"
+
+    def open_chapter(self, key):
+        first = next(i for i, s in enumerate(self.spreads) if s[0] == "list" and s[1] == key)
+        return self.open_spread(first, first - self.cur)
+
+    def click(self, e):
+        if self.busy:
+            return
+        for item in self.cv.find_overlapping(e.x - 1, e.y - 1, e.x + 1, e.y + 1):
+            for tag in self.cv.gettags(item):
+                if tag.startswith("toc:"):
+                    self.open_chapter(tag[4:])
+                    return
+        s = self.spreads[self.cur]
+        bx0, _, bx1, _ = self.page_box("left")
+        if s[0] == "list" and bx0 - 6 <= e.x <= bx1 + 6:
+            for top, bot, i in getattr(self, "rows_y", []):
+                if top <= e.y < bot:
+                    self.sel = i
+                    self.draw()
+                    return
+        x0, _, x1, _ = self.book
+        if self.spine < e.x <= x1:
+            self.turn(1)
+        elif x0 <= e.x < self.spine and s[0] == "front":
+            self.turn(-1)
+
+    def cycle_palette(self):
+        names = list(BOOK_PALETTES)
+        self.pal_name = names[(names.index(self.pal_name) + 1) % len(names)]
+        self.draw()
+
+    def toggle_animation(self):
+        self.animate = not self.animate
+        self.draw()
+
+    def resized(self, _e=None):
+        if self._job and not self.busy:
+            try:
+                self.root.after_cancel(self._job)
+            except tk.TclError:
+                pass
+        self._job = self.root.after(80, self.relayout)
+
+    def relayout(self):
+        self._job = None
+        if self.busy:
+            return
+        self.paginate()
+        self.draw()
+
+
+def cmd_book():
+    """Abre a base como livro, só para ler."""
+    global tk, tkfont, ttk
+    try:
+        import tkinter as _tk
+        from tkinter import font as _tkfont, ttk as _ttk
+    except ImportError:
+        raise SystemExit("Este Python veio sem Tkinter. Reinstale marcando tcl/tk.")
+    tk, tkfont, ttk = _tk, _tkfont, _ttk
+    data = load_json()
+    if needs_upgrade(data):
+        print("A base ainda não tem números de registro: abra o programa normal "
+              "uma vez antes (o livro não grava nada).")
+    root = tk.Tk()
+    BookView(root, data)
+    root.mainloop()
+    return 0
+
+
 # ================================================================ app
 
 def cmd_app(open_id=None):
@@ -7107,6 +7664,8 @@ def main():
     cmd, rest = args[0], args[1:]
     if cmd == "app":
         return cmd_app(rest[0] if rest else None)
+    if cmd == "livro":
+        return cmd_book()
     if cmd == "migrate":
         return cmd_migrate()
     if cmd == "merge":
