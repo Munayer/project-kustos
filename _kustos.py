@@ -5217,6 +5217,8 @@ class App:
         v = self.menu(m)
         v.add_command(label="Tipo de letra do terminal…", command=self.choose_typeface)
         v.add_command(label="Campos do verbete…", command=self.card_layout_dialog)
+        v.add_command(label="Abrir como livro", accelerator="Ctrl+B", command=self.open_book)
+        v.add_separator()
         v.add_command(label="Redefinir larguras", command=self.reset_layout)
         v.add_checkbutton(label="Travar larguras", onvalue=True, offvalue=False,
                           variable=self.locked_var, command=self.lock_panes)
@@ -5259,6 +5261,7 @@ class App:
         r.bind("<Control-Prior>", lambda e: self.turn(-1))
         r.bind("<Control-Next>", lambda e: self.turn(1))
         r.bind("<Control-l>", lambda e: self.to_register())
+        r.bind("<Control-b>", lambda e: self.open_book())
         self.list.bind("<Control-Home>", lambda e: self.turn_to(0))
         self.list.bind("<Control-End>", lambda e: self.turn_to(None))
         self.list.bind("<Down>", lambda e: self.edge_step(1, e))
@@ -5348,6 +5351,24 @@ class App:
         self._fit_job = None
         if self.rows_fit() != self.rows:
             self.refresh_list()
+
+    def open_book(self):
+        """Ctrl+B: a base como livro, numa segunda janela, aberto na página
+        do registro atual. Só lê; Enter no livro traz o registro para cá."""
+        self.commit_if_dirty()
+        rec = self.current()
+        win = tk.Toplevel(self.root)
+        win.book = BookView(win, self.data, start_id=(rec or {}).get("id"),
+                            on_open=self.open_from_book)
+        return "break"
+
+    def open_from_book(self, rid):
+        if rid not in by_id(self.data):
+            self.say(f"{rid} não existe mais (o livro mostra a base de quando abriu).")
+            return
+        self.goto(rid)
+        self.root.lift()
+        self.root.focus_force()
 
     def to_register(self, n=None):
         """Ctrl+L: sai da busca e dos filtros e mostra o registro aberto (ou o
@@ -6915,6 +6936,8 @@ class App:
                        "\n  Ctrl+J / Ctrl+K   próximo / anterior, de qualquer lugar"
                        "\n  Ctrl+G     ir para: nº (1852), carimbo, id ou nome"
                        "\n  Ctrl+L     ver no registro: sai da busca, mostra o nº do aberto"
+                       "\n  Ctrl+B     abrir como livro (segunda janela, só leitura;"
+                       "\n             Enter no livro traz o registro para o cartão)"
                        "\n  Ctrl+1..4  escopo pessoas / verba / fontes / corpus; Ctrl+0 tudo"
                        "\n  /  na lista volta à busca;  Enter na lista vai ao cartão"
                        "\n  Home / End na página;  PageUp / PageDown ou a roda vira a página"
@@ -7063,8 +7086,9 @@ class BookView:
     TURN_FRAMES = 14
     TURN_MS = 15
 
-    def __init__(self, root, data):
+    def __init__(self, root, data, start_id=None, on_open=None):
         self.root, self.data = root, data
+        self.on_open = on_open     # da janela principal: abrir o registro no cartão
         self.idx = by_id(data)
         self.pal_name = "papel"
         self.animate = True
@@ -7094,6 +7118,10 @@ class BookView:
         self.cv = tk.Canvas(root, highlightthickness=0, bd=0)
         self.cv.pack(fill="both", expand=True)
         self.chapters = self.build_chapters()
+        self.pending = None        # registro onde o livro abre
+        for i, (_, o) in enumerate(self.chapters["registro"]):
+            if start_id and o.get("id") == start_id:
+                self.pending = ("registro", i)
 
         b = root.bind
         for k in ("<Next>", "<Right>", "<space>"):
@@ -7111,6 +7139,8 @@ class BookView:
             b(str(n), lambda e, k=key: self.open_chapter(k))
         b("<t>", lambda e: self.cycle_palette())
         b("<a>", lambda e: self.toggle_animation())
+        b("<Return>", lambda e: self.open_in_card())
+        self.cv.bind("<Double-Button-1>", lambda e: self.open_in_card())
         b("<Escape>", lambda e: root.destroy())
         b("<q>", lambda e: root.destroy())
         self.cv.bind("<Button-1>", self.click)
@@ -7127,14 +7157,16 @@ class BookView:
         out = {"registro": [("r", live[n]) if n in live else ("x", gone[n])
                             for n in sorted(set(live) | set(gone))]}
         for coll in ("people", "entries", "sources", "corpus"):
-            rows = sorted(data[coll], key=lambda r: sort_key(label_any(r, data)))
+            rows = sorted((r for r in data[coll] if not r["id"].startswith("__")),
+                          key=lambda r: sort_key(label_any(r, data)))
             out[coll] = [("r", r) for r in rows]
         return out
 
     def paginate(self):
         """Refaz as páginas para o tamanho atual da janela, mantendo aberto o
         registro que estava aberto."""
-        keep = self.current_rec()
+        keep = self.current_rec() or self.pending
+        self.pending = None
         self.spreads = [("front",)]
         per = max(4, self.list_rows())
         for key, _ in BOOK_CHAPTERS:
@@ -7297,7 +7329,7 @@ class BookView:
             self.text(bx1, by0, f"{a}–{a + len(items) - 1} de {total}", self.f_small, "ne")
         self.rule(bx0, bx1, by0 + 18, double=True)
         cols = int((bx1 - bx0) // self.cw)
-        tags = KIND_TAG if cols >= 46 else KIND_SHORT      # página estreita: rótulo curto
+        tags = KIND_TAG if cols >= 42 else KIND_SHORT      # página estreita: rótulo curto
         y = by0 + 32
         self.rows_y = []
         for i, (kind, o) in enumerate(items):
@@ -7440,10 +7472,12 @@ class BookView:
         n = self.cur * 2 + 1
         self.text(x0 + self.pad, y1 - 10, str(n), self.f_small, "sw")
         self.text(x1 - self.pad, y1 - 10, str(n + 1), self.f_small, "se")
+        card = "Enter: abrir no cartão · " if self.on_open else ""
         hint = ("PageUp / PageDown, ← →, roda: virar · ↑ ↓: rol · 1–5: capítulos · "
-                "t: tinta · a: animação · Esc: fechar · só leitura")
+                f"{card}t: tinta · a: animação · Esc: fechar · só leitura")
         if self.f_small.measure(hint) > self.W - 20:
-            hint = "PgUp/PgDn ← → roda · ↑ ↓ · 1–5 · t · a · Esc · só leitura"
+            hint = ("PgUp/PgDn ← → roda · ↑ ↓ · 1–5 · " + ("Enter · " if card else "")
+                    + "t · a · Esc · só leitura")
         self.text(self.W / 2, self.H - 6, hint, self.f_small, "s", fill=self.ink()["hint"])
 
     # ---------------------------------------------------------- virar
@@ -7546,6 +7580,17 @@ class BookView:
             self.turn(1)
         elif x0 <= e.x < self.spine and s[0] == "front":
             self.turn(-1)
+
+    def open_in_card(self):
+        """Leva a janela principal ao registro escolhido (o livro só lê)."""
+        if not self.on_open or self.busy:
+            return "break"
+        items = self.page_items()
+        if items:
+            kind, o = items[min(self.sel, len(items) - 1)]
+            if kind == "r":
+                self.on_open(o["id"])
+        return "break"
 
     def cycle_palette(self):
         names = list(BOOK_PALETTES)
