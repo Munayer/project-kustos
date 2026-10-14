@@ -3510,8 +3510,8 @@ class PersonCard:
         tk.Frame(c, bg=RULE, height=1).pack(fill="x", pady=(4, 0), **pad)
         self.in_ids = []
 
-        tk.Label(c, text="LOG", bg=PAPER, fg=FAINT, font=app.f_label,
-                 anchor="w").pack(fill="x", pady=(6, 2), **pad)
+        log_label = tk.Label(c, text="LOG", bg=PAPER, fg=FAINT, font=app.f_label, anchor="w")
+        log_label.pack(fill="x", pady=(6, 2), **pad)
         self.t_log = tk.Text(c, height=2, width=1, font=app.f_meta,
                              bg=PAPER, fg=INK, relief="flat", wrap="word",
                              insertbackground=INK, highlightthickness=0,
@@ -3521,6 +3521,7 @@ class PersonCard:
         app.bind_undo(self.t_log, text=True)
         self.t_log.pack(fill="x", **pad)
         app.autogrow(self.t_log, minrows=2)
+        app.readable(log_label, self.t_log, "LOG")
         addrow = tk.Frame(c, bg=PAPER)
         addrow.pack(fill="x", pady=(3, 14), **pad)
         self.e_log = tk.Entry(addrow, width=1, font=app.f_body, bg=PAPER, fg=INK,
@@ -5031,6 +5032,275 @@ HELP_TEXT = (
 )
 
 
+# the Help › Shortcuts lines for wide and reading modes
+HELP_READING = (
+    "\n  F11 / Ctrl+\\   wide card: hides the rail and the list (again: brings them back)"
+    "\n  Ctrl+E          reading mode: the long field (notes) across the whole card;"
+    "\n                  also a double-click on a field's title. Inside it:"
+    "\n                  PageUp / PageDown or the wheel turn the page, Ctrl+F finds,"
+    "\n                  Enter / Shift+Enter next / previous match, Esc closes."
+    "\n                  What you type goes back to the field and is saved as usual.\n"
+)
+
+
+class Reader:
+    """Reading mode: one long text field across the whole card, read in pages.
+
+    The text is copied into a widget of its own; typing marks the record dirty,
+    and sync() writes it back into the card's field before any save, so saving,
+    autosaving and switching records behave exactly as in the card."""
+
+    def __init__(self, app):
+        self.app = app
+        self.source = None          # the card's Text being read
+        self.rid = None             # record it belongs to
+        self.starts = None          # display line each page starts on; None = measure again
+        self.hits, self.hit_i = [], -1
+        f = self.frame = tk.Frame(app.cardbox, bg=PAPER)
+        head = tk.Frame(f, bg=PAPER)
+        head.pack(fill="x", padx=22, pady=(10, 4))
+        # the controls are packed before the title, so a long title is what gets cut
+        self.title = tk.Label(head, text="", bg=PAPER, fg=STAMP, font=app.f_label, anchor="w")
+        ttk.Button(head, text=tr("close (Esc)"), style="Quiet.TButton",
+                   command=self.close).pack(side="right", padx=(8, 0))
+        ttk.Button(head, text=tr("find"), style="Quiet.TButton",
+                   command=self.find_open).pack(side="right", padx=(8, 0))
+        ttk.Button(head, text="›", width=2, style="Quiet.TButton",
+                   command=lambda: self.turn(1)).pack(side="right")
+        self.page = tk.Label(head, text="", bg=PAPER, fg=SOFT, font=app.f_meta)
+        self.page.pack(side="right", padx=6)
+        ttk.Button(head, text="‹", width=2, style="Quiet.TButton",
+                   command=lambda: self.turn(-1)).pack(side="right")
+        self.title.pack(side="left", fill="x", expand=True)
+        self.findrow = tk.Frame(f, bg=PAPER)
+        self.q = tk.StringVar()
+        self.e_find = tk.Entry(self.findrow, textvariable=self.q, font=app.f_meta, bg=PAPER,
+                               fg=INK, insertbackground=INK, relief="flat", highlightthickness=1,
+                               highlightbackground=RULE, highlightcolor=STAMP)
+        self.e_find.pack(side="left", fill="x", expand=True, ipady=2)
+        self.found = tk.Label(self.findrow, text="", bg=PAPER, fg=OXIDE, font=app.f_meta)
+        self.found.pack(side="left", padx=10)
+        self.rule = tk.Frame(f, bg=STAMP, height=2)
+        self.rule.pack(fill="x", padx=22)
+        t = self.t = tk.Text(f, wrap="word", font=app.f_body, bg=PAPER, fg=INK, relief="flat",
+                             insertbackground=INK, highlightthickness=0, padx=22, pady=12,
+                             spacing1=2, spacing3=6, undo=True, autoseparators=True, maxundo=-1)
+        t.pack(fill="both", expand=True)
+        t.tag_configure("hit", background=RULE)
+        t.tag_configure("cur", background=SELBG, foreground=SELFG)
+        app.bind_undo(t, text=True)
+        for seq, fn in (("<Prior>", lambda e: self.turn(-1)), ("<Next>", lambda e: self.turn(1)),
+                        ("<Escape>", lambda e: self.close()), ("<Control-e>", lambda e: self.close()),
+                        ("<Control-f>", lambda e: self.find_open())):
+            t.bind(seq, fn)
+        t.bind("<MouseWheel>", lambda e: self.turn(-1 if e.delta > 0 else 1))
+        t.bind("<Button-4>", lambda e: self.turn(-1))
+        t.bind("<Button-5>", lambda e: self.turn(1))
+        t.bind("<KeyRelease>", self.typed, add="+")
+        t.bind("<Configure>", self.resized)
+        self.measure = tkfont.Font(font=app.f_body).measure("0") * 92   # ~92 characters a line
+        self.q.trace_add("write", lambda *_: self.find_update())
+        self.e_find.bind("<Return>", lambda e: self.next_hit(1))
+        self.e_find.bind("<Shift-Return>", lambda e: self.next_hit(-1))
+        self.e_find.bind("<Escape>", lambda e: self.find_close())
+        self.e_find.bind("<Prior>", lambda e: self.turn(-1))
+        self.e_find.bind("<Next>", lambda e: self.turn(1))
+
+    @property
+    def is_open(self):
+        return self.source is not None
+
+    def resized(self, event):
+        """Keeps the text column at a readable width: in a wide window the
+        margins grow instead of the lines."""
+        pad = max(22, (event.width - self.measure) // 2)
+        if int(self.t.cget("padx")) != pad:
+            self.t.configure(padx=pad)
+        self.starts = None
+        self.app.root.after_idle(self.show_page)
+
+    def open(self, source, title):
+        if str(source.cget("state")) == "disabled":
+            self.app.say(tr("Open a record first."))
+            return
+        rec = self.app.current()
+        self.source, self.rid = source, self.app.sel
+        self.title.configure(text=f"{title}  ·  {one_liner(label_any(rec, self.app.data), 60)}"
+                             if rec else title)
+        self.t.delete("1.0", "end")
+        self.t.insert("1.0", source.get("1.0", "end-1c"))
+        self.t.edit_reset()
+        self.t.mark_set("insert", "1.0")
+        self.starts = None
+        self.find_close()
+        self.frame.place(x=0, y=0, relwidth=1, relheight=1)
+        self.frame.lift()
+        self.t.focus_set()
+        self.t.yview_moveto(0)
+        self.app.root.after_idle(self.show_page)
+
+    def typed(self, event):
+        if event.keysym not in ("Prior", "Next", "Escape") and not event.keysym.startswith(
+                ("Control", "Shift", "Alt")):
+            self.app.mark_dirty()
+            self.starts = None
+
+    def sync(self):
+        """Writes the reader's text back into the card's field, if it changed."""
+        if not self.is_open:
+            return
+        text = self.t.get("1.0", "end-1c")
+        if text != self.source.get("1.0", "end-1c"):
+            self.source.delete("1.0", "end")
+            self.source.insert("1.0", text)
+            self.app.mark_dirty()
+
+    def close(self, keep=True):
+        if not self.is_open:
+            return "break"
+        if keep:
+            self.sync()
+        src = self.source
+        self.source = self.rid = None
+        self.frame.place_forget()
+        try:
+            src.focus_set()
+            self.app.refit_card()
+        except tk.TclError:
+            pass
+        return "break"
+
+    # ---- pages: where each page starts is measured on screen, page by page
+    def lines(self, a, b):
+        n = self.t.count(a, b, "displaylines")
+        return (n[0] if isinstance(n, tuple) else n) or 0
+
+    def go_line(self, line):
+        self.t.yview("1.0")
+        if line > 0:
+            self.t.yview_scroll(line, "units")
+        self.t.update_idletasks()      # Tk applies the scroll lazily; settle it before reading "@0,0"
+
+    def paginate(self):
+        """The display line each page starts on. How many lines fit depends on
+        how many paragraph gaps fall on the page, so each page is measured on
+        screen where it falls: no line skipped, at most one repeated. Tk's
+        `sync` lays the whole text out first, so the first measurement is not
+        taken before the text has been laid out."""
+        t = self.t
+        if not t.winfo_ismapped() or t.winfo_height() < 40:
+            self.starts = [0]                   # not on screen yet: measure on the next call
+            return False
+        t.tk.call(t._w, "sync")
+        t.update_idletasks()
+        keep = self.lines("1.0", "@0,0")
+        h = t.winfo_height()
+        total = self.lines("1.0", "end")
+        starts = [0]
+        while len(starts) < 5000:
+            self.go_line(starts[-1])
+            if t.yview()[1] >= 1.0:             # the end is on screen: last page
+                break
+            fit = max(1, self.lines("@0,0", f"@0,{h - 1}"))
+            nxt = starts[-1] + fit
+            if nxt >= total:
+                break
+            starts.append(nxt)
+        self.starts = starts
+        self.go_line(keep)
+        return True
+
+    def page_of(self, line):
+        starts = self.starts or [0]
+        i = 0
+        while i + 1 < len(starts) and starts[i + 1] <= line:
+            i += 1
+        return i
+
+    def current_page(self):
+        if self.t.yview()[1] >= 1.0:
+            return len(self.starts) - 1
+        return self.page_of(self.lines("1.0", "@0,0"))
+
+    def turn(self, delta):
+        if not self.is_open:
+            return "break"
+        if self.starts is None:
+            self.paginate()
+        page = max(0, min(self.current_page() + delta, len(self.starts) - 1))
+        self.go_line(self.starts[page])
+        self.t.mark_set("insert", "@0,0")
+        self.show_page()
+        return "break"
+
+    def show_page(self):
+        if not self.is_open:
+            return
+        if self.starts is None and not self.paginate():
+            self.starts = None
+            self.app.root.after(60, self.show_page)
+            return
+        self.page.configure(text=tr("page {p} of {n}", p=self.current_page() + 1,
+                                    n=len(self.starts)))
+
+    # ---- find inside the text
+    def find_open(self):
+        self.findrow.pack(fill="x", padx=22, pady=(0, 6), before=self.rule)
+        self.starts = None                     # the text area just got shorter
+        self.e_find.focus_set()
+        self.e_find.select_range(0, "end")
+        return "break"
+
+    def find_close(self):
+        self.t.tag_remove("hit", "1.0", "end")
+        self.t.tag_remove("cur", "1.0", "end")
+        self.hits, self.hit_i = [], -1
+        self.found.configure(text="")
+        self.findrow.pack_forget()
+        self.starts = None
+        if self.is_open:
+            self.t.focus_set()
+        return "break"
+
+    def find_update(self):
+        t = self.t
+        t.tag_remove("hit", "1.0", "end")
+        t.tag_remove("cur", "1.0", "end")
+        self.hits, self.hit_i = [], -1
+        q = self.q.get()
+        if q:
+            idx = "1.0"
+            while True:
+                pos = t.search(q, idx, nocase=True, stopindex="end")
+                if not pos:
+                    break
+                end = f"{pos}+{len(q)}c"
+                t.tag_add("hit", pos, end)
+                self.hits.append((pos, end))
+                idx = end
+        if not q:
+            self.found.configure(text="")
+        elif not self.hits:
+            self.found.configure(text=tr("not found"))
+        else:
+            self.next_hit(1)
+
+    def next_hit(self, delta):
+        if not self.hits:
+            return "break"
+        self.hit_i = (self.hit_i + delta) % len(self.hits)
+        pos, end = self.hits[self.hit_i]
+        self.t.tag_remove("cur", "1.0", "end")
+        self.t.tag_add("cur", pos, end)
+        if self.starts is None:
+            self.paginate()
+        self.go_line(self.starts[self.page_of(self.lines("1.0", pos))])   # the page holding the match
+        self.t.mark_set("insert", pos)
+        self.found.configure(text=f"{self.hit_i + 1}/{len(self.hits)}")
+        self.show_page()
+        return "break"
+
+
 # ================================================================ window
 
 class App:
@@ -5046,6 +5316,7 @@ class App:
         self.view_stype = None                                # source filter
         self.view_system = None                               # corpus filter
         self.source_hints = []
+        self.read_titles = {}       # Text widget -> its title, for reading mode
         self.draft = None
         self.dirty = False
         self.loading = False
@@ -5183,6 +5454,8 @@ class App:
         self.rail.tag_configure("scope", foreground=STAMP)
         self.rail.bind("<<TreeviewSelect>>", self.on_rail)
         pw.add(rail, weight=0)
+        self.rail_pane = rail
+        self.wide = False
 
         mid = tk.Frame(pw, bg=SHELL)
         head = tk.Frame(mid, bg=SHELL)
@@ -5210,6 +5483,7 @@ class App:
         self.list.bind("<Button-4>", lambda e: self.turn(-1))
         self.list.bind("<Button-5>", lambda e: self.turn(1))
         pw.add(mid, weight=1)
+        self.mid_pane = mid
 
         self.cardbox = tk.Frame(pw, bg=PAPER)
         self.locus = tk.Label(self.cardbox, text="", bg=PAPER, fg=FAINT,
@@ -5224,6 +5498,7 @@ class App:
         self.mc = MetricCard(self, self.cardbox)
         self.cards = {"person": self.pc, "entry": self.vc, "source": self.sc,
                       "metric": self.mc}
+        self.reader = Reader(self)
         self.show_card("person")
         for c in self.cards.values():
             c.enable(False)
@@ -5333,6 +5608,8 @@ class App:
             return False
 
     def remember_panes(self):
+        if self.wide:
+            return
         width = self.pw.winfo_width()
         if width < 200 or self.locked_panes:
             return
@@ -5344,6 +5621,42 @@ class App:
         if not (0.05 < a < b < 0.95):
             return
         self.data = save_ui({"panes": [round(a, 4), round(b, 4)]})
+
+    def toggle_wide(self):
+        """F11 / Ctrl+Backslash: the card alone in the window, or back with the rail and list."""
+        if self.wide:
+            self.pw.insert(0, self.rail_pane, weight=0)
+            self.pw.insert(1, self.mid_pane, weight=1)
+            self.wide = False
+
+            def restore():
+                saved = (self.data.get("ui") or {}).get("panes")
+                if not (saved and self.apply_panes(saved, self.pw.winfo_width())):
+                    self.reset_layout()
+                self.refresh_list()
+            self.root.after_idle(restore)
+            self.say(tr("Rail and list back."))
+        else:
+            self.remember_panes()
+            self.pw.forget(self.rail_pane)
+            self.pw.forget(self.mid_pane)
+            self.wide = True
+            self.say(tr("Wide card. F11 brings the rail and the list back."))
+        self.root.after_idle(self.refit_card)
+        return "break"
+
+    def open_reader(self):
+        """Ctrl+E: reading mode for the text field in focus, or the card's notes."""
+        if self.reader.is_open:
+            return self.reader.close()
+        w = self.root.focus_get()
+        if w in self.read_titles:
+            self.reader.open(w, self.read_titles[w])
+        elif self.sel:
+            t = getattr(self.card, "t_notes", None)
+            if t is not None:
+                self.reader.open(t, self.read_titles.get(t, tr("NOTES")))
+        return "break"
 
     def lock_panes(self):
         self.locked_panes = bool(self.locked_var.get())
@@ -5420,6 +5733,8 @@ class App:
         v.add_command(label=tr("Terminal typeface…"), command=self.choose_typeface)
         v.add_command(label=tr("Entry card fields…"), command=self.card_layout_dialog)
         v.add_command(label=tr("Open as logbook"), accelerator="Ctrl+B", command=self.open_book)
+        v.add_command(label=tr("Wide card"), accelerator="F11", command=self.toggle_wide)
+        v.add_command(label=tr("Read field"), accelerator="Ctrl+E", command=self.open_reader)
         v.add_separator()
         v.add_command(label=tr("Reset widths"), command=self.reset_layout)
         v.add_checkbutton(label=tr("Lock widths"), onvalue=True, offvalue=False,
@@ -5470,6 +5785,9 @@ class App:
         r.bind("<Control-Next>", lambda e: self.turn(1))
         r.bind("<Control-l>", lambda e: self.to_register())
         r.bind("<Control-b>", lambda e: self.open_book())
+        r.bind("<F11>", lambda e: self.toggle_wide())
+        r.bind("<Control-backslash>", lambda e: self.toggle_wide())
+        r.bind("<Control-e>", lambda e: self.open_reader())
         self.list.bind("<Control-Home>", lambda e: self.turn_to(0))
         self.list.bind("<Control-End>", lambda e: self.turn_to(None))
         self.list.bind("<Down>", lambda e: self.edge_step(1, e))
@@ -5674,8 +5992,15 @@ class App:
 
     # ------------------------------------------------------------ widgets
     def label(self, parent, text, pad):
-        tk.Label(parent, text=text, bg=PAPER, fg=FAINT, font=self.f_label,
-                 anchor="w").pack(fill="x", pady=(6, 2), **pad)
+        lbl = tk.Label(parent, text=text, bg=PAPER, fg=FAINT, font=self.f_label, anchor="w")
+        lbl.pack(fill="x", pady=(6, 2), **pad)
+        return lbl
+
+    def readable(self, label, text, title):
+        """A double-click on the field's title opens it in reading mode."""
+        self.read_titles[text] = title
+        label.configure(cursor="hand2")
+        label.bind("<Double-Button-1>", lambda e: self.reader.open(text, title))
 
     def field(self, parent, text, font, pad):
         self.label(parent, text, pad)
@@ -5688,7 +6013,7 @@ class App:
         return e
 
     def textfield(self, parent, text, rows, font, pad):
-        self.label(parent, text, pad)
+        lbl = self.label(parent, text, pad)
         box = tk.Frame(parent, bg=PAPER)
         box.pack(fill="x", **pad)
         t = tk.Text(box, height=rows, width=1, font=font, bg=PAPER, fg=INK,
@@ -5700,6 +6025,7 @@ class App:
         t.pack(side="left", fill="both", expand=True)
         self.autogrow(t, minrows=rows)
         tk.Frame(parent, bg=RULE, height=1).pack(fill="x", pady=(4, 0), **pad)
+        self.readable(lbl, t, text.split("  (")[0])
         return t
 
     def scroll_area(self, parent):
@@ -6517,6 +6843,8 @@ class App:
         self.dirty = False
         self.sel = None
         self.set_locus(None)
+        if getattr(self, "reader", None):
+            self.reader.close(keep=False)
 
     def show_cancelled(self, n):
         """A cancelled number: the card stays empty and the header says what
@@ -6534,6 +6862,8 @@ class App:
         rec = by_id(self.data).get(rid)
         if not rec:
             return
+        if self.reader.is_open and rid != self.reader.rid:
+            self.reader.close()
         self.sel = rid
         self.loading = True
         kind = self.rec_kind(rec)
@@ -6645,6 +6975,7 @@ class App:
         return out["id"]
 
     def save(self, reopen=True, auto=False):
+        self.reader.sync()
         if not self.sel:
             return None
         rec = self.current()
@@ -6721,6 +7052,7 @@ class App:
         return rec["id"]
 
     def commit_if_dirty(self):
+        self.reader.sync()
         if not self.dirty or not self.sel:
             return
         if not self.card.e_name.get().strip():
@@ -7154,7 +7486,8 @@ class App:
         self.root.destroy()
 
     def do_help(self):
-        self.show_text(tr("Shortcuts"), tr(HELP_TEXT, conflicts=CONFLICT_DIR.name, stem=STEM))
+        self.show_text(tr("Shortcuts"), tr(HELP_TEXT, conflicts=CONFLICT_DIR.name, stem=STEM)
+                       + tr(HELP_READING))
 
     # ------------------------------------------------------------ dialogs
     def dialog(self, title, width=520, height=None):
@@ -8780,6 +9113,26 @@ PT = {
         "Aberto também em {host} desde {since}: editar nas duas máquinas ao mesmo tempo gera conflito.",
     "The record {id} does not exist.":
         "O registro {id} não existe.",
+    "close (Esc)":
+        "fechar (Esc)",
+    "find":
+        "buscar",
+    "Open a record first.":
+        "Abra um registro primeiro.",
+    "page {p} of {n}":
+        "página {p} de {n}",
+    "not found":
+        "não encontrado",
+    "Wide card":
+        "Cartão largo",
+    "Read field":
+        "Ler campo",
+    "Rail and list back.":
+        "Trilho e lista de volta.",
+    "Wide card. F11 brings the rail and the list back.":
+        "Cartão largo. F11 traz o trilho e a lista de volta.",
+    "\n  F11 / Ctrl+\\   wide card: hides the rail and the list (again: brings them back)\n  Ctrl+E          reading mode: the long field (notes) across the whole card;\n                  also a double-click on a field's title. Inside it:\n                  PageUp / PageDown or the wheel turn the page, Ctrl+F finds,\n                  Enter / Shift+Enter next / previous match, Esc closes.\n                  What you type goes back to the field and is saved as usual.\n":
+        "\n  F11 / Ctrl+\\   cartão largo: esconde o trilho e a lista (de novo: traz de volta)\n  Ctrl+E          modo de leitura: o campo longo (notas) no cartão inteiro;\n                  também um duplo clique no título de um campo. Dentro dele:\n                  PageUp / PageDown ou a roda viram a página, Ctrl+F busca,\n                  Enter / Shift+Enter próxima / anterior ocorrência, Esc fecha.\n                  O que você digita volta para o campo e é salvo como sempre.\n",
 }
 
 if __name__ == "__main__":
