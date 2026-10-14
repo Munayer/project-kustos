@@ -33,6 +33,11 @@ updating of files and conflicts if used any syncing app or cloud sync.
   Without a search, the list is the register itself, in number order.
 - **No scrolling**: the list shows exactly as many rows as fit the window and
   pages through the rest (PageUp/PageDown or the mouse wheel turn a page).
+- **Reading long notes**: `Ctrl+E` (or a double-click on a field's title) opens
+  the field across the whole card, read in pages with PageUp/PageDown or the
+  wheel, with `Ctrl+F` to find inside it; it stays editable. `F11` hides the
+  rail and the list so the card takes the whole window; the text column keeps
+  a readable width.
 - **Search**, the "indexer": results come in alphabetic order, paged, each with its register number, with operators of search:
 
   ```
