@@ -40,6 +40,7 @@ USAGE
     python _kustos.py doctor          check the structure, change nothing
     python _kustos.py mirror          rebuild the markdown mirror
     python _kustos.py corpus          rebuild the body map (HTML) and open it
+    python _kustos.py health          make the health report (HTML) and open it
     python _kustos.py search <text>   literal search across the four collections
     python _kustos.py cite <id|text> [abnt|abnt-autor-data|bibtex|csl-json|bruto]
     python _kustos.py export [bibtex|csl|abnt] [file]
@@ -1354,7 +1355,7 @@ def resolve_source(text, data):
 SYSTEMS = ["cardiovascular", "hematológico", "metabólico", "renal", "hepático",
            "endócrino", "imunológico", "respiratório", "musculoesquelético",
            "nervoso", "digestivo", "dermatológico", "antropometria", "sono",
-           "atividade", "outro"]
+           "atividade", "oftalmológico", "outro"]
 SYSTEM_EN = {
     "cardiovascular": "cardiovascular", "hematológico": "hematologic",
     "metabólico": "metabolic", "renal": "renal", "hepático": "hepatic",
@@ -1362,6 +1363,7 @@ SYSTEM_EN = {
     "musculoesquelético": "musculoskeletal", "nervoso": "nervous",
     "digestivo": "digestive", "dermatológico": "dermatologic",
     "antropometria": "anthropometry", "sono": "sleep", "atividade": "activity",
+    "oftalmológico": "eyes",
     "outro": "other",
 }
 _SYSTEM_FROM_EN = {v: k for k, v in SYSTEM_EN.items()}
@@ -1432,8 +1434,62 @@ def out_of_range(m, r):
     return False
 
 
+HEALTH_TYPES = ("measure", "medication", "activity", "event")
+HEALTH_TYPE_LABEL = {"measure": "measurement", "medication": "medication",
+                     "activity": "activity or habit", "event": "event"}
+EVENT_KINDS = ("consultation", "exam", "symptom", "procedure", "vaccine", "other")
+
+
+def htype(m):
+    """The kind of corpus record. Records from before the types are measures."""
+    t = (m or {}).get("ctype") or "measure"
+    return t if t in HEALTH_TYPES else "measure"
+
+
+def med_in_use(m, today=None):
+    """A medication is in use while it has no end date, or the end is still ahead."""
+    end = (m.get("end") or "").strip()
+    return not end or end >= (today or TODAY())
+
+
+def who_is(value, data):
+    """A prescriber or doctor field: a person's p_ id becomes their name."""
+    value = (value or "").strip()
+    if value.startswith("p_") and data is not None:
+        p = next((p for p in data.get("people", []) if p["id"] == value), None)
+        if p:
+            return p["name"]
+    return value
+
+
+def reading_status(m, value):
+    """ok | near | out | unknown -- the same rule as the body map page: inside
+    the range but within 8% of either edge is near the limit."""
+    v = reading_number(value)
+    lo = reading_number(m.get("ref_low")) if m.get("ref_low") not in ("", None) else None
+    hi = reading_number(m.get("ref_high")) if m.get("ref_high") not in ("", None) else None
+    if v is None or (lo is None and hi is None):
+        return "unknown"
+    if (lo is not None and v < lo) or (hi is not None and v > hi):
+        return "out"
+    if lo is not None and hi is not None:
+        span = hi - lo
+        if v < lo + span * 0.08 or v > hi - span * 0.08:
+            return "near"
+    return "ok"
+
+
+STATUS_LABEL = {"ok": "in range", "near": "near the limit", "out": "out",
+                "unknown": "no reference"}
+
+
 def fix_metric(m):
     m.setdefault("name", "")
+    m.setdefault("ctype", "measure")
+    for k in ("dose", "frequency", "start", "end", "prescriber", "purpose",
+              "target", "etype", "date", "doctor", "place"):
+        m.setdefault(k, "")
+    m.setdefault("sessions", [])
     m.setdefault("system", "")
     m.setdefault("unit", "")
     m.setdefault("ref_low", "")
@@ -1472,6 +1528,12 @@ def haystack_metric(m, data):
              " ".join(m.get("tags", [])), " ".join(m.get("links", []))]
     for r in m.get("readings", []):
         parts.append(f"{r.get('date', '')} {r.get('value', '')} {r.get('note', '')}")
+    parts += [tr(HEALTH_TYPE_LABEL[htype(m)]), m.get("dose", ""), m.get("frequency", ""),
+              m.get("purpose", ""), who_is(m.get("prescriber"), data), m.get("target", ""),
+              tr(m["etype"]) if m.get("etype") else "", m.get("date", ""),
+              who_is(m.get("doctor"), data), m.get("place", "")]
+    for s in m.get("sessions", []):
+        parts.append(f"{s.get('date', '')} {s.get('text', '')}")
     for a in edges_from(data, m["id"]):
         parts.append(f"{a['rel']} {a['to']} {a.get('why', '')}")
     return "  ".join(parts).lower()
@@ -2119,7 +2181,7 @@ def check(data):
         seen.add(m["id"])
         if not m.get("name"):
             errors.append(tr("{id}: measurement without a name", id=m["id"]))
-        if not m.get("system"):
+        if not m.get("system") and htype(m) == "measure":
             warnings.append(tr("{id}: measurement without a system", id=m["id"]))
         for r in m.get("readings", []):
             if out_of_range(m, r):
@@ -2205,7 +2267,7 @@ def summary(data):
     n_f = sum(1 for e in data["entries"] if e["kind"] == "form")
     n_r = sum(len(m.get("readings", [])) for m in data.get("corpus", []))
     return tr("{people} people · {entries} entries ({concepts} concepts, {forms} forms) · "
-              "{sources} sources · {metrics} measurements ({readings} readings) · "
+              "{sources} sources · {metrics} health records ({readings} readings) · "
               "{links} links", people=len(data["people"]), entries=len(data["entries"]),
               concepts=n_c, forms=n_f, sources=len(data.get("sources", [])),
               metrics=len(data.get("corpus", [])), readings=n_r, links=len(data["edges"]))
@@ -2233,6 +2295,35 @@ def cmd_doctor():
 
 
 # ================================================================ mirror
+
+def health_facts(m, data):
+    """The type-specific facts of a corpus record, as short phrases."""
+    t, out = htype(m), []
+    if t == "medication":
+        out += [x for x in (m.get("dose"), m.get("frequency")) if x]
+        if m.get("start"):
+            out.append(tr("since {date}", date=m["start"]))
+        if (m.get("end") or "").strip():
+            out.append(tr("until {date}", date=m["end"]))
+        out.append(tr("in use") if med_in_use(m) else tr("ended"))
+        if m.get("purpose"):
+            out.append(tr("for: ") + m["purpose"])
+        if m.get("prescriber"):
+            out.append(tr("prescribed by ") + who_is(m["prescriber"], data))
+    elif t == "activity":
+        if m.get("target"):
+            out.append(tr("aim: ") + m["target"])
+        if m.get("sessions"):
+            out.append(tr("{n} sessions · last {date}", n=len(m["sessions"]),
+                          date=max(x.get("date", "") for x in m["sessions"])))
+    elif t == "event":
+        out += [x for x in (m.get("date"), tr(m["etype"]) if m.get("etype") else "") if x]
+        if m.get("doctor"):
+            out.append(tr("with ") + who_is(m["doctor"], data))
+        if m.get("place"):
+            out.append(m["place"])
+    return out
+
 
 def mirror_locus(r):
     if not r.get("reg_n"):
@@ -2367,7 +2458,8 @@ def write_mirror(data):
                                                    sort_key(x["name"]))):
         out.append(f"## {metric_label(m)}")
         out.append(mirror_locus(m))
-        meta = []
+        meta = [tr(HEALTH_TYPE_LABEL[htype(m)])]
+        meta += health_facts(m, data)
         if m.get("unit"):
             meta.append(tr("unit: ") + m["unit"])
         if m.get("ref_low") or m.get("ref_high"):
@@ -2383,7 +2475,9 @@ def write_mirror(data):
             flag = " (!)" if out_of_range(m, r) else ""
             out.append(f"- {r.get('date', '')} — {r.get('value', '')}{flag}"
                        + (f" — {r['note']}" if r.get("note") else ""))
-        if m.get("readings"):
+        for s_ in m.get("sessions", []):
+            out.append(f"- {s_.get('date', '')} — {s_.get('text', '')}")
+        if m.get("readings") or m.get("sessions"):
             out.append("")
         out += [f"`{m['id']}`", ""]
     MIRROR_FILE.write_text("\n".join(out), encoding="utf-8")
@@ -2881,6 +2975,8 @@ def corpus_payload(data):
     """Groups the measurements by system in the shape the page expects."""
     systems = {}
     for m in data.get("corpus", []):
+        if htype(m) != "measure":
+            continue
         sname = m.get("system") or "outro"
         sys_ = systems.setdefault(sname, {"id": slug(sname), "name": system_label(sname),
                                           "plate": PLATE_OF.get(sname), "metrics": []})
@@ -2932,6 +3028,270 @@ def cmd_corpus(open_it=True):
         import webbrowser
         webbrowser.open(CORPUS_HTML_FILE.as_uri())
     return 0
+
+# ================================================================ health report
+#
+# One HTML page built from the corpus, with two views switched at the top:
+# CONSULTATION (what a doctor wants in two minutes: medications in use, the
+# latest value of every measurement with its status, recent events, current
+# activities) and FOLLOW-UP (the whole history: trends, how steady each
+# activity has been, every event, every medication with its period). Printing
+# prints the view on screen. Static HTML, no data leaves the folder.
+
+HEALTH_HTML_FILE = BASE / f"{STEM}_health.html"
+
+
+def _sparkline(m, width=240, height=46):
+    """The readings of a measurement as a small SVG line, reference band hatched."""
+    pts = [(r.get("date", "")[:10], reading_number(r.get("value"))) for r in m.get("readings", [])]
+    pts = [(d, v) for d, v in pts if v is not None]
+    if not pts:
+        return ""
+    lo = reading_number(m.get("ref_low")) if m.get("ref_low") not in ("", None) else None
+    hi = reading_number(m.get("ref_high")) if m.get("ref_high") not in ("", None) else None
+    vals = [v for _, v in pts] + [x for x in (lo, hi) if x is not None]
+    vmin, vmax = min(vals), max(vals)
+    if vmin == vmax:
+        vmin, vmax = vmin - 1, vmax + 1
+    pad = 5
+
+    def X(i):
+        return pad + (i / max(1, len(pts) - 1)) * (width - 2 * pad)
+
+    def Y(v):
+        return pad + (1 - (v - vmin) / (vmax - vmin)) * (height - 2 * pad)
+
+    out = [f'<svg viewBox="0 0 {width} {height}" width="{width}" height="{height}" class="spark">']
+    if lo is not None or hi is not None:
+        y0 = Y(hi) if hi is not None else pad
+        y1 = Y(lo) if lo is not None else height - pad
+        out.append(f'<rect x="{pad}" y="{y0:.1f}" width="{width - 2 * pad}" '
+                   f'height="{max(1, y1 - y0):.1f}" class="band"/>')
+    if len(pts) > 1:
+        line = " ".join(f"{X(i):.1f},{Y(v):.1f}" for i, (_, v) in enumerate(pts))
+        out.append(f'<polyline points="{line}" class="line"/>')
+    for i, (d, v) in enumerate(pts):
+        bad = reading_status(m, v) == "out"
+        out.append(f'<circle cx="{X(i):.1f}" cy="{Y(v):.1f}" r="2.6" '
+                   f'class="{"dot bad" if bad else "dot"}"><title>{d}: {v:g}</title></circle>')
+    out.append("</svg>")
+    return "".join(out)
+
+
+def _weeks_strip(sessions, weeks=12):
+    """Sessions per week over the last `weeks` weeks, as small bars."""
+    today = date.today()
+    monday = today - timedelta(days=today.weekday())
+    counts = []
+    for k in range(weeks - 1, -1, -1):
+        start = monday - timedelta(weeks=k)
+        end = start + timedelta(days=7)
+        counts.append(sum(1 for x in sessions
+                          if start.isoformat() <= (x.get("date") or "")[:10] < end.isoformat()))
+    top = max(counts + [1])
+    bars = []
+    for i, c in enumerate(counts):
+        h = 4 + 30 * c / top
+        bars.append(f'<rect x="{i * 14}" y="{36 - h:.1f}" width="10" height="{h:.1f}" '
+                    f'class="{"bar" if c else "bar zero"}"><title>{c}</title></rect>')
+    return (f'<svg viewBox="0 0 {weeks * 14} 36" width="{weeks * 14}" height="36" class="weeks">'
+            + "".join(bars) + "</svg>")
+
+
+def health_report(data):
+    """The report page, as HTML text."""
+    import html as H
+
+    def esc(x):
+        return H.escape(str(x if x is not None else ""))
+
+    corpus = [m for m in data.get("corpus", []) if not m.get("id", "").startswith("__")]
+    today = TODAY()
+    year_ago = (date.today() - timedelta(days=365)).isoformat()
+    month_ago = (date.today() - timedelta(days=30)).isoformat()
+    by_type = {t: [m for m in corpus if htype(m) == t] for t in HEALTH_TYPES}
+    subject = (data.get("ui") or {}).get("corpus_subject") or ""
+    who = lambda v: who_is(v, data)
+
+    def table(head, rows, empty):
+        if not rows:
+            return f'<p class="empty">{esc(empty)}</p>'
+        th = "".join(f"<th>{esc(h)}</th>" for h in head)
+        body = "".join("<tr" + (' class="flag"' if flag else "") + ">"
+                       + "".join(f"<td>{c}</td>" for c in cells) + "</tr>" for cells, flag in rows)
+        return f"<table><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table>"
+
+    def status_tag(st):
+        return f'<span class="st {st}">{esc(tr(STATUS_LABEL[st]))}</span>'
+
+    def ref_text(m):
+        lo, hi = m.get("ref_low") or "", m.get("ref_high") or ""
+        return esc(f"{lo or '…'}–{hi or '…'} {m.get('unit', '')}".strip()) if (lo or hi) else ""
+
+    # ---- consultation
+    meds_now = sorted((m for m in by_type["medication"] if med_in_use(m, today)),
+                      key=lambda m: sort_key(m.get("name", "")))
+    med_rows = [([f"<b>{esc(m['name'])}</b>", esc(m.get("dose")), esc(m.get("frequency")),
+                  esc(m.get("start")), esc(m.get("purpose")), esc(who(m.get("prescriber")))],
+                 False) for m in meds_now]
+    latest = []
+    for m in sorted(by_type["measure"], key=lambda m: (sort_key(system_label(m.get("system"))),
+                                                        sort_key(m.get("name", "")))):
+        lr = last_reading(m)
+        if not lr:
+            continue
+        st = reading_status(m, lr.get("value"))
+        latest.append(([f"<b>{esc(m['name'])}</b>", esc(system_label(m.get("system"))),
+                        f"{esc(lr.get('value'))} {esc(m.get('unit'))}", esc(lr.get("date", "")[:10]),
+                        ref_text(m), status_tag(st)], st == "out"))
+    events_recent = sorted((m for m in by_type["event"] if (m.get("date") or "") >= year_ago),
+                           key=lambda m: m.get("date") or "", reverse=True)
+    ev_rows = [([esc(m.get("date")), esc(tr(m["etype"]) if m.get("etype") else ""),
+                 f"<b>{esc(m['name'])}</b>", esc(who(m.get("doctor"))),
+                 esc(one_liner(m.get("notes"), 120))], False) for m in events_recent]
+    act_rows = []
+    for m in sorted(by_type["activity"], key=lambda m: sort_key(m.get("name", ""))):
+        ss = m.get("sessions", [])
+        recent = sum(1 for x in ss if (x.get("date") or "") >= month_ago)
+        last = max((x.get("date") or "" for x in ss), default="")
+        act_rows.append(([f"<b>{esc(m['name'])}</b>", esc(m.get("target")), esc(recent),
+                          esc(last)], False))
+    consult = [
+        f"<h2>{esc(tr('Medications in use'))}</h2>",
+        table([tr("Medication"), tr("Dose"), tr("Frequency"), tr("Since"), tr("For"),
+               tr("Prescribed by")], med_rows, tr("No medication in use.")),
+        f"<h2>{esc(tr('Latest measurements'))}</h2>",
+        table([tr("Measurement"), tr("System"), tr("Latest"), tr("Date"), tr("Reference"),
+               tr("Status")], latest, tr("No measurement with readings.")),
+        f"<h2>{esc(tr('Events in the last 12 months'))}</h2>",
+        table([tr("Date"), tr("Kind"), tr("Event"), tr("With"), tr("Notes")], ev_rows,
+              tr("No events in the last 12 months.")),
+        f"<h2>{esc(tr('Activities and habits'))}</h2>",
+        table([tr("Activity"), tr("Aim"), tr("Sessions, last 30 days"), tr("Last session")],
+              act_rows, tr("No activities recorded.")),
+    ]
+
+    # ---- follow-up
+    trend_rows = []
+    for m in sorted(by_type["measure"], key=lambda m: (sort_key(system_label(m.get("system"))),
+                                                        sort_key(m.get("name", "")))):
+        nums = [reading_number(r.get("value")) for r in m.get("readings", [])]
+        nums = [n for n in nums if n is not None]
+        stats = (tr("{n} readings · min {lo} · max {hi} · mean {mean}", n=len(nums),
+                    lo=f"{min(nums):g}", hi=f"{max(nums):g}", mean=f"{sum(nums) / len(nums):.2f}")
+                 if nums else tr("no readings"))
+        first = m["readings"][0]["date"][:10] if m.get("readings") else ""
+        trend_rows.append(([f"<b>{esc(m['name'])}</b><br><small>{esc(system_label(m.get('system')))}"
+                            f"</small>", _sparkline(m) or "—",
+                            esc(stats) + (f"<br><small>{esc(tr('since {date}', date=first))}</small>"
+                                          if first else ""), ref_text(m)], False))
+    steady = []
+    for m in sorted(by_type["activity"], key=lambda m: sort_key(m.get("name", ""))):
+        ss = m.get("sessions", [])
+        steady.append(([f"<b>{esc(m['name'])}</b><br><small>{esc(m.get('target'))}</small>",
+                        _weeks_strip(ss), esc(len(ss))], False))
+    all_events = sorted(by_type["event"], key=lambda m: m.get("date") or "", reverse=True)
+    all_ev = [([esc(m.get("date")), esc(tr(m["etype"]) if m.get("etype") else ""),
+                f"<b>{esc(m['name'])}</b>", esc(who(m.get("doctor"))), esc(m.get("place")),
+                esc(m.get("notes"))], False) for m in all_events]
+    med_hist = [([f"<b>{esc(m['name'])}</b>", esc(m.get("dose")), esc(m.get("start")),
+                  esc(m.get("end") or "—"),
+                  esc(tr("in use") if med_in_use(m, today) else tr("ended")),
+                  esc(m.get("purpose"))], False)
+                for m in sorted(by_type["medication"], key=lambda m: m.get("start") or "",
+                                reverse=True)]
+    follow = [
+        f"<h2>{esc(tr('Measurements over time'))}</h2>",
+        table([tr("Measurement"), tr("Trend"), tr("Summary"), tr("Reference")], trend_rows,
+              tr("No measurements.")),
+        f"<h2>{esc(tr('Activities: sessions per week, last 12 weeks'))}</h2>",
+        table([tr("Activity"), tr("Weeks"), tr("Sessions in total")], steady,
+              tr("No activities recorded.")),
+        f"<h2>{esc(tr('All events'))}</h2>",
+        table([tr("Date"), tr("Kind"), tr("Event"), tr("With"), tr("Place"), tr("Notes")],
+              all_ev, tr("No events recorded.")),
+        f"<h2>{esc(tr('Medication history'))}</h2>",
+        table([tr("Medication"), tr("Dose"), tr("Since"), tr("Until"), tr("Status"), tr("For")],
+              med_hist, tr("No medication recorded.")),
+    ]
+
+    title = tr("Health report")
+    who_line = f"{esc(subject)} · " if subject else ""
+    return f"""<!doctype html>
+<html lang="{'pt-BR' if LANG == 'pt' else 'en'}">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{esc(title)}</title>
+<style>
+  :root {{ --paper:#f4efe4; --ink:#211e17; --soft:#6f6754; --rule:#d6ccb6; --bad:#8a2b25;
+           --near:#8a6a1f; --ok:#4a5d3a; --band:#e4dbc6; }}
+  @media (prefers-color-scheme: dark) {{ :root {{ --paper:#17150f; --ink:#ece5d3; --soft:#a89f89;
+           --rule:#3a352a; --bad:#d58b84; --near:#d1a94a; --ok:#8fae78; --band:#2a261d; }} }}
+  * {{ box-sizing:border-box; }}
+  body {{ margin:0; background:var(--paper); color:var(--ink); font:14px/1.45 Georgia, "Times New Roman", serif; }}
+  .wrap {{ max-width:1040px; margin:0 auto; padding:24px 20px 60px; }}
+  header {{ display:flex; justify-content:space-between; align-items:baseline; gap:16px; flex-wrap:wrap;
+            border-bottom:2px solid var(--ink); padding-bottom:10px; }}
+  h1 {{ font-size:26px; margin:0; font-weight:600; }}
+  .meta {{ color:var(--soft); font:12px ui-monospace, Consolas, monospace; }}
+  nav {{ margin:14px 0 4px; display:flex; gap:6px; }}
+  nav button {{ font:12px ui-monospace, Consolas, monospace; background:none; color:var(--soft);
+                border:1px solid var(--rule); padding:6px 12px; cursor:pointer; }}
+  nav button.on {{ color:var(--ink); border-color:var(--ink); }}
+  h2 {{ font-size:15px; text-transform:uppercase; letter-spacing:.06em; margin:26px 0 8px;
+        border-bottom:1px solid var(--rule); padding-bottom:4px; }}
+  table {{ width:100%; border-collapse:collapse; font-size:13px; }}
+  th {{ text-align:left; font:11px ui-monospace, Consolas, monospace; color:var(--soft);
+        text-transform:uppercase; letter-spacing:.04em; padding:4px 8px 4px 0; border-bottom:1px solid var(--rule); }}
+  td {{ padding:6px 8px 6px 0; border-bottom:1px solid var(--rule); vertical-align:top; }}
+  tr.flag td {{ background:color-mix(in srgb, var(--bad) 9%, transparent); }}
+  small {{ color:var(--soft); }}
+  .empty {{ color:var(--soft); font-style:italic; }}
+  .st {{ font:11px ui-monospace, Consolas, monospace; padding:1px 6px; border:1px solid currentColor; white-space:nowrap; }}
+  .st.out {{ color:var(--bad); }} .st.near {{ color:var(--near); }} .st.ok {{ color:var(--ok); }} .st.unknown {{ color:var(--soft); }}
+  .spark .band {{ fill:var(--band); }} .spark .line {{ fill:none; stroke:var(--ink); stroke-width:1.5; }}
+  .spark .dot {{ fill:var(--paper); stroke:var(--ink); stroke-width:1.2; }} .spark .dot.bad {{ fill:var(--bad); stroke:var(--bad); }}
+  .weeks .bar {{ fill:var(--ink); }} .weeks .bar.zero {{ fill:var(--rule); }}
+  .view {{ display:none; }} .view.on {{ display:block; }}
+  footer {{ margin-top:30px; color:var(--soft); font:11px ui-monospace, Consolas, monospace; }}
+  @media print {{ nav {{ display:none; }} body {{ background:#fff; color:#000; }}
+                  tr {{ break-inside:avoid; }} h2 {{ break-after:avoid; }} }}
+</style></head>
+<body><div class="wrap">
+<header><h1>{esc(title)}</h1>
+<span class="meta">{who_line}{esc(tr("generated on {date}", date=today))}</span></header>
+<nav>
+  <button class="on" data-v="consult">{esc(tr("Consultation"))}</button>
+  <button data-v="follow">{esc(tr("Follow-up"))}</button>
+</nav>
+<section class="view on" id="consult">{"".join(consult)}</section>
+<section class="view" id="follow">{"".join(follow)}</section>
+<footer>{esc(tr("Made by _kustos.py from the corpus; edit the records in the window, not here."))}</footer>
+</div>
+<script>
+  document.querySelectorAll("nav button").forEach(function (b) {{
+    b.addEventListener("click", function () {{
+      document.querySelectorAll("nav button").forEach(function (x) {{ x.classList.toggle("on", x === b); }});
+      document.querySelectorAll(".view").forEach(function (v) {{ v.classList.toggle("on", v.id === b.dataset.v); }});
+    }});
+  }});
+</script>
+</body></html>
+"""
+
+
+def write_health_html(data):
+    HEALTH_HTML_FILE.write_text(health_report(data), encoding="utf-8")
+
+
+def cmd_health(open_it=True):
+    data = load_json()
+    write_health_html(data)
+    print(tr("Health report -> {name}", name=HEALTH_HTML_FILE.name))
+    if open_it:
+        import webbrowser
+        webbrowser.open(HEALTH_HTML_FILE.as_uri())
+    return 0
+
 
 
 CORPUS_HTML = r"""<!doctype html>
@@ -4692,7 +5052,10 @@ class SourceCard:
 
 
 class MetricCard:
-    """The measurement card: unit, reference range, readings over time."""
+    """The health card. Its fields follow the record's type: a measurement
+    (unit, reference range, readings over time), a medication (dose,
+    frequency, since/until, prescriber), an activity or habit (aim, sessions)
+    or an event (kind, date, doctor, place)."""
 
     def __init__(self, app, parent):
         self.app = app
@@ -4710,6 +5073,8 @@ class MetricCard:
                    command=app.save_and_new).pack(side="left", padx=(8, 0))
         ttk.Button(foot, text=tr("body map"), style="Quiet.TButton",
                    command=app.do_corpus).pack(side="left", padx=(8, 0))
+        ttk.Button(foot, text=tr("report"), style="Quiet.TButton",
+                   command=app.do_health).pack(side="left", padx=(8, 0))
         self.msg = tk.Label(foot, text="", bg=PAPER, fg=OXIDE, font=app.f_meta)
         self.msg.pack(side="left", padx=14)
         ttk.Button(foot, text=tr("Delete"), style="Quiet.TButton",
@@ -4733,51 +5098,74 @@ class MetricCard:
 
         row = tk.Frame(c, bg=PAPER)
         row.pack(fill="x", **pad)
-        scol = tk.Frame(row, bg=PAPER)
-        scol.pack(side="left", padx=(0, 14))
-        tk.Label(scol, text=tr("SYSTEM"), bg=PAPER, fg=FAINT, font=app.f_label,
-                 anchor="w").pack(fill="x", pady=(8, 2))
+        self.v_type = tk.StringVar()
+        self.type_of = {tr(HEALTH_TYPE_LABEL[t]): t for t in HEALTH_TYPES}
+        self.e_type = self.combo(row, tr("TYPE"), self.v_type, list(self.type_of), 22, True)
+        self.e_type.bind("<<ComboboxSelected>>", self.type_changed)
         self.v_system = tk.StringVar()
-        self.e_system = ttk.Combobox(scol, textvariable=self.v_system,
-                                     values=[system_label(s) for s in SYSTEMS],
-                                     width=20, font=app.f_meta)
-        self.e_system.pack(anchor="w")
+        self.e_system = self.combo(row, tr("SYSTEM"), self.v_system,
+                                   [system_label(s) for s in SYSTEMS], 20)
         self.e_system.bind("<<ComboboxSelected>>", app.mark_dirty)
-        for title, attr in ((tr("UNIT"), "e_unit"), (tr("REF. MIN."), "e_lo"),
-                            (tr("REF. MAX."), "e_hi")):
-            col = tk.Frame(row, bg=PAPER)
-            col.pack(side="left", fill="x", expand=True, padx=(0, 10))
-            tk.Label(col, text=title, bg=PAPER, fg=FAINT, font=app.f_label,
-                     anchor="w").pack(fill="x", pady=(8, 2))
-            ent = tk.Entry(col, width=8, font=app.f_meta, bg=PAPER, fg=INK,
-                           insertbackground=INK, relief="flat", highlightthickness=0,
-                           disabledbackground=PAPER, disabledforeground=FAINT)
-            ent.pack(fill="x")
-            tk.Frame(col, bg=RULE, height=1).pack(fill="x", pady=(4, 0))
-            app.bind_undo(ent)
-            setattr(self, attr, ent)
+
+        # one block of fields per type; only the record's type is shown, but every
+        # block keeps what was loaded, so changing the type loses nothing
+        self.typebox = tk.Frame(c, bg=PAPER)
+        self.typebox.pack(fill="x")
+        self.blocks = {t: tk.Frame(self.typebox, bg=PAPER) for t in HEALTH_TYPES}
+
+        b = self.blocks["measure"]
+        r1 = tk.Frame(b, bg=PAPER)
+        r1.pack(fill="x", **pad)
+        self.e_unit = self.small(r1, tr("UNIT"))
+        self.e_lo = self.small(r1, tr("REF. MIN."))
+        self.e_hi = self.small(r1, tr("REF. MAX."))
+        lbl = app.label(b, tr("READINGS  (one per line:  2026-09-01 [10:30]  value  note)"), pad)
+        self.t_read = app.textfield_bare(b, 3, pad)
+        app.readable(lbl, self.t_read, tr("READINGS"))
+        self.summary = tk.Label(b, text="", bg=PAPER, fg=SOFT, font=app.f_meta, anchor="w")
+        self.summary.pack(fill="x", pady=(2, 0), **pad)
+        self.trend = tk.Canvas(b, height=96, bg=PAPER, highlightthickness=0, bd=0)
+        self.trend.pack(fill="x", pady=(6, 0), **pad)
+        self.trend.bind("<Configure>", lambda e: self.draw_trend())
+        self.e_new = self.add_row(b, tr("+ today's reading"), self.add_reading, pad)
+
+        b = self.blocks["medication"]
+        r1 = tk.Frame(b, bg=PAPER)
+        r1.pack(fill="x", **pad)
+        self.e_dose = self.small(r1, tr("DOSE"), 14)
+        self.e_freq = self.small(r1, tr("FREQUENCY"), 14)
+        self.e_start = self.small(r1, tr("SINCE"), 11)
+        self.e_end = self.small(r1, tr("UNTIL"), 11)
+        self.e_purpose = app.field(b, tr("FOR"), app.f_body, pad)
+        self.e_prescriber = app.field(b, tr("PRESCRIBED BY  (a person's p_…, or a name)"),
+                                      app.f_meta, pad)
+        self.med_state = tk.Label(b, text="", bg=PAPER, fg=OXIDE, font=app.f_meta, anchor="w")
+        self.med_state.pack(fill="x", pady=(4, 0), **pad)
+
+        b = self.blocks["activity"]
+        self.e_target = app.field(b, tr("AIM  (e.g. 3 times a week)"), app.f_meta, pad)
+        lbl = app.label(b, tr("SESSIONS  (one per line:  2026-10-15  60 min  note)"), pad)
+        self.t_sessions = app.textfield_bare(b, 3, pad)
+        app.readable(lbl, self.t_sessions, tr("SESSIONS"))
+        self.sess_summary = tk.Label(b, text="", bg=PAPER, fg=SOFT, font=app.f_meta, anchor="w")
+        self.sess_summary.pack(fill="x", pady=(2, 0), **pad)
+        self.e_session = self.add_row(b, tr("+ today's session"), self.add_session, pad)
+
+        b = self.blocks["event"]
+        r1 = tk.Frame(b, bg=PAPER)
+        r1.pack(fill="x", **pad)
+        self.v_kind = tk.StringVar()
+        self.kind_of = {tr(k): k for k in EVENT_KINDS}
+        self.e_kind = self.combo(r1, tr("KIND"), self.v_kind, list(self.kind_of), 16, True)
+        self.e_kind.bind("<<ComboboxSelected>>", app.mark_dirty)
+        self.e_date = self.small(r1, tr("DATE"), 12)
+        self.e_doctor = app.field(b, tr("WITH  (a person's p_…, or a name)"), app.f_meta, pad)
+        self.e_place = app.field(b, tr("PLACE"), app.f_meta, pad)
+        self.ctype = "measure"
 
         self.e_source = app.source_field(c, pad)
         self.e_tags = app.field(c, tr("TAGS"), app.f_meta, pad)
         self.t_notes = app.textfield(c, tr("NOTES"), 2, app.f_body, pad)
-
-        app.label(c, tr("READINGS  (one per line:  2026-09-01 [10:30]  value  note)"), pad)
-        self.t_read = app.textfield_bare(c, 3, pad)
-        self.summary = tk.Label(c, text="", bg=PAPER, fg=SOFT, font=app.f_meta, anchor="w")
-        self.summary.pack(fill="x", pady=(2, 0), **pad)
-        self.trend = tk.Canvas(c, height=96, bg=PAPER, highlightthickness=0, bd=0)
-        self.trend.pack(fill="x", pady=(6, 0), **pad)
-        self.trend.bind("<Configure>", lambda e: self.draw_trend())
-        addrow = tk.Frame(c, bg=PAPER)
-        addrow.pack(fill="x", pady=(3, 10), **pad)
-        self.e_new = tk.Entry(addrow, width=1, font=app.f_body, bg=PAPER, fg=INK,
-                              relief="flat", highlightthickness=1,
-                              highlightbackground=RULE, highlightcolor=STAMP,
-                              disabledbackground=PAPER, disabledforeground=FAINT)
-        self.e_new.pack(side="left", fill="x", expand=True, ipady=2)
-        self.e_new.bind("<Return>", lambda e: self.add_reading())
-        ttk.Button(addrow, text=tr("+ today's reading"), command=self.add_reading
-                   ).pack(side="left", padx=(8, 0))
 
         b = tk.Frame(c, bg=PAPER)
         b.pack(fill="x")
@@ -4801,8 +5189,10 @@ class MetricCard:
         tk.Frame(c, bg=PAPER, height=12).pack(fill="x")
 
         self.entries = [self.e_name, self.e_unit, self.e_lo, self.e_hi, self.e_source,
-                        self.e_tags, self.e_new]
-        self.texts = [self.t_notes, self.t_read, self.t_edges, self.t_links]
+                        self.e_tags, self.e_new, self.e_dose, self.e_freq, self.e_start,
+                        self.e_end, self.e_purpose, self.e_prescriber, self.e_target,
+                        self.e_session, self.e_date, self.e_doctor, self.e_place]
+        self.texts = [self.t_notes, self.t_read, self.t_edges, self.t_links, self.t_sessions]
         app.bind_undo(self.e_name)
         for w in self.entries + self.texts:
             for ev in ("<KeyRelease>", "<<Paste>>", "<<Cut>>"):
@@ -4810,12 +5200,97 @@ class MetricCard:
         self.t_read.bind("<KeyRelease>", lambda e: self.refresh_summary(), add="+")
         for w in (self.e_lo, self.e_hi):
             w.bind("<KeyRelease>", lambda e: self.refresh_summary(), add="+")
+        self.t_sessions.bind("<KeyRelease>", lambda e: self.refresh_sessions(), add="+")
+        self.e_end.bind("<KeyRelease>", lambda e: self.refresh_med(), add="+")
+        self.e_start.bind("<KeyRelease>", lambda e: self.refresh_med(), add="+")
+        self.apply_type()
+
+    # ---- pieces of the card
+    def small(self, parent, title, width=8):
+        col = tk.Frame(parent, bg=PAPER)
+        col.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        tk.Label(col, text=title, bg=PAPER, fg=FAINT, font=self.app.f_label,
+                 anchor="w").pack(fill="x", pady=(8, 2))
+        ent = tk.Entry(col, width=width, font=self.app.f_meta, bg=PAPER, fg=INK,
+                       insertbackground=INK, relief="flat", highlightthickness=0,
+                       disabledbackground=PAPER, disabledforeground=FAINT)
+        ent.pack(fill="x")
+        tk.Frame(col, bg=RULE, height=1).pack(fill="x", pady=(4, 0))
+        self.app.bind_undo(ent)
+        return ent
+
+    def combo(self, parent, title, var, values, width, readonly=False):
+        col = tk.Frame(parent, bg=PAPER)
+        col.pack(side="left", padx=(0, 14))
+        tk.Label(col, text=title, bg=PAPER, fg=FAINT, font=self.app.f_label,
+                 anchor="w").pack(fill="x", pady=(8, 2))
+        box = ttk.Combobox(col, textvariable=var, values=values, width=width,
+                           font=self.app.f_meta, state="readonly" if readonly else "normal")
+        box.pack(anchor="w")
+        box.readonly = readonly
+        return box
+
+    def add_row(self, parent, button, command, pad):
+        row = tk.Frame(parent, bg=PAPER)
+        row.pack(fill="x", pady=(3, 10), **pad)
+        e = tk.Entry(row, width=1, font=self.app.f_body, bg=PAPER, fg=INK, relief="flat",
+                     highlightthickness=1, highlightbackground=RULE, highlightcolor=STAMP,
+                     disabledbackground=PAPER, disabledforeground=FAINT)
+        e.pack(side="left", fill="x", expand=True, ipady=2)
+        e.bind("<Return>", lambda ev: command())
+        ttk.Button(row, text=button, command=command).pack(side="left", padx=(8, 0))
+        return e
+
+    def apply_type(self):
+        for f in self.blocks.values():
+            f.pack_forget()
+        self.blocks[self.ctype].pack(fill="x")
+
+    def type_changed(self, _e=None):
+        self.ctype = self.type_of.get(self.v_type.get(), "measure")
+        self.apply_type()
+        self.app.mark_dirty()
+        self.app.root.after_idle(self.app.refit_card)
+
+    def refresh_med(self):
+        end, start = self.e_end.get().strip(), self.e_start.get().strip()
+        if end and end < TODAY():
+            text = tr("ended on {date}", date=end)
+        else:
+            text = tr("in use") + (" · " + tr("since {date}", date=start) if start else "")
+        self.med_state.configure(text=text)
+
+    def refresh_sessions(self):
+        ss = parse_log(self.t_sessions.get("1.0", "end-1c"))
+        if not ss:
+            self.sess_summary.configure(text=tr("no sessions"))
+            return
+        month = (date.today() - timedelta(days=30)).isoformat()
+        recent = sum(1 for x in ss if x["date"] >= month)
+        self.sess_summary.configure(text=tr("{n} sessions · {m} in the last 30 days · last {date}",
+                                            n=len(ss), m=recent,
+                                            date=max(x["date"] for x in ss)))
+
+    def add_session(self):
+        text = self.e_session.get().strip()
+        if not self.app.current() or not text:
+            return
+        existing = self.t_sessions.get("1.0", "end-1c").rstrip()
+        line = text if LOG_RE.match(text) and LOG_RE.match(text).group(2) else f"{TODAY()}   {text}"
+        self.t_sessions.delete("1.0", "end")
+        self.t_sessions.insert("1.0", (existing + "\n" + line) if existing else line)
+        self.e_session.delete(0, "end")
+        self.app.mark_dirty()
+        self.app.refit_card()
+        self.app.save()
 
     def enable(self, on):
         state = "normal" if on else "disabled"
         for w in self.entries + self.texts:
             w.configure(state=state)
         self.e_system.configure(state="normal" if on else "disabled")
+        for box in (self.e_type, self.e_kind):
+            box.configure(state=("readonly" if on else "disabled"))
 
     def clear(self):
         for w in self.entries:
@@ -4823,6 +5298,10 @@ class MetricCard:
         for t in self.texts:
             t.delete("1.0", "end")
         self.v_system.set("")
+        self.v_type.set("")
+        self.v_kind.set("")
+        self.med_state.configure(text="")
+        self.sess_summary.configure(text="")
         self.outbox.delete(0, "end")
         self.inbox.delete(0, "end")
         self.summary.configure(text="")
@@ -4835,8 +5314,14 @@ class MetricCard:
         self.e_name.delete(0, "end")
         self.e_name.insert(0, m.get("name", ""))
         self.v_system.set(system_label(m.get("system", "")))
+        self.ctype = htype(m)
+        self.v_type.set(tr(HEALTH_TYPE_LABEL[self.ctype]))
+        self.v_kind.set(tr(m["etype"]) if m.get("etype") else "")
         for w, k in ((self.e_unit, "unit"), (self.e_lo, "ref_low"), (self.e_hi, "ref_high"),
-                     (self.e_source, "source")):
+                     (self.e_source, "source"), (self.e_dose, "dose"), (self.e_freq, "frequency"),
+                     (self.e_start, "start"), (self.e_end, "end"), (self.e_purpose, "purpose"),
+                     (self.e_prescriber, "prescriber"), (self.e_target, "target"),
+                     (self.e_date, "date"), (self.e_doctor, "doctor"), (self.e_place, "place")):
             w.delete(0, "end")
             w.insert(0, str(m.get(k, "") or ""))
         self.app.update_source_hint(self.e_source)
@@ -4846,6 +5331,11 @@ class MetricCard:
         self.t_notes.insert("1.0", m.get("notes", ""))
         self.t_read.delete("1.0", "end")
         self.t_read.insert("1.0", format_readings(m.get("readings", [])))
+        self.t_sessions.delete("1.0", "end")
+        self.t_sessions.insert("1.0", format_log(m.get("sessions", [])))
+        self.apply_type()
+        self.refresh_med()
+        self.refresh_sessions()
         self.t_links.delete("1.0", "end")
         self.t_links.insert("1.0", "\n".join(m.get("links", [])))
         self.t_edges.delete("1.0", "end")
@@ -4973,6 +5463,19 @@ class MetricCard:
             "readings": parse_readings(self.t_read.get("1.0", "end-1c")),
             "links": [l.strip() for l in self.t_links.get("1.0", "end-1c").splitlines()
                       if l.strip()],
+            "ctype": self.ctype,
+            "dose": self.e_dose.get().strip(),
+            "frequency": self.e_freq.get().strip(),
+            "start": self.e_start.get().strip(),
+            "end": self.e_end.get().strip(),
+            "purpose": self.e_purpose.get().strip(),
+            "prescriber": self.e_prescriber.get().strip(),
+            "target": self.e_target.get().strip(),
+            "sessions": parse_log(self.t_sessions.get("1.0", "end-1c")),
+            "etype": self.kind_of.get(self.v_kind.get(), m.get("etype", "")),
+            "date": self.e_date.get().strip(),
+            "doctor": self.e_doctor.get().strip(),
+            "place": self.e_place.get().strip(),
         })
         return out
 
@@ -5352,6 +5855,7 @@ class App:
         self.view_kind = self.view_lang = self.view_domain = None  # verba filters
         self.view_stype = None                                # source filter
         self.view_system = None                               # corpus filter
+        self.view_htype = None                                # corpus type filter
         self.source_hints = []
         self.read_titles = {}       # Text widget -> its title, for reading mode
         self.draft = None
@@ -5460,7 +5964,7 @@ class App:
         self.count.pack(side="left", padx=14)
         ttk.Button(bar, text=tr("quick entry"), command=self.quick_add
                    ).pack(side="right", padx=(4, 12))
-        ttk.Button(bar, text=tr("+ measurement"), command=self.new_metric
+        ttk.Button(bar, text=tr("+ health"), command=self.new_metric
                    ).pack(side="right", padx=(4, 0))
         ttk.Button(bar, text=tr("+ source"), command=self.new_source
                    ).pack(side="right", padx=(4, 0))
@@ -5757,7 +6261,7 @@ class App:
         f.add_command(label=tr("New concept"), command=lambda: self.new_entry("concept"))
         f.add_command(label=tr("New form"), command=lambda: self.new_entry("form"))
         f.add_command(label=tr("New source"), command=self.new_source)
-        f.add_command(label=tr("New measurement (corpus)"), command=self.new_metric)
+        f.add_command(label=tr("New health record (corpus)"), command=self.new_metric)
         f.add_command(label=tr("Quick entry…"), accelerator="Ctrl+Q", command=self.quick_add)
         f.add_separator()
         f.add_command(label=tr("Save"), accelerator="Ctrl+S", command=self.save)
@@ -5769,6 +6273,7 @@ class App:
         b = self.menu(m)
         b.add_command(label=tr("Rebuild markdown mirror"), command=self.do_mirror)
         b.add_command(label=tr("Open body map (corpus, HTML)"), command=self.do_corpus)
+        b.add_command(label=tr("Health report (corpus, HTML)"), command=self.do_health)
         b.add_command(label=tr("Check structure"), command=self.do_doctor)
         b.add_command(label=tr("Normalize inline #tags (people)"), command=self.do_normalize)
         b.add_separator()
@@ -6528,6 +7033,8 @@ class App:
             for m in self.data["corpus"]:
                 if not base_ok(m):
                     continue
+                if self.view_htype and htype(m) != self.view_htype:
+                    continue
                 if self.view_system is not None and (m.get("system") or "") != self.view_system:
                     continue
                 out.append(m)
@@ -6548,12 +7055,16 @@ class App:
                                                     if year_of_source(r) else "")
             return r.get("name") or r.get("raw", ""), sub
         if kind == "metric":
-            lr = last_reading(r)
-            sub = system_label(r.get("system") or "") + (
-                f" · {lr['date']} = {lr['value']} {r.get('unit', '')}" if lr
-                else " · " + tr("no readings"))
-            if lr and out_of_range(r, lr):
-                sub += "  (!)"
+            t = htype(r)
+            if t == "measure":
+                lr = last_reading(r)
+                sub = system_label(r.get("system") or "") + (
+                    f" · {lr['date']} = {lr['value']} {r.get('unit', '')}" if lr
+                    else " · " + tr("no readings"))
+                if lr and out_of_range(r, lr):
+                    sub += "  (!)"
+            else:
+                sub = tr(HEALTH_TYPE_LABEL[t]) + " · " + " · ".join(health_facts(r, self.data))
             return r["name"], sub
         p = r
         live = open_tasks(p)
@@ -6583,7 +7094,7 @@ class App:
     def filter_sig(self):
         return (self.q.get().strip(), self.scope, self.tag, self.viewmode, self.date,
                 self.view_kind, self.view_lang, self.view_domain, self.view_stype,
-                self.view_system)
+                self.view_htype, self.view_system)
 
     def refresh_list(self):
         """Without a search or filter, the list is the REGISTER: everything in
@@ -6778,6 +7289,16 @@ class App:
                 r.insert("", "end", iid="y:" + t, text="  " + type_label(t), values=(types[t],),
                          tags=("on",) if self.view_stype == t else ())
         if self.data["corpus"]:
+            types = {}
+            for m in self.data["corpus"]:
+                types[htype(m)] = types.get(htype(m), 0) + 1
+            r.insert("", "end", iid="h9", text="", tags=("head",))
+            r.insert("", "end", iid="h9b", text=tr("HEALTH"), tags=("head",))
+            for t in HEALTH_TYPES:
+                if types.get(t):
+                    r.insert("", "end", iid="u:" + t, text="  " + tr(HEALTH_TYPE_LABEL[t]),
+                             values=(types[t],),
+                             tags=("on",) if self.view_htype == t else ())
             systems = {}
             for m in self.data["corpus"]:
                 sname = m.get("system") or ""
@@ -6813,7 +7334,7 @@ class App:
     def clear_filters(self):
         self.tag = self.viewmode = self.date = None
         self.view_kind = self.view_lang = self.view_domain = None
-        self.view_stype = self.view_system = None
+        self.view_stype = self.view_system = self.view_htype = None
 
     def on_rail(self, _event):
         sel = self.rail.selection()
@@ -6860,6 +7381,11 @@ class App:
             self.clear_filters()
             self.view_stype = None if was == key else key
             self.scope = "sources"
+        elif iid.startswith("u:"):
+            was = self.view_htype
+            self.clear_filters()
+            self.view_htype = None if was == key else key
+            self.scope = "corpus"
         elif iid.startswith("z:"):
             was = self.view_system
             self.clear_filters()
@@ -7007,13 +7533,14 @@ class App:
     def new_metric(self):
         self.commit_if_dirty()
         self.draft = fix_metric({"id": "__draft_h__", "name": self.q.get().strip(),
-                                 "system": self.view_system or ""})
+                                 "system": self.view_system or "",
+                                 "ctype": self.view_htype or "measure"})
         self.draft["_h"] = ""
         self.data["corpus"].append(self.draft)
         self.refresh_list()
         self.open_record("__draft_h__")
         self.mc.e_name.focus_set()
-        self.say(tr("New measurement. The id is generated when saved with a name."))
+        self.say(tr("New health record. The id is generated when saved with a name."))
 
     def _save_linked(self, coll, card, rec, auto, make_id_fn, needs_name):
         """Sources and measurements: the record plus the links going out of it,
@@ -7414,6 +7941,14 @@ class App:
         with contextlib.redirect_stdout(io.StringIO()):
             cmd_corpus(open_it=True)
         self.say(tr("Body map rebuilt and opened: {name}", name=CORPUS_HTML_FILE.name))
+
+    def do_health(self):
+        self.commit_if_dirty()
+        import io
+        import contextlib
+        with contextlib.redirect_stdout(io.StringIO()):
+            cmd_health(open_it=True)
+        self.say(tr("Health report made and opened: {name}", name=HEALTH_HTML_FILE.name))
 
     def do_mirror(self):
         self.commit_if_dirty()
@@ -8055,8 +8590,10 @@ class BookView:
             kicker += " · " + o["lang"]
         if rk == "source" and o.get("type"):
             kicker += " · " + o["type"]
-        if rk == "metric" and o.get("system"):
-            kicker += " · " + o["system"]
+        if rk == "metric":
+            kicker = tr(HEALTH_TYPE_LABEL[htype(o)]).upper()
+            if o.get("system"):
+                kicker += " · " + system_label(o["system"])
         self.text(bx0, y, kicker, self.f_small)
         y += 18
         t = self.text(bx0, y, label_any(o, self.data), self.f_title, width=width)
@@ -8108,7 +8645,12 @@ class BookView:
             if users:
                 out.append((tr("source of {n}", n=len(users)),
                             ", ".join(label_any(r, d) for r in users[:12])))
-        if rk == "metric":
+        if rk == "metric" and htype(o) != "measure":
+            out.append(("", "  ·  ".join(health_facts(o, d))))
+            if o.get("sessions"):
+                out.append((tr("sessions"), "\n".join(
+                    f"{x.get('date', '')}  {x.get('text', '')}" for x in o["sessions"][-8:])))
+        if rk == "metric" and htype(o) == "measure":
             ref = " – ".join(str(x) for x in (o.get("ref_low"), o.get("ref_high")) if x)
             out.append(("", f"{o.get('unit', '')}" + ("  ·  " + tr("reference: ") + ref if ref else "")))
             reads = o.get("readings", [])[-8:]
@@ -8388,6 +8930,8 @@ def main():
         return 0
     if cmd == "corpus":
         return cmd_corpus(open_it="--no-open" not in rest)
+    if cmd == "health":
+        return cmd_health(open_it="--no-open" not in rest)
     if cmd == "search" and rest:
         return cmd_search(" ".join(rest))
     if cmd == "history" and rest:
@@ -8598,8 +9142,8 @@ PT = {
         "carimbo {stamp} repetido: {ids}",
     "{n} number(s) with neither a record nor a cancellation: {shown}":
         "{n} número(s) sem registro nem cancelamento: {shown}",
-    "{people} people · {entries} entries ({concepts} concepts, {forms} forms) · {sources} sources · {metrics} measurements ({readings} readings) · {links} links":
-        "{people} pessoas · {entries} verbetes ({concepts} conceitos, {forms} formas) · {sources} fontes · {metrics} medidas ({readings} leituras) · {links} ligações",
+    "{people} people · {entries} entries ({concepts} concepts, {forms} forms) · {sources} sources · {metrics} health records ({readings} readings) · {links} links":
+        "{people} pessoas · {entries} verbetes ({concepts} conceitos, {forms} formas) · {sources} fontes · {metrics} registros de saúde ({readings} leituras) · {links} ligações",
     "{e} errors, {w} warnings":
         "{e} erros, {w} avisos",
     "ERROR":
@@ -9294,6 +9838,170 @@ PT = {
         "Cartão largo. F11 traz o trilho e a lista de volta.",
     "\n  F11 / Ctrl+\\   wide card: hides the rail and the list (again: brings them back)\n  Ctrl+E          reading mode: the long field (notes) across the whole card;\n                  also a double-click on a field's title. Inside it:\n                  PageUp / PageDown or the wheel turn the page, Ctrl+F finds,\n                  Enter / Shift+Enter next / previous match, Esc closes.\n                  What you type goes back to the field and is saved as usual.\n":
         "\n  F11 / Ctrl+\\   cartão largo: esconde o trilho e a lista (de novo: traz de volta)\n  Ctrl+E          modo de leitura: o campo longo (notas) no cartão inteiro;\n                  também um duplo clique no título de um campo. Dentro dele:\n                  PageUp / PageDown ou a roda viram a página, Ctrl+F busca,\n                  Enter / Shift+Enter próxima / anterior ocorrência, Esc fecha.\n                  O que você digita volta para o campo e é salvo como sempre.\n",
+    "+ health":
+        "+ saúde",
+    "+ today's session":
+        "+ sessão de hoje",
+    "AIM  (e.g. 3 times a week)":
+        "META  (ex.: 3 vezes por semana)",
+    "Activities and habits":
+        "Atividades e hábitos",
+    "Activities: sessions per week, last 12 weeks":
+        "Atividades: sessões por semana, últimas 12 semanas",
+    "Activity":
+        "Atividade",
+    "Aim":
+        "Meta",
+    "All events":
+        "Todos os eventos",
+    "Consultation":
+        "Consulta",
+    "DATE":
+        "DATA",
+    "DOSE":
+        "DOSE",
+    "Dose":
+        "Dose",
+    "Event":
+        "Evento",
+    "Events in the last 12 months":
+        "Eventos nos últimos 12 meses",
+    "FOR":
+        "PARA",
+    "FREQUENCY":
+        "FREQUÊNCIA",
+    "Follow-up":
+        "Acompanhamento",
+    "For":
+        "Para",
+    "Frequency":
+        "Frequência",
+    "HEALTH":
+        "SAÚDE",
+    "Health report":
+        "Relatório de saúde",
+    "Health report (corpus, HTML)":
+        "Relatório de saúde (corpus, HTML)",
+    "Health report -> {name}":
+        "Relatório de saúde -> {name}",
+    "Health report made and opened: {name}":
+        "Relatório de saúde feito e aberto: {name}",
+    "Kind":
+        "Tipo",
+    "Last session":
+        "Última sessão",
+    "Latest measurements":
+        "Últimas medidas",
+    "Made by _kustos.py from the corpus; edit the records in the window, not here.":
+        "Feito pelo _kustos.py a partir do corpus; edite os registros na janela, não aqui.",
+    "Measurements over time":
+        "Medidas ao longo do tempo",
+    "Medication":
+        "Medicação",
+    "Medication history":
+        "Histórico de medicações",
+    "Medications in use":
+        "Medicações em uso",
+    "New health record (corpus)":
+        "Novo registro de saúde (corpus)",
+    "New health record. The id is generated when saved with a name.":
+        "Registro de saúde novo. O id é gerado ao salvar com nome.",
+    "No activities recorded.":
+        "Nenhuma atividade registrada.",
+    "No events in the last 12 months.":
+        "Nenhum evento nos últimos 12 meses.",
+    "No events recorded.":
+        "Nenhum evento registrado.",
+    "No measurement with readings.":
+        "Nenhuma medida com leituras.",
+    "No medication in use.":
+        "Nenhuma medicação em uso.",
+    "No medication recorded.":
+        "Nenhuma medicação registrada.",
+    "PRESCRIBED BY  (a person's p_…, or a name)":
+        "PRESCRITO POR  (p_… de uma pessoa, ou um nome)",
+    "Place":
+        "Local",
+    "Prescribed by":
+        "Prescrito por",
+    "READINGS":
+        "LEITURAS",
+    "SESSIONS":
+        "SESSÕES",
+    "SESSIONS  (one per line:  2026-10-15  60 min  note)":
+        "SESSÕES  (uma por linha:  2026-10-15  60 min  observação)",
+    "SINCE":
+        "DESDE",
+    "Sessions in total":
+        "Sessões no total",
+    "Sessions, last 30 days":
+        "Sessões, últimos 30 dias",
+    "Since":
+        "Desde",
+    "Summary":
+        "Resumo",
+    "Trend":
+        "Tendência",
+    "UNTIL  (empty: in use)":
+        "ATÉ  (vazio: em uso)",
+    "Until":
+        "Até",
+    "WITH  (a person's p_…, or a name)":
+        "COM  (p_… de uma pessoa, ou um nome)",
+    "Weeks":
+        "Semanas",
+    "With":
+        "Com",
+    "activity or habit":
+        "atividade ou hábito",
+    "aim: ":
+        "meta: ",
+    "consultation":
+        "consulta",
+    "ended":
+        "encerrada",
+    "ended on {date}":
+        "encerrada em {date}",
+    "event":
+        "evento",
+    "exam":
+        "exame",
+    "for: ":
+        "para: ",
+    "generated on {date}":
+        "gerado em {date}",
+    "in use":
+        "em uso",
+    "medication":
+        "medicação",
+    "no sessions":
+        "sem sessões",
+    "other":
+        "outro",
+    "prescribed by ":
+        "prescrito por ",
+    "procedure":
+        "procedimento",
+    "report":
+        "relatório",
+    "sessions":
+        "sessões",
+    "symptom":
+        "sintoma",
+    "until {date}":
+        "até {date}",
+    "vaccine":
+        "vacina",
+    "with ":
+        "com ",
+    "{n} readings · min {lo} · max {hi} · mean {mean}":
+        "{n} leituras · mín {lo} · máx {hi} · média {mean}",
+    "{n} sessions · last {date}":
+        "{n} sessões · última em {date}",
+    "{n} sessions · {m} in the last 30 days · last {date}":
+        "{n} sessões · {m} nos últimos 30 dias · última em {date}",
+    "UNTIL":
+        "ATÉ",
 }
 
 if __name__ == "__main__":

@@ -25,7 +25,16 @@ updating of files and conflicts if used any syncing app or cloud sync.
   `attested_in`, `defined_in`, `translates`, `measured_in`…). Labels outside of the table are accepted and marked as atypical.
 - **Source**: free types (book, paper, thesis, law/bill, decisions, webpages, videos), citations in academic formats, BibTeX and CSL-JSON.
   Can import from Zotero via CSL-JSON or BibTeX without duplicating entries.
-- **Health track**: trackings with each body system, units, reference margin, dated entries; minimalist vitruvian-inspired body mapping with tendency curve. Also generates an HTML to open in the web browser.
+- **Health (corpus)**: four kinds of record, each with its own fields —
+  *measurements* (unit, reference range, dated readings with a trend curve),
+  *medications* (dose, frequency, since/until, prescriber, purpose),
+  *activities and habits* (aim and a diary of sessions) and *events*
+  (consultations, exams, symptoms, procedures, vaccines). A minimalist
+  Vitruvian body map shows the systems involved. **Base › Health report** (or
+  `python _kustos.py health`) writes `_kustos_health.html` with two views:
+  *Consultation* (medications in use, latest values with their status, recent
+  events, current activities) and *Follow-up* (trends, sessions per week, full
+  history); printing prints the view on screen.
 - **Register number**, similar to notary and public registry systems: on its
   first save, every entry gets a stamp (`YYYYMMDDHHmmss`) and a sequential
   order number (`nº 1852`). The number never changes and is never reused;
