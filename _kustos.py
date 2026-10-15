@@ -55,6 +55,7 @@ USAGE
 
 import hashlib
 import json
+import marshal
 import math
 import os
 import re
@@ -1519,15 +1520,42 @@ def read_vault(path):
         return None
 
 
+# The last state read from or written to the disk, as a marshal blob, with the
+# file's (mtime, size) at that moment. While the file is unchanged, load_json()
+# hands out a fresh copy of it instead of parsing and fixing the whole JSON
+# again; a change on disk (another save here, Syncthing bringing the other
+# machine's) changes the stamp, and the file is read for real.
+_DISK = {"stamp": None, "blob": None}
+
+
+def _disk_stamp():
+    try:
+        st = JSON_FILE.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
 def load_json():
     if not JSON_FILE.exists():
         return blank_vault()
+    stamp = _disk_stamp()
+    if stamp is not None and stamp == _DISK["stamp"] and _DISK["blob"] is not None:
+        return marshal.loads(_DISK["blob"])
     data = read_vault(JSON_FILE)
     if data is None:
         raise SystemExit(tr("{name} could not be read. Nothing was written. Check "
                             "the file, or use `replay` to rebuild it from the logs.",
                             name=JSON_FILE.name))
+    _remember_disk(data, stamp)
     return data
+
+
+def _remember_disk(data, stamp):
+    try:
+        _DISK["blob"], _DISK["stamp"] = marshal.dumps(data), stamp
+    except ValueError:           # something marshal cannot hold: just do not cache
+        _DISK["blob"] = _DISK["stamp"] = None
 
 
 def write_json(data):
@@ -1548,6 +1576,7 @@ def write_json(data):
             if attempt == 5:
                 raise
             time.sleep(0.25 * (attempt + 1))
+    _remember_disk(data, _disk_stamp())
     if numbered:
         log_append("reg", "vault", {"regs": numbered})
 
@@ -1742,6 +1771,14 @@ def register_new(data):
     Returns {id: [stamp, number]} for what changed, for the log."""
     if "book" not in data:
         return open_book(data)
+    # the usual case on a save: nothing new to number and no number repeated --
+    # a cheap check spares sorting every record
+    rows = book_rows(data)
+    nums = [r["reg_n"] for r in rows if r.get("reg_n")]
+    if len(nums) == len(set(nums)) and all(
+            r.get("reg_n") for coll in COLLS for r in data.get(coll, [])
+            if not r.get("id", "").startswith("__")):
+        return {}
     regs = {}
     owner = {}
     for r in sorted((r for r in book_rows(data) if r.get("reg_n")),
@@ -5366,7 +5403,6 @@ class App:
         st = ttk.Style(root)
         st.theme_use("clam")
         st.configure("TFrame", background=SHELL)
-        st.configure("TPanedwindow", background=RULE)
         self.row_h = 24
         st.configure("Treeview", background=SHELL, fieldbackground=SHELL,
                      foreground=INK, borderwidth=0, rowheight=self.row_h, font=self.f_row)
@@ -5435,7 +5471,11 @@ class App:
         ttk.Button(bar, text=tr("+ person"), command=self.new_person).pack(side="right")
 
     def build_body(self):
-        pw = ttk.Panedwindow(self.root, orient="horizontal")
+        # opaqueresize off: while the divider is dragged only a thin line moves,
+        # and the columns are laid out once, on release, instead of at every pixel
+        pw = tk.PanedWindow(self.root, orient="horizontal", opaqueresize=False,
+                            sashwidth=4, sashrelief="flat", bd=0, bg=RULE,
+                            showhandle=False)
         pw.pack(fill="both", expand=True)
 
         rail = tk.Frame(pw, bg=SHELL)
@@ -5453,7 +5493,7 @@ class App:
         self.rail.tag_configure("today", foreground=STAMP)
         self.rail.tag_configure("scope", foreground=STAMP)
         self.rail.bind("<<TreeviewSelect>>", self.on_rail)
-        pw.add(rail, weight=0)
+        pw.add(rail, stretch="never", minsize=120)
         self.rail_pane = rail
         self.wide = False
 
@@ -5482,14 +5522,14 @@ class App:
         self.list.bind("<MouseWheel>", lambda e: self.turn(-1 if e.delta > 0 else 1))
         self.list.bind("<Button-4>", lambda e: self.turn(-1))
         self.list.bind("<Button-5>", lambda e: self.turn(1))
-        pw.add(mid, weight=1)
+        pw.add(mid, stretch="always", minsize=200)
         self.mid_pane = mid
 
         self.cardbox = tk.Frame(pw, bg=PAPER)
         self.locus = tk.Label(self.cardbox, text="", bg=PAPER, fg=FAINT,
                               font=self.f_label, anchor="w", padx=22)
         self.locus.pack(fill="x", pady=(8, 0))
-        pw.add(self.cardbox, weight=2)
+        pw.add(self.cardbox, stretch="always", minsize=320)
         self.pw = pw
         self.apply_pane_lock()
         self.pc = PersonCard(self, self.cardbox)
@@ -5601,11 +5641,17 @@ class App:
         if not (0.05 < a < b < 0.95):
             return False
         try:
-            self.pw.sashpos(0, int(width * a))
-            self.pw.sashpos(1, int(width * b))
+            self.set_sash(0, int(width * a))
+            self.set_sash(1, int(width * b))
             return True
         except Exception:
             return False
+
+    def set_sash(self, i, x):
+        self.pw.sash_place(i, x, 0)
+
+    def get_sash(self, i):
+        return self.pw.sash_coord(i)[0]
 
     def remember_panes(self):
         if self.wide:
@@ -5614,8 +5660,8 @@ class App:
         if width < 200 or self.locked_panes:
             return
         try:
-            a = self.pw.sashpos(0) / width
-            b = self.pw.sashpos(1) / width
+            a = self.get_sash(0) / width
+            b = self.get_sash(1) / width
         except Exception:
             return
         if not (0.05 < a < b < 0.95):
@@ -5625,8 +5671,8 @@ class App:
     def toggle_wide(self):
         """F11 / Ctrl+Backslash: the card alone in the window, or back with the rail and list."""
         if self.wide:
-            self.pw.insert(0, self.rail_pane, weight=0)
-            self.pw.insert(1, self.mid_pane, weight=1)
+            self.pw.add(self.mid_pane, before=self.cardbox, stretch="always", minsize=200)
+            self.pw.add(self.rail_pane, before=self.mid_pane, stretch="never", minsize=120)
             self.wide = False
 
             def restore():
@@ -5671,15 +5717,17 @@ class App:
             else:
                 self.pw.unbind(seq)
         if not self.locked_panes:
-            self.pw.bind("<ButtonRelease-1>", lambda e: self.remember_panes(), add="+")
+            # the class binding moves the sash after this one runs: read it afterwards
+            self.pw.bind("<ButtonRelease-1>",
+                         lambda e: self.root.after_idle(self.remember_panes), add="+")
 
     def reset_layout(self):
         width = max(self.pw.winfo_width(), 700)
         rail = max(150, min(210, int(width * 0.17)))
         listw = max(230, int(width * 0.30))
         try:
-            self.pw.sashpos(0, rail)
-            self.pw.sashpos(1, rail + listw)
+            self.set_sash(0, rail)
+            self.set_sash(1, rail + listw)
         except Exception:
             pass
 
@@ -6148,15 +6196,19 @@ class App:
         t.bind("<Configure>", on_configure, add="+")
         for seq in ("<<Paste>>", "<<Cut>>", "<<Undo>>", "<<Redo>>"):
             t.bind(seq, later, add="+")
-        self.fits.append(fit)
+        self.fits.append((t, fit))
         self.pendings.append((t, last))
         return fit
 
     def refit_card(self):
-        for fit in self.fits:
-            fit()
+        """Fits the fields and the scroll area of the card on screen only; the
+        three hidden cards are fitted when they are shown."""
+        shown = str(self.card.frame) + "."
+        for t, fit in self.fits:
+            if str(t).startswith(shown):
+                fit()
         for canvas in getattr(self, "canvases", []):
-            if canvas.winfo_exists():
+            if str(canvas).startswith(shown) and canvas.winfo_exists():
                 canvas.update_idletasks()
                 canvas.configure(scrollregion=canvas.bbox("all"))
                 canvas.yview_moveto(0)
@@ -6335,15 +6387,23 @@ class App:
 
     # ------------------------------------------------------------ dados
     def reload(self):
+        """Reads the base again and rebuilds the search text of each record --
+        only for records whose timestamp changed since the last time."""
         self.data = load_json()
-        for p in self.data["people"]:
-            p["_h"] = haystack_person(p)
-        for e in self.data["entries"]:
-            e["_h"] = haystack_entry(e, self.data)
-        for s in self.data["sources"]:
-            s["_h"] = haystack_source(s, self.data)
-        for m in self.data["corpus"]:
-            m["_h"] = haystack_metric(m, self.data)
+        cache = getattr(self, "_hay", {})
+        fresh = {}
+        makers = (("people", lambda r: haystack_person(r)),
+                  ("entries", lambda r: haystack_entry(r, self.data)),
+                  ("sources", lambda r: haystack_source(r, self.data)),
+                  ("corpus", lambda r: haystack_metric(r, self.data)))
+        for coll, make in makers:
+            for r in self.data[coll]:
+                key = (r["id"], stamp_of(r))
+                h = cache.get(key)
+                if h is None:
+                    h = make(r)
+                r["_h"] = fresh[key] = h
+        self._hay = fresh
         if self.draft:
             self.data[coll_of(self.draft["id"])].append(self.draft)
         self.refresh_rail()
@@ -6982,6 +7042,8 @@ class App:
         if not rec:
             return None
         kind = self.rec_kind(rec)
+        old_id = rec["id"]
+        self._reshaped = False          # set when saving changes what the card shows
         try:
             if kind == "person":
                 new_id = self._save_person(rec, auto)
@@ -7002,8 +7064,22 @@ class App:
         self.dirty = False
         self.sel = new_id
         self.reload()
-        if reopen:
+        if reopen and (new_id != old_id or self._reshaped):
             self.open_record(new_id)
+        elif reopen:
+            # the card already shows what was saved: refresh only what the save
+            # itself changes (number, stamp, resolved links) instead of
+            # rebuilding every field
+            saved = self.current()
+            self.set_locus(saved)
+            card = self.card
+            if hasattr(card, "refresh_neighbours"):
+                card.refresh_neighbours(new_id)
+            elif hasattr(card, "refresh_citing"):
+                card.refresh_citing(saved)
+            if self.list.exists(new_id):
+                self.list.selection_set(new_id)
+        if reopen:
             self.flash(tr("Saved {date}", date=TODAY()))
         return new_id
 
@@ -7014,6 +7090,7 @@ class App:
                 self.flash(tr("A person needs a name."))
             return None
         filed = fold_finished_tasks(rec)
+        self._reshaped = self._reshaped or bool(filed)     # finished tasks moved to the log
         if rec["id"].startswith("__"):
             rec["met"] = rec.get("met") or TODAY()
             rec["id"] = make_id(rec["name"], set(by_id(load_json())))
@@ -7240,7 +7317,80 @@ class App:
         box.focus_set()
 
     # ------------------------------------------------------------ base
-    def safe_mirror(self, data):
+    MIRROR_DELAY = 1500       # ms after the last save before the mirror is rebuilt
+
+    def safe_mirror(self, data, now=False):
+        """Rebuilds the markdown mirror and the body-map page. They are only
+        readable copies, so this happens off the save: 1.5 s after the last
+        save, in a thread, on a snapshot of the data -- typing and saving never
+        wait for it. `now` (and closing the window) does it immediately."""
+        try:
+            self._mirror_blob = marshal.dumps(data)
+        except ValueError:
+            self._mirror_blob = None
+            now = True
+        if getattr(self, "_mirror_job", None):
+            try:
+                self.root.after_cancel(self._mirror_job)
+            except tk.TclError:
+                pass
+            self._mirror_job = None
+        if now:
+            self.flush_mirror(data)
+        else:
+            self._mirror_job = self.root.after(self.MIRROR_DELAY, self.start_mirror)
+
+    def start_mirror(self):
+        import threading
+        self._mirror_job = None
+        busy = getattr(self, "_mirror_thread", None)
+        if busy is not None and busy.is_alive():          # one at a time
+            self._mirror_job = self.root.after(300, self.start_mirror)
+            return
+        blob, self._mirror_blob = getattr(self, "_mirror_blob", None), None
+        if blob is None:
+            return
+        self._mirror_error = None
+
+        def work():
+            try:
+                snapshot = marshal.loads(blob)
+                write_mirror(snapshot)
+                write_corpus_html(snapshot)
+            except SystemExit as exc:
+                self._mirror_error = str(exc)
+            except OSError as exc:
+                self._mirror_error = str(exc)
+
+        self._mirror_thread = threading.Thread(target=work, daemon=True)
+        self._mirror_thread.start()
+        self.root.after(200, self.check_mirror)
+
+    def check_mirror(self):
+        t = getattr(self, "_mirror_thread", None)
+        if t is not None and t.is_alive():
+            self.root.after(200, self.check_mirror)
+        elif getattr(self, "_mirror_error", None):
+            err, self._mirror_error = self._mirror_error, None
+            self.notify(tr("Mirror not rebuilt"), err)
+
+    def flush_mirror(self, data=None):
+        """Finishes the mirror now: waits for a running rebuild, then writes
+        whatever is still pending (used on close)."""
+        if getattr(self, "_mirror_job", None):
+            try:
+                self.root.after_cancel(self._mirror_job)
+            except tk.TclError:
+                pass
+            self._mirror_job = None
+        t = getattr(self, "_mirror_thread", None)
+        if t is not None and t.is_alive():
+            t.join(10)
+        blob, self._mirror_blob = getattr(self, "_mirror_blob", None), None
+        if data is None and blob is not None:
+            data = marshal.loads(blob)
+        if data is None:
+            return
         try:
             write_mirror(data)
         except SystemExit as exc:
@@ -7260,7 +7410,7 @@ class App:
 
     def do_mirror(self):
         self.commit_if_dirty()
-        self.safe_mirror(load_json())
+        self.safe_mirror(load_json(), now=True)
         self.say(tr("Mirror rebuilt: {name}", name=MIRROR_FILE.name))
 
     def do_doctor(self):
@@ -7457,6 +7607,7 @@ class App:
             win.destroy()
             self.commit_if_dirty()
             self.restart_theme = self.theme
+            self.flush_mirror()
             self.stop_carets()
             self.root.destroy()
 
@@ -7471,6 +7622,7 @@ class App:
         self.commit_if_dirty()
         save_ui({"theme": key})
         self.restart_theme = key
+        self.flush_mirror()
         self.stop_carets()
         self.root.destroy()
 
@@ -7482,6 +7634,7 @@ class App:
         save_ui({"lang": code})
         set_lang(code)
         self.restart_theme = self.theme
+        self.flush_mirror()
         self.stop_carets()
         self.root.destroy()
 
@@ -7557,6 +7710,7 @@ class App:
 
     def on_close(self):
         self.commit_if_dirty()
+        self.flush_mirror()
         self.stop_carets()
         self.root.destroy()
 
