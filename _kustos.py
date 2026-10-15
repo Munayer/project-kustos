@@ -6692,7 +6692,9 @@ class App:
                  values=(len(self.data["corpus"]),),
                  tags=("on",) if self.scope == "corpus" else ("scope",))
 
-        if self.scope in (None, "people"):
+        # every section is always shown, whichever collection is open: picking an
+        # item in one opens its collection by itself (see on_rail)
+        if people:
             counts = {k: sum(1 for p in people if open_tasks(p, k))
                       for k in ("todo", "doing", "waiting")}
             untag = sum(1 for p in people if not p.get("tags"))
@@ -6704,17 +6706,6 @@ class App:
                                 ("untagged", tr("untagged"), untag)):
                 r.insert("", "end", iid="v:" + key, text="  " + lab, values=(n,),
                          tags=("on",) if self.viewmode == key else ())
-            tags = {}
-            for p in people:
-                for t in p.get("tags", []):
-                    if ":" not in t:
-                        tags[t] = tags.get(t, 0) + 1
-            if tags:
-                r.insert("", "end", iid="h2", text="", tags=("head",))
-                r.insert("", "end", iid="h2b", text=tr("TAGS"), tags=("head",))
-                for t in sorted(tags, key=sort_key):
-                    r.insert("", "end", iid="t:" + t, text="  " + t, values=(tags[t],),
-                             tags=("on",) if self.tag == t else ())
             days = {}
             for p in people:
                 for t in dated_tasks(p):
@@ -6734,8 +6725,19 @@ class App:
                         mark = ("on",)
                     r.insert("", "end", iid="d:" + day, text=flag + day,
                              values=(days[day],), tags=mark)
+            tags = {}
+            for p in people:
+                for t in p.get("tags", []):
+                    if ":" not in t:
+                        tags[t] = tags.get(t, 0) + 1
+            if tags:
+                r.insert("", "end", iid="h2", text="", tags=("head",))
+                r.insert("", "end", iid="h2b", text=tr("TAGS"), tags=("head",))
+                for t in sorted(tags, key=sort_key):
+                    r.insert("", "end", iid="t:" + t, text="  " + t, values=(tags[t],),
+                             tags=("on",) if self.tag == t else ())
 
-        if self.scope in (None, "entries"):
+        if entries:
             n_c = sum(1 for e in entries if e["kind"] == "concept")
             n_f = sum(1 for e in entries if e["kind"] == "form")
             r.insert("", "end", iid="h4", text="", tags=("head",))
@@ -6765,7 +6767,7 @@ class App:
                     r.insert("", "end", iid="m:" + d, text="  " + d, values=(doms[d],),
                              tags=("on",) if self.view_domain == d else ())
 
-        if self.scope in (None, "sources") and self.data["sources"]:
+        if self.data["sources"]:
             types = {}
             for s in self.data["sources"]:
                 t = s.get("type") or "outro"
@@ -6775,7 +6777,7 @@ class App:
             for t in sorted(types, key=lambda t: sort_key(type_label(t))):
                 r.insert("", "end", iid="y:" + t, text="  " + type_label(t), values=(types[t],),
                          tags=("on",) if self.view_stype == t else ())
-        if self.scope in (None, "corpus") and self.data["corpus"]:
+        if self.data["corpus"]:
             systems = {}
             for m in self.data["corpus"]:
                 sname = m.get("system") or ""
