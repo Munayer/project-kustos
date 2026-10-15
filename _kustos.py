@@ -4244,7 +4244,7 @@ class BodyMap:
         else:
             self.wrap.pack_forget()
         if save:
-            self.app.data = save_ui({"map_open": on})
+            self.app.save_prefs({"map_open": on})
 
     # ---- geometry
     def P(self, x, y):
@@ -5653,6 +5653,11 @@ class App:
     def get_sash(self, i):
         return self.pw.sash_coord(i)[0]
 
+    def save_prefs(self, patch):
+        """Saves window preferences (ui.*) and takes back only those: the records
+        loaded in the window keep their search text, drafts and the rest."""
+        self.data["ui"] = save_ui(patch).get("ui", {})
+
     def remember_panes(self):
         if self.wide:
             return
@@ -5666,7 +5671,7 @@ class App:
             return
         if not (0.05 < a < b < 0.95):
             return
-        self.data = save_ui({"panes": [round(a, 4), round(b, 4)]})
+        self.save_prefs({"panes": [round(a, 4), round(b, 4)]})
 
     def toggle_wide(self):
         """F11 / Ctrl+Backslash: the card alone in the window, or back with the rail and list."""
@@ -5706,7 +5711,7 @@ class App:
 
     def lock_panes(self):
         self.locked_panes = bool(self.locked_var.get())
-        self.data = save_ui({"panes_locked": self.locked_panes})
+        self.save_prefs({"panes_locked": self.locked_panes})
         self.apply_pane_lock()
         self.say(tr("Widths locked.") if self.locked_panes else tr("Widths free."))
 
@@ -7558,7 +7563,7 @@ class App:
 
         def apply_now():
             self.vc.layout = list(work)
-            self.data = save_ui({"card_fields": [{"id": f, "on": on} for f, on in work]})
+            self.save_prefs({"card_fields": [{"id": f, "on": on} for f, on in work]})
             self.vc.apply_layout()
             win.destroy()
             self.say(tr("Fields rearranged."))
