@@ -8843,6 +8843,17 @@ class BookView:
         self.draw()
 
 
+def set_window_icon(root):
+    """kustos.ico next to the program, if present, for every window (title bar
+    and taskbar); otherwise Tk's own icon stays."""
+    icon = BASE / "kustos.ico"
+    if icon.exists() and sys.platform == "win32":
+        try:
+            root.iconbitmap(default=str(icon))
+        except tk.TclError:
+            pass
+
+
 def cmd_book():
     """Opens the base as a logbook, for reading only."""
     global tk, tkfont, ttk
@@ -8857,6 +8868,7 @@ def cmd_book():
         print(tr("The base has no register numbers yet: open the main program once "
                  "first (the logbook writes nothing)."))
     root = tk.Tk()
+    set_window_icon(root)
     BookView(root, data)
     root.mainloop()
     return 0
@@ -8905,6 +8917,7 @@ def cmd_app(open_id=None):
         while True:
             load_palette(theme)
             root = tk.Tk()
+            set_window_icon(root)
             ui = App(root, theme, notices)
             notices = []
             if first:

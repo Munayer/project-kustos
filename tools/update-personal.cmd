@@ -22,5 +22,6 @@ python -m py_compile _kustos.py || (
 copy /y "_kustos.py"  "%TARGET%\" >nul
 copy /y "_kustos.cmd" "%TARGET%\" >nul
 copy /y "_kustos_logbook.cmd" "%TARGET%\" >nul
+copy /y "kustos.ico" "%TARGET%\" >nul
 echo Program copied to %TARGET%
 pause
