@@ -5852,6 +5852,7 @@ class App:
         self.sel = None
         self.scope = None          # None | "people" | "entries"
         self.tag = self.viewmode = self.date = None           # people filters
+        self.view_circle = None                               # people filter: a circle, or "none"
         self.view_kind = self.view_lang = self.view_domain = None  # verba filters
         self.view_stype = None                                # source filter
         self.view_system = None                               # corpus filter
@@ -7010,6 +7011,11 @@ class App:
                     continue
                 if self.date and not any(t["due"] == self.date for t in dated_tasks(p)):
                     continue
+                if self.view_circle == "none" and p.get("circles"):
+                    continue
+                if self.view_circle not in (None, "none") and \
+                        self.view_circle not in p.get("circles", []):
+                    continue
                 out.append(p)
         if scope in (None, "entries"):
             for e in self.data["entries"]:
@@ -7094,7 +7100,7 @@ class App:
     def filter_sig(self):
         return (self.q.get().strip(), self.scope, self.tag, self.viewmode, self.date,
                 self.view_kind, self.view_lang, self.view_domain, self.view_stype,
-                self.view_htype, self.view_system)
+                self.view_htype, self.view_circle, self.view_system)
 
     def refresh_list(self):
         """Without a search or filter, the list is the REGISTER: everything in
@@ -7236,6 +7242,16 @@ class App:
                         mark = ("on",)
                     r.insert("", "end", iid="d:" + day, text=flag + day,
                              values=(days[day],), tags=mark)
+            # Covey's circles, outermost first; a person can be in more than one
+            rings = {c: sum(1 for p in people if c in p.get("circles", [])) for c in CIRCLES}
+            r.insert("", "end", iid="h2c", text="", tags=("head",))
+            r.insert("", "end", iid="h2d", text=tr("CIRCLES"), tags=("head",))
+            for c in CIRCLES:
+                r.insert("", "end", iid="o:" + c, text="  " + tr(c), values=(rings[c],),
+                         tags=("on",) if self.view_circle == c else ())
+            r.insert("", "end", iid="o:none", text="  " + tr("no circle"),
+                     values=(sum(1 for p in people if not p.get("circles")),),
+                     tags=("on",) if self.view_circle == "none" else ())
             tags = {}
             for p in people:
                 for t in p.get("tags", []):
@@ -7332,7 +7348,7 @@ class App:
         self.mc.map.set_current(self.view_system)
 
     def clear_filters(self):
-        self.tag = self.viewmode = self.date = None
+        self.tag = self.viewmode = self.date = self.view_circle = None
         self.view_kind = self.view_lang = self.view_domain = None
         self.view_stype = self.view_system = self.view_htype = None
 
@@ -7350,6 +7366,11 @@ class App:
             was = self.viewmode
             self.clear_filters()
             self.viewmode = None if was == key else key
+            self.scope = "people"
+        elif iid.startswith("o:"):
+            was = self.view_circle
+            self.clear_filters()
+            self.view_circle = None if was == key else key
             self.scope = "people"
         elif iid.startswith("t:"):
             was = self.tag
