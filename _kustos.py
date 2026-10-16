@@ -5583,6 +5583,16 @@ HELP_READING = (
 )
 
 
+# the Help › Shortcuts lines for copying
+HELP_COPY = (
+    "\n  Ctrl+Shift+C    copy the open record's id (to paste into SOURCE or LINKS);"
+    "\n                  a click on the id in the card's corner does the same,"
+    "\n                  a click on the REGISTER line copies its nº."
+    "\n  Right-click on a list row: copy its id, its nº, a source's ABNT citation"
+    "\n                  or a ready link line. In the logbook, c copies the id.\n"
+)
+
+
 class Reader:
     """Reading mode: one long text field across the whole card, read in pages.
 
@@ -6022,6 +6032,7 @@ class App:
         self.list.tag_configure("sub", foreground=FAINT, font=self.f_meta)
         self.list.tag_configure("cancel", foreground=FAINT, font=self.f_meta)
         self.list.bind("<<TreeviewSelect>>", self.on_pick)
+        self.list.bind("<Button-3>", self.row_menu)
         # no scrolling: the list shows what fits, and the rest is the next page
         self.list.bind("<Configure>", self.fit_soon)
         self.list.bind("<MouseWheel>", lambda e: self.turn(-1 if e.delta > 0 else 1))
@@ -6044,6 +6055,11 @@ class App:
         self.cards = {"person": self.pc, "entry": self.vc, "source": self.sc,
                       "metric": self.mc}
         self.reader = Reader(self)
+        for card in self.cards.values():
+            card.stamp.configure(cursor="hand2")
+            card.stamp.bind("<Button-1>", lambda e: self.copy_id())
+        self.locus.configure(cursor="hand2")
+        self.locus.bind("<Button-1>", lambda e: self.copy_number())
         self.show_card("person")
         for c in self.cards.values():
             c.enable(False)
@@ -6201,6 +6217,55 @@ class App:
         self.root.after_idle(self.refit_card)
         return "break"
 
+    # ---- copying ids, numbers and citations, to paste into SOURCE and LINKS
+    def copy_text(self, text):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.say(tr("Copied: {value}", value=one_liner(text, 90)))
+
+    def copy_id(self, rid=None):
+        rid = rid or self.sel
+        if not rid or rid.startswith("__"):
+            self.say(tr("Save the record first: it gets its id on saving."))
+            return "break"
+        self.copy_text(rid)
+        return "break"
+
+    def copy_number(self, rid=None):
+        rec = by_id(self.data).get(rid or self.sel or "")
+        if rec and rec.get("reg_n"):
+            self.copy_text(f"nº {rec['reg_n']}")
+        return "break"
+
+    def row_menu(self, event):
+        """Right-click on a list row: copy its id, its number, or (sources) the
+        citation, without opening it."""
+        iid = self.list.identify_row(event.y)
+        if not iid:
+            return "break"
+        m = self.menu(self.root)
+        if iid.startswith("x:"):
+            m.add_command(label=tr("Copy register number"),
+                          command=lambda: self.copy_text(f"nº {iid[2:]}"))
+        else:
+            rec = by_id(self.data).get(iid)
+            if not rec or iid.startswith("__"):
+                return "break"
+            m.add_command(label=tr("Copy id") + f"   {iid}", command=lambda: self.copy_id(iid))
+            if rec.get("reg_n"):
+                m.add_command(label=tr("Copy register number") + f"   nº {rec['reg_n']}",
+                              command=lambda: self.copy_number(iid))
+            if coll_of(iid) == "sources":
+                m.add_command(label=tr("Copy ABNT citation"),
+                              command=lambda: self.copy_text(cite(rec, "abnt", self.data)))
+            m.add_command(label=tr("Copy as a link line") + f"   about {iid}",
+                          command=lambda: self.copy_text(f"about {iid}"))
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
+        return "break"
+
     def open_reader(self):
         """Ctrl+E: reading mode for the text field in focus, or the card's notes."""
         if self.reader.is_open:
@@ -6347,6 +6412,7 @@ class App:
         r.bind("<F11>", lambda e: self.toggle_wide())
         r.bind("<Control-backslash>", lambda e: self.toggle_wide())
         r.bind("<Control-e>", lambda e: self.open_reader())
+        r.bind("<Control-C>", lambda e: self.copy_id())        # Ctrl+Shift+C
         self.list.bind("<Control-Home>", lambda e: self.turn_to(0))
         self.list.bind("<Control-End>", lambda e: self.turn_to(None))
         self.list.bind("<Down>", lambda e: self.edge_step(1, e))
@@ -8203,7 +8269,7 @@ class App:
 
     def do_help(self):
         self.show_text(tr("Shortcuts"), tr(HELP_TEXT, conflicts=CONFLICT_DIR.name, stem=STEM)
-                       + tr(HELP_READING))
+                       + tr(HELP_READING) + tr(HELP_COPY))
 
     # ------------------------------------------------------------ dialogs
     def dialog(self, title, width=520, height=None):
@@ -8355,6 +8421,7 @@ class BookView:
         for n, (key, _) in enumerate(BOOK_CHAPTERS, 1):
             b(str(n), lambda e, k=key: self.open_chapter(k))
         b("<t>", lambda e: self.cycle_palette())
+        b("<c>", lambda e: self.copy_id())
         b("<a>", lambda e: self.toggle_animation())
         b("<Return>", lambda e: self.open_in_card())
         self.cv.bind("<Double-Button-1>", lambda e: self.open_in_card())
@@ -8816,6 +8883,18 @@ class BookView:
             kind, o = items[min(self.sel, len(items) - 1)]
             if kind == "r":
                 self.on_open(o["id"])
+        return "break"
+
+    def copy_id(self):
+        items = self.page_items()
+        if not items:
+            return "break"
+        kind, o = items[min(self.sel, len(items) - 1)]
+        text = o.get("id", "") if kind == "r" else f"nº {o.get('reg_n')}"
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.title(tr("Copied: {value}", value=text))
+        self.root.after(2500, lambda: self.root.title(tr("Kustos · logbook (read-only)")))
         return "break"
 
     def cycle_palette(self):
@@ -10036,6 +10115,20 @@ PT = {
         "{n} sessões · {m} nos últimos 30 dias · última em {date}",
     "UNTIL":
         "ATÉ",
+    "Copied: {value}":
+        "Copiado: {value}",
+    "Save the record first: it gets its id on saving.":
+        "Salve o registro antes: ele ganha o id ao salvar.",
+    "Copy register number":
+        "Copiar nº do registro",
+    "Copy id":
+        "Copiar id",
+    "Copy ABNT citation":
+        "Copiar citação ABNT",
+    "Copy as a link line":
+        "Copiar como linha de ligação",
+    "\n  Ctrl+Shift+C    copy the open record's id (to paste into SOURCE or LINKS);\n                  a click on the id in the card's corner does the same,\n                  a click on the REGISTER line copies its nº.\n  Right-click on a list row: copy its id, its nº, a source's ABNT citation\n                  or a ready link line. In the logbook, c copies the id.\n":
+        "\n  Ctrl+Shift+C    copia o id do registro aberto (para colar em FONTE ou LIGAÇÕES);\n                  um clique no id, no canto do cartão, faz o mesmo,\n                  um clique na linha REGISTRO copia o nº.\n  Botão direito numa linha da lista: copia o id, o nº, a citação ABNT de\n                  uma fonte ou uma linha de ligação pronta. No livro, c copia o id.\n",
 }
 
 if __name__ == "__main__":
