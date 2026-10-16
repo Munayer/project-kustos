@@ -15,6 +15,9 @@ updating of files and conflicts if used any syncing app or cloud sync.
 
 1. Download `_kustos.py` and `_kustos.cmd` onto an empty folder.
 2. Open `_kustos.cmd` to start using (or `_kustos_logbook.cmd` to read the base as a logbook, read-only; inside the app, `Ctrl+B` opens the logbook on the current entry and `Enter` in the logbook brings an entry back to the app). The empty folder will be the locus of files.
+   On Windows you can also make a shortcut to `pythonw.exe "<folder>\_kustos.py"` with
+   `kustos.ico` as its icon (`python tools/make_icon.py` draws it) and pin it to the
+   Start menu or the taskbar.
 3. Upon the first entry, the program creates the `_kustos.json` database. All files are local and don't leave your computer, unless you use a cloud or sync app.
 
 ## Components
