@@ -58,6 +58,12 @@ updating of files and conflicts if used any syncing app or cloud sync.
   tag:x lang:de type:book sys:renal dom:law id:c_
   ```
 
+  The search always runs over the whole base. The rail keeps every category
+  visible and its numbers count what the search finds (categories with nothing
+  are dimmed), so a search in one collection shows at once where else it
+  matches. The filters in force sit as chips above the list: `×` drops one,
+  *clear all* drops them all.
+
 - **Sync between machines**: each machine that you end up using and syncing will write its own diary of usage
   (`_kustos.log.<machine>.jsonl`); files `*.sync-conflict-*` are mixed register by register on opening. The complete history of each register comes out in the diaries.
 
