@@ -5863,6 +5863,7 @@ class App:
         self.scope = None          # None | "people" | "entries"
         self.tag = self.viewmode = self.date = None           # people filters
         self.view_circle = None                               # people filter: a circle, or "none"
+        self.scope_explicit = False     # scope picked in COLLECTIONS (not implied by a filter)
         self.view_kind = self.view_lang = self.view_domain = None  # verba filters
         self.view_stype = None                                # source filter
         self.view_system = None                               # corpus filter
@@ -6007,14 +6008,17 @@ class App:
         self.rail.tag_configure("late", foreground=OXIDE)
         self.rail.tag_configure("today", foreground=STAMP)
         self.rail.tag_configure("scope", foreground=STAMP)
+        self.rail.tag_configure("zero", foreground=FAINT)
         self.rail.bind("<<TreeviewSelect>>", self.on_rail)
         pw.add(rail, stretch="never", minsize=120)
         self.rail_pane = rail
         self.wide = False
 
         mid = tk.Frame(pw, bg=SHELL)
+        self.chips = tk.Frame(mid, bg=SHELL)       # the filters in force (refresh_chips)
         head = tk.Frame(mid, bg=SHELL)
         head.pack(fill="x")
+        self.list_head = head
         self.page_lbl = tk.Label(head, text="", bg=SHELL, fg=STAMP, font=self.f_label,
                                  anchor="w")
         self.page_lbl.pack(side="left", fill="x", expand=True, padx=(8, 0))
@@ -6559,6 +6563,7 @@ class App:
         self.commit_if_dirty()
         self.clear_filters()
         self.scope = key
+        self.scope_explicit = key is not None
         self.refresh_rail()
         self.refresh_list()
         if key == "corpus" and (self.sel is None or self.rec_kind(self.current()) != "metric"):
@@ -7008,7 +7013,12 @@ class App:
                 self.root.after_cancel(self._q_job)
             except tk.TclError:
                 pass
-        self._q_job = self.root.after(150, self.refresh_list)
+        self._q_job = self.root.after(150, self.search_changed)
+
+    def search_changed(self):
+        self._q_job = None
+        self.refresh_list()
+        self.refresh_rail()
 
     def parse_query(self):
         """Search operators:
@@ -7051,12 +7061,12 @@ class App:
                 return False
         return True
 
-    def matches(self):
+    def query_base(self):
+        """What the search text alone finds, per collection: the words, ^prefix,
+        field operators and p:/v:/f:/c:, but none of the rail's filters."""
         qscope, prefix, fields, terms = self.parse_query()
-        scope = qscope or self.scope
-        out = []
 
-        def base_ok(r):
+        def ok(r):
             if terms and not all(t in r.get("_h", "") for t in terms):
                 return False
             if prefix and not sort_key(r.get("name", ""))[0].startswith(
@@ -7064,10 +7074,17 @@ class App:
                 return False
             return self.field_ok(r, fields) if fields else True
 
+        return {c: ([r for r in self.data[c] if ok(r)] if qscope in (None, c) else [])
+                for c in COLLS}
+
+    def matches(self):
+        qscope = self.parse_query()[0]
+        scope = qscope or self.scope
+        base = self.query_base()
+        out = []
+
         if scope in (None, "people"):
-            for p in self.data["people"]:
-                if not base_ok(p):
-                    continue
+            for p in base["people"]:
                 if self.tag and self.tag not in p.get("tags", []):
                     continue
                 if self.viewmode in ("todo", "doing", "waiting") and \
@@ -7084,9 +7101,7 @@ class App:
                     continue
                 out.append(p)
         if scope in (None, "entries"):
-            for e in self.data["entries"]:
-                if not base_ok(e):
-                    continue
+            for e in base["entries"]:
                 if self.view_kind and e["kind"] != self.view_kind:
                     continue
                 if self.view_lang and e.get("lang") != self.view_lang:
@@ -7095,16 +7110,12 @@ class App:
                     continue
                 out.append(e)
         if scope in (None, "sources"):
-            for s in self.data["sources"]:
-                if not base_ok(s):
-                    continue
+            for s in base["sources"]:
                 if self.view_stype and (s.get("type") or "outro") != self.view_stype:
                     continue
                 out.append(s)
         if scope in (None, "corpus"):
-            for m in self.data["corpus"]:
-                if not base_ok(m):
-                    continue
+            for m in base["corpus"]:
                 if self.view_htype and htype(m) != self.view_htype:
                     continue
                 if self.view_system is not None and (m.get("system") or "") != self.view_system:
@@ -7229,6 +7240,7 @@ class App:
             self.count.configure(text=tr("{n} of {total}", n=len(self.view), total=total))
         if self.sel and self.list.exists(self.sel):
             self.list.selection_set(self.sel)
+        self.refresh_chips()
 
     def show_in_list(self, rid):
         """Moves the view to the record, if it is outside it."""
@@ -7260,138 +7272,216 @@ class App:
         self.locus.configure(text=text)
 
     def refresh_rail(self):
+        """The rail lists every category of the base, always; its numbers count
+        what the current search finds, so typing shows at once where the
+        matches are (another collection, a tag, a language...). Categories with
+        nothing for the search are dimmed, not hidden."""
         r = self.rail
-        r.delete(*r.get_children())
-        people, entries = self.data["people"], self.data["entries"]
-        r.insert("", "end", iid="h0", text=tr("COLLECTIONS"), tags=("head",))
-        r.insert("", "end", iid="s:people", text="  " + tr("people"), values=(len(people),),
-                 tags=("on",) if self.scope == "people" else ("scope",))
-        r.insert("", "end", iid="s:entries", text="  " + tr("verba"), values=(len(entries),),
-                 tags=("on",) if self.scope == "entries" else ("scope",))
-        r.insert("", "end", iid="s:sources", text="  " + tr("sources"),
-                 values=(len(self.data["sources"]),),
-                 tags=("on",) if self.scope == "sources" else ("scope",))
-        r.insert("", "end", iid="s:corpus", text="  " + tr("corpus"),
-                 values=(len(self.data["corpus"]),),
-                 tags=("on",) if self.scope == "corpus" else ("scope",))
+        out = []                        # (iid, text, values, tags), applied at the end
+        data = self.data
+        base = self.query_base()
+        people, entries, sources, corpus = (base[c] for c in COLLS)
+        searching = bool(self.q.get().strip())
 
-        # every section is always shown, whichever collection is open: picking an
-        # item in one opens its collection by itself (see on_rail)
-        if people:
-            counts = {k: sum(1 for p in people if open_tasks(p, k))
-                      for k in ("todo", "doing", "waiting")}
-            untag = sum(1 for p in people if not p.get("tags"))
-            r.insert("", "end", iid="h1", text="", tags=("head",))
-            r.insert("", "end", iid="h1b", text=tr("WORK"), tags=("head",))
-            for key, lab, n in (("todo", tr("to do"), counts["todo"]),
-                                ("doing", tr("in progress"), counts["doing"]),
-                                ("waiting", tr("waiting on"), counts["waiting"]),
-                                ("untagged", tr("untagged"), untag)):
-                r.insert("", "end", iid="v:" + key, text="  " + lab, values=(n,),
-                         tags=("on",) if self.viewmode == key else ())
-            days = {}
-            for p in people:
-                for t in dated_tasks(p):
-                    days[t["due"]] = days.get(t["due"], 0) + 1
-            if days:
-                r.insert("", "end", iid="h3", text="", tags=("head",))
-                r.insert("", "end", iid="h3b", text=tr("CALENDAR"), tags=("head",))
+        def head(iid, text):
+            out.append((iid, "", (), ("head",)))
+            out.append((iid + "b", text, (), ("head",)))
+
+        def item(iid, text, n, on, extra=()):
+            tags = ("on",) if on else tuple(extra) + (("zero",) if searching and not n else ())
+            out.append((iid, text, (n,), tags))
+
+        out.append(("h0", tr("COLLECTIONS"), (), ("head",)))
+        for coll, rows in zip(COLLS, (people, entries, sources, corpus)):
+            item("s:" + coll, "  " + tr(COLL_LABEL[coll]), len(rows), self.scope == coll,
+                 ("scope",))
+
+        if data["people"]:
+            head("h1", tr("WORK"))
+            for key, lab in (("todo", tr("to do")), ("doing", tr("in progress")),
+                             ("waiting", tr("waiting on"))):
+                item("v:" + key, "  " + lab, sum(1 for p in people if open_tasks(p, key)),
+                     self.viewmode == key)
+            item("v:untagged", "  " + tr("untagged"),
+                 sum(1 for p in people if not p.get("tags")), self.viewmode == "untagged")
+            all_days = sorted({t["due"] for p in data["people"] for t in dated_tasks(p)})
+            if all_days:
+                days = {}
+                for p in people:
+                    for t in dated_tasks(p):
+                        days[t["due"]] = days.get(t["due"], 0) + 1
+                head("h3", tr("CALENDAR"))
                 today = TODAY()
-                for day in sorted(days):
-                    if day < today:
-                        mark, flag = ("late",), "! "
-                    elif day == today:
-                        mark, flag = ("today",), "> "
-                    else:
-                        mark, flag = (), "  "
-                    if self.date == day:
-                        mark = ("on",)
-                    r.insert("", "end", iid="d:" + day, text=flag + day,
-                             values=(days[day],), tags=mark)
+                for day in all_days:
+                    mark, flag = ((("late",), "! ") if day < today else
+                                  (("today",), "> ") if day == today else ((), "  "))
+                    item("d:" + day, flag + day, days.get(day, 0), self.date == day, mark)
             # Covey's circles, outermost first; a person can be in more than one
-            rings = {c: sum(1 for p in people if c in p.get("circles", [])) for c in CIRCLES}
-            r.insert("", "end", iid="h2c", text="", tags=("head",))
-            r.insert("", "end", iid="h2d", text=tr("CIRCLES"), tags=("head",))
+            head("h2c", tr("CIRCLES"))
             for c in CIRCLES:
-                r.insert("", "end", iid="o:" + c, text="  " + tr(c), values=(rings[c],),
-                         tags=("on",) if self.view_circle == c else ())
-            r.insert("", "end", iid="o:none", text="  " + tr("no circle"),
-                     values=(sum(1 for p in people if not p.get("circles")),),
-                     tags=("on",) if self.view_circle == "none" else ())
-            tags = {}
-            for p in people:
-                for t in p.get("tags", []):
-                    if ":" not in t:
+                item("o:" + c, "  " + tr(c), sum(1 for p in people if c in p.get("circles", [])),
+                     self.view_circle == c)
+            item("o:none", "  " + tr("no circle"),
+                 sum(1 for p in people if not p.get("circles")), self.view_circle == "none")
+            all_tags = sorted({t for p in data["people"] for t in p.get("tags", []) if ":" not in t},
+                              key=sort_key)
+            if all_tags:
+                tags = {}
+                for p in people:
+                    for t in p.get("tags", []):
                         tags[t] = tags.get(t, 0) + 1
-            if tags:
-                r.insert("", "end", iid="h2", text="", tags=("head",))
-                r.insert("", "end", iid="h2b", text=tr("TAGS"), tags=("head",))
-                for t in sorted(tags, key=sort_key):
-                    r.insert("", "end", iid="t:" + t, text="  " + t, values=(tags[t],),
-                             tags=("on",) if self.tag == t else ())
+                head("h2", tr("TAGS"))
+                for t in all_tags:
+                    item("t:" + t, "  " + t, tags.get(t, 0), self.tag == t)
 
-        if entries:
-            n_c = sum(1 for e in entries if e["kind"] == "concept")
-            n_f = sum(1 for e in entries if e["kind"] == "form")
-            r.insert("", "end", iid="h4", text="", tags=("head",))
-            r.insert("", "end", iid="h4b", text=tr("KIND"), tags=("head",))
-            for key, lab, n in (("concept", tr("concepts"), n_c), ("form", tr("forms"), n_f)):
-                r.insert("", "end", iid="k:" + key, text="  " + lab, values=(n,),
-                         tags=("on",) if self.view_kind == key else ())
-            langs = {}
-            for e in entries:
-                if e["kind"] == "form" and e.get("lang"):
-                    langs[e["lang"]] = langs.get(e["lang"], 0) + 1
-            if langs:
-                r.insert("", "end", iid="h5", text="", tags=("head",))
-                r.insert("", "end", iid="h5b", text=tr("LANGUAGE"), tags=("head",))
-                for lang in sorted(langs, key=sort_key):
-                    r.insert("", "end", iid="l:" + lang, text="  " + lang,
-                             values=(langs[lang],),
-                             tags=("on",) if self.view_lang == lang else ())
-            doms = {}
-            for e in entries:
-                for d in e.get("domains", []):
-                    doms[d] = doms.get(d, 0) + 1
-            if doms:
-                r.insert("", "end", iid="h6", text="", tags=("head",))
-                r.insert("", "end", iid="h6b", text=tr("DOMAIN"), tags=("head",))
-                for d in sorted(doms, key=sort_key):
-                    r.insert("", "end", iid="m:" + d, text="  " + d, values=(doms[d],),
-                             tags=("on",) if self.view_domain == d else ())
+        if data["entries"]:
+            head("h4", tr("KIND"))
+            for key, lab in (("concept", tr("concepts")), ("form", tr("forms"))):
+                item("k:" + key, "  " + lab, sum(1 for e in entries if e["kind"] == key),
+                     self.view_kind == key)
+            all_langs = sorted({e["lang"] for e in data["entries"]
+                                if e["kind"] == "form" and e.get("lang")}, key=sort_key)
+            if all_langs:
+                head("h5", tr("LANGUAGE"))
+                for lang in all_langs:
+                    item("l:" + lang, "  " + lang,
+                         sum(1 for e in entries if e["kind"] == "form" and e.get("lang") == lang),
+                         self.view_lang == lang)
+            all_doms = sorted({d for e in data["entries"] for d in e.get("domains", [])},
+                              key=sort_key)
+            if all_doms:
+                head("h6", tr("DOMAIN"))
+                for d in all_doms:
+                    item("m:" + d, "  " + d, sum(1 for e in entries if d in e.get("domains", [])),
+                         self.view_domain == d)
 
-        if self.data["sources"]:
-            types = {}
-            for s in self.data["sources"]:
-                t = s.get("type") or "outro"
-                types[t] = types.get(t, 0) + 1
-            r.insert("", "end", iid="h7", text="", tags=("head",))
-            r.insert("", "end", iid="h7b", text=tr("SOURCE TYPE"), tags=("head",))
-            for t in sorted(types, key=lambda t: sort_key(type_label(t))):
-                r.insert("", "end", iid="y:" + t, text="  " + type_label(t), values=(types[t],),
-                         tags=("on",) if self.view_stype == t else ())
-        if self.data["corpus"]:
-            types = {}
-            for m in self.data["corpus"]:
-                types[htype(m)] = types.get(htype(m), 0) + 1
-            r.insert("", "end", iid="h9", text="", tags=("head",))
-            r.insert("", "end", iid="h9b", text=tr("HEALTH"), tags=("head",))
+        if data["sources"]:
+            head("h7", tr("SOURCE TYPE"))
+            for t in sorted({s.get("type") or "outro" for s in data["sources"]},
+                            key=lambda t: sort_key(type_label(t))):
+                item("y:" + t, "  " + type_label(t),
+                     sum(1 for s in sources if (s.get("type") or "outro") == t),
+                     self.view_stype == t)
+        if data["corpus"]:
+            head("h9", tr("HEALTH"))
+            present = {htype(m) for m in data["corpus"]}
             for t in HEALTH_TYPES:
-                if types.get(t):
-                    r.insert("", "end", iid="u:" + t, text="  " + tr(HEALTH_TYPE_LABEL[t]),
-                             values=(types[t],),
-                             tags=("on",) if self.view_htype == t else ())
-            systems = {}
-            for m in self.data["corpus"]:
-                sname = m.get("system") or ""
-                systems[sname] = systems.get(sname, 0) + 1
-            r.insert("", "end", iid="h8", text="", tags=("head",))
-            r.insert("", "end", iid="h8b", text=tr("SYSTEM"), tags=("head",))
-            for sname in sorted(systems, key=lambda s: sort_key(system_label(s))):
-                r.insert("", "end", iid="z:" + sname,
-                         text="  " + (system_label(sname) or tr("(no system)")),
-                         values=(systems[sname],),
-                         tags=("on",) if self.view_system == sname else ())
+                if t in present:
+                    item("u:" + t, "  " + tr(HEALTH_TYPE_LABEL[t]),
+                         sum(1 for m in corpus if htype(m) == t), self.view_htype == t)
+            head("h8", tr("SYSTEM"))
+            for sname in sorted({m.get("system") or "" for m in data["corpus"]},
+                                key=lambda x: sort_key(system_label(x))):
+                item("z:" + sname, "  " + (system_label(sname) or tr("(no system)")),
+                     sum(1 for m in corpus if (m.get("system") or "") == sname),
+                     self.view_system == sname)
+        self.apply_rail(out)
+
+    def apply_rail(self, rows):
+        """Puts the rows on the rail. While typing the categories stay the same and
+        only their numbers and dimming change, so the items are updated in place
+        (a rebuild would redraw the whole rail and lose its scroll position)."""
+        r = self.rail
+        if tuple(r.get_children()) != tuple(iid for iid, *_ in rows):
+            top = r.yview()[0]
+            r.delete(*r.get_children())
+            for iid, text, values, tags in rows:
+                r.insert("", "end", iid=iid, text=text, values=values, tags=tags)
+            r.yview_moveto(top)
+            self._rail_rows = {iid: rest for iid, *rest in rows}
+            return
+        old = getattr(self, "_rail_rows", {})
+        for iid, text, values, tags in rows:
+            if old.get(iid) != [text, values, tags]:
+                r.item(iid, text=text, values=values, tags=tags)
+        self._rail_rows = {iid: [text, values, tags] for iid, text, values, tags in rows}
+
+    # ---- the filters in force, shown as chips above the list
+    FACETS = (("tag", "people"), ("viewmode", "people"), ("date", "people"),
+              ("view_circle", "people"), ("view_kind", "entries"), ("view_lang", "entries"),
+              ("view_domain", "entries"), ("view_stype", "sources"), ("view_htype", "corpus"),
+              ("view_system", "corpus"))
+
+    def facet_label(self, attr, value):
+        if attr == "tag":
+            return tr("tag: {tag}", tag=value)
+        if attr == "viewmode":
+            return {"todo": tr("to do"), "doing": tr("in progress"), "waiting": tr("waiting on"),
+                    "untagged": tr("untagged")}.get(value, value)
+        if attr == "view_circle":
+            return tr("no circle") if value == "none" else tr(value)
+        if attr == "view_kind":
+            return tr("concepts") if value == "concept" else tr("forms")
+        if attr == "view_stype":
+            return type_label(value)
+        if attr == "view_htype":
+            return tr(HEALTH_TYPE_LABEL[value])
+        if attr == "view_system":
+            return system_label(value) or tr("(no system)")
+        return value
+
+    def drop_filter(self, attr):
+        """Takes one filter away. A collection that only a filter had imposed
+        (a tag implies people) goes with it; one picked in COLLECTIONS stays."""
+        self.commit_if_dirty()
+        if attr == "q":
+            self.q.set("")
+        elif attr == "scope":
+            self.scope, self.scope_explicit = None, False
+            self.clear_filters()
+        elif attr == "all":
+            self.q.set("")
+            self.clear_filters()
+            self.scope, self.scope_explicit = None, False
+        else:
+            setattr(self, attr, None)
+            if not self.scope_explicit and all(getattr(self, a) is None for a, _ in self.FACETS):
+                self.scope = None
+        if self._q_job:
+            try:
+                self.root.after_cancel(self._q_job)
+            except tk.TclError:
+                pass
+            self._q_job = None
+        self.refresh_rail()
+        self.refresh_list()
+
+    def refresh_chips(self):
+        """The bar of filters in force. Typing only changes the search chip's text,
+        so the labels are kept and updated in place: rebuilding them (and packing
+        the bar again) on every keystroke cost a full relayout of the list."""
+        box = self.chips
+        items = []
+        q = self.q.get().strip()
+        if q:
+            items.append((tr("search: {q}", q=one_liner(q, 28)), "q"))
+        if self.scope and self.scope_explicit:
+            items.append((tr(COLL_LABEL[self.scope]), "scope"))
+        for attr, _ in self.FACETS:
+            value = getattr(self, attr)
+            if value is not None and (value != "" or attr == "view_system"):
+                items.append((self.facet_label(attr, value), attr))
+        if len(items) > 1:
+            items.append((tr("clear all"), "all"))
+        shape = tuple(a for _, a in items)
+        if shape != getattr(self, "_chip_shape", None):
+            self._chip_shape = shape
+            for w in box.winfo_children():
+                w.destroy()
+            for text, attr in items:
+                lbl = tk.Label(box, bg=PAPER, fg=STAMP if attr != "all" else SOFT,
+                               font=self.f_label, cursor="hand2", padx=6, pady=1,
+                               highlightthickness=1, highlightbackground=RULE)
+                lbl.pack(side="left", padx=(6, 0), pady=4)
+                lbl.bind("<Button-1>", lambda e, a=attr: self.drop_filter(a))
+            if items and not box.winfo_manager():
+                box.pack(fill="x", before=self.list_head)
+            elif not items and box.winfo_manager():
+                box.pack_forget()
+        for lbl, (text, attr) in zip(box.winfo_children(), items):
+            text = ("× " if attr != "all" else "") + text
+            if lbl.cget("text") != text:
+                lbl.configure(text=text)
 
     def filter_system(self, sname):
         """A click on the map: filters the list by that system (again, removes the filter)."""
@@ -7415,6 +7505,7 @@ class App:
 
     def clear_filters(self):
         self.tag = self.viewmode = self.date = self.view_circle = None
+        self.scope_explicit = False
         self.view_kind = self.view_lang = self.view_domain = None
         self.view_stype = self.view_system = self.view_htype = None
 
@@ -7428,6 +7519,7 @@ class App:
         if iid.startswith("s:"):
             self.clear_filters()
             self.scope = None if self.scope == key else key
+            self.scope_explicit = self.scope is not None
         elif iid.startswith("v:"):
             was = self.viewmode
             self.clear_filters()
@@ -10129,6 +10221,12 @@ PT = {
         "Copiar como linha de ligação",
     "\n  Ctrl+Shift+C    copy the open record's id (to paste into SOURCE or LINKS);\n                  a click on the id in the card's corner does the same,\n                  a click on the REGISTER line copies its nº.\n  Right-click on a list row: copy its id, its nº, a source's ABNT citation\n                  or a ready link line. In the logbook, c copies the id.\n":
         "\n  Ctrl+Shift+C    copia o id do registro aberto (para colar em FONTE ou LIGAÇÕES);\n                  um clique no id, no canto do cartão, faz o mesmo,\n                  um clique na linha REGISTRO copia o nº.\n  Botão direito numa linha da lista: copia o id, o nº, a citação ABNT de\n                  uma fonte ou uma linha de ligação pronta. No livro, c copia o id.\n",
+    "search: {q}":
+        "busca: {q}",
+    "clear all":
+        "limpar tudo",
+    "tag: {tag}":
+        "tag: {tag}",
 }
 
 if __name__ == "__main__":
