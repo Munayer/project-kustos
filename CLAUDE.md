@@ -1,3 +1,7 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # Working on Project Kustos
 
 Notes for Claude Code sessions on this repository, on any of the owner's machines.
@@ -9,10 +13,62 @@ interface, a single file. The data lives in `_kustos.json` (the source of
 truth) beside per-machine append-only logs `_kustos.log.<host>.jsonl`, a lock
 file and a markdown mirror. See `README.md` for the features.
 
+## Commands
+
+There is no build, linter or test suite; the checks are:
+
+```
+python -m py_compile _kustos.py     # syntax (tools/update-personal.cmd runs it too)
+python _kustos.py doctor            # structure of the base: must report 0 errors
+python _kustos.py                   # open the window (needs Tk and a display)
+python _kustos.py help              # any unknown command prints the full usage (__doc__)
+```
+
+The other subcommands (`mirror`, `search`, `history <id>`, `replay`, `merge`,
+`cite`, `export`, `import`, `health`, `corpus`...) are listed in the module
+docstring and dispatched in `main()` near the end of the file.
+
+The program works on the folder **it sits in** (`BASE = Path(__file__).parent`),
+not the current directory. To test on a temporary copy, copy `_kustos.py` into
+that copy and run it from there; running the repository's file against an
+empty repository folder gives an empty base (and `doctor` passes on it).
+
+## Architecture
+
+`_kustos.py` is split into sections marked `# ==== <name>`, in this order:
+language (`tr`), common, the four collections (**people** `p_`, **verba**
+`c_`/`f_` concepts and forms, **sources** `s_`, **corpus** `h_` health
+records), then file, register, conflicts, lock, doctor, mirror, search,
+history, migration, upgrade, citation, health report, themes, the Tk
+`*Card` editors, `App` (the main window), `BookView` (the logbook), the
+`cmd_*` functions and `main()`, and finally the `PT` dict.
+
+Ideas that span several sections:
+
+- **Saving is per record.** `save_record`/`delete_record` reread the JSON,
+  replace only that record, write atomically through `write_json`, then append
+  to this machine's log. `write_json` is the single choke point: it also numbers
+  new records (`register_new`). Never write the JSON another way.
+- **`load_json` is cached** as a `marshal` blob keyed by the file's
+  (mtime, size), so callers get a fresh copy cheaply; a change on disk
+  (another save, Syncthing) invalidates it.
+- **`fix_*` functions** (`fix_vault`, `fix_person`, `fix_entry`, `fix_source`,
+  `fix_metric`) fill defaults on every read; new fields get their default there.
+  Changes to the stored shape bump `SCHEMA` and get a step in `upgrade_vault`,
+  which runs on open.
+- **Sync conflicts** (`*.sync-conflict-*`) are merged record by record on open,
+  newest `updated_at` wins, deletions are kept as tombstones in `deleted`.
+- **The register**: every record has a `reg` stamp and a `reg_n` number that
+  never changes and is never reused (see the comment at `# ==== register`).
+- **Links** live in a top-level `edges` list (`from`, `to`, `rel`), not inside
+  records; `RELS` defines the types.
+- **The logs are the history**: `history <id>` and `replay` (rebuilds the base
+  from logs into `_kustos.replay.json`) read them; there are no `.bak` files.
+
 ## The two instances
 
 - **Dev**: this repository (`C:\bmm\dev\project-kustos`), published to
-  `github.com/Munayer/project-kustos` (private).
+  `github.com/Munayer/project-kustos` (public: anyone can read it, so nothing personal goes into the code either).
 - **Personal**: the Syncthing folder `C:\bmm\sync\_bmm_index_v3`, which holds
   the program *and the owner's personal data*. Syncthing keeps it the same on
   both computers.
