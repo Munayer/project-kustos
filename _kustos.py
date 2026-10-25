@@ -3858,8 +3858,12 @@ class FieldPages:
     whole text stays in the widget, so typing and saving are as before: the
     other pages are only hidden (an elided tag), never cut out."""
 
-    def __init__(self, app, t, nav_parent):
+    def __init__(self, app, t, nav_parent, on_show=None):
+        """nav_parent: where the ‹ page › buttons go, beside the field's title;
+        None when the caller has its own (reading mode), and then on_show is
+        told the page after every change."""
         self.app, self.t = app, t
+        self.on_show = on_show
         t.pages = self
         self.starts = []            # a mark where each page starts (marks move with typing)
         self.cur = 0
@@ -3867,6 +3871,11 @@ class FieldPages:
         self.stale = False          # text may have changed off the page on show
         self.widths = {}            # character -> width in the field's font
         t.tag_configure("off_page", elide=True)
+        for seq in ("<<Undo>>", "<<Redo>>", "<<Paste>>"):    # may touch other pages
+            t.bind(seq, lambda e: setattr(self, "stale", True), add="+")
+        self.nav = None
+        if nav_parent is None:
+            return
         nav = self.nav = tk.Frame(nav_parent, bg=PAPER)
         ttk.Button(nav, text="›", width=2, style="Quiet.TButton",
                    command=lambda: self.turn(1)).pack(side="right")
@@ -3876,8 +3885,6 @@ class FieldPages:
                    command=lambda: self.turn(-1)).pack(side="right")
         t.bind("<Prior>", lambda e: self.turn(-1))
         t.bind("<Next>", lambda e: self.turn(1))
-        for seq in ("<<Undo>>", "<<Redo>>", "<<Paste>>"):    # may touch other pages
-            t.bind(seq, lambda e: setattr(self, "stale", True), add="+")
 
     @property
     def paged(self):
@@ -3892,8 +3899,13 @@ class FieldPages:
 
     def room(self, rows):
         """The inside height, in pixels, of the field `rows` lines tall (Tk
-        gives each row the font's line plus the paragraph spacing)."""
+        gives each row the font's line plus the paragraph spacing); with rows
+        None, of the widget as it stands (reading mode fills the card)."""
         t = self.t
+        if rows is None:
+            inset = int(t.cget("borderwidth")) + int(t.cget("highlightthickness")) \
+                + int(t.cget("pady"))
+            return t.winfo_height() - 2 * inset
         line = tkfont.Font(font=t.cget("font")).metrics("linespace")
         return rows * (line + int(t.cget("spacing1")) + int(t.cget("spacing3")))
 
@@ -4021,7 +4033,8 @@ class FieldPages:
         Then nothing needs measuring again."""
         t = self.t
         if self.stale or "off_page" in t.tag_names("insert") \
-                or t.winfo_width() != self.width or int(t.cget("height")) != rows:
+                or t.winfo_width() != self.width \
+                or (rows is not None and int(t.cget("height")) != rows):
             return False
         return self.count("1.0", "end", "ypixels") <= self.room(rows)   # hidden pages: 0
 
@@ -4031,7 +4044,8 @@ class FieldPages:
             self.t.mark_unset(name)
         self.starts = []
         self.unhide()
-        self.nav.pack_forget()
+        if self.nav is not None:
+            self.nav.pack_forget()
 
     def show(self, k):
         t = self.t
@@ -4043,6 +4057,10 @@ class FieldPages:
         if k + 1 < len(self.starts):
             t.tag_add("off_page", self.starts[k + 1], "end")
         t.yview_moveto(0)
+        if self.on_show:
+            self.on_show()
+        if self.nav is None:
+            return
         if self.paged:
             self.lbl.configure(text=tr("page {p} of {n}", p=k + 1, n=len(self.starts)))
             if not self.nav.winfo_manager():
@@ -4057,7 +4075,7 @@ class FieldPages:
         if not self.paged:
             return None
         if self.stale:
-            self.repage(int(self.t.cget("height")), "insert")
+            self.repage(None if self.nav is None else int(self.t.cget("height")), "insert")
         self.show(self.cur + delta)
         t = self.t
         t.mark_set("insert", self.starts[self.cur])
@@ -5875,6 +5893,8 @@ class Reader:
         t.bind("<Button-5>", lambda e: self.turn(1))
         t.bind("<KeyRelease>", self.typed, add="+")
         t.bind("<Configure>", self.resized)
+        self.book = FieldPages(app, t, None, on_show=self.page_shown)
+        self._check_job = None
         self.measure = tkfont.Font(font=app.f_body).measure("0") * 92   # ~92 characters a line
         self.q.trace_add("write", lambda *_: self.find_update())
         self.e_find.bind("<Return>", lambda e: self.next_hit(1))
@@ -5893,7 +5913,10 @@ class Reader:
         pad = max(22, (event.width - self.measure) // 2)
         if int(self.t.cget("padx")) != pad:
             self.t.configure(padx=pad)
-        self.starts = None
+        if self.starts is not None and (event.width, event.height) == getattr(self, "_size", None):
+            return
+        self._size = (event.width, event.height)
+        self.starts = None                      # F11, a resize: the pages change
         self.app.root.after_idle(self.show_page)
 
     def open(self, source, title):
@@ -5904,10 +5927,14 @@ class Reader:
         self.source, self.rid = source, self.app.sel
         self.title.configure(text=f"{title}  ·  {one_liner(label_any(rec, self.app.data), 60)}"
                              if rec else title)
+        self.book.off()
         self.t.delete("1.0", "end")
         self.t.insert("1.0", source.get("1.0", "end-1c"))
         self.t.edit_reset()
-        self.t.mark_set("insert", "1.0")
+        card = getattr(source, "pages", None)
+        at = source.index(card.starts[card.cur]) if card is not None and card.paged else "1.0"
+        self.t.mark_set("insert", at)       # the reader opens on the page the card showed,
+        self.open_last = card is not None and card.paged             and card.cur == len(card.starts) - 1     # or on its last, if the card was there
         self.starts = None
         self.find_close()
         self.frame.place(x=0, y=0, relwidth=1, relheight=1)
@@ -5917,10 +5944,17 @@ class Reader:
         self.app.root.after_idle(self.show_page)
 
     def typed(self, event):
-        if event.keysym not in ("Prior", "Next", "Escape") and not event.keysym.startswith(
+        if event.keysym in ("Prior", "Next", "Escape") or event.keysym.startswith(
                 ("Control", "Shift", "Alt")):
+            return
+        if event.keysym not in ("Up", "Down", "Left", "Right", "Home", "End"):
             self.app.mark_dirty()
-            self.starts = None
+        if self._check_job:
+            try:
+                self.app.root.after_cancel(self._check_job)
+            except tk.TclError:
+                pass
+        self._check_job = self.app.root.after(120, self.check_page)
 
     def sync(self):
         """Writes the reader's text back into the card's field, if it changed."""
@@ -5939,6 +5973,7 @@ class Reader:
             self.sync()
         src = self.source
         self.source = self.rid = None
+        self.book.off()
         self.frame.place_forget()
         try:
             src.focus_set()
@@ -5947,78 +5982,47 @@ class Reader:
             pass
         return "break"
 
-    # ---- pages: where each page starts is measured on screen, page by page
-    def lines(self, a, b):
-        n = self.t.count(a, b, "displaylines")
-        return (n[0] if isinstance(n, tuple) else n) or 0
-
-    def go_line(self, line):
-        self.t.yview("1.0")
-        if line > 0:
-            self.t.yview_scroll(line, "units")
-        self.t.update_idletasks()      # Tk applies the scroll lazily; settle it before reading "@0,0"
-
-    def paginate(self):
-        """The display line each page starts on. How many lines fit depends on
-        how many paragraph gaps fall on the page, so each page is measured on
-        screen where it falls: no line skipped, at most one repeated. Tk's
-        `sync` lays the whole text out first, so the first measurement is not
-        taken before the text has been laid out."""
+    # ---- pages: the same as the card's (FieldPages), on the whole card's height:
+    # each page starts at an entry or paragraph and holds exactly what fits
+    def paginate(self, keep="insert"):
         t = self.t
         if not t.winfo_ismapped() or t.winfo_height() < 40:
-            self.starts = [0]                   # not on screen yet: measure on the next call
-            return False
-        t.tk.call(t._w, "sync")
-        t.update_idletasks()
-        keep = self.lines("1.0", "@0,0")
-        h = t.winfo_height()
-        total = self.lines("1.0", "end")
-        starts = [0]
-        while len(starts) < 5000:
-            self.go_line(starts[-1])
-            if t.yview()[1] >= 1.0:             # the end is on screen: last page
-                break
-            fit = max(1, self.lines("@0,0", f"@0,{h - 1}"))
-            nxt = starts[-1] + fit
-            if nxt >= total:
-                break
-            starts.append(nxt)
-        self.starts = starts
-        self.go_line(keep)
+            return False                        # not on screen yet: measure on the next call
+        self.book.repage(None, keep)
+        self.starts = self.book.starts
         return True
 
-    def page_of(self, line):
-        starts = self.starts or [0]
-        i = 0
-        while i + 1 < len(starts) and starts[i + 1] <= line:
-            i += 1
-        return i
-
     def current_page(self):
-        if self.t.yview()[1] >= 1.0:
-            return len(self.starts) - 1
-        return self.page_of(self.lines("1.0", "@0,0"))
+        return self.book.cur
 
     def turn(self, delta):
         if not self.is_open:
             return "break"
-        if self.starts is None:
-            self.paginate()
-        page = max(0, min(self.current_page() + delta, len(self.starts) - 1))
-        self.go_line(self.starts[page])
-        self.t.mark_set("insert", "@0,0")
-        self.show_page()
+        if self.starts is None and not self.paginate():
+            return "break"
+        self.book.turn(delta)
         return "break"
 
     def show_page(self):
         if not self.is_open:
             return
-        if self.starts is None and not self.paginate():
-            self.starts = None
+        keep = "last" if getattr(self, "open_last", False) else "insert"
+        if self.starts is None and not self.paginate(keep):
             self.app.root.after(60, self.show_page)
             return
-        self.page.configure(text=tr("page {p} of {n}", p=self.current_page() + 1,
-                                    n=len(self.starts)))
+        self.open_last = False
+        self.page_shown()
+
+    def page_shown(self):
+        n = max(1, len(self.book.starts))
+        self.page.configure(text=tr("page {p} of {n}", p=self.book.cur + 1, n=n))
+
+    def check_page(self):
+        """After typing: measure again only if the page on show overflows or
+        the cursor has left it."""
+        self._check_job = None
+        if self.is_open and self.starts is not None and not self.book.holds(None):
+            self.paginate("insert")
 
     # ---- find inside the text
     def find_open(self):
@@ -6048,7 +6052,8 @@ class Reader:
         if q:
             idx = "1.0"
             while True:
-                pos = t.search(q, idx, nocase=True, stopindex="end")
+                pos = t.search(q, idx, nocase=True, stopindex="end",
+                               elide=True)          # the other pages too, hidden or not
                 if not pos:
                     break
                 end = f"{pos}+{len(q)}c"
@@ -6071,8 +6076,9 @@ class Reader:
         self.t.tag_add("cur", pos, end)
         if self.starts is None:
             self.paginate()
-        self.go_line(self.starts[self.page_of(self.lines("1.0", pos))])   # the page holding the match
         self.t.mark_set("insert", pos)
+        if self.book.paged:
+            self.book.show(self.book.page_of(pos))          # the page holding the match
         self.found.configure(text=f"{self.hit_i + 1}/{len(self.hits)}")
         self.show_page()
         return "break"
