@@ -49,7 +49,9 @@ updating of files and conflicts if used any syncing app or cloud sync.
   the field across the whole card, read in pages with PageUp/PageDown or the
   wheel, with `Ctrl+F` to find inside it; it stays editable. `F11` hides the
   rail and the list so the card takes the whole window; the text column keeps
-  a readable width.
+  a readable width. A person's LOG, when long, is read in pages inside the
+  card: each page holds what fits on screen and starts at an entry (`‹ ›`
+  beside its title, or PageUp/PageDown in it), opening on the newest.
 - **Search**, the "indexer": results come in alphabetic order, paged, each with its register number, with operators of search:
 
   ```
