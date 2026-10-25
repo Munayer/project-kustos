@@ -3850,6 +3850,188 @@ def paint_frame(win):
 
 # ================================================================ cards
 
+class FieldPages:
+    """A long log read in pages inside the card. Each page holds what fits one
+    screen of the card and starts where an entry (a line) starts; an entry
+    longer than a page goes on over the next ones. The whole text stays in the
+    widget, so typing and saving are as before: the other pages are only
+    hidden (an elided tag), never cut out."""
+
+    def __init__(self, app, t, nav_parent):
+        self.app, self.t = app, t
+        self.starts = []            # a mark where each page starts (marks move with typing)
+        self.cur = 0
+        self.stale = False          # text changed off the page on show: measure before turning
+        t.tag_configure("off_page", elide=True)
+        nav = self.nav = tk.Frame(nav_parent, bg=PAPER)
+        ttk.Button(nav, text="›", width=2, style="Quiet.TButton",
+                   command=lambda: self.turn(1)).pack(side="right")
+        self.lbl = tk.Label(nav, text="", bg=PAPER, fg=SOFT, font=app.f_label)
+        self.lbl.pack(side="right", padx=4)
+        ttk.Button(nav, text="‹", width=2, style="Quiet.TButton",
+                   command=lambda: self.turn(-1)).pack(side="right")
+        t.bind("<Prior>", lambda e: self.turn(-1))
+        t.bind("<Next>", lambda e: self.turn(1))
+        for seq in ("<<Undo>>", "<<Redo>>", "<<Paste>>"):    # may touch other pages
+            t.bind(seq, lambda e: setattr(self, "stale", True), add="+")
+
+    @property
+    def paged(self):
+        return len(self.starts) > 1
+
+    def unhide(self):
+        self.t.tag_remove("off_page", "1.0", "end")
+
+    def lines(self, a, b):
+        n = self.t.count(a, b, "displaylines")
+        return (n[0] if isinstance(n, tuple) else n) or 0
+
+    def paginate(self, rows):
+        """Where each page starts, for a field `rows` lines tall: whole entries
+        while they fit; an entry taller than what is left starts a new page,
+        and one taller than a page is cut at a wrapped line."""
+        t = self.t
+        line = tkfont.Font(font=t.cget("font")).metrics("linespace")
+        gap = int(t.cget("spacing1")) + int(t.cget("spacing3"))
+        room = rows * (line + gap)          # how Tk sizes a field `rows` lines tall
+        last = int(t.index("end-1c").split(".")[0])
+        starts, used = ["1.0"], 0
+        for i in range(1, last + 1):
+            # the line's height is cached by Tk once laid out ("sync"); counting
+            # its wrapped lines lays it out again, ~1.5 ms a line
+            pix = t.count(f"{i}.0", f"{i + 1}.0" if i < last else "end", "ypixels")
+            pix = (pix[0] if isinstance(pix, tuple) else pix) or 0
+            n = max(1, round((pix - gap) / line))
+            if used and used + n * line + gap > room:
+                starts.append(f"{i}.0")
+                used = 0
+            done, wraps = 0, None
+            while used + (n - done) * line + gap > room:
+                take = max(1, (room - used - gap) // line)
+                done += take
+                if wraps is None:
+                    wraps = self.mono_wraps(i, n) or False
+                starts.append(f"{i}.{wraps[done]}" if wraps else self.wrap_start(i, done))
+                used = 0
+            used += (n - done) * line + gap
+        return starts
+
+    def wrap_start(self, i, k):
+        """The index where wrapped line k of line i starts: scroll it to the top
+        and read the character there. Asking Tk for "i.0 + k display lines", or
+        counting inside a line, takes ~0.1 s each on a long line; this ~10 ms."""
+        t = self.t
+        t.yview(f"{i}.0")
+        t.yview_scroll(k, "units")
+        t.update_idletasks()          # Tk applies the scroll lazily
+        return t.index("@0,0")
+
+    def mono_wraps(self, i, n):
+        """Where each wrapped line of line i starts, worked out as Tk wraps words
+        in a monospaced font (the log's): no layout needed. None when the font
+        is not monospaced or the result disagrees with Tk's count `n`, and then
+        wrap_start asks Tk."""
+        t = self.t
+        f = tkfont.Font(font=t.cget("font"))
+        if not f.metrics("fixed"):
+            return None
+        inset = int(t.cget("borderwidth")) + int(t.cget("highlightthickness")) + int(t.cget("padx"))
+        per = (t.winfo_width() - 2 * inset) // max(1, f.measure("0"))
+        line = t.get(f"{i}.0", f"{i}.0 lineend")
+        if per < 8 or "	" in line:
+            return None
+        starts, pos = [0], 0
+        while len(line) - pos > per:
+            edge = pos + per
+            if line[edge] == " ":                  # a word ends at the edge: its spaces stay
+                nxt = edge
+                while nxt < len(line) and line[nxt] == " ":
+                    nxt += 1
+            else:
+                sp = line.rfind(" ", pos, edge)
+                nxt = sp + 1 if sp >= pos else edge   # a word longer than a line is cut
+            if nxt >= len(line):
+                break
+            starts.append(nxt)
+            pos = nxt
+        return starts if len(starts) == n else None
+
+    def page_of(self, index):
+        k = 0
+        while k + 1 < len(self.starts) and self.t.compare(self.starts[k + 1], "<=", index):
+            k += 1
+        return k
+
+    def repage(self, rows, keep="insert"):
+        """Measures the pages again and shows one: "last" (the newest entries),
+        or the page holding the cursor."""
+        t = self.t
+        self.unhide()
+        t.tk.call(t._w, "sync")
+        for name in self.starts:
+            t.mark_unset(name)
+        self.starts = []
+        for k, index in enumerate(self.paginate(rows)):
+            t.mark_set(f"page{k}", index)
+            t.mark_gravity(f"page{k}", "left")
+            self.starts.append(f"page{k}")
+        self.stale = False
+        self.width = t.winfo_width()        # wrapping changes with it: measure again
+        if keep == "last":
+            k = len(self.starts) - 1
+        else:
+            k = self.page_of(t.index("insert"))
+        self.show(k)
+
+    def holds(self, rows):
+        """While typing: does the page on show still fit, with the cursor on it?
+        Then nothing needs measuring again."""
+        t = self.t
+        if self.stale or "off_page" in t.tag_names("insert") or                 t.winfo_width() != getattr(self, "width", None):
+            return False
+        line = tkfont.Font(font=t.cget("font")).metrics("linespace")
+        gap = int(t.cget("spacing1")) + int(t.cget("spacing3"))
+        pix = t.count("1.0", "end", "ypixels")        # hidden pages have no height
+        pix = (pix[0] if isinstance(pix, tuple) else pix) or 0
+        return pix <= rows * (line + gap) and int(t.cget("height")) == rows
+
+    def off(self):
+        """The text fits: no pages."""
+        for name in self.starts:
+            self.t.mark_unset(name)
+        self.starts = []
+        self.unhide()
+        self.nav.pack_forget()
+
+    def show(self, k):
+        t = self.t
+        k = max(0, min(k, len(self.starts) - 1))
+        self.cur = k
+        self.unhide()
+        if k > 0:
+            t.tag_add("off_page", "1.0", self.starts[k])
+        if k + 1 < len(self.starts):
+            t.tag_add("off_page", self.starts[k + 1], "end")
+        t.yview_moveto(0)
+        if self.paged:
+            self.lbl.configure(text=tr("page {p} of {n}", p=k + 1, n=len(self.starts)))
+            if not self.nav.winfo_manager():
+                self.nav.pack(side="right")
+        else:
+            self.nav.pack_forget()
+
+    def turn(self, delta):
+        if not self.paged:
+            return None
+        if self.stale:
+            self.repage(int(self.t.cget("height")), "insert")
+        self.show(self.cur + delta)
+        t = self.t
+        t.mark_set("insert", self.starts[self.cur])
+        t.focus_set()
+        return "break"
+
+
 class PersonCard:
     """The person card: fields, tasks, log, circles."""
 
@@ -3907,8 +4089,11 @@ class PersonCard:
         tk.Frame(c, bg=RULE, height=1).pack(fill="x", pady=(4, 0), **pad)
         self.in_ids = []
 
-        log_label = tk.Label(c, text="LOG", bg=PAPER, fg=FAINT, font=app.f_label, anchor="w")
-        log_label.pack(fill="x", pady=(6, 2), **pad)
+        log_row = tk.Frame(c, bg=PAPER)
+        log_row.pack(fill="x", pady=(6, 2), **pad)
+        log_label = tk.Label(log_row, text="LOG", bg=PAPER, fg=FAINT, font=app.f_label,
+                             anchor="w")
+        log_label.pack(side="left")
         self.t_log = tk.Text(c, height=2, width=1, font=app.f_meta,
                              bg=PAPER, fg=INK, relief="flat", wrap="word",
                              insertbackground=INK, highlightthickness=0,
@@ -3917,7 +4102,8 @@ class PersonCard:
         app.block_caret(self.t_log, app.f_meta)
         app.bind_undo(self.t_log, text=True)
         self.t_log.pack(fill="x", **pad)
-        app.autogrow(self.t_log, minrows=2, tail=True)
+        self.log_pages = FieldPages(app, self.t_log, log_row)
+        app.autogrow(self.t_log, minrows=2, tail=True, pages=self.log_pages)
         app.readable(log_label, self.t_log, "LOG")
         addrow = tk.Frame(c, bg=PAPER)
         addrow.pack(fill="x", pady=(3, 14), **pad)
@@ -5534,7 +5720,9 @@ HELP_TEXT = (
     "\n"
     "\n  Text fields grow with their text up to the card's height,"
     "\n  then scroll inside (ui.max_rows in the JSON sets a fixed"
-    "\n  limit); the log opens on its newest lines. The body map"
+    "\n  limit). A long LOG is read in pages that start at an entry"
+    "\n  (‹ › beside its title, or PageUp / PageDown in it), opening"
+    "\n  on the newest. The body map"
     "\n  folds with [−] and remembers its state."
     "\n"
     "\n  In the rail, COLLECTIONS limits to people or verba;"
@@ -6736,12 +6924,13 @@ class App:
         self.pendings.append((canvas, pending))
         return inner
 
-    def autogrow(self, t, minrows=2, tail=False):
+    def autogrow(self, t, minrows=2, tail=False, pages=None):
         """As many rows as the text needs, up to one screen of the card: a long
         note reads like a page, and the card's own scroll takes over past it.
         Tk counts the wrapped lines itself, at any length, once its line
         metrics are up to date ("sync"). A field with tail=True (the log, newest
-        at the end) opens on its last lines."""
+        at the end) opens on its last lines; one with `pages` (a FieldPages) is
+        read in pages instead of scrolling inside."""
         last = {"n": None, "w": None, "h": None, "job": None}
 
         def rows_needed(limit):
@@ -6785,6 +6974,10 @@ class App:
             if not t.winfo_exists():
                 return
             top = cap()
+            if pages and pages.paged and not opening and pages.holds(top):
+                return
+            if pages:
+                pages.unhide()          # measure the whole text, not the page on show
             n = rows_needed(top)
             if n is None:
                 n = int(t.index("end-1c").split(".")[0])
@@ -6792,6 +6985,12 @@ class App:
             if n != last["n"]:
                 last["n"] = n
                 t.configure(height=n)
+            if pages:
+                if n < top:
+                    pages.off()
+                else:
+                    pages.repage(top, "last" if opening else "insert")
+                return
             if n < top:
                 t.yview_moveto(0)
             elif opening:
@@ -9974,8 +10173,8 @@ PT = {
         "(padrão)",
     "Yes":
         "Sim",
-    "\n  Ctrl+F     go to the search\n  ↓ / Enter  from the search to the list\n  Ctrl+N     new person\n  Ctrl+Q     quick entry (people, forms or concepts)\n  Ctrl+S     save the open record\n  Ctrl+Enter save and start another of the same kind\n  Ctrl+Z / Ctrl+Y   undo / redo\n  Ctrl+J / Ctrl+K   next / previous, from anywhere\n  Ctrl+G     go to: nº (1852), stamp, id or name\n  Ctrl+L     show in the register: leaves the search, shows the open record's nº\n  Ctrl+B     open as logbook (second window, read-only;\n             Enter in the logbook brings the record to the card)\n  Ctrl+1..4  scope people / verba / sources / corpus; Ctrl+0 everything\n  /  in the list goes back to the search;  Enter in the list goes to the card\n  Home / End within the page;  PageUp / PageDown or the wheel turns the page\n  Ctrl+Home / Ctrl+End  start / end of the list\n  Ctrl+PageUp / Ctrl+PageDown turns the page from anywhere\n  F5         reload from disk\n  Esc        back to the list\n\n  REGISTER: every record gets, on its first save, a stamp\n  (YYYYMMDDhhmmss) and an order number that never changes;\n  what is deleted stays in the sequence as cancelled.\n  Without a search, the list is the register, in number order;\n  with a search or filter, it is the INDEX, in alphabetical order.\n  The list shows what fits the window, without scrolling: the rest\n  is on the following pages.\n\n  Search operators:\n  p: v: f: c:   only people / verba / sources / corpus\n  ^ab           name starting with ab\n  tag:csh  lang:de  type:book  sys:renal  dom:law  id:c_\n  e.g.:  v: lang:de ^ab   ·   f: type:article luhmann\n\n  Text fields grow with their text up to the card's height,\n  then scroll inside (ui.max_rows in the JSON sets a fixed\n  limit); the log opens on its newest lines. The body map\n  folds with [−] and remembers its state.\n\n  In the rail, COLLECTIONS limits to people or verba;\n  any filter below picks the collection by itself.\n\n  Tasks (people):\n  Enter       new line already with [ ]\n  Space       on the [ ] changes the state\n  Ctrl+Space  changes it from anywhere on the line\n  [ ] to do   [/] in progress  [>] waiting on\n  [x] done    [-] cancelled  (they go to the log on save)\n  A date at the end is the deadline: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. The LAST date on the line wins.\n\n  Links, one per line, on any card:\n  rel target [span] — reason # source\n  e.g.: expresses c_timoneiro -800/400 — literal sense\n  e.g.: author_of s_wiener_1948_cybernetics\n  e.g.: cites s_lochtrop_2006 — entry p. 12\n  The target is the id: c_ concept, f_ form, p_ person,\n  s_ source, h_ measurement. A rel outside the table is not\n  an error: it is an ATYPICAL link, with the label you gave;\n  the doctor lists the atypical ones for you to promote.\n\n  SOURCE (on people, entries and measurements): a source's\n  s_…, or free text. Sources cite in ABNT, author-date,\n  BibTeX or CSL-JSON (picker on the card, copy button).\n  Corpus: readings '2026-09-01 13.5 fasting', one per line;\n  out of range shows with (!).\n\n  Sync: every save rereads the disk; on opening,\n  *.sync-conflict-* files are merged and stored in\n  {conflicts}/. The full history is in\n  {stem}.log.<machine>.jsonl (Base › History).\n":
-        "\n  Ctrl+F     ir para a busca\n  ↓ / Enter  da busca para a lista\n  Ctrl+N     nova pessoa\n  Ctrl+Q     entrada rápida (pessoas, formas ou conceitos)\n  Ctrl+S     salvar o registro aberto\n  Ctrl+Enter salvar e começar outro do mesmo tipo\n  Ctrl+Z / Ctrl+Y   desfazer / refazer\n  Ctrl+J / Ctrl+K   próximo / anterior, de qualquer lugar\n  Ctrl+G     ir para: nº (1852), carimbo, id ou nome\n  Ctrl+L     ver no registro: sai da busca, mostra o nº do aberto\n  Ctrl+B     abrir como livro (segunda janela, só leitura;\n             Enter no livro traz o registro para o cartão)\n  Ctrl+1..4  escopo pessoas / verba / fontes / corpus; Ctrl+0 tudo\n  /  na lista volta à busca;  Enter na lista vai ao cartão\n  Home / End na página;  PageUp / PageDown ou a roda vira a página\n  Ctrl+Home / Ctrl+End  começo / fim da lista\n  Ctrl+PageUp / Ctrl+PageDown vira a página de qualquer lugar\n  F5         recarregar do disco\n  Esc        voltar à lista\n\n  REGISTRO: todo registro recebe, ao ser gravado pela primeira\n  vez, um carimbo (AAAAMMDDhhmmss) e um número de ordem que\n  nunca muda; o que é apagado fica na sequência como cancelado.\n  Sem busca, a lista é o registro, na ordem dos números; com\n  busca ou filtro, é o INDICADOR, em ordem alfabética. A lista\n  mostra o que cabe na janela, sem rolagem: o resto está nas\n  páginas seguintes.\n\n  Operadores da busca:\n  p: v: f: c:   só pessoas / verba / fontes / corpus\n  ^ab           nome que começa com ab\n  tag:csh  lang:de  type:livro  sys:renal  dom:direito  id:c_\n  ex.:  v: lang:de ^ab   ·   f: type:artigo luhmann\n\n  Campos de texto crescem com o texto até a altura do cartão\n  e depois rolam por dentro (ui.max_rows no JSON fixa um teto);\n  o log abre nas linhas mais novas. O mapa do corpo\n  recolhe pelo [−] e lembra o estado.\n\n  No trilho, ACERVO limita a pessoas ou a verba;\n  qualquer filtro abaixo escolhe o acervo sozinho.\n\n  Tarefas (pessoas):\n  Enter       nova linha já com [ ]\n  Espaço      sobre o [ ] muda o estado\n  Ctrl+Espaço muda de qualquer ponto da linha\n  [ ] a fazer  [/] em curso  [>] esperando\n  [x] feito    [-] cancelado  (vão para o log ao salvar)\n  Data no fim é o prazo: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. A ÚLTIMA data da linha vence.\n\n  Ligações, uma por linha, em qualquer cartão:\n  rel alvo [intervalo] — razão # fonte\n  ex.: expresses c_timoneiro -800/400 — sentido próprio\n  ex.: author_of s_wiener_1948_cybernetics\n  ex.: cites s_lochtrop_2006 — verbete p. 12\n  Alvo é o id: c_ conceito, f_ forma, p_ pessoa,\n  s_ fonte, h_ medida. Um rel fora da tabela não é\n  erro: é ligação ATÍPICA, com o rótulo que você deu;\n  o doctor lista as atípicas para você promover.\n\n  FONTE (em pessoas, verbetes e medidas): s_… de uma\n  fonte, ou texto livre. Fontes citam em ABNT, autor-data,\n  BibTeX ou CSL-JSON (seletor no cartão, botão copiar).\n  Corpus: leituras '2026-09-01 13.5 jejum', uma por linha;\n  fora da referência aparece com (!).\n\n  Sincronização: cada gravação relê o disco; ao abrir,\n  *.sync-conflict-* são fundidos e guardados em\n  {conflicts}/. O histórico completo está em\n  {stem}.log.<máquina>.jsonl (menu Base › Histórico).\n",
+    "\n  Ctrl+F     go to the search\n  ↓ / Enter  from the search to the list\n  Ctrl+N     new person\n  Ctrl+Q     quick entry (people, forms or concepts)\n  Ctrl+S     save the open record\n  Ctrl+Enter save and start another of the same kind\n  Ctrl+Z / Ctrl+Y   undo / redo\n  Ctrl+J / Ctrl+K   next / previous, from anywhere\n  Ctrl+G     go to: nº (1852), stamp, id or name\n  Ctrl+L     show in the register: leaves the search, shows the open record's nº\n  Ctrl+B     open as logbook (second window, read-only;\n             Enter in the logbook brings the record to the card)\n  Ctrl+1..4  scope people / verba / sources / corpus; Ctrl+0 everything\n  /  in the list goes back to the search;  Enter in the list goes to the card\n  Home / End within the page;  PageUp / PageDown or the wheel turns the page\n  Ctrl+Home / Ctrl+End  start / end of the list\n  Ctrl+PageUp / Ctrl+PageDown turns the page from anywhere\n  F5         reload from disk\n  Esc        back to the list\n\n  REGISTER: every record gets, on its first save, a stamp\n  (YYYYMMDDhhmmss) and an order number that never changes;\n  what is deleted stays in the sequence as cancelled.\n  Without a search, the list is the register, in number order;\n  with a search or filter, it is the INDEX, in alphabetical order.\n  The list shows what fits the window, without scrolling: the rest\n  is on the following pages.\n\n  Search operators:\n  p: v: f: c:   only people / verba / sources / corpus\n  ^ab           name starting with ab\n  tag:csh  lang:de  type:book  sys:renal  dom:law  id:c_\n  e.g.:  v: lang:de ^ab   ·   f: type:article luhmann\n\n  Text fields grow with their text up to the card's height,\n  then scroll inside (ui.max_rows in the JSON sets a fixed\n  limit). A long LOG is read in pages that start at an entry\n  (‹ › beside its title, or PageUp / PageDown in it), opening\n  on the newest. The body map\n  folds with [−] and remembers its state.\n\n  In the rail, COLLECTIONS limits to people or verba;\n  any filter below picks the collection by itself.\n\n  Tasks (people):\n  Enter       new line already with [ ]\n  Space       on the [ ] changes the state\n  Ctrl+Space  changes it from anywhere on the line\n  [ ] to do   [/] in progress  [>] waiting on\n  [x] done    [-] cancelled  (they go to the log on save)\n  A date at the end is the deadline: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. The LAST date on the line wins.\n\n  Links, one per line, on any card:\n  rel target [span] — reason # source\n  e.g.: expresses c_timoneiro -800/400 — literal sense\n  e.g.: author_of s_wiener_1948_cybernetics\n  e.g.: cites s_lochtrop_2006 — entry p. 12\n  The target is the id: c_ concept, f_ form, p_ person,\n  s_ source, h_ measurement. A rel outside the table is not\n  an error: it is an ATYPICAL link, with the label you gave;\n  the doctor lists the atypical ones for you to promote.\n\n  SOURCE (on people, entries and measurements): a source's\n  s_…, or free text. Sources cite in ABNT, author-date,\n  BibTeX or CSL-JSON (picker on the card, copy button).\n  Corpus: readings '2026-09-01 13.5 fasting', one per line;\n  out of range shows with (!).\n\n  Sync: every save rereads the disk; on opening,\n  *.sync-conflict-* files are merged and stored in\n  {conflicts}/. The full history is in\n  {stem}.log.<machine>.jsonl (Base › History).\n":
+        "\n  Ctrl+F     ir para a busca\n  ↓ / Enter  da busca para a lista\n  Ctrl+N     nova pessoa\n  Ctrl+Q     entrada rápida (pessoas, formas ou conceitos)\n  Ctrl+S     salvar o registro aberto\n  Ctrl+Enter salvar e começar outro do mesmo tipo\n  Ctrl+Z / Ctrl+Y   desfazer / refazer\n  Ctrl+J / Ctrl+K   próximo / anterior, de qualquer lugar\n  Ctrl+G     ir para: nº (1852), carimbo, id ou nome\n  Ctrl+L     ver no registro: sai da busca, mostra o nº do aberto\n  Ctrl+B     abrir como livro (segunda janela, só leitura;\n             Enter no livro traz o registro para o cartão)\n  Ctrl+1..4  escopo pessoas / verba / fontes / corpus; Ctrl+0 tudo\n  /  na lista volta à busca;  Enter na lista vai ao cartão\n  Home / End na página;  PageUp / PageDown ou a roda vira a página\n  Ctrl+Home / Ctrl+End  começo / fim da lista\n  Ctrl+PageUp / Ctrl+PageDown vira a página de qualquer lugar\n  F5         recarregar do disco\n  Esc        voltar à lista\n\n  REGISTRO: todo registro recebe, ao ser gravado pela primeira\n  vez, um carimbo (AAAAMMDDhhmmss) e um número de ordem que\n  nunca muda; o que é apagado fica na sequência como cancelado.\n  Sem busca, a lista é o registro, na ordem dos números; com\n  busca ou filtro, é o INDICADOR, em ordem alfabética. A lista\n  mostra o que cabe na janela, sem rolagem: o resto está nas\n  páginas seguintes.\n\n  Operadores da busca:\n  p: v: f: c:   só pessoas / verba / fontes / corpus\n  ^ab           nome que começa com ab\n  tag:csh  lang:de  type:livro  sys:renal  dom:direito  id:c_\n  ex.:  v: lang:de ^ab   ·   f: type:artigo luhmann\n\n  Campos de texto crescem com o texto até a altura do cartão\n  e depois rolam por dentro (ui.max_rows no JSON fixa um teto).\n  Um LOG longo é lido em páginas que começam numa entrada\n  (‹ › ao lado do título, ou PageUp / PageDown nele), abrindo\n  na mais nova. O mapa do corpo\n  recolhe pelo [−] e lembra o estado.\n\n  No trilho, ACERVO limita a pessoas ou a verba;\n  qualquer filtro abaixo escolhe o acervo sozinho.\n\n  Tarefas (pessoas):\n  Enter       nova linha já com [ ]\n  Espaço      sobre o [ ] muda o estado\n  Ctrl+Espaço muda de qualquer ponto da linha\n  [ ] a fazer  [/] em curso  [>] esperando\n  [x] feito    [-] cancelado  (vão para o log ao salvar)\n  Data no fim é o prazo: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. A ÚLTIMA data da linha vence.\n\n  Ligações, uma por linha, em qualquer cartão:\n  rel alvo [intervalo] — razão # fonte\n  ex.: expresses c_timoneiro -800/400 — sentido próprio\n  ex.: author_of s_wiener_1948_cybernetics\n  ex.: cites s_lochtrop_2006 — verbete p. 12\n  Alvo é o id: c_ conceito, f_ forma, p_ pessoa,\n  s_ fonte, h_ medida. Um rel fora da tabela não é\n  erro: é ligação ATÍPICA, com o rótulo que você deu;\n  o doctor lista as atípicas para você promover.\n\n  FONTE (em pessoas, verbetes e medidas): s_… de uma\n  fonte, ou texto livre. Fontes citam em ABNT, autor-data,\n  BibTeX ou CSL-JSON (seletor no cartão, botão copiar).\n  Corpus: leituras '2026-09-01 13.5 jejum', uma por linha;\n  fora da referência aparece com (!).\n\n  Sincronização: cada gravação relê o disco; ao abrir,\n  *.sync-conflict-* são fundidos e guardados em\n  {conflicts}/. O histórico completo está em\n  {stem}.log.<máquina>.jsonl (menu Base › Histórico).\n",
     "OK":
         "OK",
     "Kustos · logbook (read-only)":
