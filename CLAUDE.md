@@ -67,7 +67,7 @@ Ideas that span several sections:
 
 ## The two instances
 
-- **Dev**: this repository (`C:\bmm\dev\project-kustos`), published to
+- **Dev**: this repository (`C:\bmm\sync\dev-github\project-kustos`), published to
   `github.com/Munayer/project-kustos` (public: anyone can read it, so nothing personal goes into the code either).
 - **Personal**: the Syncthing folder `C:\bmm\sync\_bmm_index_v3`, which holds
   the program *and the owner's personal data*. Syncthing keeps it the same on
