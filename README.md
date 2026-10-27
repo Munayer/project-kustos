@@ -26,6 +26,17 @@ updating of files and conflicts if used any syncing app or cloud sync.
   `p_` people · `c_` concept · `f_` form · `s_` source · `h_` health track.
 - **Linked entries** between any registers (`author_of`, `cites`,
   `attested_in`, `defined_in`, `translates`, `measured_in`…). Labels outside of the table are accepted and marked as atypical.
+- **Link graph** (`Ctrl+Shift+G`, **View › Link graph**, or `python _kustos.py graph [id]`):
+  a second, read-only window with the open record in the middle and the records
+  one to three links away around it, laid out by springs that settle by
+  themselves. It follows the record you open in the main window. The records
+  glow and the glow changes as it runs, by one of three rules (`m` switches):
+  *spreading glow* (the default: light runs along the links and fades, fed by
+  recent edits and by sparks), *Conway's life* (the Game of Life with the links
+  as neighbours: a lit record stays lit with 2 or 3 lit neighbours, a dark one
+  lights with exactly 3) and *still*. Click a record to bring it to the middle;
+  double-click or `Enter` opens it on the card; right-click sparks it (in life
+  mode it flips the cell). It shows at most 160 records at a time.
 - **Source**: free types (book, paper, thesis, law/bill, decisions, webpages, videos), citations in academic formats, BibTeX and CSL-JSON.
   Can import from Zotero via CSL-JSON or BibTeX without duplicating entries.
 - **Health (corpus)**: four kinds of record, each with its own fields —
