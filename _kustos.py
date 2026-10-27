@@ -5836,7 +5836,9 @@ HELP_GRAPH = (
     "\n                  the middle, its links around it, glowing with recent edits."
     "\n                  It follows the record you open here; m switches the glow"
     "\n                  (spreading glow, Conway's life, still), Enter opens a record"
-    "\n                  on the card. The keys are listed at the top of the window.\n"
+    "\n                  on the card. p replays the logs: the base grows on screen as"
+    "\n                  it grew, with a timeline to scrub. The keys are listed at the"
+    "\n                  top of the window.\n"
 )
 
 
@@ -9417,10 +9419,16 @@ def cmd_book():
 #          neighbours, a dark one lights with exactly 3; when the pattern dies
 #          or freezes, it is seeded again from the recent edits;
 #   still  only the recency, no motion.
-# Read-only: it reads `edges` and `updated_at` and writes nothing.
+# p plays the logs back (the replay): the base grows on screen as it grew,
+# records appearing when they were first saved, links when they were written,
+# every edit a flash, with a timeline below to scrub through. Either the whole
+# base (the records touched most recently, up to the cap) or only the records
+# that were on screen when the replay began (w switches).
+# Read-only: it reads `edges`, `updated_at` and the logs, and writes nothing.
 
 GRAPH_MAX_NODES = 160        # the view stays fluid: never the whole base at once
 GRAPH_HALF_LIFE = 21         # days for an edit's glow to halve
+GRAPH_REPLAY_SECONDS = 60    # a replay at normal speed lasts about this long
 GRAPH_MODES = ("glow", "life", "still")
 GRAPH_MODE_LABEL = {"glow": "spreading glow", "life": "Conway's life", "still": "still"}
 
@@ -9462,15 +9470,77 @@ def graph_ego(adj, center, depth, cap=GRAPH_MAX_NODES):
     return seen
 
 
+def graph_kind(rec):
+    """The shape a record takes on the graph."""
+    coll = coll_of(rec.get("id", ""))
+    if coll == "entries":
+        return "form" if rec.get("kind") == "form" else "concept"
+    return {"people": "person", "sources": "source", "corpus": "metric"}[coll]
+
+
+def epoch_of(stamp):
+    """Seconds since 1970 of an ISO stamp (date or date and time); None if it
+    is not one."""
+    try:
+        return datetime.fromisoformat((stamp or "")[:19]).timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
 def recency(rec, now=None):
     """1 for a record edited just now, halving every GRAPH_HALF_LIFE days;
     0 for a record without a date."""
-    try:
-        t = datetime.fromisoformat(stamp_of(rec)[:19])
-    except ValueError:
+    t = epoch_of(stamp_of(rec))
+    if t is None:
         return 0.0
-    age = ((now or datetime.now()) - t).total_seconds() / 86400
+    age = ((now or datetime.now()).timestamp() - t) / 86400
     return 0.5 ** (max(0.0, age) / GRAPH_HALF_LIFE)
+
+
+def replay_timeline(data, logs):
+    """The logs as a timeline for the replay, oldest first:
+    [(stamp, epoch, op, id, info)], where op is "put" (info: (label, kind)),
+    "del" (info: None) or "edges" (info: [(to, rel), ...], the links going out
+    of the record, all of them). Records of the base that have no line in the
+    logs (saved before there were logs) open the timeline, at the time of the
+    oldest line; a record whose links were never logged gets today's links at
+    its first save."""
+    events = []
+    put, linked = set(), set()
+    for l in logs:
+        if l.get("op") in ("edges",) and l.get("id"):
+            linked.add(l["id"])
+    out_now = {}
+    for a in data.get("edges", []):
+        out_now.setdefault(a.get("from"), []).append((a.get("to"), a.get("rel", "")))
+    for l in logs:
+        op, rid, stamp = l.get("op"), l.get("id"), l.get("t", "")
+        t = epoch_of(stamp)
+        if not rid or t is None:
+            continue
+        if op == "put" and l.get("coll") in COLLS:
+            rec = l.get("rec") or {}
+            if not rec.get("id"):
+                continue
+            events.append((stamp, t, "put", rid, (label_any(rec, data), graph_kind(rec))))
+            if rid not in put and rid not in linked and out_now.get(rid):
+                events.append((stamp, t, "edges", rid, out_now[rid]))
+            put.add(rid)
+        elif op == "del":
+            events.append((stamp, t, "del", rid, None))
+        elif op == "edges":
+            events.append((stamp, t, "edges", rid,
+                           [(a.get("to"), a.get("rel", "")) for a in l.get("edges", [])]))
+    first = events[0][:2] if events else (NOW(), datetime.now().timestamp())
+    before = []
+    for rec in by_id(data).values():
+        rid = rec["id"]
+        if rid in put:
+            continue
+        before.append((first[0], first[1], "put", rid, (label_any(rec, data), graph_kind(rec))))
+        if rid not in linked and out_now.get(rid):
+            before.append((first[0], first[1], "edges", rid, out_now[rid]))
+    return before + events
 
 
 def blend(c0, c1, t):
@@ -9487,6 +9557,7 @@ class GraphView:
     STEPS = 24           # colour steps of the glow
     GEN_TICKS = 15       # ticks per generation in life mode
     SPARK_TICKS = 30     # ticks between sparks in glow mode
+    TOP = 44             # the keys above the graph
 
     def __init__(self, root, get_data, start_id=None, on_open=None):
         self.root, self.get_data, self.on_open = root, get_data, on_open
@@ -9497,9 +9568,9 @@ class GraphView:
         self.data = self.idx = self.adj = None
         self.recs = {}
         self.center = self.hover = None
-        self.pos, self.dist, self.kinds, self.adjv = {}, {}, {}, {}
+        self.pos, self.dist, self.kinds, self.names, self.adjv = {}, {}, {}, {}, {}
         self.heat, self.lit = {}, {}
-        self.items, self.links, self.shown = {}, [], {}
+        self.items, self.links, self.shown, self.label_on = {}, {}, {}, {}
         self.screen = {}
         self.cam, self.goal, self.zoom = [0.0, 0.0], [0.0, 0.0], 1.0
         self.fit = True      # the zoom follows the size of the graph until you zoom
@@ -9507,8 +9578,9 @@ class GraphView:
         self.gen = self.stale = 0
         self.history = []
         self.press_at = self.press_node = self.dragging = None
-        self.last, self.moved = (0, 0), False
-        self._job = self._follow = self._flash = None
+        self.last, self.moved, self.scrubbing = (0, 0), False, False
+        self.rp = None       # the replay, while it runs (see start_replay)
+        self._job = self._follow = None
         self._dirty = True
 
         fams = set(tkfont.families(root))
@@ -9536,6 +9608,9 @@ class GraphView:
         self.t_left = cv.create_text(12, 0, anchor="sw", font=self.f_status, fill=SOFT)
         self.t_right = cv.create_text(0, 0, anchor="se", font=self.f_status, fill=SOFT)
         self.t_notice = cv.create_text(0, 0, anchor="n", font=self.f_status, fill=SOFT)
+        self.bar = cv.create_line(0, 0, 0, 0, fill=RULE, width=3, state="hidden")
+        self.bar_done = cv.create_line(0, 0, 0, 0, fill=STAMP, width=3, state="hidden")
+        self.ring = cv.create_oval(0, 0, 0, 0, outline=INK, width=1, state="hidden")
 
         b = root.bind
         b("<space>", lambda e: self.toggle_pause())
@@ -9545,17 +9620,26 @@ class GraphView:
         b("<l>", lambda e: self.toggle_labels())
         b("<r>", lambda e: self.shake())
         b("<c>", lambda e: self.copy_id())
-        b("<Home>", lambda e: self.recentre(self.start))
-        b("<F5>", lambda e: self.recentre(self.center, fresh=True))
+        b("<p>", lambda e: self.toggle_replay())
+        b("<w>", lambda e: self.switch_scope())
+        for k in ("<plus>", "<equal>", "<KP_Add>"):
+            b(k, lambda e: self.set_speed(2.0))
+        for k in ("<minus>", "<KP_Subtract>"):
+            b(k, lambda e: self.set_speed(0.5))
+        b("<Left>", lambda e: self.skip(-0.02))
+        b("<Right>", lambda e: self.skip(0.02))
+        b("<Home>", lambda e: self.key_home())
+        b("<End>", lambda e: self.seek(len(self.rp["events"])) if self.rp else None)
+        b("<F5>", lambda e: None if self.rp else self.recentre(self.center, fresh=True))
         b("<Return>", lambda e: self.open_in_card())
-        b("<Escape>", lambda e: self.close())
+        b("<Escape>", lambda e: self.stop_replay() if self.rp else self.close())
         b("<q>", lambda e: self.close())
         cv.bind("<Configure>", self.resized)
         cv.bind("<Motion>", self.motion)
         cv.bind("<ButtonPress-1>", self.press)
         cv.bind("<B1-Motion>", self.drag)
         cv.bind("<ButtonRelease-1>", self.release)
-        cv.bind("<Double-Button-1>", lambda e: self.open_in_card(self.center))
+        cv.bind("<Double-Button-1>", lambda e: self.open_in_card(self.hover or self.center))
         cv.bind("<Button-3>", self.touch)
         cv.bind("<MouseWheel>", lambda e: self.zoom_at(e, 1.1 if e.delta > 0 else 1 / 1.1))
         cv.bind("<Button-4>", lambda e: self.zoom_at(e, 1.1))
@@ -9597,9 +9681,11 @@ class GraphView:
             pos[rid] = [0.0, 0.0]
         self.cam = [self.cam[0] - ox, self.cam[1] - oy]
         self.goal = [0.0, 0.0]
-        self.center, self.hover, self.pos = rid, None, pos
+        self.clear_items()
+        self.center, self.pos = rid, pos
         self.dist = {n: d for n, (d, _p) in ego.items()}
-        self.kinds = {n: self.kind_of(self.idx[n]) for n in ego}
+        self.kinds = {n: graph_kind(self.idx[n]) for n in ego}
+        self.names = {n: label_any(self.idx[n], self.data) for n in ego}
         self.adjv = {n: [m for m in self.adj.get(n, {}) if m in ego] for n in ego}
         self.heat = {n: self.heat.get(n, self.recs.get(n, 0.0) * 0.3) for n in ego}
         self.lit = {n: self.lit.get(n, False) for n in ego}
@@ -9607,58 +9693,79 @@ class GraphView:
             self.heat[rid] = 1.0
         if self.mode == "life":
             self.seed_life()
-        self.temp = max(self.temp, 30.0)
-        self.fit = True
-        self.build_items()
-        self.update_status()
-
-    def kind_of(self, rec):
-        coll = coll_of(rec.get("id", ""))
-        if coll == "entries":
-            return "form" if rec.get("kind") == "form" else "concept"
-        return {"people": "person", "sources": "source", "corpus": "metric"}[coll]
-
-    def build_items(self):
-        cv = self.cv
-        cv.delete("g")
-        self.items, self.links, self.shown = {}, [], {}
-        for a in self.pos:
+        for a in ego:
             for b, rels in self.adj.get(a, {}).items():
-                if b in self.pos and a < b:
-                    line = cv.create_line(0, 0, 0, 0, fill=RULE, width=1, tags=("g",))
-                    self.links.append((a, b, rels, line))
-        self.ring = cv.create_oval(0, 0, 0, 0, outline=INK, width=1, state="hidden",
-                                   tags=("g",))
-        for n in self.pos:
-            centre = n == self.center
-            opts = dict(fill=PAPER, outline=OXIDE if centre else FAINT,
-                        width=2 if centre else 1, tags=("g",))
-            if self.kinds[n] == "person":
-                shape = cv.create_oval(0, 0, 0, 0, **opts)
-            else:
-                shape = cv.create_polygon(0, 0, 0, 0, 0, 0, **opts)
-            name = one_liner(label_any(self.idx[n], self.data), 32)
-            text = cv.create_text(0, 0, anchor="w", text=name, tags=("g",),
-                                  font=self.f_center if centre else self.f_label,
-                                  fill=INK if self.dist[n] <= 1 else SOFT)
-            self.items[n] = (shape, text)
+                if b in ego and a < b:
+                    self.add_link((a, b), rels)
+        for n in ego:
+            self.add_node(n)
         if not self.center:
             msg = tr("The base has no records yet.")
         elif len(self.pos) == 1:
             msg = tr("No links yet: write them in the card's LINKS field, one per line.")
         else:
             msg = ""
-        cv.itemconfigure(self.t_notice, text=msg)
+        self.cv.itemconfigure(self.t_notice, text=msg)
+        self.temp = max(self.temp, 30.0)
+        self.fit = True
         self.label_states()
         self._dirty = True
+        self.update_status()
+
+    # the canvas items are made once per record and per link, and only moved and
+    # recoloured on each tick; the replay adds and drops them as the base grows
+    def clear_items(self):
+        self.cv.delete("g")
+        self.items, self.links, self.shown, self.label_on = {}, {}, {}, {}
+        self.hover = None
+
+    def add_node(self, n):
+        cv = self.cv
+        centre = n == self.center
+        opts = dict(fill=PAPER, outline=OXIDE if centre else FAINT,
+                    width=2 if centre else 1, tags=("g",))
+        if self.kinds[n] == "person":
+            shape = cv.create_oval(0, 0, 0, 0, **opts)
+        else:
+            shape = cv.create_polygon(0, 0, 0, 0, 0, 0, **opts)
+        text = cv.create_text(0, 0, anchor="w", text=one_liner(self.names[n], 32),
+                              tags=("g",), font=self.f_center if centre else self.f_label,
+                              fill=INK if self.dist.get(n, 2) <= 1 else SOFT)
+        self.items[n] = (shape, text)
+        cv.tag_raise(self.ring)
+
+    def drop_node(self, n):
+        for item in self.items.pop(n, ()):
+            self.cv.delete(item)
+        for d in (self.pos, self.heat, self.lit, self.dist, self.adjv, self.shown,
+                  self.label_on, self.kinds, self.names):
+            d.pop(n, None)
+        if self.hover == n:
+            self.hover = None
+
+    def add_link(self, key, rels):
+        line = self.cv.create_line(0, 0, 0, 0, fill=RULE, width=1, tags=("g",))
+        self.cv.tag_lower(line)
+        self.links[key] = (rels, line)
+
+    def drop_link(self, key):
+        _rels, line = self.links.pop(key)
+        self.cv.delete(line)
+        self.shown.pop(line, None)
 
     def label_shown(self, n):
-        return (n == self.center or n == self.hover or self.all_labels
-                or self.dist.get(n, 9) <= 1 or len(self.pos) <= 40)
+        if n == self.center or n == self.hover or self.all_labels:
+            return True
+        if self.rp:      # in the replay, the names of the last records edited
+            return n in self.rp.get("named", ()) or len(self.pos) <= 25
+        return self.dist.get(n, 9) <= 1 or len(self.pos) <= 40
 
     def label_states(self):
         for n, (_shape, text) in self.items.items():
-            self.cv.itemconfigure(text, state="normal" if self.label_shown(n) else "hidden")
+            on = self.label_shown(n)
+            if self.label_on.get(n) != on:
+                self.label_on[n] = on
+                self.cv.itemconfigure(text, state="normal" if on else "hidden")
 
     # ---------------------------------------------------------- motion
     def tick(self):
@@ -9673,6 +9780,8 @@ class GraphView:
             return
         self.frame += 1
         moved = self._dirty
+        if self.rp and not self.paused:
+            self.play()
         if self.temp > 0.2:
             self.layout_step()
             moved = True
@@ -9685,6 +9794,8 @@ class GraphView:
             moved = self.fit_zoom() or moved
         if not self.paused:
             self.step_heat()
+        if self.rp:
+            self.label_states()
         self.draw(moved)
         self._job = self.root.after(self.TICK_MS, self.tick)
 
@@ -9711,7 +9822,7 @@ class GraphView:
                 db = disp[b]
                 db[0] -= dx * f
                 db[1] -= dy * f
-        for a, b, _rels, _line in self.links:
+        for a, b in self.links:
             dx, dy = P[a][0] - P[b][0], P[a][1] - P[b][1]
             f = math.sqrt(dx * dx + dy * dy) / k
             disp[a][0] -= dx * f
@@ -9740,8 +9851,8 @@ class GraphView:
                 s = sum(H[m] for m in nb) / len(nb) if nb else 0.0
                 new[n] = min(1.0, h * 0.95 + s * 0.045 + R.get(n, 0.0) * 0.012)
             self.heat = new
-            if self.frame % self.SPARK_TICKS == 0:
-                self.spark()
+            if self.frame % self.SPARK_TICKS == 0 and not self.rp:
+                self.spark()      # in the replay the edits are the sparks
         elif self.mode == "life":
             if self.frame % self.GEN_TICKS == 0:
                 self.generation()
@@ -9779,20 +9890,223 @@ class GraphView:
             self.seed_life()
         self.update_status()
 
+    # ---------------------------------------------------------- replay
+    def toggle_replay(self):
+        if self.rp:
+            self.stop_replay()
+        else:
+            self.start_replay()
+
+    def start_replay(self):
+        """p: the logs played back. The neighbourhood on screen is remembered
+        for the w scope; the live graph comes back with Esc or p."""
+        self.data = self.get_data()
+        self.idx = by_id(self.data)
+        events = replay_timeline(self.data, read_logs())
+        if not events:
+            self.update_status(flash=tr("Nothing to replay: the base and the logs are empty."))
+            return
+        here = dict(self.dist)
+        self.rp = dict(events=events, i=0, acc=0.0, speed=1.0, scope="base",
+                       base_rate=len(events) / (GRAPH_REPLAY_SECONDS * 1000 / self.TICK_MS),
+                       here=here, back=self.center, alive={}, out={}, touch={},
+                       clock=events[0][1], stamp=events[0][0])
+        self.paused = False
+        self.center = None
+        self.clear_items()
+        self.pos, self.dist, self.adjv, self.heat, self.lit = {}, {}, {}, {}, {}
+        self.kinds, self.names = {}, {}
+        self.cam, self.goal, self.fit = [0.0, 0.0], [0.0, 0.0], True
+        self.cv.itemconfigure(self.t_keys, text=tr(GRAPH_REPLAY_KEYS))
+        self.cv.itemconfigure(self.t_notice, text="")
+        for item in (self.bar, self.bar_done):
+            self.cv.itemconfigure(item, state="normal")
+        self.resized()
+        self.update_status()
+
+    def stop_replay(self):
+        back = self.rp["back"]
+        self.rp = None
+        self.paused = False
+        for item in (self.bar, self.bar_done):
+            self.cv.itemconfigure(item, state="hidden")
+        self.cv.itemconfigure(self.t_keys, text=tr(GRAPH_KEYS))
+        self.pos, self.heat, self.lit = {}, {}, {}
+        self.recentre(back, fresh=True)
+        self.resized()
+
+    def apply(self, e, hits):
+        stamp, t, op, rid, info = e
+        rp = self.rp
+        if op == "put":
+            rp["alive"][rid] = info
+            rp["touch"][rid] = t
+            hits.add(rid)
+        elif op == "del":
+            for key in ("alive", "out", "touch"):
+                rp[key].pop(rid, None)
+        elif rid in rp["alive"]:
+            rp["out"][rid] = info
+            rp["touch"][rid] = t
+            hits.add(rid)
+        rp["clock"], rp["stamp"] = t, stamp
+
+    def play(self):
+        """Advances the replay by this tick's share of events."""
+        rp = self.rp
+        events = rp["events"]
+        if rp["i"] >= len(events):
+            return
+        rp["acc"] += rp["base_rate"] * rp["speed"]
+        k = int(rp["acc"])
+        if not k:
+            return
+        rp["acc"] -= k
+        hits = set()
+        end = min(len(events), rp["i"] + k)
+        for e in events[rp["i"]:end]:
+            self.apply(e, hits)
+        rp["i"] = end
+        self.sync_view(hits)
+        if end >= len(events):
+            self.paused = True
+            self.update_status(flash=tr("End of the logs: the base as it is today."))
+
+    def seek(self, i):
+        """Jumps to event i: the state is rebuilt from the start, quietly."""
+        rp = self.rp
+        if not rp:
+            return
+        i = max(0, min(len(rp["events"]), int(i)))
+        for key in ("alive", "out", "touch"):
+            rp[key] = {}
+        hits = set()
+        for e in rp["events"][:i]:
+            self.apply(e, hits)
+        if not i:
+            rp["clock"], rp["stamp"] = rp["events"][0][1], rp["events"][0][0]
+        rp["i"], rp["acc"] = i, 0.0
+        self.sync_view(set())
+        self.paused = self.paused and i < len(rp["events"])
+        self.update_status()
+
+    def skip(self, frac):
+        if self.rp:
+            self.seek(self.rp["i"] + frac * len(self.rp["events"]))
+
+    def key_home(self):
+        if self.rp:
+            self.seek(0)
+        else:
+            self.recentre(self.start)
+
+    def set_speed(self, f):
+        if self.rp:
+            self.rp["speed"] = min(64.0, max(1 / 16, self.rp["speed"] * f))
+            self.update_status()
+
+    def switch_scope(self):
+        """w: the whole base, or only what was on screen when the replay began."""
+        rp = self.rp
+        if not rp:
+            return
+        rp["scope"] = "here" if rp["scope"] == "base" and rp["here"] else "base"
+        self.seek(rp["i"])
+
+    def sync_view(self, hits):
+        """Brings the screen to the replayed base: records and links appear and
+        go, and what was just saved lights up."""
+        rp = self.rp
+        alive, touch = rp["alive"], rp["touch"]
+        if rp["scope"] == "here":
+            shown = [n for n in rp["here"] if n in alive]
+            dist = rp["here"]
+        else:
+            # the front of the work (what was touched last) and what it links to
+            front = sorted(alive, key=lambda n: -touch.get(n, 0.0))[:GRAPH_MAX_NODES // 2]
+            into = {}
+            for a, outs in rp["out"].items():
+                for to, _rel in outs:
+                    into.setdefault(to, []).append(a)
+            keep = dict.fromkeys(front)
+            for n in front:
+                for m in [to for to, _rel in rp["out"].get(n, ())] + into.get(n, []):
+                    if len(keep) >= GRAPH_MAX_NODES:
+                        break
+                    if m in alive:
+                        keep.setdefault(m)
+            shown = list(keep)
+            dist = {}
+        keep = set(shown)
+        links = {}
+        for a in shown:
+            for to, rel in rp["out"].get(a, ()):
+                if to in keep and to != a:
+                    links.setdefault((min(a, to), max(a, to)), []).append((rel, a))
+        changed = False
+        for n in [n for n in self.pos if n not in keep]:
+            self.drop_node(n)
+            changed = True
+        for key in [key for key in self.links if key not in links]:
+            self.drop_link(key)
+        for key, rels in links.items():
+            if key not in self.links:
+                self.add_link(key, rels)
+                hits.update(key)
+            else:
+                self.links[key] = (rels, self.links[key][1])
+        nbrs = {n: [] for n in shown}
+        for a, b in links:
+            nbrs[a].append(b)
+            nbrs[b].append(a)
+        for n in shown:
+            if n in self.pos:
+                continue
+            near = next((m for m in nbrs[n] if m in self.pos), None)
+            if near:
+                px, py = self.pos[near]
+                a, r = self.rng.uniform(0, 2 * math.pi), self.LINK * 0.6
+            else:
+                px, py = 0.0, 0.0
+                a, r = self.rng.uniform(0, 2 * math.pi), self.LINK * self.rng.uniform(1.0, 3.0)
+            self.pos[n] = [px + r * math.cos(a), py + r * math.sin(a)]
+            self.kinds[n], self.names[n] = alive[n][1], alive[n][0]
+            self.dist[n] = dist.get(n, 2)
+            self.heat[n], self.lit[n] = 0.0, False
+            self.add_node(n)
+            changed = True
+        self.adjv = nbrs
+        now = rp["clock"]
+        self.recs = {n: 0.5 ** (max(0.0, now - touch.get(n, now)) / 86400 / GRAPH_HALF_LIFE)
+                     for n in shown}
+        for n in hits:
+            if n in self.heat:
+                self.heat[n] = 1.0
+                self.lit[n] = True
+        rp["named"] = ([n for n in rp.get("named", []) if n in self.pos and n not in hits]
+                       + [n for n in hits if n in self.pos])[-6:]
+        if changed:
+            self.temp = max(self.temp, 12.0)
+        self.cv.itemconfigure(self.t_notice, text="" if shown else
+                              tr("Nothing yet at this point of the logs."))
+        self._dirty = True
+        self.update_status()
+
     # ---------------------------------------------------------- drawing
-    TOP, BOTTOM = 44, 26     # the keys above, the status line below
+    def bottom(self):
+        return 46 if self.rp else 26     # the status line, and the timeline
 
     def middle(self):
         cv = self.cv
-        return cv.winfo_width() / 2, (cv.winfo_height() + self.TOP - self.BOTTOM) / 2
+        return cv.winfo_width() / 2, (cv.winfo_height() + self.TOP - self.bottom()) / 2
 
     def fit_zoom(self):
         """Eases the zoom so the whole graph fits the window; True if it moved."""
         cv = self.cv
-        w, h = cv.winfo_width(), cv.winfo_height() - self.TOP - self.BOTTOM
+        w, h = cv.winfo_width(), cv.winfo_height() - self.TOP - self.bottom()
         rx = max(abs(x) for x, _y in self.pos.values()) or 1.0
         ry = max(abs(y) for _x, y in self.pos.values()) or 1.0
-        z = min(1.5, max(0.3, min((w / 2 - 110) / rx, (h / 2 - 20) / ry)))
+        z = min(1.5, max(0.12, min((w / 2 - 110) / rx, (h / 2 - 20) / ry)))
         if abs(z - self.zoom) < 0.002:
             return False
         self.zoom += (z - self.zoom) * 0.15
@@ -9804,7 +10118,7 @@ class GraphView:
         return {n: (mx + (x - cx) * z, my + (y - cy) * z) for n, (x, y) in self.pos.items()}
 
     def radius(self, n):
-        r = 9.0 if n == self.center else (6.5 if self.dist[n] == 1 else 5.0)
+        r = 9.0 if n == self.center else (6.5 if self.dist.get(n, 2) == 1 else 5.0)
         return r * min(1.5, max(0.7, self.zoom))
 
     def shape_at(self, n, x, y):
@@ -9825,7 +10139,7 @@ class GraphView:
         cv, H, n_steps = self.cv, self.heat, self.STEPS
         if coords:
             S = self.screen = self.to_screen()
-            for a, b, _rels, line in self.links:
+            for (a, b), (_rels, line) in self.links.items():
                 cv.coords(line, *S[a], *S[b])
             for n, (shape, text) in self.items.items():
                 x, y = S[n]
@@ -9842,11 +10156,24 @@ class GraphView:
                     cv.itemconfigure(shape, fill=self.ramp_fill[q])
                 else:
                     cv.itemconfigure(shape, fill=self.ramp_fill[q], outline=self.ramp_edge[q])
-        for a, b, _rels, line in self.links:
+        for (a, b), (_rels, line) in self.links.items():
             q = int((H[a] + H[b]) * 0.5 * n_steps + 0.5)
             if shown.get(line) != q:
                 shown[line] = q
                 cv.itemconfigure(line, fill=self.ramp_line[q], width=1 + 2 * q // n_steps)
+        if self.rp:
+            self.draw_timeline()
+
+    def bar_span(self):
+        cv = self.cv
+        return 12, cv.winfo_width() - 12, cv.winfo_height() - 34
+
+    def draw_timeline(self):
+        x0, x1, y = self.bar_span()
+        rp = self.rp
+        done = x0 + (x1 - x0) * rp["i"] / max(1, len(rp["events"]))
+        self.cv.coords(self.bar, x0, y, x1, y)
+        self.cv.coords(self.bar_done, x0, y, done, y)
 
     def draw_hover(self):
         cv = self.cv
@@ -9861,37 +10188,48 @@ class GraphView:
         cv.itemconfigure(self.ring, state="normal")
         for m in self.adjv.get(n, []):
             mx, my = self.screen[m]
-            words = [rel_label(rel) + (" →" if f == n else " ←")
-                     for rel, f in self.adj[n][m]]
+            rels = self.links[(min(n, m), max(n, m))][0]
+            words = [rel_label(rel) + (" →" if f == n else " ←") for rel, f in rels]
             cv.create_text((x + mx) / 2, (y + my) / 2, text=" · ".join(words), fill=SOFT,
                            font=self.f_label, tags=("g", "rel"))
 
-    def resized(self, e):
+    def resized(self, _e=None):
         cv = self.cv
-        cv.coords(self.t_left, 12, e.height - 6)
-        cv.coords(self.t_right, e.width - 12, e.height - 6)
-        cv.coords(self.t_notice, e.width / 2, e.height / 2 + 28)
-        cv.itemconfigure(self.t_keys, width=e.width - 24)
+        w, h = cv.winfo_width(), cv.winfo_height()
+        cv.coords(self.t_left, 12, h - 6)
+        cv.coords(self.t_right, w - 12, h - 6)
+        cv.coords(self.t_notice, w / 2, h / 2 + 28)
+        cv.itemconfigure(self.t_keys, width=w - 24)
         self._dirty = True
 
     def update_status(self, flash=None):
+        rp = self.rp
         rid = self.hover or self.center
         rec = self.idx.get(rid) if rid else None
         if flash:
             left = flash
-        elif rec:
-            left = label_any(rec, self.data) + (f" · nº {rec['reg_n']}" if rec.get("reg_n")
-                                                else "") + f" · {rid}"
+        elif rid and rid in self.names:
+            left = self.names[rid] + (f" · nº {rec['reg_n']}" if rec and rec.get("reg_n")
+                                      else "") + f" · {rid}"
+        elif rp:
+            left = tr("replay of the logs · {date} · event {i} of {n}",
+                      date=rp["stamp"][:16].replace("T", " "), i=rp["i"], n=len(rp["events"]))
         else:
             left = ""
         right = tr(GRAPH_MODE_LABEL[self.mode])
         if self.mode == "life":
             right += " · " + tr("generation {n}, {k} lit", n=self.gen,
                                 k=sum(1 for v in self.lit.values() if v))
+        if rp:
+            speed = rp["speed"]
+            right += " · ×" + (f"{speed:g}" if speed >= 1 else f"1/{1 / speed:g}")
+            right += " · " + (tr("whole base") if rp["scope"] == "base"
+                              else tr("around the record"))
         if self.paused:
             right += " · " + tr("paused")
-        right += " · " + tr("{n} records, {k} links, depth {d}", n=len(self.pos),
-                            k=len(self.links), d=self.depth)
+        right += " · " + tr("{n} records, {k} links", n=len(self.pos), k=len(self.links))
+        if not rp:
+            right += ", " + tr("depth {d}", d=self.depth)
         self.cv.itemconfigure(self.t_left, text=one_liner(left, 90))
         self.cv.itemconfigure(self.t_right, text=right)
 
@@ -9912,13 +10250,27 @@ class GraphView:
             self.draw_hover()
             self.update_status()
 
+    def on_bar(self, e):
+        x0, x1, y = self.bar_span()
+        return self.rp and abs(e.y - y) <= 9 and x0 - 4 <= e.x <= x1 + 4
+
+    def scrub(self, e):
+        x0, x1, _y = self.bar_span()
+        self.seek((e.x - x0) / max(1, x1 - x0) * len(self.rp["events"]))
+
     def press(self, e):
         self.cv.focus_set()
         self.press_at = self.last = (e.x, e.y)
         self.press_node, self.moved = self.node_at(e.x, e.y), False
+        self.scrubbing = bool(self.on_bar(e))
+        if self.scrubbing:
+            self.scrub(e)
 
     def drag(self, e):
         if not self.press_at:
+            return
+        if self.scrubbing:
+            self.scrub(e)
             return
         if not self.moved and abs(e.x - self.press_at[0]) + abs(e.y - self.press_at[1]) < 4:
             return
@@ -9939,9 +10291,10 @@ class GraphView:
 
     def release(self, _e):
         n = self.press_node
-        if n and not self.moved and n != self.center:
+        if n and not self.moved and not self.scrubbing and not self.rp and n != self.center:
             self.recentre(n)
         self.press_at = self.press_node = self.dragging = None
+        self.scrubbing = False
 
     def touch(self, e):
         """Right-click: in glow mode a spark; in life mode the cell flips."""
@@ -9956,7 +10309,7 @@ class GraphView:
             self.heat[n] = 1.0
 
     def zoom_at(self, e, f):
-        z = min(3.0, max(0.3, self.zoom * f))
+        z = min(3.0, max(0.12, self.zoom * f))
         mx, my = self.middle()
         self.fit = False
         for c in (self.cam, self.goal):
@@ -9968,6 +10321,8 @@ class GraphView:
     # ---------------------------------------------------------- keys
     def toggle_pause(self):
         self.paused = not self.paused
+        if self.rp and not self.paused and self.rp["i"] >= len(self.rp["events"]):
+            self.seek(0)      # at the end, space plays it again
         self.update_status()
 
     def cycle_mode(self):
@@ -9978,7 +10333,8 @@ class GraphView:
 
     def set_depth(self, d):
         self.depth = d
-        self.recentre(self.center)
+        if not self.rp:
+            self.recentre(self.center)
 
     def toggle_labels(self):
         self.all_labels = not self.all_labels
@@ -10012,7 +10368,11 @@ class GraphView:
 
     def follow(self, rid):
         """The main window opened another record: the graph moves to it, a
-        moment later (stepping through the list does not rebuild on each step)."""
+        moment later (stepping through the list does not rebuild on each step).
+        During a replay it is only remembered, for when the replay ends."""
+        if self.rp:
+            self.rp["back"] = rid
+            return
         if rid == self.center:
             return
         if self._follow:
@@ -10021,7 +10381,8 @@ class GraphView:
 
     def _do_follow(self, rid):
         self._follow = None
-        self.recentre(rid, fresh=True)
+        if not self.rp:
+            self.recentre(rid, fresh=True)
 
     def is_open(self):
         try:
@@ -10043,7 +10404,13 @@ class GraphView:
 GRAPH_KEYS = ("click: to the middle · double-click / Enter: open on the card · "
               "right-click: spark (in life: flip the cell) · drag: move · wheel: zoom · "
               "m: glow / life / still · 1-3: depth · l: all names · space: pause · "
-              "r: shake · c: copy id · Home: back to the start · F5: reread · Esc: close")
+              "r: shake · c: copy id · p: replay the logs · Home: back to the start · "
+              "F5: reread · Esc: close")
+GRAPH_REPLAY_KEYS = ("REPLAY OF THE LOGS · space: pause / play · + / -: faster / slower · "
+                     "← / →: back / ahead · Home / End: start / today · click or drag the "
+                     "timeline: go to that moment · w: whole base / around the record · "
+                     "m: glow / life / still · double-click: open on the card · "
+                     "Esc or p: back to the live graph")
 
 
 def cmd_graph(open_id=None):
@@ -11267,18 +11634,34 @@ PT = {
         "geração {n}, {k} acesos",
     "paused":
         "pausado",
-    "{n} records, {k} links, depth {d}":
-        "{n} registros, {k} ligações, profundidade {d}",
     "The base has no records yet.":
         "A base ainda não tem registros.",
     "No links yet: write them in the card's LINKS field, one per line.":
         "Ainda sem ligações: escreva-as no campo LIGAÇÕES do cartão, uma por linha.",
     "Read-only here: open the graph from Kustos (Ctrl+Shift+G) to send records to the card.":
         "Aqui é só leitura: abra o grafo pelo Kustos (Ctrl+Shift+G) para levar registros ao cartão.",
+    "{n} records, {k} links":
+        "{n} registros, {k} ligações",
+    "depth {d}":
+        "profundidade {d}",
+    "whole base":
+        "base inteira",
+    "around the record":
+        "em volta do registro",
+    "replay of the logs · {date} · event {i} of {n}":
+        "reprodução dos logs · {date} · evento {i} de {n}",
+    "Nothing to replay: the base and the logs are empty.":
+        "Nada a reproduzir: a base e os logs estão vazios.",
+    "End of the logs: the base as it is today.":
+        "Fim dos logs: a base como está hoje.",
+    "Nothing yet at this point of the logs.":
+        "Ainda nada neste ponto dos logs.",
     GRAPH_KEYS:
-        "clique: ao centro · duplo clique / Enter: abrir no cartão · botão direito: faísca (na vida: vira a célula) · arrastar: mover · roda: zoom · m: brilho / vida / parado · 1-3: profundidade · l: todos os nomes · espaço: pausa · r: sacudir · c: copiar id · Home: voltar ao início · F5: reler · Esc: fechar",
+        "clique: ao centro · duplo clique / Enter: abrir no cartão · botão direito: faísca (na vida: vira a célula) · arrastar: mover · roda: zoom · m: brilho / vida / parado · 1-3: profundidade · l: todos os nomes · espaço: pausa · r: sacudir · c: copiar id · p: reproduzir os logs · Home: voltar ao início · F5: reler · Esc: fechar",
+    GRAPH_REPLAY_KEYS:
+        "REPRODUÇÃO DOS LOGS · espaço: pausa / continua · + / -: mais rápido / mais lento · ← / →: voltar / avançar · Home / End: início / hoje · clicar ou arrastar a linha do tempo: ir àquele momento · w: base inteira / em volta do registro · m: brilho / vida / parado · duplo clique: abrir no cartão · Esc ou p: voltar ao grafo vivo",
     HELP_GRAPH:
-        "\n  Ctrl+Shift+G    grafo de ligações (segunda janela, só leitura): o registro aberto\n                  no centro, suas ligações em volta, brilhando com as edições recentes.\n                  Ele segue o registro que você abre aqui; m troca o brilho\n                  (brilho que se espalha, vida de Conway, parado), Enter abre um registro\n                  no cartão. As teclas estão no alto da janela.\n",
+        "\n  Ctrl+Shift+G    grafo de ligações (segunda janela, só leitura): o registro aberto\n                  no centro, suas ligações em volta, brilhando com as edições recentes.\n                  Ele segue o registro que você abre aqui; m troca o brilho\n                  (brilho que se espalha, vida de Conway, parado), Enter abre um registro\n                  no cartão. p reproduz os logs: a base cresce na tela como cresceu,\n                  com uma linha do tempo para percorrer. As teclas estão no alto\n                  da janela.\n",
 }
 
 if __name__ == "__main__":

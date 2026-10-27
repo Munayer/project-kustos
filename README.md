@@ -37,6 +37,13 @@ updating of files and conflicts if used any syncing app or cloud sync.
   lights with exactly 3) and *still*. Click a record to bring it to the middle;
   double-click or `Enter` opens it on the card; right-click sparks it (in life
   mode it flips the cell). It shows at most 160 records at a time.
+  `p` **replays the logs**: the base grows on screen as it grew, records
+  appearing when they were first saved, links when they were written, each
+  edit a flash, with a timeline below (click or drag it to go to a moment;
+  `space` pauses, `+`/`-` change the speed, `←`/`→` skip). `w` switches between
+  the whole base (what was being worked on, and what it links to) and only the
+  records that were on screen when the replay began. Records saved before
+  there were logs open the timeline. `Esc` goes back to the live graph.
 - **Source**: free types (book, paper, thesis, law/bill, decisions, webpages, videos), citations in academic formats, BibTeX and CSL-JSON.
   Can import from Zotero via CSL-JSON or BibTeX without duplicating entries.
 - **Health (corpus)**: four kinds of record, each with its own fields —
