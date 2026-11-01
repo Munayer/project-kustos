@@ -64,7 +64,7 @@ updating of files and conflicts if used any syncing app or cloud sync.
 - **Timeline** (`Ctrl+Shift+T`, **View › Timeline**, or `python _kustos.py
   timeline [id]`): everything dated on one line of time, in lanes — the
   people's LOG (the facts of a life), births and deaths (`BORN` / `DIED` on the
-  person card), tasks due, when sources came out, attested forms, links with a
+  person card), tasks due, when sources came out, links with a
   span (`-800/400`), health readings, sessions, events and medicines, and
   drafts with a `date` or `period` in their header. From centuries to minutes:
   the wheel zooms where the pointer is, dragging moves along, `Home` shows

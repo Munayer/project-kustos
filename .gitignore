@@ -24,3 +24,6 @@ _kustos_drafts_*.md
 # Python
 __pycache__/
 *.pyc
+
+# Claude Code: this machine's own permissions
+.claude/settings.local.json

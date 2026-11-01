@@ -6396,7 +6396,7 @@ HELP_COPY = (
 HELP_TIMELINE = (
     "\n  Ctrl+Shift+T    timeline (second window, read-only): everything dated on one"
     "\n                  line of time -- the people's LOG, births and deaths, tasks due,"
-    "\n                  sources, attested forms, links with a span, health, drafts with"
+    "\n                  sources, links with a span, health, drafts with"
     "\n                  a date or period. The wheel zooms, dragging moves, Home shows"
     "\n                  everything, t today, r when each record was registered, f"
     "\n                  follows this window's search; Enter opens a record here."
@@ -11826,7 +11826,7 @@ def cmd_graph(open_id=None):
 # Everything with a date on one line of time (Ctrl+Shift+T, View › Timeline,
 # or `python _kustos.py timeline`): the LOG of each person -- the facts of a
 # life --, births and deaths, tasks due (the calendar), when sources came
-# out, when forms are attested, the spans written on links, health readings,
+# out, the spans written on links, health readings,
 # sessions, events and medicines, drafts carrying a date or a period in their
 # header, and, as a layer to switch on, when each record was registered.
 # From centuries to minutes: the wheel zooms where the pointer is, dragging
@@ -11942,8 +11942,8 @@ def timeline_events(data):
         if when:
             add("sources", s_["id"], when, source_label(s_, data))
     for e in data["entries"]:
-        if e.get("kind") == "form" and e.get("attested"):
-            add("verba", e["id"], e["attested"], label_of(e))
+        # a form's ATTESTED says where it is attested (a work, a passage), not
+        # when: its numbers are not dates, so it stays off the timeline
         if e.get("period"):
             add("verba", e["id"], e["period"], label_of(e))
     idx = by_id(data)
@@ -13701,8 +13701,8 @@ PT = {
         "DATA OU PERÍODO  (2024-03-11, 1609, 1618/1648 — para a cronologia)",
     "Timeline":
         "Cronologia",
-    "\n  Ctrl+Shift+T    timeline (second window, read-only): everything dated on one\n                  line of time -- the people's LOG, births and deaths, tasks due,\n                  sources, attested forms, links with a span, health, drafts with\n                  a date or period. The wheel zooms, dragging moves, Home shows\n                  everything, t today, r when each record was registered, f\n                  follows this window's search; Enter opens a record here.\n  Base › Real dates in the logs: log entries whose text starts with a date\n                  (2021, 20240311, 202403110011…) get it as their date. A LOG\n                  line may carry a year (2021), a month (2024-03) or a time\n                  (2024-03-11 14:30), followed by two spaces.\n":
-        "\n  Ctrl+Shift+T    cronologia (segunda janela, só leitura): tudo o que tem data\n                  numa linha do tempo -- o LOG das pessoas, nascimentos e mortes,\n                  prazos, fontes, formas atestadas, ligações com intervalo, saúde,\n                  rascunhos com data ou período. A roda dá zoom, arrastar move,\n                  Home mostra tudo, t hoje, r quando cada registro foi registrado,\n                  f segue a busca desta janela; Enter abre um registro aqui.\n  Base › Datas reais nos logs: entradas de log cujo texto começa com uma data\n                  (2021, 20240311, 202403110011…) passam a tê-la como data. Uma\n                  linha do LOG pode levar um ano (2021), um mês (2024-03) ou uma\n                  hora (2024-03-11 14:30), seguidos de dois espaços.\n",
+    "\n  Ctrl+Shift+T    timeline (second window, read-only): everything dated on one\n                  line of time -- the people's LOG, births and deaths, tasks due,\n                  sources, links with a span, health, drafts with\n                  a date or period. The wheel zooms, dragging moves, Home shows\n                  everything, t today, r when each record was registered, f\n                  follows this window's search; Enter opens a record here.\n  Base › Real dates in the logs: log entries whose text starts with a date\n                  (2021, 20240311, 202403110011…) get it as their date. A LOG\n                  line may carry a year (2021), a month (2024-03) or a time\n                  (2024-03-11 14:30), followed by two spaces.\n":
+        "\n  Ctrl+Shift+T    cronologia (segunda janela, só leitura): tudo o que tem data\n                  numa linha do tempo -- o LOG das pessoas, nascimentos e mortes,\n                  prazos, fontes, ligações com intervalo, saúde,\n                  rascunhos com data ou período. A roda dá zoom, arrastar move,\n                  Home mostra tudo, t hoje, r quando cada registro foi registrado,\n                  f segue a busca desta janela; Enter abre um registro aqui.\n  Base › Datas reais nos logs: entradas de log cujo texto começa com uma data\n                  (2021, 20240311, 202403110011…) passam a tê-la como data. Uma\n                  linha do LOG pode levar um ano (2021), um mês (2024-03) ou uma\n                  hora (2024-03-11 14:30), seguidos de dois espaços.\n",
 }
 
 if __name__ == "__main__":
