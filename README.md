@@ -22,8 +22,25 @@ updating of files and conflicts if used any syncing app or cloud sync.
 
 ## Components
 
-- **Four collections** on the left menu, each with an unique ID:
-  `p_` people · `c_` concept · `f_` form · `s_` source · `h_` health track.
+- **Five collections** on the left menu, each with an unique ID:
+  `p_` people · `c_` concept · `f_` form · `s_` source · `h_` health track ·
+  `n_` draft.
+- **Drafts**: free notes in markdown, one `.md` file each in `notes/` beside the
+  program, so other markdown tools (Obsidian, say) read and edit the same
+  files. The title is the file name; a small header (`id`, `reg_n`, `reg`,
+  `tags`) lets Kustos follow a file renamed or moved inside `notes/`, and any
+  other header field is kept. The JSON holds only an index entry per draft,
+  never the text, so saving one does not rewrite the others; the log keeps the
+  text of every save. A `.md` put into `notes/` comes in when Kustos opens or on
+  `F5`. A file changed outside since it was opened is not overwritten without
+  asking. Deleting moves the file to `notes/.deleted`. In a draft's text:
+  `Ctrl+B` bold, `Ctrl+I` italic, `Ctrl+K` `[[link]]`, `Ctrl+Backspace`/`Delete`
+  a word, `Enter` continues a list or task, `Tab`/`Shift+Tab` indent it,
+  `Alt+↑`/`Alt+↓` move lines, with a light markdown highlight. *as HTML* writes
+  the draft as a page to read or print; **Base › Export drafts** puts them all
+  in one markdown file. On Windows the drafts' text is cached in
+  `%LOCALAPPDATA%\Kustos` (opening files is slow there), so only changed files
+  are read again.
 - **Linked entries** between any registers (`author_of`, `cites`,
   `attested_in`, `defined_in`, `translates`, `measured_in`…). Labels outside of the table are accepted and marked as atypical.
 - **Link graph** (`Ctrl+Shift+G`, **View › Link graph**, or `python _kustos.py graph [id]`):
@@ -75,7 +92,7 @@ updating of files and conflicts if used any syncing app or cloud sync.
 - **Search**, the "indexer": results come in alphabetic order, paged, each with its register number, with operators of search:
 
   ```
-  p: v: f: c:                       only people / verba / sources / body tracks
+  p: v: f: c: d:                    only people / verba / sources / body tracks / drafts
   ^ab                               name that starts with "ab"
   tag:x lang:de type:book sys:renal dom:law id:c_
   ```

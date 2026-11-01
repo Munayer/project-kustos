@@ -36,9 +36,9 @@ empty repository folder gives an empty base (and `doctor` passes on it).
 ## Architecture
 
 `_kustos.py` is split into sections marked `# ==== <name>`, in this order:
-language (`tr`), common, the four collections (**people** `p_`, **verba**
+language (`tr`), common, the collections (**people** `p_`, **verba**
 `c_`/`f_` concepts and forms, **sources** `s_`, **corpus** `h_` health
-records), then file, register, conflicts, lock, doctor, mirror, search,
+records, **notes** `n_` — shown as "drafts"), then file, register, conflicts, lock, doctor, mirror, search,
 history, migration, upgrade, citation, health report, themes, the Tk
 `*Card` editors, `App` (the main window), `BookView` (the logbook), the
 `cmd_*` functions and `main()`, and finally the `PT` dict.
@@ -64,6 +64,13 @@ Ideas that span several sections:
   records; `RELS` defines the types.
 - **The logs are the history**: `history <id>` and `replay` (rebuilds the base
   from logs into `_kustos.replay.json`) read them; there are no `.bak` files.
+- **Drafts live in files**: the `notes` collection is an index (id, title,
+  file, tags, register number); the text of each draft is a markdown file in
+  `notes/` with a small header, also read by Obsidian. `index_notes` takes in
+  new or moved files; saving writes the file and logs the text as a `text`
+  line (ignored by `replay`). The texts are cached per machine in
+  `%LOCALAPPDATA%\Kustos` by mtime and size. Test drafts only with invented
+  `.md` files, never real notes.
 
 ## The two instances
 

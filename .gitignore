@@ -10,6 +10,9 @@ _kustos_health.html
 _kustos_fontes.*
 _kustos_conflicts/
 _kustos_old/
+notes/
+_kustos_draft_*.html
+_kustos_drafts_*.md
 *.sync-conflict-*
 *.tmp
 
