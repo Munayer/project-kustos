@@ -3860,6 +3860,9 @@ class FieldPages:
     whole text stays in the widget, so typing and saving are as before: the
     other pages are only hidden (an elided tag), never cut out."""
 
+    measured = {}       # (field, text, width, room) -> where its pages start: going
+    #                     back to a record does not measure its pages again
+
     def __init__(self, app, t, nav_parent, on_show=None):
         """nav_parent: where the ‹ page › buttons go, beside the field's title;
         None when the caller has its own (reading mode), and then on_show is
@@ -3918,6 +3921,7 @@ class FieldPages:
         text is laid out), so a line drawn taller than usual still fits."""
         t = self.t
         gap = int(t.cget("spacing1")) + int(t.cget("spacing3"))
+        line = tkfont.Font(font=t.cget("font")).metrics("linespace")
         room = self.room(rows)
         last = int(t.index("end-1c").split(".")[0])
         starts, used = ["1.0"], 0
@@ -3930,14 +3934,18 @@ class FieldPages:
             if used + pix <= room:
                 used += pix
                 continue
-            n = max(1, self.count(f"{i}.0", end, "displaylines"))
+            # its wrapped lines, from its height (free: Tk keeps it); asking Tk
+            # to count them takes ~15 ms a long line, so only when the wraps
+            # worked out from the characters do not come to the same number
+            n = max(1, round((pix - gap) / line))
+            wraps = self.wraps(i, n)
+            if wraps is None:
+                n = max(1, self.count(f"{i}.0", end, "displaylines"))
             each = (pix - gap) / n                # one wrapped line, in pixels
-            wraps, done = None, 0
+            done = 0
             while used + (n - done) * each + gap > room and done < n - 1:
                 take = max(1, int((room - used - gap) // each))
                 done = min(n - 1, done + take)
-                if wraps is None:
-                    wraps = self.wraps(i, n) or False
                 starts.append(f"{i}.{wraps[done]}" if wraps else self.wrap_start(i, done, each))
                 used = 0
             used += (n - done) * each + gap
@@ -4010,11 +4018,19 @@ class FieldPages:
         newest entries), or the page holding the cursor."""
         t = self.t
         self.unhide()
-        t.tk.call(t._w, "sync")
+        text = t.get("1.0", "end-1c")
+        key = (str(t), len(text), hash(text), t.winfo_width(), self.room(rows))
+        found = FieldPages.measured.get(key)
+        if found is None:
+            t.tk.call(t._w, "sync")             # lay the whole text out: ~3 ms per 1000 chars
+            found = self.paginate(rows)
+            FieldPages.measured[key] = found
+            while len(FieldPages.measured) > 48:            # the oldest go first
+                FieldPages.measured.pop(next(iter(FieldPages.measured)))
         for name in self.starts:
             t.mark_unset(name)
         self.starts = []
-        for k, index in enumerate(self.paginate(rows)):
+        for k, index in enumerate(found):
             t.mark_set(f"page{k}", index)
             t.mark_gravity(f"page{k}", "left")
             self.starts.append(f"page{k}")
@@ -6302,12 +6318,15 @@ class App:
         pw.add(self.cardbox, stretch="always", minsize=320)
         self.pw = pw
         self.apply_pane_lock()
-        self.pc = PersonCard(self, self.cardbox)
-        self.vc = EntryCard(self, self.cardbox)
-        self.sc = SourceCard(self, self.cardbox)
-        self.mc = MetricCard(self, self.cardbox)
+        self.deck = tk.Frame(self.cardbox, bg=PAPER)      # the four cards, stacked
+        self.deck.pack(fill="both", expand=True)
+        self.pc = PersonCard(self, self.deck)
+        self.vc = EntryCard(self, self.deck)
+        self.sc = SourceCard(self, self.deck)
+        self.mc = MetricCard(self, self.deck)
         self.cards = {"person": self.pc, "entry": self.vc, "source": self.sc,
                       "metric": self.mc}
+        self.front = None
         self.reader = Reader(self)
         for card in self.cards.values():
             card.stamp.configure(cursor="hand2")
@@ -6320,13 +6339,31 @@ class App:
         self.laid_out = False
         pw.bind("<Configure>", self.first_layout)
 
-    def show_card(self, kind):
-        if self.shown == kind:
-            return
-        for c in self.cards.values():
-            c.frame.pack_forget()
-        self.cards[kind].frame.pack(fill="both", expand=True)
+    def show_card(self, kind, front=True):
+        """Only the card in use is in the deck. Another kind of card is first
+        put underneath it and laid out at the card's size, then filled and
+        measured there (its fields already have their width) and brought up
+        finished, in one paint: showing an empty card and fitting its fields
+        afterwards made the card flicker on each click. front=False only
+        prepares the card; front_card() then brings it up."""
         self.shown = kind
+        frame = self.cards[kind].frame
+        if self.front != kind and frame.winfo_manager() != "place":
+            frame.place(x=0, y=0, relwidth=1, relheight=1)
+            if self.front is not None:
+                frame.lower(self.cards[self.front].frame)
+            frame.update_idletasks()        # laid out, underneath
+        if front:
+            self.front_card()
+
+    def front_card(self):
+        kind = self.shown or "person"
+        if self.front == kind:
+            return
+        self.cards[kind].frame.lift()
+        if self.front is not None:
+            self.cards[self.front].frame.place_forget()   # out of the deck: no layout, no Tab
+        self.front = kind
 
     @property
     def card(self):
@@ -7142,8 +7179,11 @@ class App:
         return fit
 
     def refit_card(self):
-        """Fits the fields and the scroll area of the card on screen only; the
-        three hidden cards are fitted when they are shown."""
+        """Fits the fields and the scroll area of the card in use only; the
+        three underneath are fitted when they come up. The card is laid out and
+        drawn here, while it may still lie underneath (see show_card): brought
+        up already drawn, it changes in one go; drawn only once on top, it
+        showed up piece by piece."""
         shown = str(self.card.frame) + "."
         for t, fit in self.fits:
             if str(t).startswith(shown):
@@ -7998,7 +8038,7 @@ class App:
         self.sel = rid
         self.loading = True
         kind = self.rec_kind(rec)
-        self.show_card(kind)
+        self.show_card(kind, front=False)
         self.card.open(rec)
         self.set_locus(rec)
         for reset in self.undo_resets:
@@ -8013,6 +8053,7 @@ class App:
         self.loading = False
         self.dirty = False
         self.refit_card()
+        self.front_card()
         g = getattr(self, "graph", None)
         if g and g.is_open():
             g.follow(rid)
