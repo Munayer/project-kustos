@@ -61,6 +61,20 @@ updating of files and conflicts if used any syncing app or cloud sync.
   the whole base (what was being worked on, and what it links to) and only the
   records that were on screen when the replay began. Records saved before
   there were logs open the timeline. `Esc` goes back to the live graph.
+- **Timeline** (`Ctrl+Shift+T`, **View › Timeline**, or `python _kustos.py
+  timeline [id]`): everything dated on one line of time, in lanes — the
+  people's LOG (the facts of a life), births and deaths (`BORN` / `DIED` on the
+  person card), tasks due, when sources came out, attested forms, links with a
+  span (`-800/400`), health readings, sessions, events and medicines, and
+  drafts with a `date` or `period` in their header. From centuries to minutes:
+  the wheel zooms where the pointer is, dragging moves along, `Home` shows
+  everything, `t` today, `r` adds when each record was registered. It follows
+  the main window's search and filters (`f` switches), and `Enter` opens the
+  chosen record on the card. A LOG line may carry a year (`2021`), a month
+  (`2024-03`) or a time (`2024-03-11 14:30`). **Base › Real dates in the logs**
+  (or `python _kustos.py real-dates [apply [order]]`) finds log entries whose
+  text starts with a date — as imported notes have it, `20240311…` — and, on
+  confirmation, makes it the entry's date.
 - **Source**: free types (book, paper, thesis, law/bill, decisions, webpages, videos), citations in academic formats, BibTeX and CSL-JSON.
   Can import from Zotero via CSL-JSON or BibTeX without duplicating entries.
 - **Health (corpus)**: four kinds of record, each with its own fields —

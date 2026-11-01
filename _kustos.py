@@ -38,11 +38,15 @@ USAGE
     python _kustos.py app [id]        open the window on a record
     python _kustos.py logbook         the base as a logbook (read-only)
     python _kustos.py graph [id]      the links as a living graph (read-only)
+    python _kustos.py timeline [id]   everything dated, on one line of time (read-only)
     python _kustos.py doctor          check the structure, change nothing
+    python _kustos.py real-dates [apply [order]]
+                                      log entries whose text starts with a date:
+                                      list them, or move that date into the entry
     python _kustos.py mirror          rebuild the markdown mirror
     python _kustos.py corpus          rebuild the body map (HTML) and open it
     python _kustos.py health          make the health report (HTML) and open it
-    python _kustos.py search <text>   literal search across the four collections
+    python _kustos.py search <text>   literal search across the collections
     python _kustos.py cite <id|text> [abnt|abnt-autor-data|bibtex|csl-json|bruto]
     python _kustos.py export [bibtex|csl|abnt] [file]
     python _kustos.py import zotero <export.json|.bib>
@@ -269,12 +273,113 @@ def parse_circles(value):
     return [c for c in CIRCLES if c in got]
 
 
-LOG_RE = re.compile(r"^\s*(\d{4}-\d{2}-\d{2})(?:\s+(.*))?$")
+# A log line starts with its date: 2026-08-01, with a time (2026-08-01 14:30),
+# or only the month or the year (2024-03, 2021). A partial date counts only
+# when two spaces or a tab follow it -- as the card writes it -- so a line
+# that merely begins with a number ("2021 was a long year") is not misread.
+LOG_RE = re.compile(r"^\s*(\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2})?"
+                    r"|\d{4}(?:-\d{2})?(?=\s{2}|\t|\s*$))(?:\s+(.*))?$")
+
+# A date typed at the start of an entry's text, as notes imported from
+# elsewhere carry it: 2021, 202403, 20240311, 2024031100, 202403110011 or
+# 20240311 0011 -- or 2024-03-11 [14:30] --, followed by a space or a mark.
+TEXT_ISO = re.compile(r"^(\d{4})-(\d{2})(?:-(\d{2})(?:[ T](\d{2}):(\d{2}))?)?(?![\d:])"
+                      r"[\s.,;:\-\u2013\u2014]*")
+TEXT_STAMP = re.compile(r"^(\d{4})(?:(\d{2})(?:(\d{2})(?:(\d{2})(\d{2})?|[ T](\d{2})(\d{2}))?)?)?"
+                        r"(?![\d])(?!-\d)[\s.,;:\-\u2013\u2014]*")
+
+
+def stamp_in_text(text, latest=None):
+    """(date, rest of the text) when the text starts with a plausible date;
+    None otherwise. Years from 1900 to next year; month, day, hour and minute
+    must be real."""
+    m = TEXT_ISO.match(text or "")
+    if m:
+        y, mo, d, h, mi = m.groups()
+    else:
+        m = TEXT_STAMP.match(text or "")
+        if not m or m.end() == 0:
+            return None
+        y, mo, d, h1, mi1, h2, mi2 = m.groups()
+        h, mi = (h1, mi1) if h1 else (h2, mi2)
+    latest = latest or date.today().year + 1
+    if not 1900 <= int(y) <= latest:
+        return None
+    try:
+        if d:
+            date(int(y), int(mo), int(d))
+        elif mo and not 1 <= int(mo) <= 12:
+            return None
+        if h and (int(h) > 23 or (mi and int(mi) > 59)):
+            return None
+    except ValueError:
+        return None
+    out = y + (f"-{mo}" if mo else "") + (f"-{d}" if d else "")
+    if d and h and (h, mi or "00") != ("00", "00"):
+        out += f" {h}:{mi or '00'}"
+    rest = text[m.end():].strip()
+    return (out, rest) if rest else None
+
+
+def real_dates(data):
+    """Log entries whose text starts with a date other than the entry's own
+    (an import gives every entry the day of the import): [(person id, index,
+    old date, new date, old text, new text)]."""
+    out = []
+    for p in data["people"]:
+        for i, it in enumerate(p.get("interactions", [])):
+            found = stamp_in_text(it.get("text", ""))
+            if found and (found[0] != it.get("date") or found[1] != it.get("text")):
+                out.append((p["id"], i, it.get("date", ""), found[0], it.get("text", ""), found[1]))
+    return out
+
+
+def apply_real_dates(changes, order=False):
+    """Applies the chosen changes in one write; each person touched goes to the
+    log as it now is (its previous version is the line before). `order` also
+    puts each touched LOG in date order. Returns how many people changed."""
+    data = load_json()
+    idx = by_id(data)
+    touched = {}
+    for pid, i, old_date, new_date, old_text, new_text in changes:
+        p = idx.get(pid)
+        if not p or i >= len(p.get("interactions", [])):
+            continue
+        it = p["interactions"][i]
+        if it.get("date") != old_date or it.get("text") != old_text:
+            continue                         # changed since the list was made
+        it["date"], it["text"] = new_date, new_text
+        touched[pid] = p
+    for p in touched.values():
+        if order:
+            p["interactions"].sort(key=lambda it: it.get("date") or "")
+        touch(p)
+    if touched:
+        write_json(data)
+        log_many([("put", "people", {"id": p["id"], "rec": {k: v for k, v in p.items()
+                                                           if not k.startswith("_")}})
+                  for p in touched.values()])
+    return len(touched), data
+
+
+def cmd_real_dates(args):
+    """`real-dates` lists the changes; `real-dates apply [order]` makes them."""
+    data = load_json()
+    changes = real_dates(data)
+    idx = by_id(data)
+    for pid, _i, old, new, _ot, nt in changes:
+        print(f"  {one_liner(idx[pid].get('name', ''), 28):28}  {old:>16} -> {new:16}  {one_liner(nt, 50)}")
+    print("\n" + tr("{n} log entries with a date at the start of their text", n=len(changes)))
+    if args[:1] == ["apply"]:
+        n, _ = apply_real_dates(changes, order="order" in args)
+        print(tr("{n} people changed", n=n))
+    return 0
 
 
 def parse_log(text):
     """'2026-08-01   Talked about the process' -> {date, text}. A line with
-    no date gets today's."""
+    no date gets today's (Base › Real dates in the logs puts back a date typed
+    at the start of the text)."""
     out = []
     for line in (text or "").splitlines():
         line = line.strip()
@@ -370,6 +475,8 @@ def fix_person(p):
     p.setdefault("place", "")
     p.setdefault("notes_raw", "")
     p.setdefault("met", None)
+    p.setdefault("born", "")
+    p.setdefault("died", "")
     p.setdefault("followup", None)
     p.setdefault("tasks", [])
     p["circles"] = parse_circles(p.get("circles"))
@@ -1567,6 +1674,7 @@ def haystack_metric(m, data):
 NOTE_HEAD = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.S)
 NOTE_BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f#^\[\]]')
 NOTE_KEYS = ("id", "reg_n", "reg", "tags")
+_KEEP = object()
 # What the note files hold, kept between sessions on this machine, outside
 # Syncthing: opening a file costs ~10 ms on Windows (the antivirus looks at
 # each one), asking its time and size almost nothing. A note is read again only
@@ -1656,13 +1764,15 @@ def note_tags(meta):
     return [t.strip().lstrip("#") for t in tags if t.strip().lstrip("#")]
 
 
-def note_header(rec, old=""):
+def note_header(rec, old="", when=_KEEP):
     """The header of a note file: the index's own fields first, then whatever
-    else the file had (Obsidian's properties, say), untouched."""
+    else the file had (Obsidian's properties, say), untouched. `when`, if
+    given, is the note's date or period ('' takes it away)."""
+    mine = NOTE_KEYS + (("date", "period") if when is not _KEEP else ())
     keep, skip = [], False
     for line in old.splitlines():
         if line.strip() and line[:1] not in (" ", "\t", "-"):
-            skip = line.partition(":")[0].strip() in NOTE_KEYS
+            skip = line.partition(":")[0].strip() in mine
         if not skip:
             keep.append(line)
     own = [f"id: {rec['id']}"]
@@ -1672,6 +1782,9 @@ def note_header(rec, old=""):
         own.append(f"reg: {rec['reg']}")
     if rec.get("tags"):
         own.append("tags: [" + ", ".join(rec["tags"]) + "]")
+    if when is not _KEEP and when:
+        sp = span_of(when)
+        own.append(("period: " if sp and sp[1] is not None else "date: ") + when)
     return "---\n" + "\n".join(own + keep) + "\n---\n"
 
 
@@ -1719,12 +1832,12 @@ def notes_waiting(data):
     return [x for x in note_files() if x.relative_to(BASE).as_posix() not in known]
 
 
-def write_note_file(rec, body):
+def write_note_file(rec, body, when=_KEEP):
     """Writes a note's file: header and text, atomically."""
     path = note_path(rec)
     path.parent.mkdir(parents=True, exist_ok=True)
     got = read_note_file(path) if path.exists() else None
-    text = note_header(rec, got[0] if got else "") + body
+    text = note_header(rec, got[0] if got else "", when) + body
     tmp = path.with_name(path.name + ".tmp")
     with open(tmp, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
@@ -4527,6 +4640,10 @@ class PersonCard:
         self.e_tags = app.field(c, tr("TAGS"), app.f_meta, pad)
         self.t_notes = app.textfield(c, tr("NOTES"), 3, app.f_body, pad, pages=True)
         self.e_place = app.field(c, tr("DOMICILIUM"), app.f_body, pad)
+        life = tk.Frame(c, bg=PAPER)
+        life.pack(fill="x", **pad)
+        self.e_born, self.e_died = (self.date_field(life, tr(t)) for t in
+                                    ("BORN  (2024-03-11, 1890, s. XVI)", "DIED"))
         self.e_source = app.source_field(c, pad)
         self.circles = self.circle_panel(c, pad)
         self.t_alias = app.textfield(c, tr("ALSO KNOWN AS"), 2, app.f_meta, pad)
@@ -4573,10 +4690,11 @@ class PersonCard:
         ttk.Button(addrow, text="+ log", command=self.add_log
                    ).pack(side="left", padx=(8, 0))
 
-        for w in (self.e_name, self.e_tags, self.e_place, self.e_log):
+        for w in (self.e_name, self.e_tags, self.e_place, self.e_log, self.e_born, self.e_died):
             app.bind_undo(w)
         for w in (self.e_name, self.e_tags, self.e_place, self.e_source, self.t_notes,
-                  self.t_links, self.t_alias, self.t_tasks, self.t_log):
+                  self.t_links, self.t_alias, self.t_tasks, self.t_log, self.e_born,
+                  self.e_died):
             for ev in ("<KeyRelease>", "<<Paste>>", "<<Cut>>"):
                 w.bind(ev, app.mark_dirty, add="+")
 
@@ -4718,10 +4836,23 @@ class PersonCard:
         self.app.mark_dirty()
         return "break"
 
+    def date_field(self, row, label):
+        col = tk.Frame(row, bg=PAPER)
+        col.pack(side="left", fill="x", expand=True, padx=(0, 12))
+        tk.Label(col, text=label, bg=PAPER, fg=FAINT, font=self.app.f_label,
+                 anchor="w").pack(fill="x", pady=(8, 2))
+        e = tk.Entry(col, width=1, font=self.app.f_meta, bg=PAPER, fg=INK, relief="flat",
+                     insertbackground=INK, highlightthickness=0,
+                     disabledbackground=PAPER, disabledforeground=FAINT)
+        e.pack(fill="x")
+        tk.Frame(col, bg=RULE, height=1).pack(fill="x", pady=(4, 0))
+        return e
+
     # ---- state
     def enable(self, on):
         state = "normal" if on else "disabled"
-        for w in (self.e_name, self.e_tags, self.e_place, self.e_log, self.e_source):
+        for w in (self.e_name, self.e_tags, self.e_place, self.e_log, self.e_source,
+                  self.e_born, self.e_died):
             w.configure(state=state)
         for w in (self.t_notes, self.t_links, self.t_alias, self.t_tasks,
                   self.t_log):
@@ -4729,7 +4860,8 @@ class PersonCard:
         self.circles.enable_circles(on)
 
     def clear(self):
-        for w in (self.e_name, self.e_tags, self.e_place, self.e_source):
+        for w in (self.e_name, self.e_tags, self.e_place, self.e_source, self.e_born,
+                  self.e_died):
             w.delete(0, "end")
         self.app.update_source_hint(self.e_source)
         for t in (self.t_notes, self.t_alias, self.t_links, self.t_tasks,
@@ -4750,6 +4882,9 @@ class PersonCard:
         self.t_notes.insert("1.0", p.get("notes_raw", ""))
         self.e_place.delete(0, "end")
         self.e_place.insert(0, p.get("place", ""))
+        for w, k in ((self.e_born, "born"), (self.e_died, "died")):
+            w.delete(0, "end")
+            w.insert(0, p.get(k) or "")
         self.e_source.delete(0, "end")
         self.e_source.insert(0, p.get("source", ""))
         self.app.update_source_hint(self.e_source)
@@ -4795,6 +4930,8 @@ class PersonCard:
             "links": [l.strip() for l in
                       self.t_links.get("1.0", "end-1c").split("\n") if l.strip()],
             "place": self.e_place.get().strip(),
+            "born": self.e_born.get().strip(),
+            "died": self.e_died.get().strip(),
             "source": self.e_source.get().strip(),
             "aliases": parse_aliases(self.t_alias.get("1.0", "end-1c")),
             "interactions": parse_log(self.t_log.get("1.0", "end-1c")),
@@ -6255,6 +6392,22 @@ HELP_COPY = (
 )
 
 
+# the Help › Shortcuts lines for the timeline and dates
+HELP_TIMELINE = (
+    "\n  Ctrl+Shift+T    timeline (second window, read-only): everything dated on one"
+    "\n                  line of time -- the people's LOG, births and deaths, tasks due,"
+    "\n                  sources, attested forms, links with a span, health, drafts with"
+    "\n                  a date or period. The wheel zooms, dragging moves, Home shows"
+    "\n                  everything, t today, r when each record was registered, f"
+    "\n                  follows this window's search; Enter opens a record here."
+    "\n  Base › Real dates in the logs: log entries whose text starts with a date"
+    "\n                  (2021, 20240311, 202403110011…) get it as their date. A LOG"
+    "\n                  line may carry a year (2021), a month (2024-03) or a time"
+    "\n                  (2024-03-11 14:30), followed by two spaces."
+    "\n"
+)
+
+
 # the Help › Shortcuts lines for drafts
 HELP_NOTES = (
     "\n  DRAFTS: free notes in markdown, one .md file each in notes/ beside the"
@@ -6677,6 +6830,8 @@ class NoteCard:
         tk.Frame(c, bg=STAMP, height=2).pack(fill="x", pady=(6, 0), **pad)
 
         self.e_tags = app.field(c, tr("TAGS"), app.f_meta, pad)
+        self.e_when = app.field(c, tr("DATE OR PERIOD  (2024-03-11, 1609, 1618/1648 — for the timeline)"),
+                                app.f_meta, pad)
         self.t_body = app.textfield(c, tr("TEXT  (markdown)"), 12, app.f_body, pad,
                                     pages=True)
         self.md = MarkdownKeys(app, self.t_body)
@@ -6700,7 +6855,7 @@ class NoteCard:
                                  anchor="w")
         self.file_lbl.pack(fill="x", pady=(8, 14), **pad)
 
-        self.entries = [self.e_name, self.e_tags]
+        self.entries = [self.e_name, self.e_tags, self.e_when]
         self.texts = [self.t_body, self.t_edges]
         app.bind_undo(self.e_name)
         for w in self.entries + self.texts:
@@ -6731,6 +6886,11 @@ class NoteCard:
         self.e_tags.delete(0, "end")
         self.e_tags.insert(0, ", ".join(n.get("tags", [])))
         body = n["_body"] if n["id"].startswith("__") else note_body(n)
+        got = read_note_file(note_path(n)) if n.get("file") else None
+        meta = got[1] if got else {}
+        when = meta.get("period") or meta.get("date") or ""
+        self.e_when.delete(0, "end")
+        self.e_when.insert(0, when if isinstance(when, str) else "")
         self.opened = note_mtime(n)
         self.t_body.delete("1.0", "end")
         self.t_body.insert("1.0", body)
@@ -6773,6 +6933,7 @@ class NoteCard:
         out["tags"] = [t.strip().lstrip("#") for t in self.e_tags.get().split(",")
                        if t.strip().lstrip("#")]
         out["_body"] = self.t_body.get("1.0", "end-1c")
+        out["_when"] = " ".join(self.e_when.get().split())
         return out
 
     def edges_text(self):
@@ -7603,6 +7764,7 @@ class App:
         b.add_command(label=tr("Export sources (ABNT, text)"), command=lambda: self.do_export("abnt"))
         b.add_command(label=tr("Export drafts (one markdown file)"),
                       command=self.export_notes)
+        b.add_command(label=tr("Real dates in the logs…"), command=self.real_dates_dialog)
         m.add_cascade(label=tr("Base"), menu=b)
 
         v = self.menu(m)
@@ -7611,6 +7773,8 @@ class App:
         v.add_command(label=tr("Open as logbook"), accelerator="Ctrl+B", command=self.open_book)
         v.add_command(label=tr("Link graph"), accelerator="Ctrl+Shift+G",
                       command=self.open_graph)
+        v.add_command(label=tr("Timeline"), accelerator="Ctrl+Shift+T",
+                      command=self.open_timeline)
         v.add_command(label=tr("Wide card"), accelerator="F11", command=self.toggle_wide)
         v.add_command(label=tr("Read field"), accelerator="Ctrl+E", command=self.open_reader)
         lt = self.menu(v)
@@ -7670,6 +7834,7 @@ class App:
         r.bind("<Control-l>", lambda e: self.to_register())
         r.bind("<Control-b>", lambda e: self.open_book())
         r.bind("<Control-G>", lambda e: self.open_graph())      # Ctrl+Shift+G
+        r.bind("<Control-T>", lambda e: self.open_timeline())   # Ctrl+Shift+T
         r.bind("<F11>", lambda e: self.toggle_wide())
         r.bind("<Control-backslash>", lambda e: self.toggle_wide())
         r.bind("<Control-e>", lambda e: self.open_reader())
@@ -7787,6 +7952,38 @@ class App:
         self.graph = GraphView(win, lambda: self.data, start_id=(self.current() or {}).get("id"),
                                on_open=self.open_from_graph)
         return "break"
+
+    def open_timeline(self):
+        """Ctrl+Shift+T: everything dated, on one line of time, in a second
+        window; it follows the search and the filters of this one."""
+        self.commit_if_dirty()
+        tl = getattr(self, "timeline", None)
+        if tl and tl.is_open():
+            tl.root.lift()
+            return "break"
+        win = tk.Toplevel(self.root)
+        self.timeline = TimelineView(win, lambda: self.data, get_ids=self.timeline_ids,
+                                     start_id=(self.current() or {}).get("id"),
+                                     on_open=self.open_from_graph)
+        return "break"
+
+    def timeline_ids(self):
+        """The ids the search and the filters let through; None for everything."""
+        sig = self.filter_sig()
+        if not (any(sig[:-1]) or self.view_system is not None):
+            return None
+        return {r["id"] for r in self.matches()}
+
+    def timeline_soon(self):
+        tl = getattr(self, "timeline", None)
+        if not tl or not tl.is_open():
+            return
+        if getattr(self, "_tl_job", None):
+            try:
+                self.root.after_cancel(self._tl_job)
+            except tk.TclError:
+                pass
+        self._tl_job = self.root.after(300, tl.refresh)
 
     def open_from_graph(self, rid):
         if rid not in by_id(self.data):
@@ -8351,6 +8548,7 @@ class App:
         self.refresh_list()
         if getattr(self, "mc", None) and self.shown == "metric":
             self.mc.map.redraw()
+        self.timeline_soon()
         self.say(summary(self.data))
 
     def say(self, text):
@@ -8557,6 +8755,7 @@ class App:
         if sig != self.page_sig:
             self.page_sig = sig
             self.top = 0 if filtered else None
+            self.timeline_soon()
         total = sum(len(self.data[c]) for c in COLLS)
         if filtered:
             self.mode = "index"
@@ -9112,6 +9311,7 @@ class App:
         card = self.nc
         out = card.gather(rec)
         body = out.pop("_body")
+        when = out.pop("_when")
         if not out["name"]:
             if not auto:
                 self.flash(tr("A draft needs a title."))
@@ -9143,7 +9343,7 @@ class App:
         touch(out)
         self.data = save_record("notes", out, edges=links)
         saved = by_id(self.data)[out["id"]]
-        write_note_file(saved, body)
+        write_note_file(saved, body, when)
         card.opened = note_mtime(saved)
         if body != before:
             log_append("text", "notes", {"id": out["id"], "text": body})
@@ -9155,6 +9355,60 @@ class App:
         elif auto:
             self.say(tr('Saved "{name}" automatically.', name=one_liner(out["name"], 40)))
         return out["id"]
+
+    def real_dates_dialog(self):
+        """Base › Real dates in the logs: entries whose text starts with a date
+        (2021, 20240311, 202403110011…) get that date, and lose it from the
+        text. Everything found is listed and selected; what is unselected stays."""
+        self.commit_if_dirty()
+        changes = real_dates(self.data)
+        if not changes:
+            self.notify(tr("Real dates in the logs"),
+                        tr("No log entry starts with a date different from its own."))
+            return
+        idx = by_id(self.data)
+        win = self.dialog(tr("Real dates in the logs"), 900, 560)
+        tk.Label(win, text=tr("{n} log entries start with a date. Selected ones get it as their "
+                              "date (and lose it from the text); unselect what is not a date.",
+                              n=len(changes)),
+                 bg=PAPER, fg=INK, font=self.f_meta, wraplength=850, justify="left"
+                 ).pack(anchor="w", padx=20, pady=(16, 8))
+        box = tk.Frame(win, bg=PAPER)
+        box.pack(fill="both", expand=True, padx=20)
+        lb = tk.Listbox(box, selectmode="multiple", font=self.f_meta, bg=PAPER, fg=INK,
+                        relief="flat", highlightthickness=1, highlightbackground=RULE,
+                        selectbackground=SELBG, selectforeground=SELFG, activestyle="none")
+        bar = ttk.Scrollbar(box, orient="vertical", command=lb.yview)
+        lb.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y")
+        lb.pack(side="left", fill="both", expand=True)
+        for pid, _i, old, new, _ot, nt in changes:
+            lb.insert("end", f"{one_liner(idx[pid].get('name', ''), 24):24}  {old:>16} → "
+                             f"{new:16}  {one_liner(nt, 60)}")
+        lb.select_set(0, "end")
+        order = tk.BooleanVar(value=True)
+        foot = tk.Frame(win, bg=PAPER)
+        foot.pack(fill="x", padx=20, pady=12)
+        tk.Checkbutton(foot, text=tr("also put each log in date order"), variable=order,
+                       bg=PAPER, fg=INK, activebackground=PAPER, selectcolor=PAPER,
+                       font=self.f_meta).pack(side="left")
+
+        def apply():
+            chosen = [changes[i] for i in lb.curselection()]
+            win.destroy()
+            if not chosen:
+                return
+            n, data = apply_real_dates(chosen, order=order.get())
+            self.safe_mirror(data)
+            sel = self.sel
+            self.reload()
+            if sel and sel in by_id(self.data):
+                self.open_record(sel)
+            self.say(tr("{n} entries dated, in {m} people. Their previous versions are in "
+                        "the log (Base › History).", n=len(chosen), m=n))
+        ttk.Button(foot, text=tr("Cancel"), style="Quiet.TButton",
+                   command=win.destroy).pack(side="right")
+        ttk.Button(foot, text=tr("Apply"), command=apply).pack(side="right", padx=(0, 8))
 
     def export_notes(self):
         """Every draft in one markdown file beside the program, by title, each
@@ -9851,7 +10105,7 @@ class App:
     def do_help(self):
         self.show_text(tr("Shortcuts"), tr(HELP_TEXT, conflicts=CONFLICT_DIR.name, stem=STEM)
                        + tr(HELP_READING) + tr(HELP_COPY) + tr(HELP_GRAPH)
-                       + tr(HELP_NOTES))
+                       + tr(HELP_NOTES) + tr(HELP_TIMELINE))
 
     # ------------------------------------------------------------ dialogs
     def dialog(self, title, width=520, height=None):
@@ -11567,6 +11821,538 @@ def cmd_graph(open_id=None):
     return 0
 
 
+# ================================================================ timeline
+#
+# Everything with a date on one line of time (Ctrl+Shift+T, View › Timeline,
+# or `python _kustos.py timeline`): the LOG of each person -- the facts of a
+# life --, births and deaths, tasks due (the calendar), when sources came
+# out, when forms are attested, the spans written on links, health readings,
+# sessions, events and medicines, drafts carrying a date or a period in their
+# header, and, as a layer to switch on, when each record was registered.
+# From centuries to minutes: the wheel zooms where the pointer is, dragging
+# moves along. It follows the main window's search and filters. Read-only.
+
+WHEN_RE = re.compile(r"^\s*(-?\d{1,4})(?:-(\d{2})(?:-(\d{2})(?:[ T](\d{2}):(\d{2}))?)?)?\s*$")
+ROMAN = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100}
+
+
+def moment_of(text):
+    """A moment as a fractional year, from '2024-03-11 14:30', '2024-03',
+    '1609' or '-800'; None when it is not one."""
+    m = WHEN_RE.match(str(text or ""))
+    if not m:
+        return None
+    y = int(m.group(1))
+    if not m.group(2):
+        return float(y)
+    mo, d = int(m.group(2)), int(m.group(3) or 1)
+    try:
+        day = date(y, mo, d)
+    except ValueError:
+        return None
+    days = 366 if (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)) else 365
+    frac = (day - date(y, 1, 1)).days
+    if m.group(4):
+        frac += (int(m.group(4)) * 60 + int(m.group(5))) / 1440
+    return y + frac / days
+
+
+def span_of(text):
+    """(start, end) of a date or a span: '1618/1648', '1500-1600', '-800/400',
+    's. XVI' (a century), '1609' (a point: end None). None when no date is found."""
+    t = str(text or "").strip()
+    if not t:
+        return None
+    one = moment_of(t)
+    if one is not None:
+        return one, None
+    for sep in ("/", "–", "—", " - ", "--"):
+        if sep in t:
+            a, _, b = t.partition(sep)
+            ya, yb = moment_of(a), moment_of(b)
+            if ya is not None and yb is not None:
+                return min(ya, yb), max(ya, yb)
+    m = re.match(r"^(?:s\.|séc\.?|sec\.?|c\.)?\s*([IVXLC]+)\b", t, re.I)
+    if m and set(m.group(1).upper()) <= set(ROMAN):
+        n, prev = 0, 0
+        for ch in reversed(m.group(1).upper()):
+            v = ROMAN[ch]
+            n, prev = (n - v, prev) if v < prev else (n + v, v)
+        if 1 <= n <= 21:
+            return float((n - 1) * 100), float(n * 100 - 1)
+    nums = [int(x) for x in re.findall(r"(?<![\d])-?\d{3,4}(?![\d])", t)]
+    if len(nums) >= 2:
+        return float(min(nums[0], nums[-1])), float(max(nums[0], nums[-1]))
+    if nums:
+        return float(nums[0]), None
+    return None
+
+
+def when_label(t, prec_days=False):
+    """A fractional year, written back."""
+    y = math.floor(t)
+    if not prec_days:
+        return tr("{y} BC", y=-y) if y < 0 else str(y)
+    days = 366 if (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)) else 365
+    try:
+        d = date(y, 1, 1) + timedelta(days=int((t - y) * days))
+        return d.isoformat()
+    except (ValueError, OverflowError):
+        return str(y)
+
+
+TIMELINE_LANES = [("life", "people · life"), ("calendar", "calendar"),
+                  ("sources", "sources"), ("verba", "verba"), ("links", "links"),
+                  ("health", "health"), ("drafts", "drafts"),
+                  ("register", "registered")]
+
+
+def timeline_events(data):
+    """Every dated thing: dicts with t0, t1 (or None), lane, label, id, when,
+    and `other` (a link's other end)."""
+    out = []
+
+    def add(lane, rid, when, label, other=None):
+        sp = span_of(when)
+        if sp is None:
+            return
+        out.append({"t0": sp[0], "t1": sp[1], "lane": lane, "id": rid, "when": str(when),
+                    "label": one_liner(label, 160), "other": other})
+
+    for p in data["people"]:
+        name = p.get("name", "")
+        if p.get("born") or p.get("died"):
+            b, d = span_of(p.get("born")), span_of(p.get("died"))
+            if b and d:
+                out.append({"t0": b[0], "t1": d[1] or d[0], "lane": "life", "id": p["id"],
+                            "when": f"{p['born']} – {p['died']}", "label": name, "other": None})
+            elif b:
+                add("life", p["id"], p["born"], tr("{name} is born", name=name))
+            elif d:
+                add("life", p["id"], p["died"], tr("{name} dies", name=name))
+        if p.get("met"):
+            add("life", p["id"], p["met"], tr("met {name}", name=name))
+        for it in p.get("interactions", []):
+            add("life", p["id"], it.get("date"), f"{name}: {it.get('text', '')}")
+        for t in p.get("tasks", []):
+            if t.get("due"):
+                add("calendar", p["id"], t["due"][:10], f"{name}: {t.get('text', '')}")
+    for s_ in data["sources"]:
+        when = s_.get("date") or year_of_source(s_)
+        if when:
+            add("sources", s_["id"], when, source_label(s_, data))
+    for e in data["entries"]:
+        if e.get("kind") == "form" and e.get("attested"):
+            add("verba", e["id"], e["attested"], label_of(e))
+        if e.get("period"):
+            add("verba", e["id"], e["period"], label_of(e))
+    idx = by_id(data)
+    for a in data["edges"]:
+        if a.get("when") and a["from"] in idx and a["to"] in idx:
+            add("links", a["from"], a["when"],
+                f"{label_any(idx[a['from']], data)} {rel_label(a['rel'])} "
+                f"{label_any(idx[a['to']], data)}", other=a["to"])
+    for m in data["corpus"]:
+        name = m.get("name", "")
+        for r in m.get("readings", []):
+            add("health", m["id"], r.get("date"), f"{name} {r.get('value', '')} {m.get('unit', '')}")
+        for x in m.get("sessions", []):
+            add("health", m["id"], x.get("date"), f"{name}: {x.get('text', '')}")
+        if m.get("date"):
+            add("health", m["id"], m["date"], name)
+        if m.get("start"):
+            b, e_ = span_of(m["start"]), span_of(m.get("end"))
+            if b:
+                out.append({"t0": b[0], "t1": (e_[1] or e_[0]) if e_ else moment_of(TODAY()),
+                            "lane": "health", "id": m["id"], "label": name, "other": None,
+                            "when": f"{m['start']} – {m.get('end') or tr('now')}"})
+    for n in data.get("notes", []):
+        if n["id"].startswith("__"):
+            continue
+        path = note_path(n)
+        got = read_note_file(path) if path else None
+        meta = got[1] if got else {}
+        when = meta.get("period") or meta.get("date")
+        if isinstance(when, str) and when:
+            add("drafts", n["id"], when, n.get("name", ""))
+    for coll in COLLS:
+        for r in data[coll]:
+            st = r.get("reg") or ""
+            if len(st) >= 8 and st[:8].isdigit():
+                add("register", r["id"], f"{st[:4]}-{st[4:6]}-{st[6:8]}"
+                    + (f" {st[8:10]}:{st[10:12]}" if len(st) >= 12 else ""),
+                    tr("registered: {label}", label=label_any(r, data)))
+    return out
+
+
+TIMELINE_KEYS = ("wheel: zoom   drag or ← →: move   PgUp PgDn: a screen   Home: everything   "
+                 "t: today   r: when registered   f: follow the search   Enter: open")
+
+
+class TimelineView:
+    TOP, AXIS, LEFT = 46, 26, 132
+
+    def __init__(self, root, get_data, get_ids=None, start_id=None, on_open=None):
+        self.root, self.get_data, self.get_ids, self.on_open = root, get_data, get_ids, on_open
+        self.show_register, self.follow = False, True
+        self.events, self.shown, self.lanes = [], [], []
+        self.v0, self.v1 = 1900.0, 2030.0
+        self.sel = self.hover = None
+        self.drag = None
+        self._job = None
+        fams = set(tkfont.families(root))
+        mono = next((f for f in ("Cascadia Mono", "Consolas", "Lucida Console",
+                                 "DejaVu Sans Mono", "Courier New") if f in fams), "Courier")
+        self.f_small = tkfont.Font(root, family=mono, size=8)
+        self.f_lane = tkfont.Font(root, family=mono, size=9)
+        root.title(tr("Kustos · timeline (read-only)"))
+        root.configure(bg=PAPER)
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = min(1200, sw - 80), min(720, sh - 120)
+        root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
+        root.minsize(640, 360)
+        paint_frame(root)
+        self.cv = cv = tk.Canvas(root, bg=PAPER, highlightthickness=0, bd=0)
+        cv.pack(fill="both", expand=True)
+        b = root.bind
+        cv.bind("<Configure>", lambda e: self.later())
+        cv.bind("<MouseWheel>", self.wheel)
+        cv.bind("<Button-4>", lambda e: self.zoom_at(e.x, 0.8))
+        cv.bind("<Button-5>", lambda e: self.zoom_at(e.x, 1.25))
+        cv.bind("<ButtonPress-1>", self.press)
+        cv.bind("<B1-Motion>", self.move)
+        cv.bind("<ButtonRelease-1>", self.release)
+        cv.bind("<Double-Button-1>", lambda e: self.open_sel())
+        cv.bind("<Motion>", self.motion)
+        b("<Left>", lambda e: self.pan(-0.25))
+        b("<Right>", lambda e: self.pan(0.25))
+        b("<Prior>", lambda e: self.pan(-1.0))
+        b("<Next>", lambda e: self.pan(1.0))
+        for k in ("<plus>", "<equal>", "<KP_Add>"):
+            b(k, lambda e: self.zoom_at(None, 0.6))
+        for k in ("<minus>", "<KP_Subtract>"):
+            b(k, lambda e: self.zoom_at(None, 1 / 0.6))
+        b("<Home>", lambda e: self.fit(everything=True))
+        b("<t>", lambda e: self.to_today())
+        b("<r>", lambda e: self.toggle_register())
+        b("<f>", lambda e: self.toggle_follow())
+        b("<Return>", lambda e: self.open_sel())
+        b("<Escape>", lambda e: root.destroy())
+        self.refresh(start_id)
+
+    # ---- data
+    def is_open(self):
+        try:
+            return bool(self.root.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def refresh(self, center=None):
+        """Reads the base again (and the search in force, when following it)."""
+        if not self.is_open():
+            return
+        data = self.get_data()
+        evs = timeline_events(data)
+        ids = self.get_ids() if (self.follow and self.get_ids) else None
+        if ids is not None:
+            evs = [e for e in evs if e["id"] in ids or e.get("other") in ids]
+        self.all = evs
+        self.events = [e for e in evs if self.show_register or e["lane"] != "register"]
+        present = {e["lane"] for e in self.events}
+        self.lanes = [k for k, _ in TIMELINE_LANES if k in present]
+        first = not self.shown
+        if center:
+            mine = sorted(e["t0"] for e in self.events if e["id"] == center)
+            if mine:
+                self.focus_on(mine[0], mine[-1])
+                return self.later()
+        if first:
+            self.fit()
+        self.later()
+
+    def fit(self, everything=False):
+        """The view over the dated things: all of them, or (at first) the
+        middle 96 %, so one far century does not crush the rest."""
+        ts = sorted(t for e in self.events for t in (e["t0"], e["t1"]) if t is not None)
+        if not ts:
+            self.v0, self.v1 = moment_of(TODAY()) - 5, moment_of(TODAY()) + 1
+        elif everything:
+            self.v0, self.v1 = ts[0], ts[-1]
+        else:
+            k = len(ts) // 50
+            self.v0, self.v1 = ts[k], ts[-1 - k]
+        pad = max(0.5, (self.v1 - self.v0) * 0.05)
+        self.v0, self.v1 = self.v0 - pad, self.v1 + pad
+        self.later()
+
+    def focus_on(self, a, b):
+        pad = max(0.6, (b - a) * 0.3)
+        self.v0, self.v1 = a - pad, b + pad
+
+    def to_today(self):
+        now = moment_of(TODAY())
+        self.v0, self.v1 = now - 1.0, now + 0.25
+        self.later()
+
+    def toggle_register(self):
+        self.show_register = not self.show_register
+        self.refresh()
+
+    def toggle_follow(self):
+        self.follow = not self.follow
+        self.refresh()
+
+    # ---- moving
+    def x_of(self, t):
+        w = max(1, self.cv.winfo_width() - self.LEFT - 16)
+        return self.LEFT + (t - self.v0) / (self.v1 - self.v0) * w
+
+    def t_of(self, x):
+        w = max(1, self.cv.winfo_width() - self.LEFT - 16)
+        return self.v0 + (x - self.LEFT) / w * (self.v1 - self.v0)
+
+    def zoom_at(self, x, factor):
+        span = self.v1 - self.v0
+        new = min(6000.0, max(1 / (365.25 * 24), span * factor))     # an hour to six millennia
+        c = self.t_of(x) if x is not None else (self.v0 + self.v1) / 2
+        k = (c - self.v0) / span
+        self.v0 = c - k * new
+        self.v1 = self.v0 + new
+        self.later()
+
+    def wheel(self, e):
+        if e.state & 0x1:                                   # Shift: move along
+            self.pan(-0.15 if e.delta > 0 else 0.15)
+        else:
+            self.zoom_at(e.x, 0.8 if e.delta > 0 else 1.25)
+
+    def pan(self, part):
+        d = (self.v1 - self.v0) * part
+        self.v0 += d
+        self.v1 += d
+        self.later()
+
+    def press(self, e):
+        self.drag = (e.x, self.v0, self.v1, False)
+
+    def move(self, e):
+        if not self.drag:
+            return
+        x0, v0, v1, _ = self.drag
+        w = max(1, self.cv.winfo_width() - self.LEFT - 16)
+        d = (x0 - e.x) / w * (v1 - v0)
+        self.v0, self.v1 = v0 + d, v1 + d
+        self.drag = (x0, v0, v1, True)
+        self.later()
+
+    def release(self, e):
+        moved = self.drag and self.drag[3]
+        self.drag = None
+        if not moved:
+            self.sel = self.near(e.x, e.y)
+            self.later()
+
+    def motion(self, e):
+        h = self.near(e.x, e.y)
+        if h is not self.hover:
+            self.hover = h
+            self.draw_status()
+
+    def near(self, x, y):
+        best, dist = None, 7.0
+        for ev, ex0, ex1, ey in self.shown:
+            dx = 0 if ex0 <= x <= ex1 else min(abs(x - ex0), abs(x - ex1))
+            d = math.hypot(dx, y - ey)
+            if d < dist:
+                best, dist = ev, d
+        return best
+
+    def open_sel(self):
+        if self.sel and self.on_open:
+            self.on_open(self.sel["id"])
+
+    # ---- drawing
+    def later(self):
+        if self._job:
+            return
+        try:
+            self._job = self.root.after(16, self.draw)
+        except tk.TclError:
+            pass
+
+    def ticks(self):
+        """Tick marks for the span on screen: (fractional year, label)."""
+        span = self.v1 - self.v0
+        w = max(1, self.cv.winfo_width() - self.LEFT - 16)
+        want = span / max(4, w / 110)
+        out = []
+        steps = [1000, 500, 200, 100, 50, 20, 10, 5, 2, 1]
+        if want >= 1:
+            step = next((s_ for s_ in reversed(steps) if s_ >= want), 1000)
+            y = math.floor(self.v0 / step) * step
+            while y <= self.v1:
+                out.append((float(y), when_label(y)))
+                y += step
+            return out
+        months = 12 * want
+        if months >= 1:
+            step = next((m for m in (1, 2, 3, 6) if m >= months), 6)
+            y, mo = math.floor(self.v0), 1
+            while True:
+                t = moment_of(f"{y}-{mo:02d}") if y >= 1 else y + (mo - 1) / 12
+                if t is None or t > self.v1:
+                    break
+                if t >= self.v0:
+                    out.append((t, f"{y}-{mo:02d}"))
+                mo += step
+                if mo > 12:
+                    y, mo = y + 1, mo - 12
+            return out
+        days = max(1, round(365.25 * want))
+        step = next((d for d in (1, 2, 7, 14) if d >= days), 14) if days < 28 else 28
+        try:
+            d0 = date(max(1, math.floor(self.v0)), 1, 1) + timedelta(
+                days=int((self.v0 - math.floor(self.v0)) * 365.25))
+        except (ValueError, OverflowError):
+            return out
+        d = d0
+        while True:
+            t = moment_of(d.isoformat())
+            if t is None or t > self.v1 or len(out) > 60:
+                break
+            out.append((t, d.isoformat()))
+            d += timedelta(days=step)
+        return out
+
+    def draw(self):
+        self._job = None
+        if not self.is_open():
+            return
+        cv = self.cv
+        cv.delete("all")
+        W, H = cv.winfo_width(), cv.winfo_height()
+        top, bottom = self.TOP, H - self.AXIS - 22
+        cv.create_text(12, 10, anchor="nw", font=self.f_small, fill=FAINT, text=tr(TIMELINE_KEYS))
+        scope = tr("following the search") if (self.follow and self.get_ids and
+                                              self.get_ids() is not None) else tr("the whole base")
+        cv.create_text(12, 26, anchor="nw", font=self.f_small, fill=SOFT,
+                       text=tr("{n} dated things · {scope}", n=len(self.events), scope=scope))
+        for t, lab in self.ticks():
+            x = self.x_of(t)
+            if self.LEFT <= x <= W - 16:
+                cv.create_line(x, top - 4, x, bottom, fill=RULE)
+                cv.create_text(x + 3, bottom + 4, anchor="nw", font=self.f_small, fill=SOFT, text=lab)
+        now = moment_of(TODAY())
+        if self.v0 <= now <= self.v1:
+            x = self.x_of(now)
+            cv.create_line(x, top - 4, x, bottom, fill=OXIDE, dash=(2, 3))
+        self.shown = []
+        if not self.lanes:
+            cv.create_text(W // 2, (top + bottom) // 2, font=self.f_lane, fill=SOFT,
+                           text=tr("Nothing dated here."))
+            self.draw_status()
+            return
+        lane_h = (bottom - top) / len(self.lanes)
+        names = dict(TIMELINE_LANES)
+        rows = {}
+        for i, k in enumerate(self.lanes):
+            y0 = top + i * lane_h
+            rows[k] = (y0, y0 + lane_h)
+            if i:
+                cv.create_line(12, y0, W - 16, y0, fill=RULE)
+            cv.create_text(12, y0 + 6, anchor="nw", font=self.f_lane, fill=SOFT,
+                           text=tr(names[k]))
+        span = self.v1 - self.v0
+        per_lane, before, after = {}, {}, {}
+        for ev in self.events:
+            t1 = ev["t1"] if ev["t1"] is not None else ev["t0"]
+            if t1 < self.v0 - span * 0.01:
+                before[ev["lane"]] = before.get(ev["lane"], 0) + 1
+                continue
+            if ev["t0"] > self.v1 + span * 0.01:
+                after[ev["lane"]] = after.get(ev["lane"], 0) + 1
+                continue
+            per_lane.setdefault(ev["lane"], []).append(ev)
+        for k, (y0, y1) in rows.items():           # what lies off screen, counted at the edges
+            if before.get(k):
+                cv.create_text(12, y1 - 6, anchor="sw", font=self.f_small, fill=FAINT,
+                               text=f"‹ {before[k]}")
+            if after.get(k):
+                cv.create_text(W - 16, y1 - 6, anchor="se", font=self.f_small, fill=FAINT,
+                               text=f"{after[k]} ›")
+        for k, evs in per_lane.items():
+            y0, y1 = rows[k]
+            evs.sort(key=lambda e: e["t0"])
+            label_rows = max(1, int((y1 - y0 - 22) // 13))
+            ends = [-1e9] * label_rows                   # where each label row is free
+            spans_y = y0 + 20
+            for n_, ev in enumerate(evs):
+                x0 = self.x_of(ev["t0"])
+                sel = ev is self.sel
+                colour = STAMP if sel else (INK if ev["lane"] != "register" else FAINT)
+                if ev["t1"] is not None and self.x_of(ev["t1"]) - x0 >= 8:
+                    x1 = self.x_of(ev["t1"])            # a span wide enough to show as one
+                    yy = spans_y + (n_ % max(1, label_rows)) * 13
+                    cv.create_rectangle(max(self.LEFT - 4, x0), yy - 2, min(W, x1), yy + 3,
+                                        fill=colour if sel else SOFT, outline="")
+                    self.shown.append((ev, x0, x1, yy))
+                    if x1 - x0 > 40:
+                        cv.create_text(max(self.LEFT, x0) + 2, yy - 3, anchor="sw",
+                                       font=self.f_small, fill=colour,
+                                       text=one_liner(ev["label"], int((x1 - x0) / 6)))
+                    continue
+                if not self.LEFT - 4 <= x0 <= W:
+                    continue
+                for r_ in range(label_rows):
+                    if x0 >= ends[r_]:
+                        yy = y0 + 22 + r_ * 13
+                        txt = one_liner(ev["label"], 34)
+                        cv.create_oval(x0 - 2.5, yy - 2.5, x0 + 2.5, yy + 2.5, fill=colour, outline="")
+                        tw = self.f_small.measure(txt)
+                        if x0 + 6 + tw < W - 4:
+                            cv.create_text(x0 + 6, yy, anchor="w", font=self.f_small,
+                                           fill=colour if sel else SOFT, text=txt)
+                        ends[r_] = x0 + 12 + tw
+                        self.shown.append((ev, x0, x0, yy))
+                        break
+                else:                                     # no room: a tick on the lane's foot
+                    yy = y1 - 5
+                    cv.create_line(x0, yy - 3, x0, yy + 3, fill=colour)
+                    self.shown.append((ev, x0, x0, yy))
+        self.draw_status()
+
+    def draw_status(self):
+        cv = self.cv
+        cv.delete("status")
+        ev = self.hover or self.sel
+        W, H = cv.winfo_width(), cv.winfo_height()
+        if ev:
+            text = f"{ev['when']}   {ev['label']}"
+            if ev is self.sel:
+                text += "   " + tr("(Enter opens it)")
+        else:
+            text = f"{when_label(self.v0, self.v1 - self.v0 < 3)} — {when_label(self.v1, self.v1 - self.v0 < 3)}"
+        cv.create_text(12, H - 8, anchor="sw", font=self.f_lane, fill=INK, text=one_liner(text, 180),
+                       tags="status")
+
+
+def cmd_timeline(open_id=None):
+    """Opens the timeline by itself, read-only."""
+    global tk, tkfont, ttk
+    try:
+        import tkinter as _tk
+        from tkinter import font as _tkfont, ttk as _ttk
+    except ImportError:
+        raise SystemExit(tr("This Python came without Tkinter. Reinstall it with tcl/tk."))
+    tk, tkfont, ttk = _tk, _tkfont, _ttk
+    load_palette((load_json().get("ui") or {}).get("theme", "paper"))
+    root = tk.Tk()
+    set_window_icon(root)
+    root.timeline = TimelineView(root, load_json, start_id=open_id)
+    root.mainloop()
+    return 0
+
+
 # ================================================================ app
 
 def cmd_app(open_id=None):
@@ -11647,12 +12433,16 @@ def main():
         return cmd_book()
     if cmd == "graph":
         return cmd_graph(rest[0] if rest else None)
+    if cmd == "timeline":
+        return cmd_timeline(rest[0] if rest else None)
     if cmd == "migrate":
         return cmd_migrate()
     if cmd == "merge":
         return cmd_merge()
     if cmd == "doctor":
         return cmd_doctor()
+    if cmd == "real-dates":
+        return cmd_real_dates(rest)
     if cmd == "mirror":
         cmd_mirror()
         write_corpus_html(load_json())
@@ -12853,6 +13643,66 @@ PT = {
         "{n} rascunhos gravados em {file}",
     "Taking in {n} file(s) from notes/…":
         "Trazendo {n} arquivo(s) de notes/…",
+    "{n} log entries with a date at the start of their text":
+        "{n} entradas de log com uma data no começo do texto",
+    "{n} people changed":
+        "{n} pessoas alteradas",
+    "Real dates in the logs…":
+        "Datas reais nos logs…",
+    "Real dates in the logs":
+        "Datas reais nos logs",
+    "No log entry starts with a date different from its own.":
+        "Nenhuma entrada de log começa com uma data diferente da sua.",
+    "{n} log entries start with a date. Selected ones get it as their date (and lose it from the text); unselect what is not a date.":
+        "{n} entradas de log começam com uma data. As selecionadas passam a tê-la como data (e ela sai do texto); desmarque o que não for data.",
+    "also put each log in date order":
+        "também ordenar cada log por data",
+    "{n} entries dated, in {m} people. Their previous versions are in the log (Base › History).":
+        "{n} entradas datadas, em {m} pessoas. As versões anteriores estão no log (Base › Histórico).",
+    "Apply":
+        "Aplicar",
+    "{y} BC":
+        "{y} a.C.",
+    "people · life":
+        "pessoas · vida",
+    "calendar":
+        "calendário",
+    "registered":
+        "registrado",
+    "{name} is born":
+        "nasce {name}",
+    "{name} dies":
+        "morre {name}",
+    "met {name}":
+        "conheceu {name}",
+    "now":
+        "hoje",
+    "registered: {label}":
+        "registrado: {label}",
+    "wheel: zoom   drag or ← →: move   PgUp PgDn: a screen   Home: everything   t: today   r: when registered   f: follow the search   Enter: open":
+        "roda: zoom   arrastar ou ← →: mover   PgUp PgDn: uma tela   Home: tudo   t: hoje   r: quando registrado   f: seguir a busca   Enter: abrir",
+    "Kustos · timeline (read-only)":
+        "Kustos · cronologia (só leitura)",
+    "following the search":
+        "seguindo a busca",
+    "the whole base":
+        "a base inteira",
+    "{n} dated things · {scope}":
+        "{n} coisas datadas · {scope}",
+    "Nothing dated here.":
+        "Nada datado aqui.",
+    "(Enter opens it)":
+        "(Enter abre)",
+    "BORN  (2024-03-11, 1890, s. XVI)":
+        "NASCIMENTO  (2024-03-11, 1890, s. XVI)",
+    "DIED":
+        "MORTE",
+    "DATE OR PERIOD  (2024-03-11, 1609, 1618/1648 — for the timeline)":
+        "DATA OU PERÍODO  (2024-03-11, 1609, 1618/1648 — para a cronologia)",
+    "Timeline":
+        "Cronologia",
+    "\n  Ctrl+Shift+T    timeline (second window, read-only): everything dated on one\n                  line of time -- the people's LOG, births and deaths, tasks due,\n                  sources, attested forms, links with a span, health, drafts with\n                  a date or period. The wheel zooms, dragging moves, Home shows\n                  everything, t today, r when each record was registered, f\n                  follows this window's search; Enter opens a record here.\n  Base › Real dates in the logs: log entries whose text starts with a date\n                  (2021, 20240311, 202403110011…) get it as their date. A LOG\n                  line may carry a year (2021), a month (2024-03) or a time\n                  (2024-03-11 14:30), followed by two spaces.\n":
+        "\n  Ctrl+Shift+T    cronologia (segunda janela, só leitura): tudo o que tem data\n                  numa linha do tempo -- o LOG das pessoas, nascimentos e mortes,\n                  prazos, fontes, formas atestadas, ligações com intervalo, saúde,\n                  rascunhos com data ou período. A roda dá zoom, arrastar move,\n                  Home mostra tudo, t hoje, r quando cada registro foi registrado,\n                  f segue a busca desta janela; Enter abre um registro aqui.\n  Base › Datas reais nos logs: entradas de log cujo texto começa com uma data\n                  (2021, 20240311, 202403110011…) passam a tê-la como data. Uma\n                  linha do LOG pode levar um ano (2021), um mês (2024-03) ou uma\n                  hora (2024-03-11 14:30), seguidos de dois espaços.\n",
 }
 
 if __name__ == "__main__":
