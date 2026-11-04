@@ -75,6 +75,21 @@ updating of files and conflicts if used any syncing app or cloud sync.
   (or `python _kustos.py real-dates [apply [order]]`) finds log entries whose
   text starts with a date — as imported notes have it, `20240311…` — and, on
   confirmation, makes it the entry's date.
+- **Peritia, the skills panel** (`_kustos_peritia.cmd`, **View › Skills (Peritia)**,
+  or `python _kustos.py peritia`): a page in the browser, served by Kustos itself
+  on 127.0.0.1 only, that stops two minutes after the page is closed. Skills
+  (`k_`) sit on a star chart, domains as sectors and prerequisites as rings;
+  each has a journal of *study*, *practice* and *proof* entries (a proof asks
+  for a reference: a file that runs, a link, or a Kustos id), which add up to
+  XP and to a level from I to V named after Dreyfus (from III up, XP alone is
+  not enough: it takes proofs). Brightness shows freshness, and a level never
+  falls. The *Foundations* page explains where each rule comes from and lets
+  you change its numbers, keeping a dated history of every change. Skills
+  live in `_kustos.json` beside the rest, link to any record, and go through
+  the same log and conflict merge, but outside the register. A skill saved
+  over a version that changed on disk is refused and the current one
+  reloaded. `_kustos_peritia.html` is a read-only snapshot, rewritten on every
+  change; a `_peritia.json` from the panel's standalone days can be imported.
 - **Source**: free types (book, paper, thesis, law/bill, decisions, webpages, videos), citations in academic formats, BibTeX and CSL-JSON.
   Can import from Zotero via CSL-JSON or BibTeX without duplicating entries.
 - **Health (corpus)**: four kinds of record, each with its own fields —
@@ -138,6 +153,7 @@ python _kustos.py export [bibtex|csl|abnt] [arquivo]
 python _kustos.py import zotero <export.json|.bib>
 python _kustos.py mirror | corpus | merge | history <id> | replay
 python _kustos.py logbook                  the base as a logbook (read-only)
+python _kustos.py peritia [--no-open] [--port N]   the skills panel, in the browser
 ```
 
 ## Suggestion: Using Syncthing to sync

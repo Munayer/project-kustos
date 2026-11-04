@@ -15,6 +15,7 @@ FILES (all side by side, same prefix)
                                   complete history (no .bak files).
     _kustos.lock.<machine>.json   "Open over there" notice. Removed on close.
     _kustos_mirror.md             Readable mirror (Obsidian, phone).
+    _kustos_peritia.html          Skills panel, read-only snapshot (Peritia).
     _kustos_conflicts/            *.sync-conflict-* already merged. Nothing is deleted.
     _kustos_old/                  What `migrate` retired.
 
@@ -24,7 +25,8 @@ HOW CONFLICTS ARE RESOLVED
        newest `updated_at` wins; deletions are remembered as tombstones).
     3. If another machine left its lock, the status bar says so.
 
-IDS: p_ person · c_ concept · f_ form · s_ source · h_ measurement.
+IDS: p_ person · c_ concept · f_ form · s_ source · h_ measurement ·
+k_ skill (Peritia).
 
 REGISTER: besides its id, every record has a registration stamp
 (YYYYMMDDhhmmss) and an order number (nº 1852). The number never changes and
@@ -39,6 +41,7 @@ USAGE
     python _kustos.py logbook         the base as a logbook (read-only)
     python _kustos.py graph [id]      the links as a living graph (read-only)
     python _kustos.py timeline [id]   everything dated, on one line of time (read-only)
+    python _kustos.py peritia         the skills panel, in the browser (on 127.0.0.1)
     python _kustos.py doctor          check the structure, change nothing
     python _kustos.py real-dates [apply [order]]
                                       log entries whose text starts with a date:
@@ -1988,7 +1991,7 @@ def haystack_note(n):
 
 def blank_vault():
     return {"schema": SCHEMA, "ui": {}, "people": [], "entries": [],
-            "sources": [], "corpus": [], "notes": [], "edges": [], "deleted": [],
+            "sources": [], "corpus": [], "notes": [], "skills": [], "edges": [], "deleted": [],
             "book": {"opened": NOW()}}
 
 
@@ -1999,6 +2002,7 @@ def fix_vault(data):
         data.setdefault(coll, [])
     data.setdefault("edges", [])
     data.setdefault("deleted", [])
+    data.setdefault("skills", [])
     for p in data["people"]:
         fix_person(p)
     for e in data["entries"]:
@@ -2009,6 +2013,8 @@ def fix_vault(data):
         fix_metric(m)
     for n in data["notes"]:
         fix_note(n)
+    for k in data["skills"]:
+        fix_skill(k)
     for coll in COLLS:
         for r in data[coll]:
             if r.get("id") and r["id"][:2] not in PREFIX:
@@ -2441,7 +2447,7 @@ def merge_vault(base, other):
     tomb_other = {d["id"]: d.get("at", "") for d in other.get("deleted", [])}
     winners_from_other = set()
 
-    for coll in COLLS:
+    for coll in COLLS + ("skills",):
         base.setdefault(coll, [])
         idx = {r["id"]: i for i, r in enumerate(base[coll])}
         for rec in other.get(coll, []):
@@ -2475,12 +2481,17 @@ def merge_vault(base, other):
                          if a["from"] not in winners_from_other]
         base["edges"] += [a for a in other.get("edges", [])
                           if a["from"] in winners_from_other]
+    # Peritia's settings (parameters, order of the domains): the newer wins
+    mine, theirs = base.get("peritia") or {}, other.get("peritia") or {}
+    if theirs and (theirs.get("updated_at") or "") > (mine.get("updated_at") or ""):
+        base["peritia"] = theirs
+        report["replaced"].append(("peritia", "peritia", "Peritia"))
     # tombstones: union, the newest per id
     tombs = {}
     for d in base.get("deleted", []) + other.get("deleted", []):
         if d.get("id") and d.get("at", "") >= tombs.get(d["id"], {}).get("at", ""):
             tombs[d["id"]] = d
-    live = set(by_id(base))
+    live = set(by_id(base)) | {k.get("id") for k in base.get("skills", [])}
     base["deleted"] = [d for d in tombs.values() if d["id"] not in live]
     return report
 
@@ -2523,12 +2534,17 @@ def absorb_conflicts():
         # what the merge changed goes into the log as if typed here, so that
         # `replay` rebuilds the same state
         idx = by_id(data)
+        skills = {k.get("id"): k for k in data.get("skills", [])}
         for coll, rid, _ in report["added"] + report["replaced"]:
-            if rid in idx:
+            if coll == "skills" and rid in skills:
+                log_put(coll, skills[rid])
+            elif coll == "peritia":
+                log_append("put", "peritia", {"id": "peritia", "rec": data.get("peritia")})
+            elif rid in idx:
                 log_put(coll, idx[rid])
                 log_edges(rid, edges_from(data, rid))
         for coll, rid, name in report["skipped_deleted"]:
-            if rid not in idx:
+            if rid not in idx and rid not in skills:
                 log_del(coll, rid, name)
         CONFLICT_DIR.mkdir(exist_ok=True)
         try:
@@ -2708,6 +2724,7 @@ def check(data):
     for x in note_conflicts():
         warnings.append(tr("Syncthing conflict copy of a draft: {file} (compare it with "
                            "the draft, then delete it)", file=x.relative_to(BASE).as_posix()))
+    check_skills(data, errors, warnings)
     check_book(data, errors, warnings)
     return errors, warnings
 
@@ -2755,7 +2772,8 @@ def summary(data):
               "{links} links", people=len(data["people"]), entries=len(data["entries"]),
               concepts=n_c, forms=n_f, sources=len(data.get("sources", [])),
               metrics=len(data.get("corpus", [])), readings=n_r, links=len(data["edges"])) \
-        + (" · " + tr("{n} drafts", n=len(data["notes"])) if data.get("notes") else "")
+        + (" · " + tr("{n} drafts", n=len(data["notes"])) if data.get("notes") else "") \
+        + (" · " + tr("{n} skills", n=len(data["skills"])) if data.get("skills") else "")
 
 
 def cmd_doctor():
@@ -2974,6 +2992,7 @@ def write_mirror(data):
             if n.get("file"):
                 out += [f"[{n['file']}](<{n['file']}>)", ""]
             out += [f"`{n['id']}`", ""]
+    out += mirror_skills(data)
     MIRROR_FILE.write_text("\n".join(out), encoding="utf-8")
 
 
@@ -3060,7 +3079,7 @@ def cmd_replay():
             regs.update(l.get("regs", {}))
             continue
         op, coll, rid = l.get("op"), l.get("coll"), l.get("id")
-        if op == "put" and coll in COLLS:
+        if op == "put" and coll in COLLS + ("skills",):
             rec = l.get("rec", {})
             if rid in idx:
                 rows = data[coll]
@@ -3070,6 +3089,8 @@ def cmd_replay():
             else:
                 data[coll].append(rec)
             idx[rid] = coll
+        elif op == "put" and coll == "peritia":
+            data["peritia"] = l.get("rec") or {}
         elif op == "del" and rid in idx:
             data[idx[rid]] = [r for r in data[idx[rid]] if r["id"] != rid]
             data["edges"] = [a for a in data["edges"]
@@ -4276,6 +4297,1379 @@ CORPUS_HTML = r"""<!doctype html>
   if (data.systems.length) selectedSystemId = data.systems[0].id;
   renderAll();
 })();
+</script>
+</body>
+</html>
+"""
+
+
+# ================================================================ peritia
+#
+# Peritia, the skills panel: a page in the browser, served by this program on
+# 127.0.0.1 only, reading and writing the same base. The skills are the
+# top-level list `skills` (ids k_); the panel's own settings are in `peritia`:
+# the parameters, with the dated history of every change, and the order of the
+# domains. A skill is saved like a record (save_record, the log, the conflict
+# merge, replay), but it is not in the register and the main window does not
+# list it. Its links to Kustos records are ids in its own `links`; its journal
+# is `log`, entries {id, date, kind, note, ref}. The kinds (estudo, pratica,
+# prova) and the freshness windows (viva, morna) keep the Portuguese names
+# they were first stored with.
+#
+# `python _kustos.py peritia` serves the page on a free port, opens it, and
+# stops PERITIA_IDLE seconds after the last request (the page pings every 20
+# seconds while it is open). Every call to /api/ must carry the token written
+# into the page, and the Host header must be 127.0.0.1, so that no other page
+# or site can reach the base through it. The read-only snapshot,
+# _kustos_peritia.html, is rewritten on every change, like the body map.
+
+PERITIA_HTML_FILE = BASE / f"{STEM}_peritia.html"
+PERITIA_IDLE = 120          # seconds without a request before the server stops
+SKILL_KINDS = ("estudo", "pratica", "prova")
+SKILL_KIND_LABEL = {"estudo": "study", "pratica": "practice", "prova": "proof"}
+PERITIA_PARAMS = {"xp": {"estudo": 1, "pratica": 3, "prova": 8},
+                  "levels": [{"xp": 4, "p": 0}, {"xp": 10, "p": 1},
+                             {"xp": 30, "p": 3}, {"xp": 70, "p": 6}],
+                  "open_at": 2, "fresh": {"viva": 30, "morna": 90}}
+LEVEL_ROMAN = ("0", "I", "II", "III", "IV", "V")
+DAY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+class SkillConflict(Exception):
+    """The skill changed (or went) on disk after the page read it."""
+
+
+def fix_skill(s):
+    for k in ("name", "domain", "desc", "next"):
+        s.setdefault(k, "")
+    for k in ("requires", "links", "log"):
+        s.setdefault(k, [])
+    for i, e in enumerate(s["log"]):
+        for k in ("date", "note", "ref"):
+            e.setdefault(k, "")
+        e.setdefault("kind", "estudo")
+        if not e.get("id"):
+            # the same id on every read, so the page can point at the entry
+            seed = f"{s.get('id')}|{i}|{e['date']}|{e['kind']}|{e['note']}|{e['ref']}"
+            e["id"] = "l_" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:7]
+    return s
+
+
+def skill_stamp(s):
+    """What the page reads a skill with and sends back when it saves: a digest
+    of the stored skill, so any change on disk in between shows, even within
+    the second that `updated_at` counts in."""
+    clean = {k: v for k, v in s.items() if not k.startswith("_")}
+    raw = json.dumps(clean, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:16]
+
+
+def is_day(text):
+    if not DAY_RE.fullmatch(text or ""):
+        return False
+    try:
+        date.fromisoformat(text)
+    except ValueError:
+        return False
+    return True
+
+
+def check_params(P):
+    """The parameters as whole numbers, or ValueError saying what is wrong: the
+    same rules the page applies before it sends them."""
+    def whole(x):
+        if isinstance(x, bool) or not isinstance(x, int) or x < 0:
+            raise ValueError(tr("Use whole numbers from zero up."))
+        return x
+    try:
+        out = {"xp": {k: whole(P["xp"][k]) for k in SKILL_KINDS},
+               "levels": [{"xp": whole(L["xp"]), "p": whole(L["p"])} for L in P["levels"]],
+               "open_at": whole(P["open_at"]),
+               "fresh": {k: whole(P["fresh"][k]) for k in ("viva", "morna")}}
+    except (KeyError, TypeError):
+        raise ValueError(tr("Use whole numbers from zero up."))
+    if len(out["levels"]) != 4 or out["open_at"] not in (1, 2, 3):
+        raise ValueError(tr("Use whole numbers from zero up."))
+    if not out["xp"]["prova"]:
+        raise ValueError(tr("A proof has to be worth some XP."))
+    for i in range(1, 4):
+        a, b = LEVEL_ROMAN[i + 2], LEVEL_ROMAN[i + 1]
+        if out["levels"][i]["xp"] <= out["levels"][i - 1]["xp"]:
+            raise ValueError(tr("The XP of level {a} has to be more than that of level {b}.",
+                                a=a, b=b))
+        if out["levels"][i]["p"] < out["levels"][i - 1]["p"]:
+            raise ValueError(tr("Level {a} cannot ask for fewer proofs than level {b}.",
+                                a=a, b=b))
+    if out["fresh"]["viva"] >= out["fresh"]["morna"]:
+        raise ValueError(tr('The "live" window has to be shorter than the "warm" one.'))
+    return out
+
+
+def peritia_params(data):
+    """The parameters in force, with their history; the defaults if none are
+    stored or the stored ones do not hold together."""
+    stored = (data.get("peritia") or {}).get("params")
+    try:
+        P = check_params(stored)
+    except ValueError:
+        P = json.loads(json.dumps(PERITIA_PARAMS))
+    P["history"] = list((stored or {}).get("history") or []) if isinstance(stored, dict) else []
+    return P
+
+
+def params_summary(P):
+    return tr("XP {xp}; levels {levels}; opens at {open}; freshness {fresh}",
+              xp="/".join(str(P["xp"][k]) for k in SKILL_KINDS),
+              levels=", ".join(f"{L['xp']}+{L['p']}" for L in P["levels"]),
+              open=P["open_at"], fresh=f"{P['fresh']['viva']}/{P['fresh']['morna']}")
+
+
+def skill_figures(s, P):
+    """XP, proofs, date of the last entry and level of a skill: the page's
+    own arithmetic, for the mirror."""
+    xp = proofs = 0
+    last = ""
+    for e in s.get("log", []):
+        xp += P["xp"].get(e.get("kind"), P["xp"]["estudo"])
+        proofs += e.get("kind") == "prova"
+        last = max(last, e.get("date") or "")
+    level = 0
+    if s.get("log"):
+        level = 1
+        for i, L in enumerate(P["levels"]):
+            if xp >= L["xp"] and proofs >= L["p"]:
+                level = i + 2
+    return xp, proofs, last, level
+
+
+def skill_loop(skills, sid, requires):
+    """True if `sid`, requiring `requires`, would close a circle of prerequisites."""
+    req = {s.get("id"): s.get("requires", []) for s in skills}
+    req[sid] = requires
+    seen, todo = set(), list(requires)
+    while todo:
+        x = todo.pop()
+        if x == sid:
+            return True
+        if x not in seen:
+            seen.add(x)
+            todo += req.get(x, [])
+    return False
+
+
+def new_skill_id(name, taken):
+    base = "k_" + slug(name)[:48]
+    rid, n = base, 2
+    while rid in taken:
+        rid, n = f"{base}_{n}", n + 1
+    return rid
+
+
+def clean_skill(rec, old, skills):
+    """The skill the page sent, checked and tidied, on top of the stored one
+    (fields the page does not know are kept). ValueError says what is wrong."""
+    name = " ".join(str(rec.get("name") or "").split())
+    if not name:
+        raise ValueError(tr("A skill needs a name."))
+    out = {k: v for k, v in (old or {}).items() if not k.startswith("_")}
+    out["id"] = old["id"] if old else ""
+    out["name"] = name
+    out["domain"] = " ".join(str(rec.get("domain") or "").split()) or tr("General")
+    out["desc"] = str(rec.get("desc") or "").strip()
+    out["next"] = str(rec.get("next") or "").strip()
+    ids = {s.get("id") for s in skills}
+    out["requires"] = []
+    for r in rec.get("requires") or []:
+        r = str(r)
+        if out["id"] and r == out["id"]:
+            raise ValueError(tr("A skill cannot require itself."))
+        if r not in ids:
+            raise ValueError(tr("{id} does not exist.", id=r))
+        if r not in out["requires"]:
+            out["requires"].append(r)
+    out["links"] = list(dict.fromkeys(str(x).strip() for x in rec.get("links") or []
+                                      if str(x).strip()))
+    out["log"] = []
+    for e in rec.get("log") or []:
+        if not isinstance(e, dict):
+            continue
+        if e.get("kind") not in SKILL_KINDS:
+            raise ValueError(tr("Unknown kind of entry: {kind}", kind=e.get("kind")))
+        if not is_day(str(e.get("date") or "")):
+            raise ValueError(tr("Invalid date in the journal: {date}", date=e.get("date")))
+        out["log"].append({"id": str(e.get("id") or ""), "date": e["date"], "kind": e["kind"],
+                           "note": str(e.get("note") or "").strip(),
+                           "ref": str(e.get("ref") or "").strip()})
+    return out
+
+
+def save_skill(rec, base):
+    """One skill from the page. `base` is the skill_stamp the page read it with
+    (None for a new one); if the disk has another, SkillConflict. Returns
+    (vault, id)."""
+    data = load_json()
+    skills = data["skills"]
+    rid = str(rec.get("id") or "")
+    old = next((s for s in skills if s.get("id") == rid), None) if rid else None
+    if rid and old is None:
+        raise SkillConflict(tr("This skill no longer exists."))
+    if old is not None and skill_stamp(old) != (base or ""):
+        raise SkillConflict(tr("The record changed on disk; the current version is loaded."))
+    out = clean_skill(rec, old, skills)
+    if old is None:
+        taken = {s.get("id") for s in skills} | {d.get("id") for d in data.get("deleted", [])}
+        out["id"] = new_skill_id(out["name"], taken)
+    if skill_loop(skills, out["id"], out["requires"]):
+        raise ValueError(tr("These prerequisites would go round in a circle."))
+    fix_skill(out)
+    touch(out)
+    return save_record("skills", out), out["id"]
+
+
+def delete_skill(rid):
+    """Deletes a skill, leaves a tombstone for the merge, and takes it out of
+    the prerequisites of the others."""
+    data = load_json()
+    gone = next((s for s in data["skills"] if s.get("id") == rid), None)
+    if gone is None:
+        raise SkillConflict(tr("This skill no longer exists."))
+    data["skills"] = [s for s in data["skills"] if s.get("id") != rid]
+    lines = [("del", "skills", {"id": rid, "name": gone.get("name", "")})]
+    for s in data["skills"]:
+        if rid in s.get("requires", []):
+            s["requires"] = [r for r in s["requires"] if r != rid]
+            touch(s)
+            lines.append(("put", "skills", {"id": s["id"], "rec": s}))
+    data["deleted"].append({"id": rid, "at": NOW(), "name": gone.get("name", "")})
+    write_json(data)
+    log_many(lines)
+    return data
+
+
+def save_peritia_params(params, note):
+    """New parameters, with a dated line in their history."""
+    P = check_params(params)
+    data = load_json()
+    pe = data.setdefault("peritia", {})
+    P["history"] = peritia_params(data)["history"] + [{
+        "date": TODAY(), "host": HOST, "note": " ".join(str(note or "").split()),
+        "summary": params_summary(P)}]
+    pe["params"] = P
+    pe["updated_at"] = NOW()
+    write_json(data)
+    log_append("put", "peritia", {"id": "peritia", "rec": pe})
+    return data
+
+
+def import_peritia(src):
+    """A _peritia.json (the panel before it lived in Kustos) into the base. A
+    skill already here is replaced only by a newer version of it; the
+    parameters come in only if the base has none yet. Returns (vault, message)."""
+    if not isinstance(src, dict) or not str(src.get("schema", "")).startswith("peritia/") \
+            or not isinstance(src.get("skills"), list):
+        raise ValueError(tr("This is not a Peritia file (schema peritia/…)."))
+    names = {d.get("id"): d.get("name") for d in src.get("domains") or []
+             if isinstance(d, dict) and d.get("name")}
+    data = load_json()
+    skills = data["skills"]
+    here = {s.get("id"): i for i, s in enumerate(skills)}
+    taken = set(here) | {d.get("id") for d in data.get("deleted", [])}
+    added = replaced = kept = 0
+    lines, back = [], set()
+    for raw in src["skills"]:
+        if not isinstance(raw, dict) or not " ".join(str(raw.get("name") or "").split()):
+            continue
+        rec = {k: v for k, v in raw.items() if not k.startswith("_")}
+        rec["domain"] = names.get(rec.get("domain"), rec.get("domain") or "")
+        rid = str(rec.get("id") or "")
+        if not rid.startswith("k_"):
+            rid = new_skill_id(rec["name"], taken)
+        rec["id"] = rid
+        fix_skill(rec)
+        if rid in here:
+            if stamp_of(rec) <= stamp_of(skills[here[rid]]):
+                kept += 1
+                continue
+            skills[here[rid]] = rec
+            replaced += 1
+        else:
+            if not stamp_of(rec):
+                touch(rec)
+            here[rid] = len(skills)
+            skills.append(rec)
+            taken.add(rid)
+            back.add(rid)
+            added += 1
+        lines.append(("put", "skills", {"id": rid, "rec": rec}))
+    data["deleted"] = [d for d in data["deleted"] if d.get("id") not in back]
+    pe = data.setdefault("peritia", {})
+    if not pe.get("params") and isinstance(src.get("params"), dict):
+        try:
+            P = check_params(src["params"])
+            P["history"] = list(src["params"].get("history") or [])
+            pe["params"] = P
+        except ValueError:
+            pass
+    domains = [d for d in pe.get("domains") or [] if isinstance(d, str)]
+    for d in src.get("domains") or []:
+        name = d.get("name") if isinstance(d, dict) else d
+        if isinstance(name, str) and name and name not in domains:
+            domains.append(name)
+    pe["domains"] = domains
+    pe["updated_at"] = NOW()
+    write_json(data)
+    lines.append(("put", "peritia", {"id": "peritia", "rec": pe}))
+    log_many(lines)
+    return data, tr("{added} skill(s) added, {replaced} replaced by a newer version, "
+                    "{kept} kept as they were.", added=added, replaced=replaced, kept=kept)
+
+
+def peritia_state(data):
+    """What the page works from: the skills (each with the stamp it was read
+    with), the parameters, the domains, and a label for every Kustos record the
+    skills point at."""
+    idx = by_id(data)
+    skills, labels = [], {}
+    for s in data.get("skills", []):
+        s = dict(s, _stamp=skill_stamp(s))
+        skills.append(s)
+        for ref in list(s.get("links", [])) + [e.get("ref", "") for e in s.get("log", [])]:
+            r = idx.get(ref)
+            if r is not None and ref not in labels:
+                labels[ref] = {"label": label_any(r, data), "kind": kind_of(r)}
+    pe = data.get("peritia") or {}
+    return {"skills": skills,
+            "peritia": {"params": peritia_params(data),
+                        "domains": [d for d in pe.get("domains") or [] if isinstance(d, str)]},
+            "labels": labels, "host": HOST, "built": NOW(), "file": JSON_FILE.name,
+            "locks": [o.get("host") or "?" for o in other_locks()]}
+
+
+def peritia_lookup(data, q):
+    """Kustos records whose label or id holds the text, accents and case
+    ignored: [{id, label, kind}], those starting with it first, 20 at most."""
+    key = sort_key(q)[0].strip()
+    if len(key) < 2:
+        return []
+    hits = []
+    for coll in COLLS:
+        for r in data.get(coll, []):
+            rid = r.get("id", "")
+            if not rid or rid.startswith("__"):
+                continue
+            label = label_any(r, data)
+            folded = sort_key(label)[0]
+            if key in folded or key in rid.lower():
+                first = folded.startswith(key) or rid.lower().startswith(key)
+                hits.append((not first, sort_key(label), rid, label, kind_of(r)))
+    hits.sort()
+    return [{"id": h[2], "label": h[3], "kind": h[4]} for h in hits[:20]]
+
+
+def peritia_page(boot, data):
+    """The page, in the interface language and the theme of the window, with
+    `boot` written into it: {mode: live, token} or {mode: snapshot, data}."""
+    pal = THEMES.get((data.get("ui") or {}).get("theme"), THEMES["paper"])
+    mono = '"Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, ui-monospace, monospace'
+    serif = mono if pal["mono_only"] else \
+        '"Times New Roman", "Liberation Serif", "DejaVu Serif", Georgia, serif'
+    css = (f"--paper: {pal['card']}; --wash: {pal['shell']}; --rule: {pal['rule']};\n"
+           f"  --ink: {pal['ink']}; --soft: {pal['soft']}; --faint: {pal['faint']};\n"
+           f"  --accent: {pal['stamp']}; --warn: {pal['oxide']};\n"
+           f"  --serif: {serif};\n  --mono: {mono};\n"
+           f"  color-scheme: {'dark' if pal['dark'] else 'light'};")
+    html = PERITIA_HTML.replace("/*__THEME__*/", css)
+    html = html.replace("@@LANG@@", "pt-BR" if LANG == "pt" else "en")
+    html = re.sub(r"@@(.+?)@@", lambda m: tr(m.group(1)), html)
+    # the data goes in last, so that nothing in it is taken for a mark; <, > and
+    # & are escaped so that no text in it can close the script
+    blob = json.dumps(boot, ensure_ascii=False)
+    blob = blob.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    return html.replace("/*__BOOT__*/null", blob)
+
+
+def write_peritia_snapshot(data):
+    try:
+        PERITIA_HTML_FILE.write_text(
+            peritia_page({"mode": "snapshot", "data": peritia_state(data)}, data),
+            encoding="utf-8")
+    except OSError:
+        pass          # the snapshot is a convenience; it never blocks a save
+
+
+def check_skills(data, errors, warnings):
+    """The doctor's look at the skills."""
+    skills = data.get("skills", [])
+    idx = by_id(data)
+    ids = set()
+    for s in skills:
+        sid = s.get("id", "")
+        if sid in ids:
+            errors.append(tr("repeated id: {id}", id=sid))
+        ids.add(sid)
+        if not str(sid).startswith("k_"):
+            errors.append(tr("{id}: a skill's id starts with k_", id=sid))
+        if not str(s.get("name") or "").strip():
+            errors.append(tr("{id}: skill without a name", id=sid))
+    for s in skills:
+        sid = s.get("id", "")
+        for r in s.get("requires", []):
+            if r not in ids:
+                warnings.append(tr("{id}: requires {req}, which does not exist", id=sid, req=r))
+        if skill_loop(skills, sid, s.get("requires", [])):
+            errors.append(tr("{id}: its prerequisites go round in a circle", id=sid))
+        for e in s.get("log", []):
+            if e.get("kind") not in SKILL_KINDS:
+                errors.append(tr("{id}: journal entry of an unknown kind {kind}", id=sid,
+                                 kind=repr(e.get("kind"))))
+            if not is_day(str(e.get("date") or "")):
+                errors.append(tr("{id}: journal entry with an invalid date {date}", id=sid,
+                                 date=repr(e.get("date"))))
+            elif e.get("kind") == "prova" and not str(e.get("ref") or "").strip():
+                warnings.append(tr("{id}: a proof without a reference ({date})", id=sid,
+                                   date=e["date"]))
+        for target in s.get("links", []):
+            if target not in idx:
+                warnings.append(tr("{id}: links to {target}, which does not exist", id=sid,
+                                   target=target))
+    stored = (data.get("peritia") or {}).get("params")
+    if stored is not None:
+        try:
+            check_params(stored)
+        except ValueError as exc:
+            warnings.append(tr("Peritia's stored parameters do not hold together ({why}); "
+                               "the defaults are used", why=exc))
+
+
+def mirror_skills(data):
+    """The skills' part of the markdown mirror."""
+    skills = data.get("skills") or []
+    if not skills:
+        return []
+    P = peritia_params(data)
+    names = {s.get("id"): s.get("name", "") for s in skills}
+    out = ["# " + tr("Skills"), ""]
+    for s in sorted(skills, key=lambda x: (sort_key(str(x.get("domain", ""))),
+                                           sort_key(str(x.get("name", ""))))):
+        xp, proofs, last, level = skill_figures(s, P)
+        bits = [s.get("domain", ""), tr("level {r}", r=LEVEL_ROMAN[level]), f"{xp} XP",
+                tr("{n} proof(s)", n=proofs)] + ([tr("last: {date}", date=last)] if last else [])
+        out += [f"## {s.get('name', '')}", "  ·  ".join(b for b in bits if b), ""]
+        if s.get("desc"):
+            out += [s["desc"], ""]
+        if s.get("next"):
+            out += [tr("next proof: ") + s["next"], ""]
+        if s.get("requires"):
+            out += [tr("requires: ") + ", ".join(names.get(r, r) for r in s["requires"]), ""]
+        for e in sorted(s.get("log", []), key=lambda e: str(e.get("date", ""))):
+            kind = tr(SKILL_KIND_LABEL.get(e.get("kind"), "study"))
+            out.append(f"- {e.get('date', '')} — {kind} — {e.get('note', '')}"
+                       + (f" ({e['ref']})" if e.get("ref") else ""))
+        if s.get("log"):
+            out.append("")
+        out += [f"`{s['id']}`", ""]
+    return out
+
+
+def peritia_api(method, path, query, body):
+    """One call from the page: (status, answer). Writes reread the disk first,
+    like every save; a stale stamp gets 409 with the current state."""
+    message = None
+    try:
+        if method == "GET" and path == "/api/ping":
+            return 200, {"ok": True}
+        if method == "GET" and path == "/api/state":
+            return 200, peritia_state(load_json())
+        if method == "GET" and path == "/api/lookup":
+            return 200, {"hits": peritia_lookup(load_json(), (query.get("q") or [""])[0])}
+        if method != "POST":
+            return 404, {"error": tr("Not found.")}
+        if path == "/api/skill":
+            data, rid = save_skill(body.get("rec") or {}, body.get("base"))
+            write_peritia_snapshot(data)
+            return 200, {"state": peritia_state(data), "id": rid}
+        if path == "/api/skill/delete":
+            data = delete_skill(str(body.get("id") or ""))
+        elif path == "/api/params":
+            data = save_peritia_params(body.get("params") or {}, body.get("note"))
+        elif path == "/api/import":
+            data, message = import_peritia(body.get("data"))
+        elif path == "/api/mirror":
+            data = load_json()
+            try:
+                write_mirror(data)
+                message = tr("Mirror rebuilt ({mirror}); snapshot in {snapshot}.",
+                             mirror=MIRROR_FILE.name, snapshot=PERITIA_HTML_FILE.name)
+            except SystemExit as exc:
+                message = str(exc)
+        else:
+            return 404, {"error": tr("Not found.")}
+    except SkillConflict as exc:
+        return 409, {"error": str(exc), "state": peritia_state(load_json())}
+    except ValueError as exc:
+        return 400, {"error": str(exc)}
+    write_peritia_snapshot(data)
+    out = {"state": peritia_state(data)}
+    if message:
+        out["message"] = message
+    return 200, out
+
+
+def cmd_peritia(rest=()):
+    """Serves the panel on 127.0.0.1 and opens it; stops by itself when idle."""
+    import secrets
+    import threading
+    import time
+    import webbrowser
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlsplit
+
+    rest = list(rest)
+    port = 0
+    if "--port" in rest:
+        try:
+            port = int(rest[rest.index("--port") + 1])
+        except (IndexError, ValueError):
+            raise SystemExit(tr("--port needs a number"))
+    # what the window does on opening: bring the base up to date, take in the
+    # other machine's conflicting copies
+    if JSON_FILE.exists() and needs_upgrade(load_json()):
+        cmd_upgrade(quiet=True)
+    absorb_conflicts()
+    token = secrets.token_urlsafe(24)
+    guard = threading.Lock()        # one call at a time: they all read and write the base
+    last = [time.monotonic()]
+    hosts = set()
+
+    class Server(ThreadingHTTPServer):
+        daemon_threads = True
+
+        def handle_error(self, request, client_address):
+            pass                    # under pythonw there is no console to print to
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "Kustos"
+
+        def log_message(self, *args):
+            pass
+
+        def answer(self, code, body, ctype="application/json; charset=utf-8"):
+            raw = (body if isinstance(body, str)
+                   else json.dumps(body, ensure_ascii=False)).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            self.route("GET")
+
+        def do_POST(self):
+            self.route("POST")
+
+        def route(self, method):
+            last[0] = time.monotonic()
+            if self.headers.get("Host", "") not in hosts:
+                return self.answer(403, {"error": tr("Not found.")})
+            url = urlsplit(self.path)
+            if method == "GET" and url.path in ("/", "/index.html"):
+                with guard:
+                    page = peritia_page({"mode": "live", "token": token}, load_json())
+                return self.answer(200, page, "text/html; charset=utf-8")
+            if not url.path.startswith("/api/"):
+                return self.answer(404, {"error": tr("Not found.")})
+            sent = (self.headers.get("X-Kustos-Token") or "").encode("latin-1", "replace")
+            if not secrets.compare_digest(sent, token.encode("ascii")):
+                return self.answer(403, {"error": tr("This page is not the one Kustos opened: "
+                                                      "open the panel again from Kustos.")})
+            body = {}
+            if method == "POST":
+                if not (self.headers.get("Content-Type") or "").startswith("application/json"):
+                    return self.answer(415, {"error": tr("The request could not be read.")})
+                try:
+                    size = int(self.headers.get("Content-Length") or 0)
+                    if size > 16 * 1024 * 1024:
+                        return self.answer(413, {"error": tr("The request could not be read.")})
+                    body = json.loads(self.rfile.read(size) or b"{}")
+                except ValueError:
+                    return self.answer(400, {"error": tr("The request could not be read.")})
+                if not isinstance(body, dict):
+                    return self.answer(400, {"error": tr("The request could not be read.")})
+            try:
+                with guard:
+                    code, out = peritia_api(method, url.path, parse_qs(url.query), body)
+            except SystemExit as exc:          # the base could not be read
+                code, out = 500, {"error": str(exc)}
+            except Exception as exc:
+                code, out = 500, {"error": f"{type(exc).__name__}: {exc}"}
+            self.answer(code, out)
+
+    server = Server(("127.0.0.1", port), Handler)
+    port = server.server_address[1]
+    hosts.update({f"127.0.0.1:{port}", f"localhost:{port}"})
+    url = f"http://127.0.0.1:{port}/"
+    write_peritia_snapshot(load_json())
+
+    def watch():
+        while time.monotonic() - last[0] <= PERITIA_IDLE:
+            time.sleep(min(5, PERITIA_IDLE / 4))
+        server.shutdown()
+
+    threading.Thread(target=watch, daemon=True).start()
+    print(tr("Peritia at {url}: it stops by itself {n} minute(s) after the page is closed.",
+             url=url, n=max(1, PERITIA_IDLE // 60)), flush=True)
+    if "--no-open" not in rest:
+        webbrowser.open(url)
+    try:
+        server.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+PERITIA_HTML = r"""<!doctype html>
+<html lang="@@LANG@@">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Peritia · Kustos</title>
+<style>
+/* Layout: star chart of skills (sectors = domains, rings = depth of prerequisites) beside a ledger panel. Colours come from the Kustos theme. */
+:root {
+  /*__THEME__*/
+}
+
+* { box-sizing: border-box }
+[hidden] { display: none !important }
+body { background: var(--paper); color: var(--ink); font: 17px/1.45 var(--serif);
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 20px 40px }
+.wrap { max-width: 1280px; margin: 0 auto }
+header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 12px 24px;
+  border-bottom: 1px solid var(--ink); padding-bottom: 10px }
+h1 { font-size: 28px; font-weight: normal; margin: 0; letter-spacing: .01em }
+h1 small { font-size: 15px; color: var(--soft); font-style: italic; margin-left: 10px }
+.tools { display: flex; flex-wrap: wrap; gap: 6px; align-items: center }
+button, .btn { font: 13px/1 var(--mono); color: var(--ink); background: transparent; border: 1px solid var(--rule);
+  padding: 7px 10px; border-radius: 2px; cursor: pointer }
+button:hover { border-color: var(--ink) }
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, .star:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }
+button.primary { background: var(--ink); color: var(--paper); border-color: var(--ink) }
+button.armed { border-color: var(--warn); color: var(--warn) }
+.status { font: 12px var(--mono); color: var(--soft); margin: 8px 0 0; min-height: 1.3em }
+.status b { color: var(--warn); font-weight: normal }
+
+main { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 28px; margin-top: 18px; align-items: start }
+@media (max-width: 920px) { main { grid-template-columns: minmax(0, 1fr) } }
+.chart { min-width: 0 }
+.chart .scroll { overflow-x: auto }
+#chart { width: 100%; height: auto; display: block; max-width: 900px; margin: 0 auto }
+@media (max-width: 700px) { #chart { min-width: 680px } }
+.legend { font: 12px var(--mono); color: var(--soft); display: flex; flex-wrap: wrap; gap: 6px 18px; justify-content: center; margin-top: 6px }
+.legend svg { width: 14px; height: 14px; vertical-align: -3px; margin-right: 4px }
+
+aside { min-width: 0; border-left: 1px solid var(--rule); padding-left: 24px }
+@media (max-width: 920px) { aside { border-left: 0; padding-left: 0; border-top: 1px solid var(--rule); padding-top: 18px } }
+.label { font: 11px var(--mono); text-transform: uppercase; letter-spacing: .1em; color: var(--soft); margin: 22px 0 8px }
+.label:first-child { margin-top: 0 }
+.figs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px }
+.fig .v { font-size: 30px; line-height: 1; font-variant-numeric: tabular-nums }
+.fig .k { font: 11px var(--mono); color: var(--soft); margin-top: 4px }
+.fig .h { font-size: 13px; color: var(--soft); font-style: italic; margin-top: 2px }
+table { width: 100%; border-collapse: collapse; font-size: 15px }
+td, th { padding: 4px 0; border-bottom: 1px solid var(--rule); text-align: left; font-weight: normal }
+th { font: 11px var(--mono); color: var(--soft); text-transform: uppercase; letter-spacing: .08em }
+td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); font-size: 13px }
+ol.quests { list-style: none; padding: 0; margin: 0 }
+ol.quests li { padding: 7px 0; border-bottom: 1px solid var(--rule) }
+a.go, button.link { background: none; border: 0; padding: 0; font: inherit; color: var(--ink); text-decoration: underline;
+  text-decoration-color: var(--faint); text-underline-offset: 3px; cursor: pointer }
+a.go:hover, button.link:hover { text-decoration-color: var(--ink) }
+.q-next { display: block; font-size: 14px; color: var(--soft) }
+
+h2 { font-size: 26px; font-weight: normal; margin: 0; text-wrap: balance }
+.meta { font: 12px var(--mono); color: var(--soft); margin-top: 4px }
+.desc { margin: 10px 0 0 }
+.lvl { display: flex; align-items: baseline; gap: 10px; margin-top: 14px }
+.lvl .r { font-size: 40px; line-height: 1 }
+.lvl .t { font-style: italic }
+.bar { height: 4px; background: var(--wash); margin-top: 8px; position: relative }
+.bar i { position: absolute; inset: 0 auto 0 0; background: var(--ink) }
+.gate { font: 12px var(--mono); color: var(--soft); margin-top: 6px }
+.chips { display: flex; flex-wrap: wrap; gap: 6px }
+.chip { font: 12px var(--mono); border: 1px solid var(--rule); padding: 3px 7px; border-radius: 2px; background: none; color: var(--ink); cursor: pointer }
+.chip.low { color: var(--warn); border-color: var(--warn) }
+.next-box { border-left: 2px solid var(--accent); padding: 4px 0 4px 10px }
+ul.log { list-style: none; padding: 0; margin: 0 }
+ul.log li { display: grid; grid-template-columns: 88px minmax(0, 1fr) auto; gap: 4px 10px; padding: 7px 0; border-bottom: 1px solid var(--rule); font-size: 15px }
+ul.log .d { font: 12px var(--mono); color: var(--soft); padding-top: 3px }
+ul.log .kind { font: 11px var(--mono); text-transform: uppercase; letter-spacing: .08em; color: var(--soft); margin-right: 6px }
+ul.log .kind.prova { color: var(--accent) }
+ul.log .ref { display: block; font: 12px var(--mono); color: var(--soft); overflow-wrap: anywhere }
+ul.log button { font-size: 11px; padding: 3px 6px; align-self: start }
+form { display: grid; gap: 8px }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px }
+label.f { display: grid; gap: 3px; font: 11px var(--mono); color: var(--soft); text-transform: uppercase; letter-spacing: .06em; min-width: 0 }
+input, select, textarea { font: 15px var(--serif); color: var(--ink); background: var(--paper); border: 1px solid var(--rule);
+  padding: 6px 8px; border-radius: 2px; width: 100%; min-width: 0 }
+textarea { resize: vertical; min-height: 54px }
+select[multiple] { font-size: 14px }
+.err { font: 12px var(--mono); color: var(--warn); min-height: 1em }
+.actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px }
+.rules { font-size: 14px; color: var(--soft); margin-top: 22px; border-top: 1px solid var(--rule); padding-top: 10px }
+.rules p { margin: 0 0 6px }
+
+.dlg { position: fixed; inset: 0; background: color-mix(in srgb, var(--paper) 70%, transparent); display: grid; place-items: center;
+  padding: 16px; z-index: 20 }
+.dlg > div { background: var(--paper); border: 1px solid var(--ink); width: min(720px, 100%); padding: 18px; display: grid; gap: 10px }
+.dlg textarea { font: 12px/1.4 var(--mono); min-height: 320px }
+
+.fund { max-width: 860px; margin: 18px auto 0 }
+.fund h2 { font-size: 30px }
+.lede { font-size: 19px; margin: 10px 0 14px; max-width: 66ch }
+.kinds { display: flex; flex-wrap: wrap; gap: 6px 22px; font-size: 14px; color: var(--soft) }
+.nat { font: normal 10.5px var(--mono); text-transform: uppercase; letter-spacing: .08em; padding: 2px 6px; border: 1px solid var(--rule); border-radius: 2px; margin-right: 4px; white-space: nowrap; color: var(--soft) }
+.nat.fundamentado { border-color: var(--ink); color: var(--ink) }
+.nat.adaptado { border-color: var(--accent); color: var(--accent) }
+.nat.convencao { border-style: dashed }
+.fund article { border-top: 1px solid var(--ink); margin-top: 30px; padding-top: 12px }
+.fund h3 { font-size: 22px; font-weight: normal; margin: 0 0 10px; text-wrap: balance }
+.fund h3 span { display: block; font-size: 15px; font-style: italic; color: var(--soft) }
+.fund dl { display: grid; grid-template-columns: 170px minmax(0, 1fr); gap: 8px 22px; margin: 0 }
+.fund dt { font: 11px var(--mono); text-transform: uppercase; letter-spacing: .08em; color: var(--soft); padding-top: 4px }
+.fund dt .nat { display: inline-block; margin-top: 6px }
+.fund dd { margin: 0; max-width: 66ch }
+@media (max-width: 640px) { .fund dl { grid-template-columns: minmax(0, 1fr) } .fund dd { margin-bottom: 8px } }
+.ptab { overflow-x: auto }
+.ptab table { min-width: 560px }
+.ptab td { vertical-align: middle; padding: 6px 8px 6px 0 }
+.ptab input[type=number] { width: 5.5em; font-family: var(--mono); font-size: 14px }
+.ptab .pair { display: flex; gap: 6px; align-items: center; font: 12px var(--mono); color: var(--soft) }
+.ptab a { color: var(--soft); font-size: 14px }
+ol.refs { padding-left: 1.2em; font-size: 15px; margin: 0 }
+ol.refs li { margin-bottom: 6px; overflow-wrap: anywhere }
+ol.refs a { color: var(--ink); text-decoration-color: var(--faint); text-underline-offset: 3px }
+.tag { font: 11px var(--mono); color: var(--warn) }
+code { font: 13px var(--mono) }
+#params-hist .label { margin-top: 22px }
+.hist { font: 12px var(--mono); color: var(--soft); list-style: none; padding: 0; margin: 8px 0 0 }
+.hist li { padding: 3px 0; border-bottom: 1px solid var(--rule) }
+svg text { font-family: var(--serif) }
+.star { cursor: pointer }
+.star text { fill: var(--ink); font-size: 12.5px }
+.star.cold text { fill: var(--soft) }
+.star.locked text { fill: var(--faint) }
+.star:hover text { text-decoration: underline }
+@media (prefers-reduced-motion: no-preference) { .star circle { transition: r .2s } }
+.kchip { cursor: pointer; text-align: left }
+.kchip span { font-size: 11px; color: var(--soft) }
+.chip.missing { color: var(--warn); border-color: var(--warn); cursor: default }
+.chip .x { border: 0; padding: 0 2px; font-size: 13px; color: var(--soft) }
+ul.look { list-style: none; padding: 0; margin: 0; max-height: 220px; overflow-y: auto }
+ul.look li { padding: 4px 0; border-bottom: 1px solid var(--rule); font-size: 15px }
+div.f { font: 11px var(--mono); color: var(--soft); text-transform: uppercase; letter-spacing: .06em }
+.link.mono { font: 12px var(--mono); color: var(--soft) }
+ul.log .ref span { color: var(--faint) }
+</style>
+
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>@@Peritia@@ <small>@@skills observatory · Kustos@@</small></h1>
+    <div class="tools">
+      <button id="b-new" class="primary live-only" data-act="new-skill">@@New skill@@</button>
+      <button id="b-reload" class="live-only" data-act="reload" title="F5">@@Reload@@</button>
+      <button id="b-md" class="live-only" data-act="mirror">@@Mirror and snapshot@@</button>
+      <button id="b-fund" data-act="fund">@@Foundations@@</button>
+      <input id="file-in" type="file" accept=".json,application/json" hidden>
+    </div>
+  </header>
+  <p class="status" id="status"></p>
+  <main>
+    <section class="chart" aria-label="@@Star chart of the skills@@">
+      <div class="scroll"><svg id="chart" viewBox="-90 0 980 800" role="img" aria-label="@@Skills by domain and depth@@"></svg></div>
+      <div class="legend">
+        <span><svg viewBox="0 0 14 14"><circle cx="7" cy="7" r="4" fill="none" stroke="currentColor" stroke-dasharray="2 2"/></svg>@@locked@@</span>
+        <span><svg viewBox="0 0 14 14"><circle cx="7" cy="7" r="4" fill="none" stroke="currentColor"/></svg>@@unexplored@@</span>
+        <span><svg viewBox="0 0 14 14"><circle cx="7" cy="7" r="3" fill="currentColor"/></svg>@@under way@@</span>
+        <span><svg viewBox="0 0 14 14"><circle cx="7" cy="7" r="3" fill="currentColor"/><path d="M7 0v3M7 11v3M0 7h3M11 7h3" stroke="currentColor"/></svg>@@with proof (III+)@@</span>
+        <span>@@size = level · brightness = freshness · rings = depth@@</span>
+      </div>
+    </section>
+    <aside id="panel" aria-live="polite"></aside>
+  </main>
+  <section id="fund" class="fund" hidden aria-labelledby="fund-h">
+    <h2 id="fund-h">@@Foundations@@</h2>
+    <p class="lede">@@These are the parameters of Peritia. Every rule of the instrument comes from an outside model, from an adaptation of that model, or from a number chosen here. The page keeps the three apart, so that a change of number is never taken for a change of grounds.@@</p>
+    <div class="kinds">
+      <span><i class="nat fundamentado">@@grounded@@</i> @@the direction of the rule comes from the model@@</span>
+      <span><i class="nat adaptado">@@adapted@@</i> @@the model was translated into another form@@</span>
+      <span><i class="nat convencao">@@convention@@</i> @@a number chosen, not derived; can be recalibrated@@</span>
+    </div>
+
+    <div class="label">@@Parameters in force@@</div>
+    <form id="params-form" novalidate></form>
+    <div id="params-hist"></div>
+
+    <article id="f-niveis">
+      <h3>@@Levels@@ <span>@@Dreyfus and Dreyfus, 1980; S. Dreyfus, 2004@@</span></h3>
+      <dl>
+        <dt>@@What it says@@</dt><dd>@@A 1980 report for the US Air Force describes directed skill acquisition in five stages: novice, competence, proficiency, expertise and mastery. The version that spread later uses novice, advanced beginner, competent, proficient and expert. What changes from one stage to the next is the way of deciding: from rules without context, to the conscious choice of a perspective, to the intuitive recognition of the situation and, finally, to intuitive action.@@</dd>
+        <dt>@@What Peritia takes@@</dt><dd>@@The five names of the 2004 version, and the idea that one climbs by stages, not by continuous accumulation.@@</dd>
+        <dt>@@Where it adapts@@ <i class="nat adaptado">@@adapted@@</i></dt><dd>@@The model is qualitative; its question is how the person decides. Peritia trades that question for a countable signal, XP and proofs. The signal errs both ways: one can pile up XP without changing the way of deciding, and one can decide like an expert without having logged anything. Read the level as a record of evidence, not as a diagnosis. When reviewing a skill, the test is: does the description of the stage match what I do in it?@@</dd>
+      </dl>
+    </article>
+
+    <article id="f-pratica">
+      <h3>@@Practice and proof@@ <span>@@Ericsson, Krampe and Tesch-Römer, 1993; Macnamara and Maitra, 2019@@</span></h3>
+      <dl>
+        <dt>@@What it says@@</dt><dd>@@Ericsson and colleagues called deliberate practice the activity designed to improve performance, and credited it with much of the difference between violinists of different levels. The 2019 replication found a much smaller effect: about 26% of the variance explained, against 48% in the original study.@@</dd>
+        <dt>@@What Peritia takes@@</dt><dd>@@The direction of the weights: practice counts for more than study, and a proof, a verifiable result, counts for more than both. From craft certifications, awarded on a practical bench exam, comes the idea that recognition depends on demonstrating, not on adding up hours. Hence the form of a proof: mark it only when the cited file exists and runs.@@</dd>
+        <dt>@@Where it adapts@@ <i class="nat adaptado">@@adapted@@</i> <i class="nat convencao">@@convention@@</i></dt><dd>@@The replication justifies the lock: accumulated practice is not enough, so levels III to V require proofs. The weights and the XP thresholds are convention.@@</dd>
+      </dl>
+    </article>
+
+    <article id="f-frescor">
+      <h3>@@Freshness@@ <span>@@Ebbinghaus, 1885@@</span></h3>
+      <dl>
+        <dt>@@What it says@@</dt><dd>@@Ebbinghaus measured on himself, with nonsense syllables, how much of what was memorised was lost over time. The loss is fast at first and then slows down. He also measured the saving in relearning: learning again what was forgotten costs less than the first time.@@</dd>
+        <dt>@@What Peritia takes@@</dt><dd>@@Knowledge left unused decays, and the decay should be visible. Hence the brightness of the stars and the entropy figure.@@</dd>
+        <dt>@@Where it adapts@@ <i class="nat convencao">@@convention@@</i></dt><dd>@@The curve is about memorised lists, over hours and days; a procedural skill is lost at another pace. The freshness windows are convention. The decision not to lower the level comes from the saving in relearning: the level keeps what was reached, the brightness shows the cost of going back.@@</dd>
+      </dl>
+    </article>
+
+    <article id="f-estrutura">
+      <h3>@@Structure@@ <span>@@technology trees; Sugiyama, Tagawa and Toda, 1981@@</span></h3>
+      <dl>
+        <dt>@@What it says@@</dt><dd>@@Strategy games organise progress as a technology tree: each advance asks for others first. Formally it is a directed acyclic graph. Sugiyama and colleagues proposed drawing this kind of graph in layers, placing the nodes by hierarchical level to make the structure readable.@@</dd>
+        <dt>@@What Peritia takes@@</dt><dd>@@Prerequisites as edges and depth as layer.@@</dd>
+        <dt>@@Where it adapts@@ <i class="nat adaptado">@@adapted@@</i> <i class="nat convencao">@@convention@@</i></dt><dd>@@The layers become concentric rings and the domains become sectors, as on a planisphere. The opening rule is convention. Unlike games, Peritia does not prevent logging in a locked skill: the lock is a signal, not a barrier.@@</dd>
+      </dl>
+    </article>
+
+    <article id="f-gamificacao">
+      <h3>@@Gamification@@ <span>@@Deterding, Dixon, Khaled and Nacke, 2011@@</span></h3>
+      <dl>
+        <dt>@@What it says@@</dt><dd>@@The authors define gamification as the use of game design elements in contexts that are not games, setting it apart from full games and from free play.@@</dd>
+        <dt>@@What Peritia takes@@</dt><dd>@@A few elements: points, levels, opening of paths, a progress bar and a next goal.@@</dd>
+        <dt>@@What it refuses@@ <i class="nat convencao">@@decision@@</i></dt><dd>@@Left out: rankings, badges, daily streaks with penalties and losing lives. The instrument compares a person with their own history; competition and punishment would move the attention from the craft to the scoreboard.@@</dd>
+      </dl>
+    </article>
+
+    <article id="f-cibernetica">
+      <h3>@@Cybernetic reading@@ <span>@@Ashby, 1956; Shannon, 1948; Beer, 1972@@</span></h3>
+      <dl>
+        <dt>@@What it says@@</dt><dd>@@Ashby: only the variety of the regulator can reduce the variety that disturbances produce (the law of requisite variety). Shannon: entropy measures the uncertainty of a source of information. Beer: the algedonic signal is an alert of pain or pleasure that goes up the structure without waiting for the normal filter.@@</dd>
+        <dt>@@What Peritia takes@@</dt><dd>@@Variety is the number of live domains, a rough indicator of how much variety of response you keep. Entropy is the share of started skills that went cold. Feedback is the recent XP, the signal that closes the loop.@@</dd>
+        <dt>@@Where it adapts@@ <i class="nat adaptado">@@adapted@@</i></dt><dd>@@The three are operational metaphors, not formal measures. Ashby counts variety in distinguishable states, not in domains; Shannon measures entropy in bits, and here it is a percentage of disuse. The algedonic signal does not exist in the instrument yet: it would be an alert when a skill marked as essential goes cold.@@</dd>
+      </dl>
+    </article>
+
+    <article id="f-arquitetura">
+      <h3>@@Architecture@@ <span>@@Kleppmann, Wiggins, van Hardenberg and McGranaghan, 2019@@</span></h3>
+      <dl>
+        <dt>@@What it says@@</dt><dd>@@The essay on local-first software argues that data should live first on the device of whoever uses it: the program works without a network, syncs between devices, keeps the data for the long term and leaves control with the user.@@</dd>
+        <dt>@@What Peritia takes@@</dt><dd>@@The source is <code>_kustos.json</code>, on disk, synced by Syncthing. The panel is served by <code>_kustos.py</code> itself on 127.0.0.1 only, with no outside network and no dependencies. The parameters on this page live in the same file, beside the data.@@</dd>
+        <dt>@@Where it adapts@@ <i class="nat adaptado">@@adapted@@</i></dt><dd>@@The essay bets on data structures that merge by themselves (CRDTs). Here the merge is Kustos's own: an append-only log per machine and, on opening, the merge of <code>sync-conflict</code> files record by record, the newest <code>updated_at</code> winning. The panel refuses to save over a version that changed on disk after it was read, and reloads the current one.@@</dd>
+      </dl>
+    </article>
+
+    <div class="label">@@References@@</div>
+    <ol class="refs">
+      <li>ASHBY, W. Ross. <i>An introduction to cybernetics</i>. London: Chapman &amp; Hall, 1956. @@Available at@@: <a href="https://ashby.info/Ashby-Introduction-to-Cybernetics.pdf" target="_blank" rel="noopener">ashby.info</a>.</li>
+      <li>BEER, Stafford. <i>Brain of the firm</i>. London: Allen Lane, 1972. <span class="tag">@@page to be found@@</span></li>
+      <li>DETERDING, Sebastian; DIXON, Dan; KHALED, Rilla; NACKE, Lennart. From game design elements to gamefulness: defining "gamification". In: MINDTREK 2011. <i>Proceedings</i>. New York: ACM, 2011. DOI: <a href="https://doi.org/10.1145/2181037.2181040" target="_blank" rel="noopener">10.1145/2181037.2181040</a>.</li>
+      <li>DREYFUS, Stuart E.; DREYFUS, Hubert L. <i>A five-stage model of the mental activities involved in directed skill acquisition</i>. Berkeley: Operations Research Center, University of California, 1980. (ORC 80-2). @@Available at@@: <a href="https://apps.dtic.mil/sti/pdfs/ADA084551.pdf" target="_blank" rel="noopener">DTIC</a>.</li>
+      <li>DREYFUS, Stuart E. The five-stage model of adult skill acquisition. <i>Bulletin of Science, Technology &amp; Society</i>, v. 24, n. 3, p. 177-181, 2004. DOI: <a href="https://doi.org/10.1177/0270467604264992" target="_blank" rel="noopener">10.1177/0270467604264992</a>.</li>
+      <li>EBBINGHAUS, Hermann. <i>Memory: a contribution to experimental psychology</i>. @@Transl.@@ H. A. Ruger @@and@@ C. E. Bussenius. New York: Teachers College, Columbia University, 1913 [1885]. @@Available at@@: <a href="https://psychclassics.yorku.ca/Ebbinghaus/memorypref.htm" target="_blank" rel="noopener">Classics in the History of Psychology</a>.</li>
+      <li>ERICSSON, K. Anders; KRAMPE, Ralf T.; TESCH-RÖMER, Clemens. The role of deliberate practice in the acquisition of expert performance. <i>Psychological Review</i>, v. 100, n. 3, p. 363-406, 1993. DOI: <a href="https://doi.org/10.1037/0033-295X.100.3.363" target="_blank" rel="noopener">10.1037/0033-295X.100.3.363</a>.</li>
+      <li>KLEPPMANN, Martin; WIGGINS, Adam; VAN HARDENBERG, Peter; McGRANAGHAN, Mark. Local-first software: you own your data, in spite of the cloud. In: ONWARD! '19. <i>Proceedings</i>. New York: ACM, 2019. DOI: <a href="https://doi.org/10.1145/3359591.3359737" target="_blank" rel="noopener">10.1145/3359591.3359737</a>. @@Essay@@: <a href="https://inkandswitch.com/local-first/" target="_blank" rel="noopener">inkandswitch.com/local-first</a>.</li>
+      <li>MACNAMARA, Brooke N.; MAITRA, Megha. The role of deliberate practice in expert performance: revisiting Ericsson, Krampe &amp; Tesch-Römer (1993). <i>Royal Society Open Science</i>, v. 6, n. 8, 190327, 2019. DOI: <a href="https://doi.org/10.1098/rsos.190327" target="_blank" rel="noopener">10.1098/rsos.190327</a>.</li>
+      <li>SHANNON, Claude E. A mathematical theory of communication. <i>Bell System Technical Journal</i>, v. 27, n. 3, p. 379-423, 1948. <span class="tag">@@page to be found@@</span></li>
+      <li>SUGIYAMA, Kozo; TAGAWA, Shojiro; TODA, Mitsuhiko. Methods for visual understanding of hierarchical system structures. <i>IEEE Transactions on Systems, Man, and Cybernetics</i>, v. SMC-11, n. 2, p. 109-125, 1981. DOI: <a href="https://doi.org/10.1109/TSMC.1981.4308636" target="_blank" rel="noopener">10.1109/TSMC.1981.4308636</a>.</li>
+    </ol>
+  </section>
+</div>
+<script>
+const BOOT = /*__BOOT__*/null;
+const LIVE = BOOT.mode === 'live';
+const LANG = '@@LANG@@';
+const fmt = (s, o) => s.replace(/\{(\w+)\}/g, (m, k) => (k in o ? o[k] : m));
+const KINDS = { estudo: { xp: 1, label: `@@study@@` }, pratica: { xp: 3, label: `@@practice@@` }, prova: { xp: 8, label: `@@proof@@` } };
+const FRESH = { viva: `@@live@@`, morna: `@@warm@@`, fria: `@@cold@@` };
+const LEVELS = [
+  { n: 0, r: '0',   name: `@@unexplored@@`,       xp: 0,  p: 0 },
+  { n: 1, r: 'I',   name: `@@Novice@@`,           xp: 0,  p: 0 },
+  { n: 2, r: 'II',  name: `@@Advanced beginner@@`, xp: 4,  p: 0 },
+  { n: 3, r: 'III', name: `@@Competent@@`,        xp: 10, p: 1 },
+  { n: 4, r: 'IV',  name: `@@Proficient@@`,       xp: 30, p: 3 },
+  { n: 5, r: 'V',   name: `@@Expert@@`,           xp: 70, p: 6 }
+];
+let OPEN_AT = 2;
+const DEFAULT_PARAMS = { xp: { estudo: 1, pratica: 3, prova: 8 },
+  levels: [{ xp: 4, p: 0 }, { xp: 10, p: 1 }, { xp: 30, p: 3 }, { xp: 70, p: 6 }],
+  open_at: 2, fresh: { viva: 30, morna: 90 } };
+const KIND_LABEL = { person: `@@person@@`, concept: `@@concept@@`, form: `@@form@@`, source: `@@source@@`, metric: 'corpus', note: `@@draft@@`, skill: `@@skill@@` };
+const NAT = { fundamentado: `@@grounded@@`, adaptado: `@@adapted@@`, convencao: `@@convention@@` };
+
+let state = { skills: [], params: DEFAULT_PARAMS, domains: [], labels: {}, today: '' };
+let selected = null, mode = 'view', offline = false, busy = false, pendingLinks = null;
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const today = () => { const d = new Date(); return new Date(d.getTime() - d.getTimezoneOffset() * 6e4).toISOString().slice(0, 10) };
+const dayNum = s => Math.floor(Date.parse(s + 'T00:00:00Z') / 864e5);
+const rid = () => Math.random().toString(36).slice(2, 9);
+const clone = o => JSON.parse(JSON.stringify(o));
+const showDate = s => LANG === 'en' ? s : s.split('-').reverse().join('/');
+const proofs = n => fmt(n === 1 ? `@@{n} proof@@` : `@@{n} proofs@@`, { n });
+
+function applyParams() {
+  const P = state.params;
+  for (const k in KINDS) KINDS[k].xp = P.xp[k];
+  P.levels.forEach((L, i) => { LEVELS[i + 2].xp = L.xp; LEVELS[i + 2].p = L.p });
+  OPEN_AT = P.open_at;
+}
+function adopt(payload) {
+  const pe = payload.peritia || {};
+  state = { skills: payload.skills || [], params: pe.params || clone(DEFAULT_PARAMS), labels: payload.labels || {},
+    domains: [...(pe.domains || [])], host: payload.host, built: payload.built, locks: payload.locks || [], file: payload.file };
+  state.params.history = state.params.history || [];
+  for (const s of state.skills) {
+    s.requires = s.requires || []; s.links = s.links || []; s.log = s.log || [];
+    if (!state.domains.includes(s.domain)) state.domains.push(s.domain);
+  }
+  if (selected && !byId(selected)) { selected = null; mode = 'view' }
+}
+function setStatus(msg) {
+  let src;
+  if (!LIVE) src = esc(fmt(`@@snapshot of {built} · read-only · to edit, open _kustos_peritia.cmd@@`, { built: (state.built || '').replace('T', ' ') }));
+  else if (offline) src = `<b>@@Kustos is not answering: nothing will be saved. Open the panel again from Kustos.@@</b>`;
+  else src = `Kustos · ${esc(state.file || '_kustos.json')} · ${esc(state.host || '')}` +
+    (state.locks.length ? ` · <b>${esc(fmt(`@@also open on {hosts}: avoid editing on both machines@@`, { hosts: state.locks.join(', ') }))}</b>` : '');
+  $('#status').innerHTML = (msg ? esc(msg) + ' · ' : '') + src;
+}
+
+/* ---------- talking to _kustos.py ---------- */
+async function api(path, body) {
+  if (!LIVE) throw new Error(`@@read-only@@`);
+  const opt = { headers: { 'X-Kustos-Token': BOOT.token } };
+  if (body !== undefined) { opt.method = 'POST'; opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body) }
+  let res;
+  try { res = await fetch(path, opt) } catch { offline = true; setStatus(); throw new Error(`@@Kustos is not answering@@`) }
+  offline = false;
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 409) { adopt(data.state); render(); throw new Error(data.error || `@@The record changed on disk; the current version is loaded.@@`) }
+  if (!res.ok) throw new Error(data.error || fmt(`@@error {n}@@`, { n: res.status }));
+  return data;
+}
+async function load(msg) {
+  if (!LIVE) return;
+  try { adopt(await api('/api/state')); render(); setStatus(msg) } catch (e) { setStatus(e.message) }
+}
+async function putSkill(rec, base, msg) {
+  if (busy) return; busy = true;
+  try {
+    const out = await api('/api/skill', { rec, base });
+    adopt(out.state); selected = out.id; mode = 'view'; render(); setStatus(msg);
+  } catch (e) { setStatus(e.message) } finally { busy = false }
+}
+
+/* ---------- derived figures ---------- */
+const byId = id => state.skills.find(s => s.id === id);
+function stats(s) {
+  let xp = 0, p = 0, last = null;
+  for (const e of s.log) { xp += (KINDS[e.kind] || KINDS.estudo).xp; if (e.kind === 'prova') p++; if (!last || e.date > last) last = e.date }
+  let lvl = 0;
+  if (s.log.length) { lvl = 1; for (const L of LEVELS.slice(2)) if (xp >= L.xp && p >= L.p) lvl = L.n }
+  const age = last ? dayNum(today()) - dayNum(last) : null;
+  const fresh = age === null ? null : age <= state.params.fresh.viva ? 'viva' : age <= state.params.fresh.morna ? 'morna' : 'fria';
+  return { xp, p, last, lvl, age, fresh };
+}
+const isOpen = s => s.requires.every(r => { const q = byId(r); return !q || stats(q).lvl >= OPEN_AT });
+function depthMap() {
+  const memo = {}, seen = new Set();
+  const dep = id => {
+    if (id in memo) return memo[id];
+    if (seen.has(id)) return 0; seen.add(id);
+    const s = byId(id); const v = !s || !s.requires.length ? 0 : 1 + Math.max(...s.requires.map(r => byId(r) ? dep(r) : -1));
+    return memo[id] = v;
+  };
+  state.skills.forEach(s => dep(s.id)); return memo;
+}
+function nextGate(st) {
+  if (st.lvl === 0) return `@@Log a study, practice or proof to light this skill.@@`;
+  if (st.lvl === 5) return `@@Top level. Keep it fresh.@@`;
+  const L = LEVELS[st.lvl + 1], miss = [];
+  if (st.xp < L.xp) miss.push(`${L.xp - st.xp} XP`);
+  if (st.p < L.p) miss.push(proofs(L.p - st.p));
+  return fmt(`@@For {r} ({name}): {missing} to go.@@`, { r: L.r, name: L.name, missing: miss.join(` @@and@@ `) });
+}
+const usedDomains = () => state.domains.filter(d => state.skills.some(s => s.domain === d));
+function kref(id) {
+  const L = state.labels[id];
+  return L ? `<button class="chip kchip" data-act="copy-id" data-id="${esc(id)}" title="@@copy the id to paste into Kustos@@">${esc(L.label)} <span>${esc(KIND_LABEL[L.kind] || L.kind)} · ${esc(id)}</span></button>`
+           : `<span class="chip missing">${esc(id)} · @@not in Kustos@@</span>`;
+}
+
+/* ---------- star chart ---------- */
+function drawChart() {
+  const C = 400, RIN = 112, ROUT = 318, svg = $('#chart');
+  if (!state.skills.length) { svg.innerHTML = `<circle cx="${C}" cy="${C}" r="${ROUT + 22}" fill="none" stroke="var(--rule)"/><text x="${C}" y="${C}" text-anchor="middle" fill="var(--soft)" font-size="16">@@No skills in Kustos yet@@</text>`; return }
+  const dm = depthMap(), maxD = Math.max(1, ...Object.values(dm));
+  const rad = d => RIN + d * (ROUT - RIN) / maxD;
+  const doms = usedDomains();
+  const weight = d => state.skills.filter(s => s.domain === d).length + 1.5;
+  const total = doms.reduce((a, d) => a + weight(d), 0);
+  let a = -Math.PI / 2; const sect = {};
+  for (const d of doms) { const w = weight(d) / total * Math.PI * 2; sect[d] = [a, a + w]; a += w }
+  const pos = {};
+  for (const d of doms) {
+    const [a0, a1] = sect[d], groups = {};
+    state.skills.filter(s => s.domain === d).forEach(s => (groups[dm[s.id]] ||= []).push(s));
+    for (const [dep, list] of Object.entries(groups)) {
+      list.forEach((s, i) => {
+        const t = a0 + (i + 1) * (a1 - a0) / (list.length + 1);
+        const r = rad(+dep) + (list.length > 2 && i % 2 ? 16 : 0);
+        pos[s.id] = { x: C + r * Math.cos(t), y: C + r * Math.sin(t), t };
+      });
+    }
+  }
+  let g = '';
+  for (let d = 0; d <= maxD; d++) {
+    g += `<circle cx="${C}" cy="${C}" r="${rad(d)}" fill="none" stroke="var(--rule)" stroke-width="1"/>`;
+    g += `<text x="${C + 4}" y="${C - rad(d) - 4}" font-size="10" fill="var(--faint)" style="font-family:var(--mono)">${d}</text>`;
+  }
+  g += `<circle cx="${C}" cy="${C}" r="${ROUT + 22}" fill="none" stroke="var(--ink)" stroke-width="1"/>`;
+  g += `<circle cx="${C}" cy="${C}" r="3" fill="var(--faint)"/>`;
+  for (const d of doms) {
+    const [a0, a1] = sect[d], m = (a0 + a1) / 2;
+    g += `<line x1="${C + 40 * Math.cos(a0)}" y1="${C + 40 * Math.sin(a0)}" x2="${C + (ROUT + 22) * Math.cos(a0)}" y2="${C + (ROUT + 22) * Math.sin(a0)}" stroke="var(--rule)"/>`;
+    const lx = C + (ROUT + 40) * Math.cos(m), ly = C + (ROUT + 40) * Math.sin(m), c = Math.cos(m);
+    const anchor = Math.abs(c) < .25 ? 'middle' : c > 0 ? 'start' : 'end';
+    g += `<text x="${lx}" y="${ly + 4}" text-anchor="${anchor}" font-size="11" letter-spacing="1.6" fill="var(--soft)" style="font-family:var(--mono)">${esc(d.toUpperCase())}</text>`;
+  }
+  for (const s of state.skills) for (const r of s.requires) {
+    const p = pos[s.id], q = pos[r]; if (!p || !q) continue;
+    const on = selected && (selected === s.id || selected === r);
+    const mx = C + ((p.x + q.x) / 2 - C) * .82, my = C + ((p.y + q.y) / 2 - C) * .82;
+    g += `<path d="M${q.x},${q.y} Q${mx},${my} ${p.x},${p.y}" fill="none" stroke="${on ? 'var(--accent)' : 'var(--faint)'}" stroke-width="${on ? 1.6 : .8}" ${stats(byId(r)).lvl < OPEN_AT ? 'stroke-dasharray="3 3"' : ''}/>`;
+  }
+  const ctx = document.createElement('canvas').getContext('2d');
+  ctx.font = '12.5px ' + getComputedStyle(document.body).getPropertyValue('--serif');
+  const starBox = {}, boxes = [], lab = {};
+  for (const s of state.skills) { const p = pos[s.id]; if (!p) continue; const lv = stats(s).lvl, k = 3 + lv * 1.7 + (lv >= 3 ? 6 : 1);
+    starBox[s.id] = { x0: p.x - k, x1: p.x + k, y0: p.y - k, y1: p.y + k }; boxes.push(starBox[s.id]) }
+  const hit = (b, own) => boxes.some(o => o !== own && b.x0 < o.x1 && b.x1 > o.x0 && b.y0 < o.y1 && b.y1 > o.y0);
+  const order = state.skills.filter(s => pos[s.id]).sort((a, b) => dm[a.id] - dm[b.id] || pos[a.id].y - pos[b.id].y);
+  for (const s of order) {
+    const p = pos[s.id], own = starBox[s.id], gap = (own.x1 - p.x) + 3, w = ctx.measureText(s.name).width;
+    const pref = Math.cos(p.t) >= -0.05 ? 1 : -1, tries = [];
+    for (const dy of [0, -13, 13, -26, 26, -39, 39]) for (const side of [pref, -pref]) tries.push([side, dy]);
+    let pick = tries[0];
+    for (const [side, dy] of tries) {
+      const x0 = side > 0 ? p.x + gap : p.x - gap - w, b = { x0, x1: x0 + w, y0: p.y + dy - 9, y1: p.y + dy + 4 };
+      if (!hit(b, own)) { pick = [side, dy]; boxes.push(b); break }
+    }
+    lab[s.id] = { x: p.x + pick[0] * gap, y: p.y + pick[1] + 4, anchor: pick[0] > 0 ? 'start' : 'end' };
+  }
+  for (const s of state.skills) {
+    const p = pos[s.id]; if (!p) continue;
+    const st = stats(s), open = isOpen(s), r = 3 + st.lvl * 1.7;
+    const op = st.fresh === 'viva' ? 1 : st.fresh === 'morna' ? .62 : .32;
+    const cls = ['star', !st.lvl && !open ? 'locked' : '', st.fresh === 'fria' ? 'cold' : ''].join(' ');
+    let mark;
+    if (!st.lvl) mark = `<circle cx="${p.x}" cy="${p.y}" r="4" fill="var(--paper)" stroke="${open ? 'var(--ink)' : 'var(--faint)'}" ${open ? '' : 'stroke-dasharray="2 2"'}/>`;
+    else {
+      mark = `<circle cx="${p.x}" cy="${p.y}" r="${r}" fill="var(--ink)" fill-opacity="${op}"/>`;
+      if (st.lvl >= 3) { const k = r + 5; mark += `<path d="M${p.x},${p.y - k}v${k - r - 1}M${p.x},${p.y + r + 1}v${k - r - 1}M${p.x - k},${p.y}h${k - r - 1}M${p.x + r + 1},${p.y}h${k - r - 1}" stroke="var(--ink)" stroke-opacity="${op}" stroke-width="1"/>` }
+    }
+    const sel = selected === s.id ? `<circle cx="${p.x}" cy="${p.y}" r="${r + 7}" fill="none" stroke="var(--accent)" stroke-width="1.4"/>` : '';
+    const lb = lab[s.id];
+    g += `<g class="${cls}" tabindex="0" role="button" data-act="pick" data-id="${esc(s.id)}" aria-label="${esc(s.name)}, @@level@@ ${LEVELS[st.lvl].r}">${sel}<circle cx="${p.x}" cy="${p.y}" r="12" fill="transparent"/>${mark}<text x="${lb.x}" y="${lb.y}" text-anchor="${lb.anchor}">${esc(s.name)}</text></g>`;
+  }
+  svg.innerHTML = g;
+}
+
+/* ---------- panel: overview ---------- */
+function weekLedger() {
+  const t = dayNum(today()), dow = (new Date().getDay() + 6) % 7, start = t - dow - 7 * 11, bins = Array(12).fill(0);
+  for (const s of state.skills) for (const e of s.log) { const i = Math.floor((dayNum(e.date) - start) / 7); if (i >= 0 && i < 12) bins[i] += (KINDS[e.kind] || KINDS.estudo).xp }
+  const max = Math.max(4, ...bins), W = 300, H = 76, bw = W / 12;
+  let g = `<line x1="0" y1="${H - 14}" x2="${W}" y2="${H - 14}" stroke="var(--rule)"/>`;
+  bins.forEach((v, i) => {
+    const h = (H - 30) * v / max;
+    if (v) g += `<rect x="${i * bw + 3}" y="${H - 14 - h}" width="${bw - 6}" height="${h}" fill="${i === 11 ? 'var(--accent)' : 'var(--ink)'}"/><text x="${i * bw + bw / 2}" y="${H - 16 - h - 2}" text-anchor="middle" font-size="9" fill="var(--soft)" style="font-family:var(--mono)">${v}</text>`;
+  });
+  const lab = n => { const md = new Date((start + n * 7) * 864e5).toISOString().slice(5, 10); return LANG === 'en' ? md : md.split('-').reverse().join('/') };
+  g += `<text x="0" y="${H - 2}" font-size="9" fill="var(--soft)" style="font-family:var(--mono)">${lab(0)}</text><text x="${W}" y="${H - 2}" text-anchor="end" font-size="9" fill="var(--soft)" style="font-family:var(--mono)">@@this week@@</text>`;
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="@@XP per week, last twelve weeks@@">${g}</svg>`;
+}
+function emptyPanel() {
+  return `<div class="label">@@Peritia in Kustos@@</div>
+    <p>@@Skills live in <code>_kustos.json</code>, beside people, verba, sources and corpus, and go through the same log and the same conflict merge.@@</p>
+    ${LIVE ? `<p>@@To bring in what is already in a <code>_peritia.json</code>, import the file once. A skill with the same id is replaced only if the file has a newer version of it.@@</p>
+    <div class="actions"><button class="primary" data-act="import">@@Import _peritia.json…@@</button><button data-act="new-skill">@@New skill@@</button></div>` : ''}`;
+}
+function overview() {
+  if (!state.skills.length) return emptyPanel();
+  const all = state.skills.map(s => ({ s, st: stats(s) }));
+  const started = all.filter(x => x.st.lvl > 0);
+  const live = new Set(started.filter(x => x.st.age <= state.params.fresh.morna).map(x => x.s.domain));
+  const doms = usedDomains();
+  const cold = started.filter(x => x.st.fresh === 'fria').length;
+  const t = dayNum(today());
+  const xp30 = state.skills.reduce((a, s) => a + s.log.filter(e => t - dayNum(e.date) <= 30).reduce((b, e) => b + (KINDS[e.kind] || KINDS.estudo).xp, 0), 0);
+  const quests = all.filter(x => x.s.next && isOpen(x.s)).sort((a, b) => a.st.lvl - b.st.lvl || (b.st.last || '').localeCompare(a.st.last || '')).slice(0, 8);
+  const rows = doms.map(d => {
+    const xs = all.filter(x => x.s.domain === d);
+    return `<tr><td>${esc(d)}</td><td class="n">${xs.filter(x => x.st.lvl).length}/${xs.length}</td><td class="n">${xs.filter(x => x.st.lvl >= 3).length}</td><td class="n">${xs.reduce((a, x) => a + x.st.xp, 0)}</td></tr>`;
+  }).join('');
+  const linked = state.skills.reduce((a, s) => a + s.links.length, 0);
+  const P = state.params;
+  return `
+    <div class="label">@@Cybernetic reading@@</div>
+    <div class="figs">
+      <div class="fig"><div class="v">${live.size}/${doms.length}</div><div class="k">@@VARIETY@@</div><div class="h">${fmt(`@@live domains in {n} days@@`, { n: P.fresh.morna })}</div></div>
+      <div class="fig"><div class="v">${started.length ? Math.round(cold / started.length * 100) : 0}%</div><div class="k">@@ENTROPY@@</div><div class="h">${fmt(`@@started and cold (&gt;{n} d)@@`, { n: P.fresh.morna })}</div></div>
+      <div class="fig"><div class="v">${xp30}</div><div class="k">@@FEEDBACK@@</div><div class="h">@@XP in the last 30 days@@</div></div>
+    </div>
+    <div class="label">@@XP per week@@</div>${weekLedger()}
+    <div class="label">@@Domains@@</div>
+    <table><thead><tr><th>@@domain@@</th><th class="n">@@lit@@</th><th class="n">III+</th><th class="n">XP</th></tr></thead><tbody>${rows}</tbody></table>
+    <div class="label">@@Next proofs@@</div>
+    <ol class="quests">${quests.map(x => `<li><button class="link" data-act="pick" data-id="${esc(x.s.id)}">${esc(x.s.name)}</button> <span class="meta">${LEVELS[x.st.lvl].r}</span><span class="q-next">${esc(x.s.next)}</span></li>`).join('') || `<li class="meta">@@No open skill with a next proof set.@@</li>`}</ol>
+    <div class="rules">
+      <p>${fmt(`@@<b>Rule:</b> a study is worth {study} XP, a practice {practice}, a proof {proof}. A proof is a file that exists and runs, or a verifiable result; that is why it asks for a reference. The reference can be a Kustos id (a source <code>s_</code>, for example).@@`, { study: KINDS.estudo.xp, practice: KINDS.pratica.xp, proof: KINDS.prova.xp })}</p>
+      <p>${fmt(`@@XP alone does not buy a level: III asks for {p3} proof(s), IV for {p4}, V for {p5}. A skill opens when all its prerequisites reach {r}.@@`, { p3: LEVELS[3].p, p4: LEVELS[4].p, p5: LEVELS[5].p, r: LEVELS[OPEN_AT].r })}</p>
+      <p>${fmt(`@@Freshness: live up to {live} days since the last entry, warm up to {warm}, then cold. The level does not fall; the brightness does.@@`, { live: P.fresh.viva, warm: P.fresh.morna })}</p>
+      <p>${fmt(`@@{n} link(s) from skills to Kustos records.@@`, { n: linked })} <button class="link" data-act="fund">@@Foundations and parameters →@@</button></p>
+    </div>`;
+}
+
+/* ---------- panel: one skill ---------- */
+function skillView(s) {
+  const st = stats(s), L = LEVELS[st.lvl], N = LEVELS[Math.min(5, st.lvl + 1)];
+  const pct = st.lvl === 5 ? 100 : Math.min(100, Math.round(Math.min(st.xp / Math.max(1, N.xp), N.p ? st.p / N.p : 1) * 100));
+  const reqs = s.requires.map(r => byId(r)).filter(Boolean), dependents = state.skills.filter(x => x.requires.includes(s.id));
+  const chip = q => `<button class="chip ${stats(q).lvl < OPEN_AT ? 'low' : ''}" data-act="pick" data-id="${esc(q.id)}">${esc(q.name)} · ${LEVELS[stats(q).lvl].r}</button>`;
+  const refHtml = r => state.labels[r] ? `<span class="ref">→ ${esc(state.labels[r].label)} <span>(${esc(r)})</span></span>` : `<span class="ref">${esc(r)}</span>`;
+  const log = [...s.log].sort((a, b) => b.date.localeCompare(a.date)).map(e => `<li><span class="d">${esc(showDate(e.date))}</span>
+      <span><span class="kind ${esc(e.kind)}">${(KINDS[e.kind] || KINDS.estudo).label}</span>${esc(e.note)}${e.ref ? refHtml(e.ref) : ''}</span>
+      ${LIVE ? `<button data-act="del-log" data-id="${esc(e.id)}" aria-label="@@Delete entry@@">×</button>` : '<span></span>'}</li>`).join('');
+  return `
+    <div class="actions" style="margin-bottom:14px"><button data-act="back">← @@Overview@@</button>${LIVE ? `<button data-act="edit">@@Edit@@</button>` : ''}</div>
+    <h2>${esc(s.name)}</h2>
+    <div class="meta">${esc(s.domain)} · <button class="link mono" data-act="copy-id" data-id="${esc(s.id)}" title="@@copy the id@@">${esc(s.id)}</button>${isOpen(s) ? '' : ' · ' + esc(fmt(`@@locked: prerequisites below {r}@@`, { r: LEVELS[OPEN_AT].r }))}</div>
+    ${s.desc ? `<p class="desc">${esc(s.desc)}</p>` : ''}
+    <div class="lvl"><span class="r">${L.r}</span><span class="t">${L.name}</span><span class="meta">${st.xp} XP · ${proofs(st.p)}${st.last ? ` · ${FRESH[st.fresh]}, ${st.age} d` : ''}</span></div>
+    <div class="bar"><i style="width:${pct}%"></i></div>
+    <div class="gate">${esc(nextGate(st))}</div>
+    ${s.next ? `<div class="label">@@Next proof@@</div><div class="next-box">${esc(s.next)}</div>` : ''}
+    ${reqs.length ? `<div class="label">@@Requires@@</div><div class="chips">${reqs.map(chip).join('')}</div>` : ''}
+    ${dependents.length ? `<div class="label">@@Opens the way to@@</div><div class="chips">${dependents.map(chip).join('')}</div>` : ''}
+    ${s.links.length ? `<div class="label">@@In Kustos@@</div><div class="chips">${s.links.map(kref).join('')}</div>` : ''}
+    ${LIVE ? `<div class="label">@@Record it@@</div>
+    <form id="log-form" novalidate>
+      <div class="row">
+        <label class="f">@@Date@@<input id="lg-date" type="date" value="${today()}" required></label>
+        <label class="f">@@Kind@@<select id="lg-kind">${['pratica', 'estudo', 'prova'].map(k => `<option value="${k}">${KINDS[k].label} · ${KINDS[k].xp} XP</option>`).join('')}</select></label>
+      </div>
+      <label class="f">@@What was done@@<input id="lg-note" type="text" placeholder="@@e.g. ran the whole demo and read the query plan line by line@@"></label>
+      <label class="f">@@Reference (file, link or Kustos id)@@<input id="lg-ref" type="text" placeholder="@@e.g. tests/test_dates.py or s_dreyfus2004@@"></label>
+      <div class="err" id="lg-err"></div>
+      <div class="actions"><button class="primary" type="submit">@@Record it@@</button></div>
+    </form>` : ''}
+    <div class="label">${fmt(`@@Journal ({n})@@`, { n: s.log.length })}</div>
+    <ul class="log">${log || `<li><span></span><span class="meta">@@No entries yet.@@</span></li>`}</ul>`;
+}
+function skillForm(s) {
+  const doms = state.domains.map(d => `<option value="${esc(d)}">`).join('');
+  const others = state.skills.filter(x => !s || x.id !== s.id).sort((a, b) => a.domain.localeCompare(b.domain) || a.name.localeCompare(b.name));
+  const opts = others.map(x => `<option value="${esc(x.id)}" ${s && s.requires.includes(x.id) ? 'selected' : ''}>${esc(x.name)}</option>`).join('');
+  pendingLinks = s ? [...s.links] : [];
+  return `
+    <div class="actions" style="margin-bottom:14px"><button data-act="${s ? 'cancel' : 'back'}">← ${s ? `@@Back@@` : `@@Overview@@`}</button></div>
+    <h2>${s ? `@@Edit skill@@` : `@@New skill@@`}</h2>
+    <form id="skill-form" novalidate style="margin-top:14px">
+      <label class="f">@@Name@@<input id="sk-name" type="text" value="${esc(s?.name)}" required></label>
+      <label class="f">@@Domain (pick one or type a new one)@@<input id="sk-domain" type="text" list="dom-list" value="${esc(s?.domain)}"><datalist id="dom-list">${doms}</datalist></label>
+      <label class="f">@@Requires (Ctrl/⌘ for several)@@<select id="sk-req" multiple size="7">${opts}</select></label>
+      <label class="f">@@Description@@<textarea id="sk-desc">${esc(s?.desc)}</textarea></label>
+      <label class="f">@@Next proof@@<textarea id="sk-next" placeholder="@@the next verifiable result@@">${esc(s?.next)}</textarea></label>
+      <div class="f">@@Links in Kustos (sources, concepts, people)@@</div>
+      <div class="chips" id="sk-links"></div>
+      <label class="f">@@Search Kustos@@<input id="sk-look" type="search" autocomplete="off" placeholder="@@name, title or id; e.g. Dreyfus, s_@@"></label>
+      <ul class="look" id="sk-look-out"></ul>
+      <div class="err" id="sk-err"></div>
+      <div class="actions"><button class="primary" type="submit">${s ? `@@Save@@` : `@@Create@@`}</button>
+      ${s ? `<button type="button" data-act="del-skill" id="b-del-skill">@@Delete skill@@</button>` : ''}</div>
+    </form>`;
+}
+function drawLinks() {
+  const box = $('#sk-links'); if (!box) return;
+  box.innerHTML = pendingLinks.map(id => `<span class="chip kchip">${esc(state.labels[id]?.label || id)} <span>${esc(id)}</span> <button type="button" class="x" data-act="unlink" data-id="${esc(id)}" aria-label="@@Remove link@@">×</button></span>`).join('')
+    || `<span class="meta">@@No links.@@</span>`;
+}
+let lookTimer = null;
+document.addEventListener('input', ev => {
+  if (ev.target.id !== 'sk-look') return;
+  clearTimeout(lookTimer);
+  const q = ev.target.value.trim();
+  lookTimer = setTimeout(async () => {
+    const out = $('#sk-look-out'); if (!out) return;
+    if (q.length < 2) { out.innerHTML = ''; return }
+    try {
+      const r = await api('/api/lookup?q=' + encodeURIComponent(q));
+      out.innerHTML = r.hits.map(h => `<li><button type="button" class="link" data-act="link" data-id="${esc(h.id)}" data-label="${esc(h.label)}" data-kind="${esc(h.kind)}">${esc(h.label)}</button> <span class="meta">${esc(KIND_LABEL[h.kind] || h.kind)} · ${esc(h.id)}</span></li>`).join('') || `<li class="meta">@@Nothing found.@@</li>`;
+    } catch (e) { out.innerHTML = `<li class="meta">${esc(e.message)}</li>` }
+  }, 180);
+});
+function render() {
+  applyParams(); drawChart(); if (!$('#fund').hidden) renderFund();
+  const s = selected && byId(selected);
+  $('#panel').innerHTML = mode === 'new' ? skillForm(null) : !s ? overview() : mode === 'edit' ? skillForm(s) : skillView(s);
+  if (mode === 'new' || mode === 'edit') drawLinks();
+  document.querySelectorAll('.live-only').forEach(el => el.hidden = !LIVE);
+}
+
+/* ---------- foundations: the parameter page ---------- */
+function showView(v) {
+  const f = v === 'fund';
+  $('main').hidden = f; $('#fund').hidden = !f; $('#b-fund').textContent = f ? `@@Map@@` : `@@Foundations@@`;
+  try { history.replaceState(null, '', f ? '#fundamentos' : location.pathname + location.search) } catch {}
+  if (f) { renderFund(); window.scrollTo(0, 0) }
+}
+function renderFund() {
+  const P = state.params, dis = LIVE ? '' : ' disabled';
+  const n = (id, v) => `<input id="${id}" type="number" min="0" step="1" value="${v}"${dis}>`;
+  const nat = (k, l) => `<i class="nat ${k}">${l || NAT[k]}</i>`;
+  const lv = P.levels.map((L, i) => `<tr><td>@@Level@@ ${LEVELS[i + 2].r} · ${LEVELS[i + 2].name}</td>
+      <td><span class="pair">${n('pv-xp-' + i, L.xp)} XP ${n('pv-p-' + i, L.p)} @@proofs@@</span></td>
+      <td>${i ? nat('adaptado') : nat('convencao')}</td><td><a href="#f-pratica" data-act="jump">@@practice and proof@@</a></td></tr>`).join('');
+  $('#params-form').innerHTML = `<div class="ptab"><table>
+    <thead><tr><th>@@parameter@@</th><th>@@value@@</th><th>@@nature@@</th><th>@@grounds@@</th></tr></thead><tbody>
+    <tr><td>@@Weight of study · practice · proof@@</td><td><span class="pair">${n('pv-estudo', P.xp.estudo)} ${n('pv-pratica', P.xp.pratica)} ${n('pv-prova', P.xp.prova)}</span></td>
+      <td>${nat('fundamentado', `@@order@@`)} ${nat('convencao', `@@values@@`)}</td><td><a href="#f-pratica" data-act="jump">@@practice and proof@@</a></td></tr>
+    ${lv}
+    <tr><td>@@Opening: prerequisites at level@@</td><td><select id="pv-open"${dis}>${[1, 2, 3].map(k => `<option value="${k}" ${P.open_at === k ? 'selected' : ''}>${LEVELS[k].r} · ${LEVELS[k].name}</option>`).join('')}</select></td>
+      <td>${nat('convencao')}</td><td><a href="#f-estrutura" data-act="jump">@@structure@@</a></td></tr>
+    <tr><td>@@Freshness: live up to · warm up to (days)@@</td><td><span class="pair">${n('pv-viva', P.fresh.viva)} ${n('pv-morna', P.fresh.morna)}</span></td>
+      <td>${nat('convencao')}</td><td><a href="#f-frescor" data-act="jump">@@freshness@@</a></td></tr>
+    <tr><td>@@The level does not fall with time@@</td><td><span class="pair">@@fixed@@</span></td><td>${nat('adaptado')}</td><td><a href="#f-frescor" data-act="jump">@@freshness@@</a></td></tr>
+    <tr><td>@@Names of the levels@@</td><td><span class="pair">Dreyfus, 2004</span></td><td>${nat('fundamentado')}</td><td><a href="#f-niveis" data-act="jump">@@levels@@</a></td></tr>
+    </tbody></table></div>
+    ${LIVE ? `<label class="f">@@Reason for the change (kept in the history)@@<input id="pv-note" type="text" placeholder="@@e.g. a proof is worth more after reading the 2019 replication@@"></label>
+    <div class="err" id="pv-err"></div>
+    <div class="actions"><button class="primary" type="submit">@@Apply parameters@@</button><button type="button" data-act="params-default">@@Restore defaults@@</button></div>` : ''}`;
+  const h = (P.history || []).slice().reverse();
+  $('#params-hist').innerHTML = h.length ? `<div class="label">@@History of the parameters@@</div><ul class="hist">${h.map(x => `<li>${esc(x.date)}${x.host ? ' · ' + esc(x.host) : ''} · ${esc(x.note || `@@no reason given@@`)} · ${esc(x.summary)}</li>`).join('')}</ul>` : '';
+}
+const paramSummary = P => fmt(`@@XP {xp}; levels {levels}; opens at {open}; freshness {fresh}@@`,
+  { xp: `${P.xp.estudo}/${P.xp.pratica}/${P.xp.prova}`, levels: P.levels.map(l => l.xp + '+' + l.p).join(', '), open: P.open_at, fresh: `${P.fresh.viva}/${P.fresh.morna}` });
+function readParams() {
+  const v = id => Number($('#' + id).value), ints = [];
+  const P = { xp: { estudo: v('pv-estudo'), pratica: v('pv-pratica'), prova: v('pv-prova') },
+    levels: [0, 1, 2, 3].map(i => ({ xp: v('pv-xp-' + i), p: v('pv-p-' + i) })), open_at: v('pv-open'),
+    fresh: { viva: v('pv-viva'), morna: v('pv-morna') } };
+  ints.push(...Object.values(P.xp), ...P.levels.flatMap(l => [l.xp, l.p]), P.fresh.viva, P.fresh.morna);
+  if (ints.some(x => !Number.isInteger(x) || x < 0)) return `@@Use whole numbers from zero up.@@`;
+  if (!P.xp.prova) return `@@A proof has to be worth some XP.@@`;
+  for (let i = 1; i < 4; i++) {
+    if (P.levels[i].xp <= P.levels[i - 1].xp) return fmt(`@@The XP of level {a} has to be more than that of level {b}.@@`, { a: LEVELS[i + 2].r, b: LEVELS[i + 1].r });
+    if (P.levels[i].p < P.levels[i - 1].p) return fmt(`@@Level {a} cannot ask for fewer proofs than level {b}.@@`, { a: LEVELS[i + 2].r, b: LEVELS[i + 1].r });
+  }
+  if (P.fresh.viva >= P.fresh.morna) return `@@The "live" window has to be shorter than the "warm" one.@@`;
+  return P;
+}
+async function setParams(P, note) {
+  if (paramSummary(state.params) === paramSummary(P)) { $('#pv-err').textContent = `@@Nothing changed.@@`; return }
+  try { adopt((await api('/api/params', { params: P, note })).state); render(); setStatus(fmt(`@@Parameters changed: {summary}@@`, { summary: paramSummary(P) })) }
+  catch (e) { $('#pv-err').textContent = e.message }
+}
+
+/* ---------- actions ---------- */
+document.addEventListener('submit', ev => {
+  ev.preventDefault();
+  if (!LIVE) return;
+  if (ev.target.id === 'log-form') {
+    const s = byId(selected), kind = $('#lg-kind').value, note = $('#lg-note').value.trim(), ref = $('#lg-ref').value.trim(), date = $('#lg-date').value;
+    if (!date) return $('#lg-err').textContent = `@@Give the date.@@`;
+    if (!note) return $('#lg-err').textContent = `@@Describe what was done.@@`;
+    if (kind === 'prova' && !ref) return $('#lg-err').textContent = `@@A proof asks for a reference: the file that exists and runs, a link to the result or a Kustos id.@@`;
+    const rec = clone(s); rec.log.push({ id: 'l_' + rid(), date, kind, note, ref });
+    putSkill(rec, s._stamp || '', fmt(`@@Recorded: {kind} in {name}@@`, { kind: KINDS[kind].label, name: s.name }));
+  }
+  if (ev.target.id === 'params-form') {
+    const P = readParams(); if (typeof P === 'string') return $('#pv-err').textContent = P;
+    setParams(P, $('#pv-note').value.trim());
+  }
+  if (ev.target.id === 'skill-form') {
+    const name = $('#sk-name').value.trim();
+    if (!name) return $('#sk-err').textContent = `@@A skill needs a name.@@`;
+    const old = mode === 'edit' && byId(selected);
+    const rec = old ? clone(old) : { id: '', log: [] };
+    Object.assign(rec, { name, domain: $('#sk-domain').value.trim() || `@@General@@`, requires: [...$('#sk-req').selectedOptions].map(o => o.value),
+      desc: $('#sk-desc').value.trim(), next: $('#sk-next').value.trim(), links: [...pendingLinks] });
+    putSkill(rec, old ? (old._stamp || '') : null, old ? `@@Skill saved@@` : `@@Skill created@@`);
+  }
+});
+async function copyText(value, msg) {
+  try { await navigator.clipboard.writeText(value); setStatus(msg) } catch { setStatus(fmt(`@@Copy it by hand: {value}@@`, { value })) }
+}
+document.addEventListener('click', async ev => {
+  const el = ev.target.closest('[data-act]'); if (!el) return;
+  const act = el.dataset.act;
+  if (act === 'pick') { if (!$('#fund').hidden) showView('map'); selected = el.dataset.id; mode = 'view'; render(); if (innerWidth < 920) $('#panel').scrollIntoView({ behavior: 'smooth' }) }
+  else if (act === 'back') { selected = null; mode = 'view'; render() }
+  else if (act === 'cancel') { mode = 'view'; render() }
+  else if (act === 'edit') { mode = 'edit'; render() }
+  else if (act === 'new-skill') { if (!$('#fund').hidden) showView('map'); mode = 'new'; render() }
+  else if (act === 'copy-id') copyText(el.dataset.id, fmt(`@@Copied: {id}@@`, { id: el.dataset.id }));
+  else if (act === 'link') { const id = el.dataset.id; state.labels[id] = { label: el.dataset.label, kind: el.dataset.kind }; if (!pendingLinks.includes(id)) pendingLinks.push(id); drawLinks() }
+  else if (act === 'unlink') { pendingLinks = pendingLinks.filter(x => x !== el.dataset.id); drawLinks() }
+  else if (act === 'del-log' || act === 'del-skill') {
+    if (!el.classList.contains('armed')) { el.classList.add('armed'); el.textContent = act === 'del-log' ? `@@delete?@@` : `@@Confirm: delete@@`; return }
+    const s = byId(selected);
+    if (act === 'del-log') { const rec = clone(s); rec.log = rec.log.filter(e => e.id !== el.dataset.id); putSkill(rec, s._stamp || '', `@@Entry deleted@@`) }
+    else {
+      try { adopt((await api('/api/skill/delete', { id: s.id })).state); selected = null; mode = 'view'; render(); setStatus(fmt(`@@Deleted: {name}@@`, { name: s.name })) }
+      catch (e) { setStatus(e.message) }
+    }
+  }
+  else if (act === 'fund') showView($('#fund').hidden ? 'fund' : 'map');
+  else if (act === 'jump') { ev.preventDefault(); const t = document.querySelector(el.getAttribute('href')); if (t) t.scrollIntoView({ behavior: 'smooth' }) }
+  else if (act === 'params-default') setParams(clone(DEFAULT_PARAMS), `@@defaults restored@@`);
+  else if (act === 'reload') load(`@@Reloaded from disk@@`);
+  else if (act === 'mirror') { try { const r = await api('/api/mirror', {}); setStatus(r.message) } catch (e) { setStatus(e.message) } }
+  else if (act === 'import') $('#file-in').click();
+});
+$('#file-in').addEventListener('change', async ev => {
+  const f = ev.target.files[0]; ev.target.value = ''; if (!f) return;
+  let d; try { d = JSON.parse(await f.text()) } catch (e) { return setStatus(fmt(`@@Invalid file: {msg}@@`, { msg: e.message })) }
+  try { const r = await api('/api/import', { data: d }); adopt(r.state); render(); setStatus(r.message) } catch (e) { setStatus(e.message) }
+});
+document.addEventListener('keydown', ev => {
+  if ((ev.key === 'Enter' || ev.key === ' ') && ev.target.classList?.contains('star')) { ev.preventDefault(); ev.target.click() }
+  if (ev.key === 'F5' && LIVE) { ev.preventDefault(); load(`@@Reloaded from disk@@`) }
+  if (ev.key === 'Escape' && (selected || mode !== 'view')) { selected = null; mode = 'view'; render() }
+});
+
+/* ---------- start ---------- */
+if (LIVE) {
+  load();
+  setInterval(() => api('/api/ping').then(() => { if (offline) { offline = false; setStatus() } }).catch(() => {}), 20000);
+  window.addEventListener('focus', () => { if (mode === 'view') load() });
+} else {
+  adopt(BOOT.data); render(); setStatus();
+}
+if (location.hash === '#fundamentos') showView('fund');
 </script>
 </body>
 </html>
@@ -7775,6 +9169,7 @@ class App:
                       command=self.open_graph)
         v.add_command(label=tr("Timeline"), accelerator="Ctrl+Shift+T",
                       command=self.open_timeline)
+        v.add_command(label=tr("Skills (Peritia)"), command=self.open_peritia)
         v.add_command(label=tr("Wide card"), accelerator="F11", command=self.toggle_wide)
         v.add_command(label=tr("Read field"), accelerator="Ctrl+E", command=self.open_reader)
         lt = self.menu(v)
@@ -7965,6 +9360,22 @@ class App:
         self.timeline = TimelineView(win, lambda: self.data, get_ids=self.timeline_ids,
                                      start_id=(self.current() or {}).get("id"),
                                      on_open=self.open_from_graph)
+        return "break"
+
+    def open_peritia(self):
+        """View › Skills: the Peritia panel, served by a process of its own, so it
+        outlives this window; it stops by itself once its page is closed."""
+        import subprocess
+        exe = Path(sys.executable)
+        quiet = exe.with_name("pythonw.exe")
+        if sys.platform == "win32" and quiet.exists():
+            exe = quiet
+        try:
+            subprocess.Popen([str(exe), str(Path(__file__).resolve()), "peritia"], cwd=str(BASE))
+        except OSError as exc:
+            self.say(tr("Peritia did not start: {why}", why=exc))
+            return "break"
+        self.say(tr("Peritia opens in the browser."))
         return "break"
 
     def timeline_ids(self):
@@ -12435,6 +13846,8 @@ def main():
         return cmd_graph(rest[0] if rest else None)
     if cmd == "timeline":
         return cmd_timeline(rest[0] if rest else None)
+    if cmd == "peritia":
+        return cmd_peritia(rest)
     if cmd == "migrate":
         return cmd_migrate()
     if cmd == "merge":
@@ -13703,6 +15116,459 @@ PT = {
         "Cronologia",
     "\n  Ctrl+Shift+T    timeline (second window, read-only): everything dated on one\n                  line of time -- the people's LOG, births and deaths, tasks due,\n                  sources, links with a span, health, drafts with\n                  a date or period. The wheel zooms, dragging moves, Home shows\n                  everything, t today, r when each record was registered, f\n                  follows this window's search; Enter opens a record here.\n  Base › Real dates in the logs: log entries whose text starts with a date\n                  (2021, 20240311, 202403110011…) get it as their date. A LOG\n                  line may carry a year (2021), a month (2024-03) or a time\n                  (2024-03-11 14:30), followed by two spaces.\n":
         "\n  Ctrl+Shift+T    cronologia (segunda janela, só leitura): tudo o que tem data\n                  numa linha do tempo -- o LOG das pessoas, nascimentos e mortes,\n                  prazos, fontes, ligações com intervalo, saúde,\n                  rascunhos com data ou período. A roda dá zoom, arrastar move,\n                  Home mostra tudo, t hoje, r quando cada registro foi registrado,\n                  f segue a busca desta janela; Enter abre um registro aqui.\n  Base › Datas reais nos logs: entradas de log cujo texto começa com uma data\n                  (2021, 20240311, 202403110011…) passam a tê-la como data. Uma\n                  linha do LOG pode levar um ano (2021), um mês (2024-03) ou uma\n                  hora (2024-03-11 14:30), seguidos de dois espaços.\n",
+    # ---- Peritia (# ==== peritia)
+    "Peritia":
+        "_peritia",
+    "skills observatory · Kustos":
+        "observatório de habilidades · Kustos",
+    "New skill":
+        "Nova habilidade",
+    "Reload":
+        "Recarregar",
+    "Mirror and snapshot":
+        "Espelho e instantâneo",
+    "Foundations":
+        "Fundamentos",
+    "Star chart of the skills":
+        "Carta celeste das habilidades",
+    "Skills by domain and depth":
+        "Habilidades por domínio e profundidade",
+    "locked":
+        "fechada",
+    "unexplored":
+        "por explorar",
+    "under way":
+        "em curso",
+    "with proof (III+)":
+        "com prova (III+)",
+    "size = level · brightness = freshness · rings = depth":
+        "tamanho = nível · brilho = frescor · anéis = profundidade",
+    "These are the parameters of Peritia. Every rule of the instrument comes from an outside model, from an adaptation of that model, or from a number chosen here. The page keeps the three apart, so that a change of number is never taken for a change of grounds.":
+        "Este é o parâmetro do _peritia. Cada regra do instrumento vem de um modelo externo, de uma adaptação desse modelo ou de um número escolhido aqui. A página separa as três coisas, para que uma mudança de número nunca seja confundida com uma mudança de fundamento.",
+    "grounded":
+        "fundamentado",
+    "the direction of the rule comes from the model":
+        "a direção da regra vem do modelo",
+    "adapted":
+        "adaptado",
+    "the model was translated into another form":
+        "o modelo foi traduzido para outra forma",
+    "convention":
+        "convenção",
+    "a number chosen, not derived; can be recalibrated":
+        "número escolhido, sem derivação; recalibrável",
+    "Parameters in force":
+        "Parâmetros vigentes",
+    "Levels":
+        "Níveis",
+    "Dreyfus and Dreyfus, 1980; S. Dreyfus, 2004":
+        "Dreyfus e Dreyfus, 1980; S. Dreyfus, 2004",
+    "What it says":
+        "O que diz",
+    "A 1980 report for the US Air Force describes directed skill acquisition in five stages: novice, competence, proficiency, expertise and mastery. The version that spread later uses novice, advanced beginner, competent, proficient and expert. What changes from one stage to the next is the way of deciding: from rules without context, to the conscious choice of a perspective, to the intuitive recognition of the situation and, finally, to intuitive action.":
+        "Um relatório de 1980 para a Força Aérea americana descreve a aquisição de habilidade dirigida em cinco estágios: novato, competência, proficiência, perícia e maestria. A versão difundida depois usa novato, iniciante avançado, competente, proficiente e perito. O que muda de um estágio para o outro é o modo de decidir: de regras sem contexto, para a escolha consciente de uma perspectiva, para o reconhecimento intuitivo da situação e, por fim, para a ação intuitiva.",
+    "What Peritia takes":
+        "O que o _peritia toma",
+    "The five names of the 2004 version, and the idea that one climbs by stages, not by continuous accumulation.":
+        "Os cinco nomes da versão de 2004 e a ideia de que se sobe por estágios, não por acúmulo contínuo.",
+    "Where it adapts":
+        "Onde adapta",
+    "The model is qualitative; its question is how the person decides. Peritia trades that question for a countable signal, XP and proofs. The signal errs both ways: one can pile up XP without changing the way of deciding, and one can decide like an expert without having logged anything. Read the level as a record of evidence, not as a diagnosis. When reviewing a skill, the test is: does the description of the stage match what I do in it?":
+        "O modelo é qualitativo; a pergunta dele é como a pessoa decide. O _peritia troca essa pergunta por um sinal contável, XP e provas. O sinal erra nos dois sentidos: dá para acumular XP sem mudar o modo de decidir, e dá para decidir como perito sem ter registrado nada. Leia o nível como registro de evidência, não como diagnóstico. Ao revisar uma habilidade, vale o teste: a descrição do estágio bate com o que eu faço nela?",
+    "Practice and proof":
+        "Prática e prova",
+    "Ericsson, Krampe and Tesch-Römer, 1993; Macnamara and Maitra, 2019":
+        "Ericsson, Krampe e Tesch-Römer, 1993; Macnamara e Maitra, 2019",
+    "Ericsson and colleagues called deliberate practice the activity designed to improve performance, and credited it with much of the difference between violinists of different levels. The 2019 replication found a much smaller effect: about 26% of the variance explained, against 48% in the original study.":
+        "Ericsson e colegas chamaram de prática deliberada a atividade desenhada para melhorar o desempenho e atribuíram a ela grande parte da diferença entre violinistas de níveis distintos. A replicação de 2019 encontrou um efeito bem menor: cerca de 26% da variância explicada, contra 48% no estudo original.",
+    "The direction of the weights: practice counts for more than study, and a proof, a verifiable result, counts for more than both. From craft certifications, awarded on a practical bench exam, comes the idea that recognition depends on demonstrating, not on adding up hours. Hence the form of a proof: mark it only when the cited file exists and runs.":
+        "A direção dos pesos: prática vale mais que estudo, e a prova, um resultado verificável, vale mais que as duas. Das certificações de ofício, concedidas por exame prático de bancada, vem a ideia de que o reconhecimento depende de demonstrar, não de somar horas. Daí a forma da prova: marcar só quando o arquivo citado existe e roda.",
+    "The replication justifies the lock: accumulated practice is not enough, so levels III to V require proofs. The weights and the XP thresholds are convention.":
+        "A replicação justifica a trava: prática acumulada não basta, por isso os níveis III a V exigem provas. Os pesos e os limiares de XP são convenção.",
+    "Freshness":
+        "Frescor",
+    "Ebbinghaus measured on himself, with nonsense syllables, how much of what was memorised was lost over time. The loss is fast at first and then slows down. He also measured the saving in relearning: learning again what was forgotten costs less than the first time.":
+        "Ebbinghaus mediu em si mesmo, com sílabas sem sentido, quanto do material decorado se perdia com o tempo. A perda é rápida no início e depois desacelera. Ele também mediu a economia na reaprendizagem: voltar a aprender o que foi esquecido custa menos do que a primeira vez.",
+    "Knowledge left unused decays, and the decay should be visible. Hence the brightness of the stars and the entropy figure.":
+        "O conhecimento sem uso se degrada, e a degradação deve ficar visível. Daí o brilho das estrelas e o indicador de entropia.",
+    "The curve is about memorised lists, over hours and days; a procedural skill is lost at another pace. The freshness windows are convention. The decision not to lower the level comes from the saving in relearning: the level keeps what was reached, the brightness shows the cost of going back.":
+        "A curva trata de listas decoradas, em horas e dias; habilidade de procedimento se perde em outro ritmo. As janelas de frescor são convenção. A decisão de não rebaixar o nível vem da economia na reaprendizagem: o nível guarda o que já foi alcançado, o brilho mostra o custo de voltar.",
+    "technology trees; Sugiyama, Tagawa and Toda, 1981":
+        "árvores de tecnologia; Sugiyama, Tagawa e Toda, 1981",
+    "Strategy games organise progress as a technology tree: each advance asks for others first. Formally it is a directed acyclic graph. Sugiyama and colleagues proposed drawing this kind of graph in layers, placing the nodes by hierarchical level to make the structure readable.":
+        "Jogos de estratégia organizam o progresso como árvore de tecnologias: cada avanço pede outros antes. Formalmente é um grafo dirigido acíclico. Sugiyama e colegas propuseram o desenho em camadas desse tipo de grafo, distribuindo os nós por nível hierárquico para tornar a estrutura legível.",
+    "Prerequisites as edges and depth as layer.":
+        "Pré-requisitos como arestas e profundidade como camada.",
+    "The layers become concentric rings and the domains become sectors, as on a planisphere. The opening rule is convention. Unlike games, Peritia does not prevent logging in a locked skill: the lock is a signal, not a barrier.":
+        "As camadas viram anéis concêntricos e os domínios viram setores, como num planisfério. A regra de abertura é convenção. Ao contrário dos jogos, o _peritia não impede o registro numa habilidade fechada: a trava é sinal, não bloqueio.",
+    "Gamification":
+        "Gamificação",
+    "Deterding, Dixon, Khaled and Nacke, 2011":
+        "Deterding, Dixon, Khaled e Nacke, 2011",
+    "The authors define gamification as the use of game design elements in contexts that are not games, setting it apart from full games and from free play.":
+        "Os autores definem gamificação como o uso de elementos de design de jogos em contextos que não são jogos, separando-a dos jogos completos e do brinquedo livre.",
+    "A few elements: points, levels, opening of paths, a progress bar and a next goal.":
+        "Poucos elementos: pontos, níveis, abertura de caminhos, barra de progresso e próximo objetivo.",
+    "What it refuses":
+        "O que recusa",
+    "decision":
+        "decisão",
+    "Left out: rankings, badges, daily streaks with penalties and losing lives. The instrument compares a person with their own history; competition and punishment would move the attention from the craft to the scoreboard.":
+        "Ficam de fora ranking, medalhas, sequência diária com penalidade e perda de vida. O instrumento compara uma pessoa com o próprio histórico; competição e punição deslocariam a atenção do ofício para o placar.",
+    "Cybernetic reading":
+        "Leitura cibernética",
+    "Ashby: only the variety of the regulator can reduce the variety that disturbances produce (the law of requisite variety). Shannon: entropy measures the uncertainty of a source of information. Beer: the algedonic signal is an alert of pain or pleasure that goes up the structure without waiting for the normal filter.":
+        "Ashby: só a variedade do regulador pode reduzir a variedade que as perturbações produzem (lei da variedade requisita). Shannon: entropia mede a incerteza de uma fonte de informação. Beer: o sinal algedônico é um alerta de dor ou prazer que sobe pela estrutura sem esperar o filtro normal.",
+    "Variety is the number of live domains, a rough indicator of how much variety of response you keep. Entropy is the share of started skills that went cold. Feedback is the recent XP, the signal that closes the loop.":
+        "Variedade é o número de domínios vivos, um indicador grosseiro de quanta variedade de resposta você mantém. Entropia é a proporção de habilidades iniciadas que esfriaram. Realimentação é o XP recente, o sinal que fecha o laço.",
+    "The three are operational metaphors, not formal measures. Ashby counts variety in distinguishable states, not in domains; Shannon measures entropy in bits, and here it is a percentage of disuse. The algedonic signal does not exist in the instrument yet: it would be an alert when a skill marked as essential goes cold.":
+        "As três são metáforas operacionais, não medidas formais. A variedade de Ashby se conta em estados distinguíveis, não em domínios; a entropia de Shannon se mede em bits, e aqui é uma porcentagem de desuso. O sinal algedônico ainda não existe no instrumento: seria um alerta quando uma habilidade marcada como essencial esfriar.",
+    "Architecture":
+        "Arquitetura",
+    "Kleppmann, Wiggins, van Hardenberg and McGranaghan, 2019":
+        "Kleppmann, Wiggins, van Hardenberg e McGranaghan, 2019",
+    "The essay on local-first software argues that data should live first on the device of whoever uses it: the program works without a network, syncs between devices, keeps the data for the long term and leaves control with the user.":
+        "O ensaio sobre software local-first defende que os dados fiquem primeiro no aparelho de quem usa: o programa funciona sem rede, sincroniza entre dispositivos, preserva os dados a longo prazo e deixa o controle com o usuário.",
+    "The source is <code>_kustos.json</code>, on disk, synced by Syncthing. The panel is served by <code>_kustos.py</code> itself on 127.0.0.1 only, with no outside network and no dependencies. The parameters on this page live in the same file, beside the data.":
+        "A fonte é o <code>_kustos.json</code>, no disco, sincronizado pelo Syncthing. O painel é servido pelo próprio <code>_kustos.py</code> só em 127.0.0.1, sem rede externa e sem dependências. Os parâmetros desta página moram no mesmo arquivo, ao lado dos dados.",
+    "The essay bets on data structures that merge by themselves (CRDTs). Here the merge is Kustos's own: an append-only log per machine and, on opening, the merge of <code>sync-conflict</code> files record by record, the newest <code>updated_at</code> winning. The panel refuses to save over a version that changed on disk after it was read, and reloads the current one.":
+        "O ensaio aposta em estruturas de dados que se fundem sozinhas (CRDTs). Aqui a fusão é a do Kustos: um log só-de-acréscimo por máquina e, ao abrir, a fusão dos <code>sync-conflict</code> registro a registro, vencendo o <code>updated_at</code> mais novo. O painel recusa gravar sobre uma versão que mudou no disco depois de lida e recarrega a atual.",
+    "References":
+        "Referências",
+    "Available at":
+        "Disponível em",
+    "page to be found":
+        "página a localizar",
+    "Transl.":
+        "Trad.",
+    "and":
+        "e",
+    "Essay":
+        "Ensaio",
+    "study":
+        "estudo",
+    "practice":
+        "prática",
+    "proof":
+        "prova",
+    "live":
+        "viva",
+    "warm":
+        "morna",
+    "cold":
+        "fria",
+    "Novice":
+        "Novato",
+    "Advanced beginner":
+        "Iniciante avançado",
+    "Competent":
+        "Competente",
+    "Proficient":
+        "Proficiente",
+    "Expert":
+        "Perito",
+    "skill":
+        "habilidade",
+    "{n} proof":
+        "{n} prova",
+    "{n} proofs":
+        "{n} provas",
+    "snapshot of {built} · read-only · to edit, open _kustos_peritia.cmd":
+        "instantâneo de {built} · somente leitura · para editar, abra _kustos_peritia.cmd",
+    "Kustos is not answering: nothing will be saved. Open the panel again from Kustos.":
+        "Kustos não responde: nada será gravado. Abra o painel de novo pelo Kustos.",
+    "also open on {hosts}: avoid editing on both machines":
+        "aberto também em {hosts}: evite editar nas duas máquinas",
+    "read-only":
+        "somente leitura",
+    "Kustos is not answering":
+        "Kustos não responde",
+    "The record changed on disk; the current version is loaded.":
+        "O registro mudou no disco; recarreguei a versão atual.",
+    "error {n}":
+        "erro {n}",
+    "Log a study, practice or proof to light this skill.":
+        "Registre um estudo, prática ou prova para acender esta habilidade.",
+    "Top level. Keep it fresh.":
+        "Nível máximo. Mantenha o frescor.",
+    "For {r} ({name}): {missing} to go.":
+        "Para {r} ({name}): faltam {missing}.",
+    "copy the id to paste into Kustos":
+        "copiar o id para colar no Kustos",
+    "not in Kustos":
+        "não existe no Kustos",
+    "No skills in Kustos yet":
+        "Nenhuma habilidade no Kustos ainda",
+    "level":
+        "nível",
+    "this week":
+        "esta semana",
+    "XP per week, last twelve weeks":
+        "XP por semana, últimas doze semanas",
+    "Peritia in Kustos":
+        "Peritia no Kustos",
+    "Skills live in <code>_kustos.json</code>, beside people, verba, sources and corpus, and go through the same log and the same conflict merge.":
+        "As habilidades moram em <code>_kustos.json</code>, ao lado de pessoas, verba, fontes e corpus, e passam pelo mesmo log e pela mesma fusão de conflitos.",
+    "To bring in what is already in a <code>_peritia.json</code>, import the file once. A skill with the same id is replaced only if the file has a newer version of it.":
+        "Para trazer o que já está num <code>_peritia.json</code>, importe o arquivo uma vez. Habilidades com o mesmo id só são substituídas se a versão do arquivo for mais nova.",
+    "Import _peritia.json…":
+        "Importar _peritia.json…",
+    "VARIETY":
+        "VARIEDADE",
+    "live domains in {n} days":
+        "domínios vivos em {n} dias",
+    "ENTROPY":
+        "ENTROPIA",
+    "started and cold (&gt;{n} d)":
+        "iniciadas e frias (&gt;{n} d)",
+    "FEEDBACK":
+        "REALIMENTAÇÃO",
+    "XP in the last 30 days":
+        "XP nos últimos 30 dias",
+    "XP per week":
+        "XP por semana",
+    "domain":
+        "domínio",
+    "lit":
+        "acesas",
+    "Next proofs":
+        "Próximas provas",
+    "No open skill with a next proof set.":
+        "Nenhuma habilidade aberta com próximo passo definido.",
+    "<b>Rule:</b> a study is worth {study} XP, a practice {practice}, a proof {proof}. A proof is a file that exists and runs, or a verifiable result; that is why it asks for a reference. The reference can be a Kustos id (a source <code>s_</code>, for example).":
+        "<b>Regra:</b> estudo vale {study} XP, prática {practice}, prova {proof}. Prova é um arquivo que existe e roda, ou um resultado verificável; por isso pede referência. A referência pode ser um id do Kustos (uma fonte <code>s_</code>, por exemplo).",
+    "XP alone does not buy a level: III asks for {p3} proof(s), IV for {p4}, V for {p5}. A skill opens when all its prerequisites reach {r}.":
+        "XP sozinho não compra nível: III pede {p3} prova(s), IV pede {p4}, V pede {p5}. Uma habilidade abre quando todos os pré-requisitos chegam a {r}.",
+    "Freshness: live up to {live} days since the last entry, warm up to {warm}, then cold. The level does not fall; the brightness does.":
+        "Frescor: viva até {live} dias desde o último registro, morna até {warm}, depois fria. Nível não cai; o brilho sim.",
+    "{n} link(s) from skills to Kustos records.":
+        "{n} ligação(ões) de habilidades com registros do Kustos.",
+    "Foundations and parameters →":
+        "Fundamentos e parâmetros →",
+    "Delete entry":
+        "Apagar registro",
+    "Overview":
+        "Visão geral",
+    "Edit":
+        "Editar",
+    "copy the id":
+        "copiar o id",
+    "locked: prerequisites below {r}":
+        "fechada: pré-requisitos abaixo de {r}",
+    "Next proof":
+        "Próxima prova",
+    "Requires":
+        "Requer",
+    "Opens the way to":
+        "Abre caminho para",
+    "In Kustos":
+        "No Kustos",
+    "Record it":
+        "Registrar",
+    "What was done":
+        "O que foi feito",
+    "e.g. ran the whole demo and read the query plan line by line":
+        "ex.: rodei a demonstração inteira e li o plano da consulta linha a linha",
+    "Reference (file, link or Kustos id)":
+        "Referência (arquivo, link ou id do Kustos)",
+    "e.g. tests/test_dates.py or s_dreyfus2004":
+        "ex.: tests/test_datas.py ou s_dreyfus2004",
+    "Journal ({n})":
+        "Diário ({n})",
+    "No entries yet.":
+        "Nenhum registro ainda.",
+    "Back":
+        "Voltar",
+    "Edit skill":
+        "Editar habilidade",
+    "Name":
+        "Nome",
+    "Domain (pick one or type a new one)":
+        "Domínio (escolha ou escreva um novo)",
+    "Requires (Ctrl/⌘ for several)":
+        "Requer (Ctrl/⌘ para vários)",
+    "Description":
+        "Descrição",
+    "the next verifiable result":
+        "o próximo resultado verificável",
+    "Links in Kustos (sources, concepts, people)":
+        "Ligações no Kustos (fontes, conceitos, pessoas)",
+    "Search Kustos":
+        "Buscar no Kustos",
+    "name, title or id; e.g. Dreyfus, s_":
+        "nome, título ou id; ex.: Dreyfus, s_",
+    "Create":
+        "Criar",
+    "Delete skill":
+        "Apagar habilidade",
+    "Remove link":
+        "Remover ligação",
+    "No links.":
+        "Nenhuma ligação.",
+    "Nothing found.":
+        "Nada encontrado.",
+    "Level":
+        "Nível",
+    "proofs":
+        "provas",
+    "practice and proof":
+        "prática e prova",
+    "parameter":
+        "parâmetro",
+    "value":
+        "valor",
+    "nature":
+        "natureza",
+    "grounds":
+        "fundamento",
+    "Weight of study · practice · proof":
+        "Peso do estudo · prática · prova",
+    "order":
+        "ordem",
+    "values":
+        "valores",
+    "Opening: prerequisites at level":
+        "Abertura: pré-requisitos no nível",
+    "structure":
+        "estrutura",
+    "Freshness: live up to · warm up to (days)":
+        "Frescor: viva até · morna até (dias)",
+    "freshness":
+        "frescor",
+    "The level does not fall with time":
+        "Nível não cai com o tempo",
+    "fixed":
+        "fixo",
+    "Names of the levels":
+        "Nomes dos níveis",
+    "levels":
+        "níveis",
+    "Reason for the change (kept in the history)":
+        "Motivo da alteração (fica no histórico)",
+    "e.g. a proof is worth more after reading the 2019 replication":
+        "ex.: prova vale mais depois de rever a replicação de 2019",
+    "Apply parameters":
+        "Aplicar parâmetro",
+    "Restore defaults":
+        "Restaurar padrão",
+    "History of the parameters":
+        "Histórico do parâmetro",
+    "no reason given":
+        "sem motivo registrado",
+    "XP {xp}; levels {levels}; opens at {open}; freshness {fresh}":
+        "XP {xp}; níveis {levels}; abre em {open}; frescor {fresh}",
+    "Use whole numbers from zero up.":
+        "Use números inteiros a partir de zero.",
+    "A proof has to be worth some XP.":
+        "A prova precisa valer algum XP.",
+    "The XP of level {a} has to be more than that of level {b}.":
+        "O XP do nível {a} precisa ser maior que o do nível {b}.",
+    "Level {a} cannot ask for fewer proofs than level {b}.":
+        "O nível {a} não pode pedir menos provas que o {b}.",
+    "The \"live\" window has to be shorter than the \"warm\" one.":
+        "A janela \"viva\" precisa ser menor que a \"morna\".",
+    "Nothing changed.":
+        "Nada mudou.",
+    "Parameters changed: {summary}":
+        "Parâmetro alterado: {summary}",
+    "Give the date.":
+        "Informe a data.",
+    "Describe what was done.":
+        "Descreva o que foi feito.",
+    "A proof asks for a reference: the file that exists and runs, a link to the result or a Kustos id.":
+        "Prova pede referência: o arquivo que existe e roda, um link para o resultado ou um id do Kustos.",
+    "Recorded: {kind} in {name}":
+        "Registrado: {kind} em {name}",
+    "A skill needs a name.":
+        "A habilidade precisa de nome.",
+    "General":
+        "Geral",
+    "Skill saved":
+        "Habilidade salva",
+    "Skill created":
+        "Habilidade criada",
+    "Copy it by hand: {value}":
+        "Copie à mão: {value}",
+    "Copied: {id}":
+        "Copiado: {id}",
+    "delete?":
+        "apagar?",
+    "Confirm: delete":
+        "Confirmar: apagar",
+    "Entry deleted":
+        "Registro apagado",
+    "Deleted: {name}":
+        "Apagada: {name}",
+    "defaults restored":
+        "restaurado o padrão",
+    "Reloaded from disk":
+        "Recarregado do disco",
+    "Invalid file: {msg}":
+        "Arquivo inválido: {msg}",
+    "This skill no longer exists.":
+        "Esta habilidade não existe mais.",
+    "A skill cannot require itself.":
+        "Uma habilidade não pode requerer a si mesma.",
+    "Unknown kind of entry: {kind}":
+        "Tipo de registro desconhecido: {kind}",
+    "Invalid date in the journal: {date}":
+        "Data inválida no diário: {date}",
+    "These prerequisites would go round in a circle.":
+        "Esses pré-requisitos fechariam um círculo.",
+    "This is not a Peritia file (schema peritia/…).":
+        "Este não é um arquivo do Peritia (schema peritia/…).",
+    "{added} skill(s) added, {replaced} replaced by a newer version, {kept} kept as they were.":
+        "{added} habilidade(s) adicionada(s), {replaced} substituída(s) por versão mais nova, {kept} mantida(s) como estavam.",
+    "Mirror rebuilt ({mirror}); snapshot in {snapshot}.":
+        "Espelho refeito ({mirror}); instantâneo em {snapshot}.",
+    "Not found.":
+        "Não encontrado.",
+    "This page is not the one Kustos opened: open the panel again from Kustos.":
+        "Esta não é a página que o Kustos abriu: abra o painel de novo pelo Kustos.",
+    "The request could not be read.":
+        "Não foi possível ler o pedido.",
+    "--port needs a number":
+        "--port pede um número",
+    "Peritia at {url}: it stops by itself {n} minute(s) after the page is closed.":
+        "Peritia em {url}: para sozinho {n} minuto(s) depois que a página é fechada.",
+    "{id}: a skill's id starts with k_":
+        "{id}: o id de uma habilidade começa com k_",
+    "{id}: skill without a name":
+        "{id}: habilidade sem nome",
+    "{id}: requires {req}, which does not exist":
+        "{id}: requer {req}, que não existe",
+    "{id}: its prerequisites go round in a circle":
+        "{id}: os pré-requisitos fecham um círculo",
+    "{id}: journal entry of an unknown kind {kind}":
+        "{id}: registro do diário de tipo desconhecido {kind}",
+    "{id}: journal entry with an invalid date {date}":
+        "{id}: registro do diário com data inválida {date}",
+    "{id}: a proof without a reference ({date})":
+        "{id}: prova sem referência ({date})",
+    "{id}: links to {target}, which does not exist":
+        "{id}: liga a {target}, que não existe",
+    "Peritia's stored parameters do not hold together ({why}); the defaults are used":
+        "Os parâmetros gravados do Peritia não se sustentam ({why}); vale o padrão",
+    "{n} skills":
+        "{n} habilidades",
+    "Skills":
+        "Habilidades",
+    "level {r}":
+        "nível {r}",
+    "{n} proof(s)":
+        "{n} prova(s)",
+    "last: {date}":
+        "último: {date}",
+    "next proof: ":
+        "próxima prova: ",
+    "requires: ":
+        "requer: ",
+    "Skills (Peritia)":
+        "Habilidades (Peritia)",
+    "Peritia opens in the browser.":
+        "O Peritia abre no navegador.",
+    "Peritia did not start: {why}":
+        "O Peritia não abriu: {why}",
 }
 
 if __name__ == "__main__":

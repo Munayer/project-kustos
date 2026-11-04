@@ -39,7 +39,7 @@ empty repository folder gives an empty base (and `doctor` passes on it).
 language (`tr`), common, the collections (**people** `p_`, **verba**
 `c_`/`f_` concepts and forms, **sources** `s_`, **corpus** `h_` health
 records, **notes** `n_` — shown as "drafts"), then file, register, conflicts, lock, doctor, mirror, search,
-history, migration, upgrade, citation, health report, themes, the Tk
+history, migration, upgrade, citation, health report, peritia, themes, the Tk
 `*Card` editors, `App` (the main window), `BookView` (the logbook), the
 `cmd_*` functions and `main()`, and finally the `PT` dict.
 
@@ -62,6 +62,13 @@ Ideas that span several sections:
   never changes and is never reused (see the comment at `# ==== register`).
 - **Links** live in a top-level `edges` list (`from`, `to`, `rel`), not inside
   records; `RELS` defines the types.
+- **Peritia** (`# ==== peritia`): the skills panel is a page served by
+  `cmd_peritia` on 127.0.0.1 (a token in the page, the Host header checked),
+  from the template `PERITIA_HTML` (strings as `@@English@@`, translated by
+  `tr` when the page is built). Skills are the top-level list `skills` (`k_`),
+  the panel's parameters are in `peritia`; they save, log, merge and replay
+  like records but stay out of `COLLS` and the register. Test it on invented
+  data with `peritia_api(...)`, no browser needed.
 - **The logs are the history**: `history <id>` and `replay` (rebuilds the base
   from logs into `_kustos.replay.json`) read them; there are no `.bak` files.
 - **Drafts live in files**: the `notes` collection is an index (id, title,
@@ -99,7 +106,8 @@ The rules, in order:
 4. Commit with an English message ending in
    `Co-Authored-By: Claude <noreply@anthropic.com>`, then push.
 5. Copy to the personal folder (`tools\update-personal.cmd`, or copy
-   `_kustos.py`, `_kustos.cmd`, `_kustos_logbook.cmd`, `kustos.ico`) **only when
+   `_kustos.py`, `_kustos.cmd`, `_kustos_logbook.cmd`, `_kustos_peritia.cmd`,
+   `kustos.ico`) **only when
    Kustos is closed** — check that no `python`/`pythonw` process is running, or
    ask the owner — then verify the copies match (ignoring CRLF/LF).
 
