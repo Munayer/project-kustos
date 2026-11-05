@@ -73,6 +73,7 @@ import shutil
 import socket
 import sys
 import textwrap
+import time
 import unicodedata
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -5744,6 +5745,69 @@ def paint_frame(win):
         pass
 
 
+# ================================================================ motion
+# How the window moves, tuned here. Times are in milliseconds; 0 turns a movement
+# off. A tween follows the clock, not a count of frames: Tk's timer slips (16 ms
+# is 30 now and then), and a late frame then skips ahead instead of dragging the
+# movement out. Keep frames cheap: a tag's colour costs ~0.3 ms, while configuring
+# a Text costs ~5 ms on a very long note.
+
+FRAME_MS = 16           # ~60 frames a second
+CARET_HOLD_MS = 530     # the caret rests, lit or dark, this long...
+CARET_FADE_MS = 160     # ...then fades to the other
+CARET_SLEEP_MS = 15000  # left alone this long it stays lit and its timer stops
+AFTERGLOW_MS = 200      # the trace a moving caret leaves, like phosphor
+AFTERGLOW = 0.45        # how bright that trace starts (0 to 1)
+SCROLL_MS = 130         # the card settles after a turn of the wheel
+TURN_MS = 300           # a leaf of the logbook turns
+
+
+def ease_out(k):
+    """Starts at once and settles: for what answers the hand."""
+    return 1 - (1 - k) ** 3
+
+
+def ease_both(k):
+    """Starts and ends softly: for what moves on its own."""
+    return (1 - math.cos(math.pi * k)) / 2
+
+
+def mix(a, b, k):
+    """The colour k of the way from #rrggbb a to #rrggbb b."""
+    return "#" + "".join(f"{round(int(a[i:i + 2], 16) * (1 - k) + int(b[i:i + 2], 16) * k):02x}"
+                         for i in (1, 3, 5))
+
+
+def halt(w, state):
+    """Stops the timer kept in state["job"]."""
+    if state.get("job"):
+        try:
+            w.after_cancel(state["job"])
+        except tk.TclError:
+            pass
+        state["job"] = None
+
+
+def tween(w, state, ms, step, done=None, ease=ease_out):
+    """Calls step(k) with k going from 0 to 1 over ms, then done(). The timer
+    lives in state["job"]; a new tween on the same state replaces the old."""
+    halt(w, state)
+    begun = time.perf_counter()
+
+    def frame():
+        state["job"] = None
+        if not w.winfo_exists():
+            return
+        k = min(1.0, (time.perf_counter() - begun) * 1000 / ms) if ms > 0 else 1.0
+        step(ease(k))
+        if k < 1:
+            state["job"] = w.after(FRAME_MS, frame)
+        elif done:
+            done()
+
+    frame()
+
+
 # ================================================================ cards
 
 class FieldPages:
@@ -7677,7 +7741,7 @@ HELP_TEXT = (
     "\n  Ctrl+F     go to the search"
     "\n  ↓ / Enter  from the search to the list"
     "\n  Ctrl+N     new person"
-    "\n  Ctrl+Q     quick entry (people, forms or concepts)"
+    "\n  Ctrl+Q     bulk entries (any kind, one per line)"
     "\n  Ctrl+S     save the open record"
     "\n  Ctrl+Enter save and start another of the same kind"
     "\n  Ctrl+Z / Ctrl+Y   undo / redo"
@@ -7809,7 +7873,7 @@ HELP_NOTES = (
     "\n                  its title is its file name. A .md put in notes/ comes in when"
     "\n                  Kustos opens, or on F5. d: in the search, Ctrl+5 the scope."
     "\n                  Deleting moves the file to notes/.deleted."
-    "\n  In a draft's text: Ctrl+B bold, Ctrl+I italic, Ctrl+K [[link]] (on the"
+    "\n  In a draft's text or any NOTES: Ctrl+B bold, Ctrl+I italic, Ctrl+K [[link]] (on the"
     "\n                  selection; again, unwraps), Ctrl+Backspace / Ctrl+Delete a"
     "\n                  word, Enter continues a list or a task, Tab / Shift+Tab"
     "\n                  indent it, Alt+Up / Alt+Down move the line. Shift with the"
@@ -7820,8 +7884,9 @@ HELP_NOTES = (
 
 
 class MarkdownKeys:
-    """Markdown editing in a draft's text. The text stays plain markdown; the
-    keys only type it, and the look is a light highlight:
+    """Markdown editing in the long texts: a draft's text, a record's NOTES and
+    both in reading mode. The text stays plain markdown; the keys only type it,
+    and the look is a light highlight:
       Ctrl+B / Ctrl+I / Ctrl+K   **bold**, *italic*, [[link]] around the
                                  selection (again on a wrapped one: unwraps)
       Ctrl+Backspace / Delete    a whole word
@@ -7869,6 +7934,8 @@ class MarkdownKeys:
         t.tag_configure("md_mark", foreground=SOFT)
         for tag in ("md_link", "md_tag", "md_mark"):
             t.tag_raise(tag)
+        if "caret" in t.tag_names():            # the block keeps its colours on a heading
+            t.tag_raise("caret")
         t.tag_raise("sel")
         b = t.bind
         b("<Control-b>", lambda e: self.wrap("**"))
@@ -7898,8 +7965,9 @@ class MarkdownKeys:
     def changed(self):
         self.t.edit_separator()
         self.t.configure(autoseparators=True)
-        self.app.mark_dirty()
-        self.later()
+        if str(self.t.cget("state")) != "disabled":     # no record open: nothing changed
+            self.app.mark_dirty()
+            self.later()
         return "break"
 
     def wrap(self, left, right=None):
@@ -8057,6 +8125,11 @@ class MarkdownKeys:
         for t, fit in self.app.fits:            # a heading or code may change the page
             if t is self.t:
                 fit()
+
+    def repaint(self):
+        """The whole text, at once: on opening, before the pages are measured."""
+        self.paint()
+        self.full, self.lines_typed = False, set()
 
     def paint(self, first=None, last=None):
         """The highlight of the whole text, or of lines first..last."""
@@ -8228,7 +8301,6 @@ class NoteCard:
                                 app.f_meta, pad)
         self.t_body = app.textfield(c, tr("TEXT  (markdown)"), 12, app.f_body, pad,
                                     pages=True)
-        self.md = MarkdownKeys(app, self.t_body)
         app.label(c, tr("LINKS  (rel  target  [span]  — reason  # source)"), pad)
         self.t_edges = tk.Text(c, height=2, width=1, font=app.f_meta, bg=PAPER, fg=INK,
                                insertbackground=INK, relief="flat", wrap="word",
@@ -8289,8 +8361,6 @@ class NoteCard:
         self.t_body.delete("1.0", "end")
         self.t_body.insert("1.0", body)
         self.t_body.mark_set("insert", "1.0")
-        self.md.paint()                 # before the pages are measured
-        self.md.full, self.md.lines_typed = False, set()
         self.t_edges.delete("1.0", "end")
         text = format_edges(edges_from(self.app.data, n["id"]))
         if n.get("edge_drafts"):
@@ -8426,6 +8496,9 @@ class Reader:
         t.bind("<KeyRelease>", self.typed, add="+")
         t.bind("<Configure>", self.resized)
         self.book = FieldPages(app, t, None, on_show=self.page_shown)
+        self.md = MarkdownKeys(app, t)
+        t.tag_raise("hit")                      # what was found shows above the marks
+        t.tag_raise("cur")
         self._check_job = None
         self.measure = tkfont.Font(font=app.f_body).measure("0") * 92   # ~92 characters a line
         self.q.trace_add("write", lambda *_: self.find_update())
@@ -8462,6 +8535,7 @@ class Reader:
         self.book.off()
         self.t.delete("1.0", "end")
         self.t.insert("1.0", source.get("1.0", "end-1c"))
+        self.md.repaint()
         self.t.edit_reset()
         card = getattr(source, "pages", None)
         at = source.index(card.starts[card.cur]) if card is not None and card.paged else "1.0"
@@ -8743,19 +8817,16 @@ class App:
         self.entry.pack(side="left", fill="x", expand=True, ipady=4)
         self.count = tk.Label(bar, text="", bg=PAPER, fg=OXIDE, font=self.f_meta)
         self.count.pack(side="left", padx=14)
-        ttk.Button(bar, text=tr("quick entry"), command=self.quick_add
-                   ).pack(side="right", padx=(4, 12))
-        ttk.Button(bar, text=tr("+ draft"), command=self.new_note
-                   ).pack(side="right", padx=(4, 0))
-        ttk.Button(bar, text=tr("+ health"), command=self.new_metric
-                   ).pack(side="right", padx=(4, 0))
-        ttk.Button(bar, text=tr("+ source"), command=self.new_source
-                   ).pack(side="right", padx=(4, 0))
-        ttk.Button(bar, text=tr("+ form"), command=lambda: self.new_entry("form")
-                   ).pack(side="right", padx=(4, 0))
-        ttk.Button(bar, text=tr("+ concept"), command=lambda: self.new_entry("concept")
-                   ).pack(side="right", padx=(4, 0))
-        ttk.Button(bar, text=tr("+ person"), command=self.new_person).pack(side="right")
+        add = ttk.Button(bar, text=tr("+ new ▾"))
+        menu = self.add_menu = self.menu(add)
+        for kind in self.NEW_KINDS:
+            menu.add_command(label=tr(self.NEW_KINDS[kind][0]),
+                             command=lambda k=kind: self.new_window(k))
+        menu.add_separator()
+        menu.add_command(label=tr("bulk entries"), accelerator="Ctrl+Q", command=self.bulk_add)
+        add.configure(command=lambda: menu.tk_popup(add.winfo_rootx(),
+                                                    add.winfo_rooty() + add.winfo_height()))
+        add.pack(side="right", padx=(4, 12))
 
     def build_body(self):
         # opaqueresize off: while the divider is dragged only a thin line moves,
@@ -9133,7 +9204,7 @@ class App:
         f.add_command(label=tr("New form"), command=lambda: self.new_entry("form"))
         f.add_command(label=tr("New source"), command=self.new_source)
         f.add_command(label=tr("New health record (corpus)"), command=self.new_metric)
-        f.add_command(label=tr("Quick entry…"), accelerator="Ctrl+Q", command=self.quick_add)
+        f.add_command(label=tr("Bulk entries…"), accelerator="Ctrl+Q", command=self.bulk_add)
         f.add_separator()
         f.add_command(label=tr("Save"), accelerator="Ctrl+S", command=self.save)
         f.add_command(label=tr("Reload from disk"), accelerator="F5", command=self.reload)
@@ -9205,7 +9276,7 @@ class App:
                                          self.entry.select_range(0, "end")))
         r.bind("<Control-s>", lambda e: self.save())
         r.bind("<Control-n>", lambda e: self.new_person())
-        r.bind("<Control-q>", lambda e: self.quick_add())
+        r.bind("<Control-q>", lambda e: self.bulk_add())
         r.bind("<Control-Return>", lambda e: self.save_and_new())
         r.bind("<F5>", lambda e: self.reread())
         r.bind("<Escape>", lambda e: self.list.focus_set())
@@ -9530,8 +9601,9 @@ class App:
         return e
 
     def textfield(self, parent, text, rows, font, pad, pages=False):
-        """A text field under its title. With pages=True a long text is read in
-        pages (FieldPages), whose buttons sit beside the title."""
+        """A text field under its title. With pages=True it is a long text: read
+        in pages (FieldPages), whose buttons sit beside the title, and written in
+        markdown (MarkdownKeys)."""
         if pages:
             row = tk.Frame(parent, bg=PAPER)
             row.pack(fill="x", pady=(6, 2), **pad)
@@ -9552,6 +9624,7 @@ class App:
         self.autogrow(t, minrows=rows, pages=t.pages)
         tk.Frame(parent, bg=RULE, height=1).pack(fill="x", pady=(4, 0), **pad)
         self.readable(lbl, t, text.split("  (")[0])
+        t.md = MarkdownKeys(self, t) if pages else None
         return t
 
     def scroll_area(self, parent):
@@ -9603,6 +9676,16 @@ class App:
                 seen["job"] = canvas.after(90, refit_fields)
 
         canvas.bind("<Configure>", canvas_resized)
+        scroll = canvas.scroll = {"job": None, "to": 0.0}
+
+        def glide(step):
+            """Three units of the wheel (a tenth of the view each), eased. Turning
+            on while it moves adds to where it was heading."""
+            top, bottom = canvas.yview()
+            span = bottom - top
+            base = top if scroll["job"] is None else scroll["to"]
+            to = scroll["to"] = max(0.0, min(1.0 - span, base + step * 0.3 * span))
+            tween(canvas, scroll, SCROLL_MS, lambda k: canvas.yview_moveto(top + (to - top) * k))
 
         def wheel(e):
             if not canvas.winfo_exists():
@@ -9614,14 +9697,14 @@ class App:
                 if book.can_turn(step):
                     book.turn(step, focus=False)
                     return
-                canvas.yview_scroll(step * 3, "units")
+                glide(step)
                 return
             if isinstance(w, tk.Text):
                 first, last_ = w.yview()
                 if not (first <= 0.0 and last_ >= 1.0):
                     w.yview_scroll(step * 2, "units")
                     return
-            canvas.yview_scroll(step * 3, "units")
+            glide(step)
 
         def claim(_e=None):
             for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
@@ -9634,7 +9717,7 @@ class App:
         canvas.bind("<Enter>", claim)
         canvas.bind("<Leave>", release)
         self.canvases = getattr(self, "canvases", []) + [canvas]
-        self.pendings.append((canvas, pending))
+        self.pendings += [(canvas, pending), (canvas, scroll)]
         return inner
 
     def autogrow(self, t, minrows=2, tail=False, pages=None):
@@ -9693,6 +9776,8 @@ class App:
         def fit(_e=None, opening=False):
             if not t.winfo_exists():
                 return
+            if opening and getattr(t, "md", None):
+                t.md.repaint()
             pages = paged_view()
             top = cap()
             if pages and pages.paged and not opening and pages.holds(top):
@@ -9753,6 +9838,7 @@ class App:
             if str(canvas).startswith(shown) and canvas.winfo_exists():
                 canvas.update_idletasks()
                 canvas.configure(scrollregion=canvas.bbox("all"))
+                halt(canvas, canvas.scroll)
                 canvas.yview_moveto(0)
 
     def bind_undo(self, widget, text=False):
@@ -9852,56 +9938,91 @@ class App:
         self.carets = []
 
     def block_caret(self, t, font):
-        """A block cursor, inverting the character under it."""
+        """A block cursor, inverting the character under it. It fades instead of
+        blinking, stays lit while in use, and leaves a short afterglow where it
+        was. Only the field with the focus has a timer running, and only until
+        the caret has been left alone for a while. At the end of a
+        line there is no character to invert, so Tk's own cursor, kept wide, is
+        the block: its colour costs a configure, which only the idle fade pays."""
         cw = self.char_width(font)
-        t.configure(insertwidth=0, insertbackground=INK)
+        t.configure(insertwidth=0, insertbackground=INK, insertofftime=0)   # the blink is ours
         t.tag_configure("caret", background=INK, foreground=PAPER)
+        t.tag_configure("glow")
         try:
             t.tag_lower("caret", "sel")
+            t.tag_lower("glow", "caret")
         except tk.TclError:
             pass
-        state = {"on": True, "job": None, "focus": False}
+        state = {"job": None, "focus": False, "level": 1.0, "at": None, "width": 0,
+                 "color": INK, "woke": 0.0}
+        glow = {"job": None}
 
-        def paint():
-            if not t.winfo_exists():
-                return
+        def place():
+            """Puts the block on the cursor; gives the cursor's index."""
             t.tag_remove("caret", "1.0", "end")
-            if not state["focus"] or not state["on"] or t.tag_ranges("sel"):
-                t.configure(insertwidth=0)
-                return
             i = t.index("insert")
-            if t.compare(i, ">=", i.split(".")[0] + ".end"):
-                t.configure(insertwidth=cw)
-            else:
-                t.configure(insertwidth=0)
+            shown = state["focus"] and not t.tag_ranges("sel")
+            width = cw if shown and t.compare(i, ">=", i.split(".")[0] + ".end") else 0
+            if width != state["width"]:
+                state["width"] = width
+                t.configure(insertwidth=width)
+            if shown and not width:
                 t.tag_add("caret", i, i + "+1c")
+            return i
 
-        def blink():
-            if not t.winfo_exists():
-                return
-            state["on"] = not state["on"]
-            paint()
-            state["job"] = t.after(530, blink)
+        def shade(level):
+            state["level"] = level
+            bg = mix(PAPER, INK, level)
+            if not state["width"]:
+                t.tag_configure("caret", background=bg, foreground=mix(INK, PAPER, level))
+            elif bg != state["color"]:
+                state["color"] = bg
+                t.configure(insertbackground=bg)
+
+        def fade(to):
+            start = state["level"]
+            tween(t, state, CARET_FADE_MS, lambda k: shade(start + (to - start) * k),
+                  lambda: rest(1 - to), ease_both)
+
+        def rest(to):
+            asleep = to == 0 and (time.perf_counter() - state["woke"]) * 1000 >= CARET_SLEEP_MS
+            if not asleep:
+                state["job"] = t.after(CARET_HOLD_MS, fade, to)
+
+        def afterglow(was):
+            t.tag_remove("glow", "1.0", "end")
+            if AFTERGLOW_MS and t.compare(was, "<", was + " lineend"):  # a line end would fill the row
+                t.tag_add("glow", was, was + "+1c")
+                tween(t, glow, AFTERGLOW_MS,
+                      lambda k: t.tag_configure("glow", background=mix(PAPER, INK, AFTERGLOW * (1 - k))),
+                      lambda: t.tag_remove("glow", "1.0", "end"))
 
         def wake(_e=None):
-            state["on"] = True
-            paint()
+            if not state["focus"] or not t.winfo_exists():
+                return
+            halt(t, state)
+            was, state["at"] = state["at"], place()
+            if was and was != state["at"] and not t.tag_ranges("sel"):
+                afterglow(was)
+            shade(1.0)
+            state["woke"] = time.perf_counter()
+            rest(0.0)
 
         def gained(_e=None):
-            state["focus"] = True
+            state["focus"], state["at"] = True, None
             wake()
 
         def lost(_e=None):
             state["focus"] = False
-            paint()
+            halt(t, state)
+            place()
 
         t.bind("<FocusIn>", gained, add="+")
         t.bind("<FocusOut>", lost, add="+")
         for ev in ("<KeyRelease>", "<ButtonRelease-1>", "<<Selection>>", "<B1-Motion>"):
             t.bind(ev, wake, add="+")
-        state["job"] = t.after(530, blink)
         self.carets.append((t, state))
-        paint()
+        self.pendings.append((t, glow))
 
     def usable_mono(self, family):
         try:
@@ -10653,8 +10774,16 @@ class App:
             self.flash("")
 
     # ------------------------------------------------------------ writing
-    def new_person(self):
+    def clear_drafts(self):
+        """Saves what is open and drops any empty new record left behind: all
+        of a kind share one id, so the next would fail to enter the list."""
         self.commit_if_dirty()
+        for coll in COLLS:
+            self.data[coll] = [r for r in self.data[coll] if not r["id"].startswith("__")]
+        self.draft = None
+
+    def new_person(self):
+        self.clear_drafts()
         self.draft = blank_person(self.q.get().strip())
         self.draft["id"] = "__draft_p__"
         self.draft["_h"] = ""
@@ -10665,7 +10794,7 @@ class App:
         self.say(tr("New person. It only reaches the disk when saved."))
 
     def new_entry(self, kind):
-        self.commit_if_dirty()
+        self.clear_drafts()
         self.draft = {"id": "__draft_e__", "kind": kind, "name": "", "gloss": "",
                       "tags": [], "notes": "", "source": "", "links": [],
                       "domains": [], "updated": None, "_h": ""}
@@ -10678,9 +10807,9 @@ class App:
         self.vc.e_name.focus_set()
         self.say(tr("New entry. The id is generated when saved with a name."))
 
-    def new_source(self):
-        self.commit_if_dirty()
-        raw = self.q.get().strip()
+    def new_source(self, raw=None):
+        self.clear_drafts()
+        raw = self.q.get().strip() if raw is None else raw
         self.draft = source_from_raw(raw) if raw else fix_source({"type": "livro"})
         self.draft["id"] = "__draft_s__"
         self.draft["_h"] = ""
@@ -10691,7 +10820,7 @@ class App:
         self.say(tr("New source. The id is generated when saved with a title."))
 
     def new_metric(self):
-        self.commit_if_dirty()
+        self.clear_drafts()
         self.draft = fix_metric({"id": "__draft_h__", "name": self.q.get().strip(),
                                  "system": self.view_system or "",
                                  "ctype": self.view_htype or "measure"})
@@ -10703,7 +10832,7 @@ class App:
         self.say(tr("New health record. The id is generated when saved with a name."))
 
     def new_note(self):
-        self.commit_if_dirty()
+        self.clear_drafts()
         self.draft = fix_note({"id": "__draft_n__", "name": self.q.get().strip(),
                                "file": "", "updated": None})
         self.draft["_h"] = ""
@@ -11045,11 +11174,102 @@ class App:
                  if e.get("kind") == "form" and e.get("lang")}
         return sorted(langs, key=sort_key)
 
-    def quick_add(self):
-        """Several entries at once, one per line."""
+    # kind: its name in the menu, the window's title and the titles of its two fields
+    NEW_KINDS = {
+        "person": ("+ person", "New person", "NAME", "NOTES"),
+        "concept": ("+ concept", "New concept", "NAME", "GLOSS"),
+        "form": ("+ form", "New form", "NAME", "GLOSS"),
+        "source": ("+ source", "New source", "REFERENCE OR TITLE", "NOTES"),
+        "health": ("+ health", "New health record", "NAME", "NOTES"),
+        "draft": ("+ draft", "New draft", "TITLE", "TEXT  (markdown)"),
+    }
+
+    def create(self, kind, name, text="", lang=""):
+        """A new record through its card, so it saves like any other. Gives its
+        id, or None when it was not saved."""
+        if kind == "source":
+            self.new_source(name)               # the card reads the reference
+        else:
+            {"person": self.new_person, "health": self.new_metric, "draft": self.new_note,
+             "concept": lambda: self.new_entry("concept"),
+             "form": lambda: self.new_entry("form")}[kind]()
+            self.card.e_name.delete(0, "end")
+            self.card.e_name.insert(0, name)
+        if kind == "form":
+            self.vc.e_lang.delete(0, "end")
+            self.vc.e_lang.insert(0, lang)
+        card = self.card
+        field = (card.t_body if kind == "draft"
+                 else card.t_gloss if kind in ("concept", "form") else card.t_notes)
+        field.insert("1.0", text)
+        self.dirty = True
+        return self.save()
+
+    def new_window(self, kind):
+        """A window to write a new record in: a name, its main text and, for a
+        form, the language. The card shows it once saved, for the other fields."""
+        _menu, title, first, second = self.NEW_KINDS[kind]
+        win = self.dialog(tr(title), 600, 430)
+
+        def label(text):
+            tk.Label(win, text=tr(text), bg=PAPER, fg=FAINT, font=self.f_label,
+                     anchor="w").pack(fill="x", padx=20, pady=(12, 2))
+
+        label(first)
+        e_name = tk.Entry(win, font=self.f_body, bg=PAPER, fg=INK, insertbackground=INK,
+                          relief="flat", highlightthickness=1, highlightbackground=RULE,
+                          highlightcolor=STAMP)
+        e_name.pack(fill="x", padx=20, ipady=3)
+        e_name.insert(0, self.q.get().strip())
+        e_name.select_range(0, "end")
+        v_lang = tk.StringVar(value="")
+        if kind == "form":
+            label("LANGUAGE")
+            ttk.Combobox(win, textvariable=v_lang, values=self.known_langs(), width=14,
+                         font=self.f_meta).pack(anchor="w", padx=20)
+        foot = tk.Frame(win, bg=PAPER)
+        foot.pack(fill="x", side="bottom", padx=20, pady=14)
+        label(second)
+        box = tk.Text(win, height=6, font=self.f_body, bg=PAPER, fg=INK, insertbackground=INK,
+                      relief="flat", wrap="word", highlightthickness=1,
+                      highlightbackground=RULE, highlightcolor=STAMP, padx=8, pady=6, undo=True)
+        box.pack(fill="both", expand=True, padx=20)
+        msg = tk.Label(foot, text="", bg=PAPER, fg=OXIDE, font=self.f_meta)
+
+        def done(again=False):
+            name, lang = e_name.get().strip(), v_lang.get().strip()
+            if not name or (kind == "form" and not lang):
+                msg.configure(text=tr("A form needs a language.") if name
+                              else tr("It needs a name."))
+                return "break"
+            if self.create(kind, name, box.get("1.0", "end-1c").strip(), lang) is None:
+                msg.configure(text=tr("Not saved"))
+                return "break"
+            if not again:
+                win.destroy()
+                return "break"
+            e_name.delete(0, "end")
+            box.delete("1.0", "end")
+            msg.configure(text=tr("Saved {date}", date=TODAY()))
+            e_name.focus_set()
+            return "break"
+
+        ttk.Button(foot, text=tr("Save"), command=done).pack(side="left")
+        ttk.Button(foot, text=tr("Save and new"), style="Quiet.TButton",
+                   command=lambda: done(True)).pack(side="left", padx=(8, 0))
+        ttk.Button(foot, text=tr("Cancel"), style="Quiet.TButton",
+                   command=win.destroy).pack(side="left", padx=(8, 0))
+        msg.pack(side="left", padx=14)
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.bind("<Control-Return>", lambda e: done())
+        e_name.bind("<Return>", lambda e: box.focus_set())
+        e_name.focus_set()
+
+    def bulk_add(self):
+        """Several records at once, one per line."""
         self.commit_if_dirty()
-        win = self.dialog(tr("Quick entry"), 640, 520)
-        tk.Label(win, text=tr("QUICK ENTRY"), bg=PAPER, fg=FAINT,
+        win = self.dialog(tr("Bulk entries"), 640, 520)
+        tk.Label(win, text=tr("BULK ENTRIES"), bg=PAPER, fg=FAINT,
                  font=self.f_label).pack(anchor="w", padx=20, pady=(16, 2))
         hint = tk.Label(win, text="", bg=PAPER, fg=SOFT, font=self.f_meta,
                         justify="left")
@@ -11065,7 +11285,7 @@ class App:
                      anchor="w").pack(fill="x", pady=(0, 2))
             return c
 
-        kinds = {tr(k): k for k in ("person", "form", "concept", "source")}
+        kinds = {tr(k): k for k in ("person", "form", "concept", "source", "health", "draft")}
         v_kind = tk.StringVar(value=tr("person"))
         kb = ttk.Combobox(col(tr("KIND"), 10, 0), textvariable=v_kind, state="readonly",
                           values=list(kinds), width=10, font=self.f_meta)
@@ -11083,8 +11303,11 @@ class App:
         def toggle(*_a):
             k = kinds.get(v_kind.get(), "person")
             lang_box.configure(state="normal" if k == "form" else "disabled")
-            e_source.configure(state="normal" if k != "person" else "disabled")
+            e_source.configure(state="normal" if k in ("form", "concept", "source")
+                               else "disabled")
             hint.configure(text={"person": tr("One per line:  - Name. Notes about the person."),
+                                 "health": tr("One per line:  name. notes"),
+                                 "draft": tr("One per line:  title. text"),
                                  "source": tr("One reference per line, as you would write it "
                                               "(SURNAME, Name. Title. Place: Publisher, year)."),
                                  }.get(k, tr("One per line:  name. gloss")))
@@ -11124,6 +11347,16 @@ class App:
                 if identical:
                     bits.append(tr("{n} were already there", n=identical))
                 self.say(" · ".join(bits) or tr("Nothing to add."))
+                return
+            if kind in ("health", "draft"):
+                lines = [l.strip().removeprefix("- ").removeprefix("* ").strip()
+                         for l in text.splitlines()]
+                made = 0
+                for line in filter(None, lines):
+                    name, _dot, rest = line.partition(". ")
+                    made += self.create(kind, name.strip(), rest.strip()) is not None
+                win.destroy()
+                self.say(tr("{n} entry(ies) added.", n=made))
                 return
             if kind == "source":
                 items = [source_from_raw(l) for l in text.splitlines() if l.strip()]
@@ -11614,8 +11847,6 @@ KIND_SHORT = {"person": "per", "concept": "con", "form": "frm",
 
 
 class BookView:
-    TURN_FRAMES = 14
-    TURN_MS = 15
 
     def __init__(self, root, data, start_id=None, on_open=None):
         self.root, self.data = root, data
@@ -12059,15 +12290,12 @@ class BookView:
                                       outline="")
         parts = (leaf, back, shadow)
 
-        def frame(k):
-            self.leaf_at(parts, k / self.TURN_FRAMES, direction)
-            if k < self.TURN_FRAMES:
-                self._job = self.root.after(self.TURN_MS, frame, k + 1)
-            else:
-                self.cv.delete(*parts)
-                self.busy = False
+        def landed():
+            self.cv.delete(*parts)
+            self.busy = False
 
-        frame(0)
+        # the leaf's own cosine (leaf_at) already eases it: the clock goes in straight
+        tween(self.cv, {}, TURN_MS, lambda k: self.leaf_at(parts, k, direction), landed, float)
 
     def leaf_at(self, parts, t, direction):
         """The leaf at instant t (0 to 1): held at the spine, its free edge goes
@@ -14378,8 +14606,28 @@ PT = {
         " · {n} fora da referência",
     "Typeface \"{name}\" {why}; using {mono}.":
         "Tipo \"{name}\" {why}; usando {mono}.",
-    "quick entry":
-        "entrada rápida",
+    "bulk entries":
+        "entradas em lote",
+    "+ new ▾":
+        "+ novo ▾",
+    "New health record":
+        "Novo registro de saúde",
+    "New draft":
+        "Novo rascunho",
+    "NAME":
+        "NOME",
+    "TITLE":
+        "TÍTULO",
+    "REFERENCE OR TITLE":
+        "REFERÊNCIA OU TÍTULO",
+    "It needs a name.":
+        "Precisa de um nome.",
+    "One per line:  name. notes":
+        "Uma por linha:  nome. notas",
+    "One per line:  title. text":
+        "Uma por linha:  título. texto",
+    "health":
+        "saúde",
     "+ measurement":
         "+ medida",
     "+ source":
@@ -14410,8 +14658,8 @@ PT = {
         "Nova fonte",
     "New measurement (corpus)":
         "Nova medida (corpus)",
-    "Quick entry…":
-        "Entrada rápida…",
+    "Bulk entries…":
+        "Entradas em lote…",
     "Reload from disk":
         "Recarregar do disco",
     "Quit":
@@ -14570,10 +14818,10 @@ PT = {
         "O log guarda a versão anterior (menu Base › Histórico).",
     "Deleted. The previous version is in the log.":
         "Apagado. A versão anterior está no log.",
-    "Quick entry":
-        "Entrada rápida",
-    "QUICK ENTRY":
-        "ENTRADA RÁPIDA",
+    "Bulk entries":
+        "Entradas em lote",
+    "BULK ENTRIES":
+        "ENTRADAS EM LOTE",
     "SOURCE":
         "FONTE",
     "One per line:  - Name. Notes about the person.":
@@ -14664,8 +14912,8 @@ PT = {
         "(padrão)",
     "Yes":
         "Sim",
-    "\n  Ctrl+F     go to the search\n  ↓ / Enter  from the search to the list\n  Ctrl+N     new person\n  Ctrl+Q     quick entry (people, forms or concepts)\n  Ctrl+S     save the open record\n  Ctrl+Enter save and start another of the same kind\n  Ctrl+Z / Ctrl+Y   undo / redo\n  Ctrl+J / Ctrl+K   next / previous, from anywhere\n  Ctrl+G     go to: nº (1852), stamp, id or name\n  Ctrl+L     show in the register: leaves the search, shows the open record's nº\n  Ctrl+B     open as logbook (second window, read-only;\n             Enter in the logbook brings the record to the card)\n  Ctrl+1..4  scope people / verba / sources / corpus; Ctrl+0 everything\n  /  in the list goes back to the search;  Enter in the list goes to the card\n  Home / End within the page;  PageUp / PageDown or the wheel turns the page\n  Ctrl+Home / Ctrl+End  start / end of the list\n  Ctrl+PageUp / Ctrl+PageDown turns the page from anywhere\n  F5         reload from disk\n  Esc        back to the list\n\n  REGISTER: every record gets, on its first save, a stamp\n  (YYYYMMDDhhmmss) and an order number that never changes;\n  what is deleted stays in the sequence as cancelled.\n  Without a search, the list is the register, in number order;\n  with a search or filter, it is the INDEX, in alphabetical order.\n  The list shows what fits the window, without scrolling: the rest\n  is on the following pages.\n\n  Search operators:\n  p: v: f: c:   only people / verba / sources / corpus\n  ^ab           name starting with ab\n  tag:csh  lang:de  type:book  sys:renal  dom:law  id:c_\n  e.g.:  v: lang:de ^ab   ·   f: type:article luhmann\n\n  Text fields grow with their text up to the card's height,\n  then scroll inside (ui.max_rows in the JSON sets a fixed\n  limit). A long LOG or NOTES is read one page per view, each\n  page starting at an entry or paragraph: ‹ › beside the title,\n  PageUp / PageDown in it, or the wheel over it (the LOG opens\n  on the newest). View › Long texts › Continuous scrolls instead.\n  The body map\n  folds with [−] and remembers its state.\n\n  In the rail, COLLECTIONS limits to people or verba;\n  any filter below picks the collection by itself.\n\n  Tasks (people):\n  Enter       new line already with [ ]\n  Space       on the [ ] changes the state\n  Ctrl+Space  changes it from anywhere on the line\n  [ ] to do   [/] in progress  [>] waiting on\n  [x] done    [-] cancelled  (they go to the log on save)\n  A date at the end is the deadline: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. The LAST date on the line wins.\n\n  Links, one per line, on any card:\n  rel target [span] — reason # source\n  e.g.: expresses c_timoneiro -800/400 — literal sense\n  e.g.: author_of s_wiener_1948_cybernetics\n  e.g.: cites s_lochtrop_2006 — entry p. 12\n  The target is the id: c_ concept, f_ form, p_ person,\n  s_ source, h_ measurement. A rel outside the table is not\n  an error: it is an ATYPICAL link, with the label you gave;\n  the doctor lists the atypical ones for you to promote.\n\n  SOURCE (on people, entries and measurements): a source's\n  s_…, or free text. Sources cite in ABNT, author-date,\n  BibTeX or CSL-JSON (picker on the card, copy button).\n  Corpus: readings '2026-09-01 13.5 fasting', one per line;\n  out of range shows with (!).\n\n  Sync: every save rereads the disk; on opening,\n  *.sync-conflict-* files are merged and stored in\n  {conflicts}/. The full history is in\n  {stem}.log.<machine>.jsonl (Base › History).\n":
-        "\n  Ctrl+F     ir para a busca\n  ↓ / Enter  da busca para a lista\n  Ctrl+N     nova pessoa\n  Ctrl+Q     entrada rápida (pessoas, formas ou conceitos)\n  Ctrl+S     salvar o registro aberto\n  Ctrl+Enter salvar e começar outro do mesmo tipo\n  Ctrl+Z / Ctrl+Y   desfazer / refazer\n  Ctrl+J / Ctrl+K   próximo / anterior, de qualquer lugar\n  Ctrl+G     ir para: nº (1852), carimbo, id ou nome\n  Ctrl+L     ver no registro: sai da busca, mostra o nº do aberto\n  Ctrl+B     abrir como livro (segunda janela, só leitura;\n             Enter no livro traz o registro para o cartão)\n  Ctrl+1..4  escopo pessoas / verba / fontes / corpus; Ctrl+0 tudo\n  /  na lista volta à busca;  Enter na lista vai ao cartão\n  Home / End na página;  PageUp / PageDown ou a roda vira a página\n  Ctrl+Home / Ctrl+End  começo / fim da lista\n  Ctrl+PageUp / Ctrl+PageDown vira a página de qualquer lugar\n  F5         recarregar do disco\n  Esc        voltar à lista\n\n  REGISTRO: todo registro recebe, ao ser gravado pela primeira\n  vez, um carimbo (AAAAMMDDhhmmss) e um número de ordem que\n  nunca muda; o que é apagado fica na sequência como cancelado.\n  Sem busca, a lista é o registro, na ordem dos números; com\n  busca ou filtro, é o INDICADOR, em ordem alfabética. A lista\n  mostra o que cabe na janela, sem rolagem: o resto está nas\n  páginas seguintes.\n\n  Operadores da busca:\n  p: v: f: c:   só pessoas / verba / fontes / corpus\n  ^ab           nome que começa com ab\n  tag:csh  lang:de  type:livro  sys:renal  dom:direito  id:c_\n  ex.:  v: lang:de ^ab   ·   f: type:artigo luhmann\n\n  Campos de texto crescem com o texto até a altura do cartão\n  e depois rolam por dentro (ui.max_rows no JSON fixa um teto).\n  LOG e NOTAS longos são lidos uma página por vez, cada página\n  começando numa entrada ou parágrafo: ‹ › ao lado do título,\n  PageUp / PageDown nele, ou a roda sobre ele (o LOG abre na\n  mais nova). Ver › Textos longos › Contínuo rola em vez disso.\n  O mapa do corpo\n  recolhe pelo [−] e lembra o estado.\n\n  No trilho, ACERVO limita a pessoas ou a verba;\n  qualquer filtro abaixo escolhe o acervo sozinho.\n\n  Tarefas (pessoas):\n  Enter       nova linha já com [ ]\n  Espaço      sobre o [ ] muda o estado\n  Ctrl+Espaço muda de qualquer ponto da linha\n  [ ] a fazer  [/] em curso  [>] esperando\n  [x] feito    [-] cancelado  (vão para o log ao salvar)\n  Data no fim é o prazo: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. A ÚLTIMA data da linha vence.\n\n  Ligações, uma por linha, em qualquer cartão:\n  rel alvo [intervalo] — razão # fonte\n  ex.: expresses c_timoneiro -800/400 — sentido próprio\n  ex.: author_of s_wiener_1948_cybernetics\n  ex.: cites s_lochtrop_2006 — verbete p. 12\n  Alvo é o id: c_ conceito, f_ forma, p_ pessoa,\n  s_ fonte, h_ medida. Um rel fora da tabela não é\n  erro: é ligação ATÍPICA, com o rótulo que você deu;\n  o doctor lista as atípicas para você promover.\n\n  FONTE (em pessoas, verbetes e medidas): s_… de uma\n  fonte, ou texto livre. Fontes citam em ABNT, autor-data,\n  BibTeX ou CSL-JSON (seletor no cartão, botão copiar).\n  Corpus: leituras '2026-09-01 13.5 jejum', uma por linha;\n  fora da referência aparece com (!).\n\n  Sincronização: cada gravação relê o disco; ao abrir,\n  *.sync-conflict-* são fundidos e guardados em\n  {conflicts}/. O histórico completo está em\n  {stem}.log.<máquina>.jsonl (menu Base › Histórico).\n",
+    "\n  Ctrl+F     go to the search\n  ↓ / Enter  from the search to the list\n  Ctrl+N     new person\n  Ctrl+Q     bulk entries (any kind, one per line)\n  Ctrl+S     save the open record\n  Ctrl+Enter save and start another of the same kind\n  Ctrl+Z / Ctrl+Y   undo / redo\n  Ctrl+J / Ctrl+K   next / previous, from anywhere\n  Ctrl+G     go to: nº (1852), stamp, id or name\n  Ctrl+L     show in the register: leaves the search, shows the open record's nº\n  Ctrl+B     open as logbook (second window, read-only;\n             Enter in the logbook brings the record to the card)\n  Ctrl+1..4  scope people / verba / sources / corpus; Ctrl+0 everything\n  /  in the list goes back to the search;  Enter in the list goes to the card\n  Home / End within the page;  PageUp / PageDown or the wheel turns the page\n  Ctrl+Home / Ctrl+End  start / end of the list\n  Ctrl+PageUp / Ctrl+PageDown turns the page from anywhere\n  F5         reload from disk\n  Esc        back to the list\n\n  REGISTER: every record gets, on its first save, a stamp\n  (YYYYMMDDhhmmss) and an order number that never changes;\n  what is deleted stays in the sequence as cancelled.\n  Without a search, the list is the register, in number order;\n  with a search or filter, it is the INDEX, in alphabetical order.\n  The list shows what fits the window, without scrolling: the rest\n  is on the following pages.\n\n  Search operators:\n  p: v: f: c:   only people / verba / sources / corpus\n  ^ab           name starting with ab\n  tag:csh  lang:de  type:book  sys:renal  dom:law  id:c_\n  e.g.:  v: lang:de ^ab   ·   f: type:article luhmann\n\n  Text fields grow with their text up to the card's height,\n  then scroll inside (ui.max_rows in the JSON sets a fixed\n  limit). A long LOG or NOTES is read one page per view, each\n  page starting at an entry or paragraph: ‹ › beside the title,\n  PageUp / PageDown in it, or the wheel over it (the LOG opens\n  on the newest). View › Long texts › Continuous scrolls instead.\n  The body map\n  folds with [−] and remembers its state.\n\n  In the rail, COLLECTIONS limits to people or verba;\n  any filter below picks the collection by itself.\n\n  Tasks (people):\n  Enter       new line already with [ ]\n  Space       on the [ ] changes the state\n  Ctrl+Space  changes it from anywhere on the line\n  [ ] to do   [/] in progress  [>] waiting on\n  [x] done    [-] cancelled  (they go to the log on save)\n  A date at the end is the deadline: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. The LAST date on the line wins.\n\n  Links, one per line, on any card:\n  rel target [span] — reason # source\n  e.g.: expresses c_timoneiro -800/400 — literal sense\n  e.g.: author_of s_wiener_1948_cybernetics\n  e.g.: cites s_lochtrop_2006 — entry p. 12\n  The target is the id: c_ concept, f_ form, p_ person,\n  s_ source, h_ measurement. A rel outside the table is not\n  an error: it is an ATYPICAL link, with the label you gave;\n  the doctor lists the atypical ones for you to promote.\n\n  SOURCE (on people, entries and measurements): a source's\n  s_…, or free text. Sources cite in ABNT, author-date,\n  BibTeX or CSL-JSON (picker on the card, copy button).\n  Corpus: readings '2026-09-01 13.5 fasting', one per line;\n  out of range shows with (!).\n\n  Sync: every save rereads the disk; on opening,\n  *.sync-conflict-* files are merged and stored in\n  {conflicts}/. The full history is in\n  {stem}.log.<machine>.jsonl (Base › History).\n":
+        "\n  Ctrl+F     ir para a busca\n  ↓ / Enter  da busca para a lista\n  Ctrl+N     nova pessoa\n  Ctrl+Q     entradas em lote (qualquer tipo, uma por linha)\n  Ctrl+S     salvar o registro aberto\n  Ctrl+Enter salvar e começar outro do mesmo tipo\n  Ctrl+Z / Ctrl+Y   desfazer / refazer\n  Ctrl+J / Ctrl+K   próximo / anterior, de qualquer lugar\n  Ctrl+G     ir para: nº (1852), carimbo, id ou nome\n  Ctrl+L     ver no registro: sai da busca, mostra o nº do aberto\n  Ctrl+B     abrir como livro (segunda janela, só leitura;\n             Enter no livro traz o registro para o cartão)\n  Ctrl+1..4  escopo pessoas / verba / fontes / corpus; Ctrl+0 tudo\n  /  na lista volta à busca;  Enter na lista vai ao cartão\n  Home / End na página;  PageUp / PageDown ou a roda vira a página\n  Ctrl+Home / Ctrl+End  começo / fim da lista\n  Ctrl+PageUp / Ctrl+PageDown vira a página de qualquer lugar\n  F5         recarregar do disco\n  Esc        voltar à lista\n\n  REGISTRO: todo registro recebe, ao ser gravado pela primeira\n  vez, um carimbo (AAAAMMDDhhmmss) e um número de ordem que\n  nunca muda; o que é apagado fica na sequência como cancelado.\n  Sem busca, a lista é o registro, na ordem dos números; com\n  busca ou filtro, é o INDICADOR, em ordem alfabética. A lista\n  mostra o que cabe na janela, sem rolagem: o resto está nas\n  páginas seguintes.\n\n  Operadores da busca:\n  p: v: f: c:   só pessoas / verba / fontes / corpus\n  ^ab           nome que começa com ab\n  tag:csh  lang:de  type:livro  sys:renal  dom:direito  id:c_\n  ex.:  v: lang:de ^ab   ·   f: type:artigo luhmann\n\n  Campos de texto crescem com o texto até a altura do cartão\n  e depois rolam por dentro (ui.max_rows no JSON fixa um teto).\n  LOG e NOTAS longos são lidos uma página por vez, cada página\n  começando numa entrada ou parágrafo: ‹ › ao lado do título,\n  PageUp / PageDown nele, ou a roda sobre ele (o LOG abre na\n  mais nova). Ver › Textos longos › Contínuo rola em vez disso.\n  O mapa do corpo\n  recolhe pelo [−] e lembra o estado.\n\n  No trilho, ACERVO limita a pessoas ou a verba;\n  qualquer filtro abaixo escolhe o acervo sozinho.\n\n  Tarefas (pessoas):\n  Enter       nova linha já com [ ]\n  Espaço      sobre o [ ] muda o estado\n  Ctrl+Espaço muda de qualquer ponto da linha\n  [ ] a fazer  [/] em curso  [>] esperando\n  [x] feito    [-] cancelado  (vão para o log ao salvar)\n  Data no fim é o prazo: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. A ÚLTIMA data da linha vence.\n\n  Ligações, uma por linha, em qualquer cartão:\n  rel alvo [intervalo] — razão # fonte\n  ex.: expresses c_timoneiro -800/400 — sentido próprio\n  ex.: author_of s_wiener_1948_cybernetics\n  ex.: cites s_lochtrop_2006 — verbete p. 12\n  Alvo é o id: c_ conceito, f_ forma, p_ pessoa,\n  s_ fonte, h_ medida. Um rel fora da tabela não é\n  erro: é ligação ATÍPICA, com o rótulo que você deu;\n  o doctor lista as atípicas para você promover.\n\n  FONTE (em pessoas, verbetes e medidas): s_… de uma\n  fonte, ou texto livre. Fontes citam em ABNT, autor-data,\n  BibTeX ou CSL-JSON (seletor no cartão, botão copiar).\n  Corpus: leituras '2026-09-01 13.5 jejum', uma por linha;\n  fora da referência aparece com (!).\n\n  Sincronização: cada gravação relê o disco; ao abrir,\n  *.sync-conflict-* são fundidos e guardados em\n  {conflicts}/. O histórico completo está em\n  {stem}.log.<máquina>.jsonl (menu Base › Histórico).\n",
     "OK":
         "OK",
     "Kustos · logbook (read-only)":
@@ -15044,8 +15292,8 @@ PT = {
         "{n} rascunho(s) novo(s) trazido(s) de notes/",
     "+ draft":
         "+ rascunho",
-    "\n  DRAFTS: free notes in markdown, one .md file each in notes/ beside the\n                  program (Obsidian sees the same files). + draft starts one;\n                  its title is its file name. A .md put in notes/ comes in when\n                  Kustos opens, or on F5. d: in the search, Ctrl+5 the scope.\n                  Deleting moves the file to notes/.deleted.\n  In a draft's text: Ctrl+B bold, Ctrl+I italic, Ctrl+K [[link]] (on the\n                  selection; again, unwraps), Ctrl+Backspace / Ctrl+Delete a\n                  word, Enter continues a list or a task, Tab / Shift+Tab\n                  indent it, Alt+Up / Alt+Down move the line. Shift with the\n                  arrows, Home, End (and Ctrl) selects. 'as HTML' writes the\n                  draft as a page to read or print; Base › Export drafts\n                  puts them all in one markdown file.\n":
-        "\n  RASCUNHOS: notas livres em markdown, um arquivo .md cada em notes/ ao lado\n                  do programa (o Obsidian vê os mesmos arquivos). + rascunho começa\n                  um; o título é o nome do arquivo. Um .md posto em notes/ entra\n                  quando o Kustos abre, ou no F5. d: na busca, Ctrl+5 o escopo.\n                  Apagar move o arquivo para notes/.deleted.\n  No texto de um rascunho: Ctrl+B negrito, Ctrl+I itálico, Ctrl+K [[link]]\n                  (na seleção; de novo, desfaz), Ctrl+Backspace / Ctrl+Delete\n                  apagam uma palavra, Enter continua lista ou tarefa, Tab /\n                  Shift+Tab recuam, Alt+↑ / Alt+↓ movem a linha. Shift com as\n                  setas, Home, End (e Ctrl) seleciona. 'como HTML' grava o\n                  rascunho como página para ler ou imprimir; Base › Exportar\n                  rascunhos junta todos num arquivo markdown.\n",
+    "\n  DRAFTS: free notes in markdown, one .md file each in notes/ beside the\n                  program (Obsidian sees the same files). + draft starts one;\n                  its title is its file name. A .md put in notes/ comes in when\n                  Kustos opens, or on F5. d: in the search, Ctrl+5 the scope.\n                  Deleting moves the file to notes/.deleted.\n  In a draft's text or any NOTES: Ctrl+B bold, Ctrl+I italic, Ctrl+K [[link]] (on the\n                  selection; again, unwraps), Ctrl+Backspace / Ctrl+Delete a\n                  word, Enter continues a list or a task, Tab / Shift+Tab\n                  indent it, Alt+Up / Alt+Down move the line. Shift with the\n                  arrows, Home, End (and Ctrl) selects. 'as HTML' writes the\n                  draft as a page to read or print; Base › Export drafts\n                  puts them all in one markdown file.\n":
+        "\n  RASCUNHOS: notas livres em markdown, um arquivo .md cada em notes/ ao lado\n                  do programa (o Obsidian vê os mesmos arquivos). + rascunho começa\n                  um; o título é o nome do arquivo. Um .md posto em notes/ entra\n                  quando o Kustos abre, ou no F5. d: na busca, Ctrl+5 o escopo.\n                  Apagar move o arquivo para notes/.deleted.\n  No texto de um rascunho ou em NOTAS: Ctrl+B negrito, Ctrl+I itálico, Ctrl+K [[link]]\n                  (na seleção; de novo, desfaz), Ctrl+Backspace / Ctrl+Delete\n                  apagam uma palavra, Enter continua lista ou tarefa, Tab /\n                  Shift+Tab recuam, Alt+↑ / Alt+↓ movem a linha. Shift com as\n                  setas, Home, End (e Ctrl) seleciona. 'como HTML' grava o\n                  rascunho como página para ler ou imprimir; Base › Exportar\n                  rascunhos junta todos num arquivo markdown.\n",
     "as HTML":
         "como HTML",
     "Written {file}":

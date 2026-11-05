@@ -33,8 +33,8 @@ updating of files and conflicts if used any syncing app or cloud sync.
   never the text, so saving one does not rewrite the others; the log keeps the
   text of every save. A `.md` put into `notes/` comes in when Kustos opens or on
   `F5`. A file changed outside since it was opened is not overwritten without
-  asking. Deleting moves the file to `notes/.deleted`. In a draft's text:
-  `Ctrl+B` bold, `Ctrl+I` italic, `Ctrl+K` `[[link]]`, `Ctrl+Backspace`/`Delete`
+  asking. Deleting moves the file to `notes/.deleted`. In a draft's text, in
+  any record's NOTES and in reading mode: `Ctrl+B` bold, `Ctrl+I` italic, `Ctrl+K` `[[link]]`, `Ctrl+Backspace`/`Delete`
   a word, `Enter` continues a list or task, `Tab`/`Shift+Tab` indent it,
   `Alt+↑`/`Alt+↓` move lines, with a light markdown highlight. *as HTML* writes
   the draft as a page to read or print; **Base › Export drafts** puts them all

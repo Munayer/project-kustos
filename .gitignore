@@ -17,6 +17,9 @@ _kustos_drafts_*.md
 *.sync-conflict-*
 *.tmp
 
+# Where this machine's copy of the program goes
+tools/target.local.txt
+
 # Syncthing
 .stfolder/
 .stignore

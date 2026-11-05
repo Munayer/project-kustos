@@ -18,7 +18,7 @@ file and a markdown mirror. See `README.md` for the features.
 There is no build, linter or test suite; the checks are:
 
 ```
-python -m py_compile _kustos.py     # syntax (tools/update-personal.cmd runs it too)
+python -m py_compile _kustos.py     # syntax (tools/update-instance.cmd runs it too)
 python _kustos.py doctor            # structure of the base: must report 0 errors
 python _kustos.py                   # open the window (needs Tk and a display)
 python _kustos.py help              # any unknown command prints the full usage (__doc__)
@@ -39,8 +39,8 @@ empty repository folder gives an empty base (and `doctor` passes on it).
 language (`tr`), common, the collections (**people** `p_`, **verba**
 `c_`/`f_` concepts and forms, **sources** `s_`, **corpus** `h_` health
 records, **notes** `n_` — shown as "drafts"), then file, register, conflicts, lock, doctor, mirror, search,
-history, migration, upgrade, citation, health report, peritia, themes, the Tk
-`*Card` editors, `App` (the main window), `BookView` (the logbook), the
+history, migration, upgrade, citation, health report, peritia, themes, motion,
+the Tk `*Card` editors, `App` (the main window), `BookView` (the logbook), the
 `cmd_*` functions and `main()`, and finally the `PT` dict.
 
 Ideas that span several sections:
@@ -69,6 +69,12 @@ Ideas that span several sections:
   the panel's parameters are in `peritia`; they save, log, merge and replay
   like records but stay out of `COLLS` and the register. Test it on invented
   data with `peritia_api(...)`, no browser needed.
+- **Long texts are markdown**: `textfield(..., pages=True)` (every NOTES and the
+  draft's text) gets `MarkdownKeys`, and `fit(opening=True)` paints it before
+  the pages are measured. The text stored stays plain.
+- **Motion** (`# ==== motion`): the timings are constants there, and `tween`
+  follows the clock. Animate a tag's colour, not a Text's options: `configure`
+  on a Text costs ~20 times as much per frame.
 - **The logs are the history**: `history <id>` and `replay` (rebuilds the base
   from logs into `_kustos.replay.json`) read them; there are no `.bak` files.
 - **Drafts live in files**: the `notes` collection is an index (id, title,
@@ -81,18 +87,17 @@ Ideas that span several sections:
 
 ## The two instances
 
-- **Dev**: this repository (`C:\path\to\project-kustos`), published to
-  `github.com/Munayer/project-kustos` (public: anyone can read it, so nothing personal goes into the code either).
-- **Personal**: the Syncthing folder `C:\path\to\kustos`, which holds
-  the program *and the owner's personal data*. Syncthing keeps it the same on
-  both computers.
+- **Dev**: this repository, public on GitHub: anyone can read it, so nothing
+  personal goes into the code, the docs or the commit messages either.
+- **Instance**: a separate folder, outside this repository, which holds the
+  program *and the owner's data*. Its location is not recorded here.
 
 The rules, in order:
 
-1. **The personal instance comes first and must stay safe.** The program is for
+1. **The instance comes first and must stay safe.** The program is for
    the owner's own use.
 2. **Both instances always run the same, latest program.**
-3. **Personal data never goes to GitHub.** `.gitignore` keeps out `_kustos.json`,
+3. **The owner's data never goes to GitHub.** `.gitignore` keeps out `_kustos.json`,
    logs, locks, mirrors, reports, conflicts and Syncthing files; never add them,
    and never copy real records into tests, fixtures or examples.
 
@@ -100,12 +105,12 @@ The rules, in order:
 
 1. Edit `_kustos.py` here, in the repository.
 2. Test on a **temporary copy** of the personal data (a `kustos_*` folder in
-   `%TEMP%`), never on the personal folder itself; delete the copy, and any
+   `%TEMP%`), never on the instance itself; delete the copy, and any
    screenshots, afterwards. Health data is sensitive.
 3. `python _kustos.py doctor` must report 0 errors.
 4. Commit with an English message ending in
    `Co-Authored-By: Claude <noreply@anthropic.com>`, then push.
-5. Copy to the personal folder (`tools\update-personal.cmd`, or copy
+5. Copy to the instance (`tools\update-instance.cmd`, or copy
    `_kustos.py`, `_kustos.cmd`, `_kustos_logbook.cmd`, `_kustos_peritia.cmd`,
    `kustos.ico`) **only when
    Kustos is closed** — check that no `python`/`pythonw` process is running, or
