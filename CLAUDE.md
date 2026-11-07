@@ -140,7 +140,11 @@ The rules, in order:
 1. Edit `_kustos.py` here, in the repository.
 2. Test on a **temporary copy** of the personal data (a `kustos_*` folder in
    `%TEMP%`), never on the instance itself; delete the copy, and any
-   screenshots, afterwards. Health data is sensitive.
+   screenshots, afterwards. Health data is sensitive. Or test on invented
+   records: `python tools/demo_base.py <folder>` builds the web demo's base
+   through Kustos's own save functions (`tools\demo.cmd` opens it in
+   `%TEMP%\kustos_demo`); its pictures can be shared, and it refuses a folder
+   it did not make.
 3. `python _kustos.py doctor` must report 0 errors.
 4. Commit with an English message ending in
    `Co-Authored-By: Claude <noreply@anthropic.com>`, then push.

@@ -50,6 +50,16 @@ selected, and the path finder with its steps written out.
    Start menu or the taskbar.
 3. Upon the first entry, the program creates the `_kustos.json` database. All files are local and don't leave your computer, unless you use a cloud or sync app.
 
+### Trying it on invented data
+
+`tools\demo.cmd` (from a copy of this repository) opens Kustos on a base of
+invented records, the same as the web demo's, in `%TEMP%\kustos_demo`, apart
+from your own folder: to try a change, to compare the window with the web page
+on the same records (`tools\demo.cmd web`), or to take pictures you can share.
+It always runs the repository's program; its records are kept, with anything
+you add to them, until `tools\demo.cmd fresh`. `pt` or `en` sets the language.
+It refuses any folder it did not make, so it never touches a real base.
+
 ## Components
 
 - **Five collections** on the left menu, each with an unique ID:
