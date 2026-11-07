@@ -7423,10 +7423,11 @@ function gGeneration() {
   for (const n of G.ids) {
     if (next[n] && !N[n].lit) {      // a birth: the light of its lit neighbours flows to it
       born++;
-      for (const m of G.adj[n]) if (N[m].lit) G.pulses.push({a: m, b: n, start: G.clock, dur: FLOW_MS});
-      N[n].arrive = G.clock + FLOW_MS;
+      const dur = FLOW_MS * (0.7 + 0.6 * Math.random());  // each birth at its own pace
+      for (const m of G.adj[n]) if (N[m].lit) G.pulses.push({a: m, b: n, start: G.clock, dur});
+      N[n].arrive = G.clock + dur;
     }
-    if (!next[n] && N[n].lit) died++;
+    if (!next[n] && N[n].lit) { died++; N[n].dimAt = G.clock + Math.random() * 600; }  // deaths fade one by one
   }
   for (const n of G.ids) N[n].lit = next[n];
   const state = G.ids.filter(n => next[n]).sort().join(" ");
@@ -7454,8 +7455,9 @@ function gHeat() {
   } else if (G.mode === "life") {
     if (!G.settled && G.frame % GEN_TICKS === 0) gGeneration();
     for (const n of G.ids) {
-      const p = N[n], want = p.lit && G.clock >= (p.arrive || 0) ? 1 : 0;
-      p.heat += (want - p.heat) * (want ? 0.12 : 0.06);  // lighting is quicker than fading
+      const p = N[n], want = p.lit ? (G.clock >= (p.arrive || 0) ? 1 : 0)
+                                   : (G.clock < (p.dimAt || 0) ? p.heat : 0);
+      p.heat += (want - p.heat) * (want ? 0.09 : 0.05);  // lighting is quicker than fading
     }
   } else {
     for (const n of G.ids) N[n].heat += (N[n].rec - N[n].heat) * 0.1;
