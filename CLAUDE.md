@@ -190,7 +190,10 @@ Force pushes are run by the owner, not by Claude.
   Over a card the vertical wheel scrolls the card, whatever field is under
   the pointer; a long (paged) field turns its pages with a sideways swipe or
   Shift+wheel, or with the wheel once the card is at its end (a new gesture,
-  so one that only reaches the end does not spill into page turns).
+  so one that only reaches the end does not spill into page turns). A field
+  that scrolls inside (Continuous, `ui.max_rows`) does the same; `text_wheel`
+  replaces Tk's own Text wheel so a card's field never scrolls by itself, and
+  a `TCombobox` has no wheel at all -- it changed a record's type in passing.
 - Patching with shell heredocs mangles backslashes; write patch scripts to a
   file and `compile()` the result before writing it.
 

@@ -12805,18 +12805,13 @@ class App:
                 if notches(e):                  # a page a notch, however small the steps
                     book.turn(step, focus=False)
                 return
-            if sideways or paged:
-                if not sideways:
-                    glide(units)
-                return
-            if isinstance(w, tk.Text):
-                first, last_ = w.yview()
-                if not (first <= 0.0 and last_ >= 1.0):
-                    n = notches(e)
-                    if n:
-                        w.yview_scroll(n * 2, "units")
+            if isinstance(w, tk.Text) and not paged and (sideways or gesture["edge"]):
+                first, last_ = w.yview()        # a field that scrolls inside, as a long field pages
+                if (last_ < 0.999) if step > 0 else (first > 0.001):
+                    w.yview_scroll(int(round(units * 40)) or step, "pixels")
                     return
-            glide(units)
+            if not sideways:
+                glide(units)
 
         # Tk sends the wheel to the widget under the pointer, on every system;
         # one handler for the whole window passes it to the card that widget is
@@ -12827,18 +12822,45 @@ class App:
             self._card_wheel = True
             for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
                 self.root.bind_all(seq, self.card_wheel, add="+")
+                # a text field scrolled itself before the card heard of it (and,
+                # at its end, the card stayed still): in a card, the card decides
+                self.root.bind_class("Text", seq, self.text_wheel)
+                # a drop-down box changed its value under the wheel -- a source's
+                # type, a form's status -- while the card scrolled past it
+                self.root.unbind_class("TCombobox", seq)
         self.canvases = getattr(self, "canvases", []) + [canvas]
         self.pendings += [(canvas, pending), (canvas, scroll)]
         return inner
 
-    def card_wheel(self, e):
-        """The wheel or the touchpad over a card -- a field of it included --
-        scrolls that card (or turns the field's page), whatever was clicked."""
-        path = str(e.widget)
+    def card_canvas(self, widget):
+        """The scrolling canvas of the card a widget is in, or None."""
+        path = str(widget)
         for canvas in getattr(self, "canvases", []):
             mine = str(canvas)
             if path == mine or path.startswith(mine + "."):
-                return canvas.wheel(e) if canvas.winfo_exists() else None
+                return canvas if canvas.winfo_exists() else None
+        return None
+
+    def card_wheel(self, e):
+        """The wheel or the touchpad over a card -- a field of it included --
+        scrolls that card (or turns the field's page), whatever was clicked."""
+        canvas = self.card_canvas(e.widget)
+        return canvas.wheel(e) if canvas is not None else None
+
+    def text_wheel(self, e):
+        """A text field's own wheel, as Tk has it -- except in a card, where
+        the card decides (card_wheel) and the field does not move by itself."""
+        if self.card_canvas(e.widget) is not None:
+            self.card_wheel(e)
+            return "break"
+        w, num = e.widget, getattr(e, "num", 0)
+        if num in (4, 5):
+            w.yview_scroll(-50 if num == 4 else 50, "pixels")
+        elif sys.platform == "darwin":
+            w.yview_scroll(-15 * e.delta, "pixels")
+        else:
+            d = e.delta
+            w.yview_scroll(-d // 3 if d >= 0 else (2 - d) // 3, "pixels")
         return None
 
     def autogrow(self, t, minrows=2, tail=False, pages=None):
