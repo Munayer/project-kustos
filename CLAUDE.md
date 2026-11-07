@@ -39,7 +39,7 @@ empty repository folder gives an empty base (and `doctor` passes on it).
 language (`tr`), common, the collections (**people** `p_`, **verba**
 `c_`/`f_` concepts and forms, **sources** `s_`, **corpus** `h_` health
 records, **notes** `n_` — shown as "drafts"), then file, register, conflicts, lock, doctor, mirror, search,
-history, migration, upgrade, citation, health report, peritia, themes, motion,
+history, migration, upgrade, citation, health report, peritia, web, themes, motion,
 the Tk `*Card` editors, `App` (the main window), `BookView` (the logbook), the
 `cmd_*` functions and `main()`, and finally the `PT` dict.
 
@@ -61,7 +61,16 @@ Ideas that span several sections:
 - **The register**: every record has a `reg` stamp and a `reg_n` number that
   never changes and is never reused (see the comment at `# ==== register`).
 - **Links** live in a top-level `edges` list (`from`, `to`, `rel`), not inside
-  records; `RELS` defines the types.
+  records; `RELS` defines the types. `write_link` adds, changes or removes one
+  link as a save of the record it comes from (the web page and the window's
+  graph both write through it; it refuses a RELS type that does not fit the two
+  records, as the doctor would). What a line shows -- family colour, age from
+  the logs (`edge_times`, cached), stroke by evidence, taper by direction -- is
+  `link_facts`, shared by both graphs. The path finder's chains come from
+  `link_paths` (breadth-first over `graph_adjacency`, `PATH_LIMIT` shortest,
+  `PATH_MAX` links at most), also shared: the web asks `web_path`, the window
+  calls it in `GraphView.show_path` (`f` opens `PathDialog`, Ctrl+click a
+  record).
 - **Peritia** (`# ==== peritia`): the skills panel is a page served by
   `cmd_peritia` on 127.0.0.1 (a token in the page, the Host header checked),
   from the template `PERITIA_HTML` (strings as `@@English@@`, translated by
@@ -69,6 +78,24 @@ Ideas that span several sections:
   the panel's parameters are in `peritia`; they save, log, merge and replay
   like records but stay out of `COLLS` and the register. Test it on invented
   data with `peritia_api(...)`, no browser needed.
+- **Web** (`# ==== web`): `cmd_web` serves the whole base the same way, from
+  `WEB_HTML` (its strings come in the boot data as `T`, from `WEB_STRINGS`,
+  translated by `tr`). The page edits the text the window's cards hold and
+  `web_gather` reads it back with the same parsers (`parse_log`,
+  `parse_tasks`, `parse_edges`...), then `save_record`: a change to a card's
+  fields or to how it saves belongs in both places. Search and list rows are
+  shared with the window (`parse_search`, `search_base`, `list_row_text`).
+  Test it on invented data with `web_api(...)`, or run it with `--stay` and
+  drive the page in a headless browser. The page's link graph gets its records
+  from `web_graph` (`graph_adjacency`, `graph_ego`, as the window) and draws
+  them itself; its life, glow and still rules, its springs and the way changes
+  are drawn are the window's `GraphView` ones rewritten in JavaScript, so a
+  change to one belongs in the other. Both: life's generations last 1.2 s and
+  the run rests when the pattern settles; changes grow, wither and flow (light
+  along the links into a birth) instead of jumping; every brightness eases;
+  the springs take damped steps that keep half of the last one, and dragging
+  holds the view still -- full-temperature steps made every record shake
+  around its place, which read as flicker.
 - **Long texts are markdown**: `textfield(..., pages=True)` (every NOTES and the
   draft's text) gets `MarkdownKeys`, and `fit(opening=True)` paints it before
   the pages are measured. The text stored stays plain.
