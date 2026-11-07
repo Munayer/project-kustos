@@ -179,6 +179,10 @@ Force pushes are run by the owner, not by Claude.
 - Keep it fluid: the list pages instead of scrolling (`rows_fit`, `turn`),
   searching is debounced, and heavy work (the mirror) runs in the background.
   Measure before and after a change that touches typing or redrawing.
+- A touchpad sends many small wheel events where a mouse sends one a notch:
+  never move a fixed step per event. Amounts (a zoom, a scroll) take
+  `wheel_units(e)`; steps (a page) count with `WheelNotches` / `wheel_turn`.
+  The page's graph does the same in `gWheelZoom`.
 - Patching with shell heredocs mangles backslashes; write patch scripts to a
   file and `compile()` the result before writing it.
 

@@ -179,6 +179,55 @@ def TODAY():
     return date.today().isoformat()
 
 
+# ---- the wheel and the touchpad. A mouse wheel sends one event a notch (a
+# delta of 120 on Windows); a touchpad sends many small ones for the same
+# movement, a few units each. What moves by steps -- a page of the list, of a
+# long field, of the logbook -- counts them and moves once a notch's worth
+# (WheelNotches); what moves by an amount -- a zoom, a scroll -- takes the
+# fraction (wheel_units). X11 sends Button-4/5, one notch each.
+
+WHEEL_NOTCH = 120
+WHEEL_GESTURE_S = 0.4       # a pause this long, or a turn back, starts afresh
+
+
+def wheel_units(e):
+    """Notches an event is worth, positive toward the end (down, next): 1.0
+    for a notch of a mouse wheel, a fraction for a step of a touchpad."""
+    num = getattr(e, "num", 0)
+    if num in (4, 5):
+        return 1.0 if num == 5 else -1.0
+    d = getattr(e, "delta", 0) or 0
+    return float(-d) if sys.platform == "darwin" else -d / WHEEL_NOTCH
+
+
+class WheelNotches:
+    """Counts a wheel's or a touchpad's movement and gives it back in whole
+    notches: a mouse wheel moves once a notch, as it always did; a touchpad
+    once every notch's worth of its small steps, not once a step."""
+
+    def __init__(self):
+        self.acc, self.at = 0.0, 0.0
+
+    def __call__(self, e):
+        u, now = wheel_units(e), time.monotonic()
+        if now - self.at > WHEEL_GESTURE_S or (self.acc and (self.acc > 0) != (u > 0)):
+            self.acc = 0.0
+        self.at = now
+        self.acc += u
+        n = int(self.acc)               # toward zero: what is left waits for more
+        self.acc -= n
+        return n
+
+
+def wheel_turn(notches, e, turn):
+    """A page turned by `turn(+1 | -1)` once a whole notch; "break" either way,
+    so the widget's own scrolling does not move it too."""
+    n = notches(e)
+    for _ in range(abs(n)):
+        turn(1 if n > 0 else -1)
+    return "break"
+
+
 def NOW():
     return datetime.now().isoformat(timespec="seconds")
 
@@ -7636,7 +7685,7 @@ function graphMount() {
   c.addEventListener("pointerup", gUp);
   c.addEventListener("pointercancel", gUp);
   c.addEventListener("pointerleave", e => { if (e.pointerType === "mouse" && !G.press) G.hover = null; });
-  c.addEventListener("wheel", e => { e.preventDefault(); gZoomAt(e.offsetX, e.offsetY, e.deltaY < 0 ? 1.1 : 1 / 1.1); },
+  c.addEventListener("wheel", e => { e.preventDefault(); gZoomAt(e.offsetX, e.offsetY, gWheelZoom(e)); },
                      {passive: false});
   c.addEventListener("contextmenu", e => e.preventDefault());
   G.last = performance.now();
@@ -8138,6 +8187,13 @@ function gNodeAt(x, y, slop) {
     if (d < bd) { best = n; bd = d; }
   }
   return best;
+}
+// A notch of a mouse wheel zooms by 1.1; a touchpad's many small steps, or a
+// pinch (which comes as a wheel with Ctrl), by their share of it -- not 1.1 each.
+function gWheelZoom(e) {
+  const px = e.deltaY * (e.deltaMode === 1 ? 33 : e.deltaMode === 2 ? 600 : 1);
+  const f = Math.pow(1.1, -px / (e.ctrlKey ? 12 : 100));
+  return Math.min(1.5, Math.max(1 / 1.5, f));
 }
 function gZoomAt(x, y, f) {
   const z = Math.min(3, Math.max(0.12, G.zoom * f)), [mx, my] = gMiddle();
@@ -11476,7 +11532,8 @@ class Reader:
                         ("<Escape>", lambda e: self.close()), ("<Control-e>", lambda e: self.close()),
                         ("<Control-f>", lambda e: self.find_open())):
             t.bind(seq, fn)
-        t.bind("<MouseWheel>", lambda e: self.turn(-1 if e.delta > 0 else 1))
+        notches = WheelNotches()
+        t.bind("<MouseWheel>", lambda e: wheel_turn(notches, e, self.turn))
         t.bind("<Button-4>", lambda e: self.turn(-1))
         t.bind("<Button-5>", lambda e: self.turn(1))
         t.bind("<KeyRelease>", self.typed, add="+")
@@ -11867,7 +11924,8 @@ class App:
         self.list.bind("<Button-3>", self.row_menu)
         # no scrolling: the list shows what fits, and the rest is the next page
         self.list.bind("<Configure>", self.fit_soon)
-        self.list.bind("<MouseWheel>", lambda e: self.turn(-1 if e.delta > 0 else 1))
+        self._list_notches = WheelNotches()
+        self.list.bind("<MouseWheel>", lambda e: wheel_turn(self._list_notches, e, self.turn))
         self.list.bind("<Button-4>", lambda e: self.turn(-1))
         self.list.bind("<Button-5>", lambda e: self.turn(1))
         pw.add(mid, stretch="always", minsize=200)
@@ -12704,9 +12762,12 @@ class App:
         canvas.bind("<Configure>", canvas_resized)
         scroll = canvas.scroll = {"job": None, "to": 0.0}
 
+        notches = WheelNotches()
+
         def glide(step):
-            """Three units of the wheel (a tenth of the view each), eased. Turning
-            on while it moves adds to where it was heading."""
+            """Three units of the wheel (a tenth of the view each) a notch -- a
+            touchpad's step, its fraction --, eased. Turning on while it moves
+            adds to where it was heading."""
             top, bottom = canvas.yview()
             span = bottom - top
             base = top if scroll["job"] is None else scroll["to"]
@@ -12716,21 +12777,28 @@ class App:
         def wheel(e):
             if not canvas.winfo_exists():
                 return
-            step = 1 if (getattr(e, "num", 0) == 5 or e.delta < 0) else -1
+            units = wheel_units(e)
+            if not units:
+                return
+            step = 1 if units > 0 else -1
             w = e.widget
             book = getattr(w, "pages", None)
             if isinstance(w, tk.Text) and book is not None and book.paged:
                 if book.can_turn(step):
-                    book.turn(step, focus=False)
+                    n = notches(e)              # a page a notch, however small the steps
+                    if n:
+                        book.turn(step, focus=False)
                     return
-                glide(step)
+                glide(units)
                 return
             if isinstance(w, tk.Text):
                 first, last_ = w.yview()
                 if not (first <= 0.0 and last_ >= 1.0):
-                    w.yview_scroll(step * 2, "units")
+                    n = notches(e)
+                    if n:
+                        w.yview_scroll(n * 2, "units")
                     return
-            glide(step)
+            glide(units)
 
         def claim(_e=None):
             for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
@@ -14838,7 +14906,8 @@ class BookView:
         b("<Up>", lambda e: self.step(-1))
         b("<Home>", lambda e: self.open_spread(0, -1))
         b("<End>", lambda e: self.open_spread(len(self.spreads) - 1, 1))
-        b("<MouseWheel>", lambda e: self.turn(-1 if e.delta > 0 else 1))
+        notches = WheelNotches()
+        b("<MouseWheel>", lambda e: wheel_turn(notches, e, self.turn))
         b("<Button-4>", lambda e: self.turn(-1))
         b("<Button-5>", lambda e: self.turn(1))
         for n, (key, _) in enumerate(BOOK_CHAPTERS, 1):
@@ -15823,7 +15892,7 @@ class GraphView:
         cv.bind("<Shift-B1-Motion>", self.link_drag)
         cv.bind("<Shift-ButtonRelease-1>", self.link_release)
         cv.bind("<Button-3>", self.touch)
-        cv.bind("<MouseWheel>", lambda e: self.zoom_at(e, 1.1 if e.delta > 0 else 1 / 1.1))
+        cv.bind("<MouseWheel>", lambda e: self.zoom_at(e, 1.1 ** -wheel_units(e)))
         cv.bind("<Button-4>", lambda e: self.zoom_at(e, 1.1))
         cv.bind("<Button-5>", lambda e: self.zoom_at(e, 1 / 1.1))
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -17622,7 +17691,7 @@ class MonadView:
         cv.bind("<B1-Motion>", self.drag)
         cv.bind("<ButtonRelease-1>", self.release)
         cv.bind("<Double-Button-1>", lambda e: self.open_in_card(self.hover or self.center))
-        cv.bind("<MouseWheel>", lambda e: self.zoom_at(e, 1.1 if e.delta > 0 else 1 / 1.1))
+        cv.bind("<MouseWheel>", lambda e: self.zoom_at(e, 1.1 ** -wheel_units(e)))
         cv.bind("<Button-4>", lambda e: self.zoom_at(e, 1.1))
         cv.bind("<Button-5>", lambda e: self.zoom_at(e, 1 / 1.1))
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -18295,10 +18364,11 @@ class TimelineView:
         self.later()
 
     def wheel(self, e):
+        u = wheel_units(e)                                  # a fraction, from a touchpad
         if e.state & 0x1:                                   # Shift: move along
-            self.pan(-0.15 if e.delta > 0 else 0.15)
+            self.pan(0.15 * u)
         else:
-            self.zoom_at(e.x, 0.8 if e.delta > 0 else 1.25)
+            self.zoom_at(e.x, 1.25 ** u)
 
     def pan(self, part):
         d = (self.v1 - self.v0) * part
