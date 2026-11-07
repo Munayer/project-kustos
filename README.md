@@ -254,8 +254,10 @@ It refuses any folder it did not make, so it never touches a real base.
   rail and the list so the card takes the whole window; the text column keeps
   a readable width. A long LOG or NOTES field is read one page per view
   inside the card: each page holds what fits on screen and starts at an entry
-  or paragraph (`‹ ›` beside the title, PageUp/PageDown, or the mouse wheel
-  over it); the LOG opens on the newest. **View › Long texts › Continuous**
+  or paragraph (`‹ ›` beside the title, PageUp/PageDown, a sideways swipe or
+  Shift+wheel over it, or the wheel over it once the card is at its end); the
+  LOG opens on the newest. Otherwise the wheel and the touchpad scroll the card,
+  whatever field is under the pointer. **View › Long texts › Continuous**
   makes them scroll instead.
 - **Search**, the "indexer": results come in alphabetic order, paged, each with its register number, with operators of search:
 
