@@ -108,6 +108,20 @@ def main():
     for seq in SEQS:
         root.bind_class("WheelProbe", seq, raw)
 
+    def raw_touch(e):
+        """Tk 9's touchpad: <TouchpadScroll>, in pixels."""
+        w = e.widget if not isinstance(e.widget, str) else None
+        dx, dy = K.touchpad_deltas(e.delta) if hasattr(K, "touchpad_deltas") else ("?", "?")
+        note("TOUCHPAD", f"{cls(w)} {short(w)}", f"dx={dx} dy={dy}", f"state={getattr(e, 'state', '')}",
+             "|", state_of(w))
+        root.after(300, lambda: note("   0.3 s later:", state_of(w)))
+
+    try:                                    # Tk 9 and later only
+        root.bind_class("WheelProbe", "<TouchpadScroll>", raw_touch)
+        lines.insert(3, "touchpad event <TouchpadScroll>: recorded (Tk 9)")
+    except tkinter.TclError:
+        lines.insert(3, "touchpad event <TouchpadScroll>: not in this Tk")
+
     def tag_all(w=None):
         """The probe's tag first on every widget, so it sees each signal before any handler."""
         for c in (w or root).winfo_children():
@@ -153,7 +167,7 @@ def main():
     print("then close the window. The record goes to:", OUT)
     root.mainloop()
     OUT.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print("Written:", OUT, f"({sum(1 for l in lines if 'SIGNAL' in l)} scroll signals)")
+    print("Written:", OUT, f"({sum(1 for l in lines if 'SIGNAL' in l or 'TOUCHPAD' in l)} scroll signals)")
     return 0
 
 

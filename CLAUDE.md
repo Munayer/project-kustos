@@ -194,6 +194,12 @@ Force pushes are run by the owner, not by Claude.
   that scrolls inside (Continuous, `ui.max_rows`) does the same; `text_wheel`
   replaces Tk's own Text wheel so a card's field never scrolls by itself, and
   a `TCombobox` has no wheel at all -- it changed a record's type in passing.
+  From Tk 9 (Python 3.13 and later on Windows; the owner runs 3.14 / Tk 9)
+  a touchpad comes as `<TouchpadScroll>`, in pixels with dx and dy packed in
+  `delta` (`touchpad_deltas`); only a mouse wheel's notches stay
+  `<MouseWheel>`. Every wheel binding has a `bind_touchpad` twin, which reads
+  the event as a `TouchWheel`; the card follows its `pixels`. Test wheel and
+  window changes under Tk 9 as well (`uv python install 3.14` brings one).
   What a machine's wheel or touchpad really sends, and what each signal does,
   is recorded by `python tools/wheel_probe.py` (invented records, written to
   `wheel_probe.txt`, ignored by git): ask for it before guessing again.
