@@ -7,6 +7,36 @@ mirrored in markdown files capable of giving users readibility out of the
 python ecosystem. Can be runned locally with synchronized folders, with automatic
 updating of files and conflicts if used any syncing app or cloud sync.
 
+## A look
+
+All the pictures below are of an invented base, made up for the demo.
+
+**On a phone** (`python _kustos.py web`): the list, a person's card, the link
+graph in Conway's life, a link's card, the key of the lines, the path between
+two records, and the links that still need a reason.
+
+<p>
+<img src="docs/images/web-list.png" width="180" alt="The list of records on a phone">
+<img src="docs/images/web-record.png" width="180" alt="A person's card on a phone">
+<img src="docs/images/web-graph.png" width="180" alt="The link graph in Conway's life">
+<img src="docs/images/web-link-card.png" width="180" alt="A link's card, opened by tapping its line">
+</p>
+<p>
+<img src="docs/images/web-key.png" width="180" alt="The key of what a line shows">
+<img src="docs/images/web-path.png" width="180" alt="The path finder: the chains of links between two records">
+<img src="docs/images/web-links.png" width="180" alt="Every link, filtered to those that need a reason">
+</p>
+
+**In the window**: the link graph with the key of the lines and a link
+selected, and the path finder with its steps written out.
+
+<p>
+<img src="docs/images/desktop-graph.png" width="720" alt="The window's link graph, with the key and a selected link">
+</p>
+<p>
+<img src="docs/images/desktop-path.png" width="720" alt="The window's path finder: three chains between two records, and their steps">
+</p>
+
 ## Requisites
 
 - Python 3.10 or newer with Tkinter.
@@ -19,6 +49,17 @@ updating of files and conflicts if used any syncing app or cloud sync.
    `kustos.ico` as its icon (`python tools/make_icon.py` draws it) and pin it to the
    Start menu or the taskbar.
 3. Upon the first entry, the program creates the `_kustos.json` database. All files are local and don't leave your computer, unless you use a cloud or sync app.
+
+### Trying it on invented data
+
+`tools\demo.cmd` (from a copy of this repository: double-click it, or in
+PowerShell type `.\tools\demo.cmd`) opens Kustos on a base of
+invented records, the same as the web demo's, in `%TEMP%\kustos_demo`, apart
+from your own folder: to try a change, to compare the window with the web page
+on the same records (`tools\demo.cmd web`), or to take pictures you can share.
+It always runs the repository's program; its records are kept, with anything
+you add to them, until `tools\demo.cmd fresh`. `pt` or `en` sets the language.
+It refuses any folder it did not make, so it never touches a real base.
 
 ## Components
 
@@ -43,17 +84,42 @@ updating of files and conflicts if used any syncing app or cloud sync.
   are read again.
 - **Linked entries** between any registers (`author_of`, `cites`,
   `attested_in`, `defined_in`, `translates`, `measured_in`…). Labels outside of the table are accepted and marked as atypical.
+- **Monads** (`Ctrl+Shift+M`, **View › Monads**, or `python _kustos.py monads [id]`):
+  a second, read-only window that shows what records share with no link written,
+  after Leibniz. Each person, concept, form or source is a disc and no line is
+  drawn: what they have in common comes from the words they use (the rarer, the
+  more it counts) and from the links that exist. The nearer a disc, the more
+  clearly the one in the middle perceives it; the rest of the base stays as dust
+  at the edge. The dots inside a disc are what it perceives, on the side where
+  each is. Passing over a disc shows the others from its side and says what it
+  shares with the middle; a click moves there, `←` `→` walk back and forward, the
+  wheel zooms, `k` filters by kind, `1`-`3` show more or fewer, Enter opens the
+  record on the card. All the rims breathe on one clock. Health and drafts stay
+  out, and nothing it computes is saved; `F5` rereads what was edited since.
 - **Link graph** (`Ctrl+Shift+G`, **View › Link graph**, or `python _kustos.py graph [id]`):
-  a second, read-only window with the open record in the middle and the records
+  a second window with the open record in the middle and the records
   one to three links away around it, laid out by springs that settle by
-  themselves. It follows the record you open in the main window. The records
+  themselves. It follows the record you open in the main window. It looks and
+  is worked like the web page's graph: buttons at the top switch the rule and
+  the depth (1–3), pause, reseed, show every name (**Aa**) and open the middle
+  record; **?**, **⇢ Path** and **⤳ Link** float at its foot; a hint above the
+  graph goes after the first click, and in life a small line at the top right
+  follows how many are lit. Every button has its key too. The records
   glow and the glow changes as it runs, by one of three rules (`m` switches):
-  *spreading glow* (the default: light runs along the links and fades, fed by
-  recent edits and by sparks), *Conway's life* (the Game of Life with the links
-  as neighbours: a lit record stays lit with 2 or 3 lit neighbours, a dark one
-  lights with exactly 3) and *still*. Click a record to bring it to the middle;
-  double-click or `Enter` opens it on the card; right-click sparks it (in life
-  mode it flips the cell). It shows at most 160 records at a time.
+  *Conway's life* (the default: the Game of Life with the links as neighbours —
+  a lit record stays lit with 2 or 3 lit neighbours, a dark one lights with
+  exactly 3, a generation every 1.2 s; a birth is fed by its lit neighbours,
+  whose light flows along the links into it; when the pattern dies out or
+  settles the run rests, the survivors lit, until ↻ or `r` starts it again),
+  *spreading glow* (light runs along the links and fades, fed by recent edits
+  and by sparks) and *still*. Nothing jumps: when the middle changes, the
+  records already there keep their place and light, new ones sprout beside the
+  record that brought them and their links grow out to them, the ones that
+  leave wither; links are soft curves; every brightness eases. Click a record
+  to bring it to the middle; double-click or `Enter` opens it on the card;
+  right-click sparks it (in life mode it flips the cell); dragging a record
+  moves it while its neighbours follow gently and the view holds still. It
+  shows at most 160 records at a time. The web version's graph moves the same.
   `p` **replays the logs**: the base grows on screen as it grew, records
   appearing when they were first saved, links when they were written, each
   edit a flash, with a timeline below (click or drag it to go to a moment;
@@ -61,6 +127,35 @@ updating of files and conflicts if used any syncing app or cloud sync.
   the whole base (what was being worked on, and what it links to) and only the
   records that were on screen when the replay began. Records saved before
   there were logs open the timeline. `Esc` goes back to the live graph.
+- **What a link line shows**, in the graph (window and web alike): its
+  *colour* is the family of its type (verba, people, sources, corpus), *how
+  vivid* it is says how recently it was written (from the logs), its *stroke*
+  says what backs it — solid with a reason or a source, dashed with neither
+  (a link that still needs a reason), dotted for a type outside the list — and
+  a *taper*, thick at the record it comes from, gives its direction (two-way
+  types like *knows* stay even). The types of the middle record's links (or
+  of the one under the pointer) are written on their lines, when it has at
+  most a dozen. **?** (or `k` in the window) shows the key. Click a line (tap,
+  on the web) to read its links: type, reason, source, span, when written. In
+  the window, double-click the line to open the record it comes from on the
+  card. **⤳ Link** turns dragging from one record to another into drawing a
+  new link (in the window, Shift+drag does it too): type, reason, source,
+  span; only the types that fit the two records are offered, and one that
+  does not fit is refused. On the web the link card edits and deletes links
+  too, and **⋯ › Links** lists every link, with *Needs a reason* and
+  *Atypical* as filters. A link is always saved as a change of the record it
+  comes from, with its log line, as when typed in its LINKS field.
+- **Path finder** — how are two records related? In the graph (window and web
+  alike), **⇢ Path** (or `f` in the window) asks for a record by a few
+  letters of its name; `Ctrl+click` on a record in the window, or *Tap a record
+  in the graph* on the web, takes it straight from the graph. The graph then
+  shows only the shortest chains of links between the middle record and that
+  one — up to three, all of the same length, eight links at most — still, a
+  light running along them from one end to the other, both ends ringed. The
+  steps are written out (in the window above the status line; on the web
+  under *Details*, where a step opens its link card). `Esc` in the window, `×`
+  on the web, goes back to the neighbourhood. When no chain joins the two, it
+  says so.
 - **Timeline** (`Ctrl+Shift+T`, **View › Timeline**, or `python _kustos.py
   timeline [id]`): everything dated on one line of time, in lanes — the
   people's LOG (the facts of a life), births and deaths (`BORN` / `DIED` on the
@@ -90,6 +185,34 @@ updating of files and conflicts if used any syncing app or cloud sync.
   over a version that changed on disk is refused and the current one
   reloaded. `_kustos_peritia.html` is a read-only snapshot, rewritten on every
   change; a `_peritia.json` from the panel's standalone days can be imported.
+- **Web version** (`python _kustos.py web`): the whole base in the browser,
+  laid out for a phone as much as for a desk, served by Kustos itself on
+  127.0.0.1 only; it stops two minutes after the page is closed (`--stay`
+  keeps it up). Search with the same operators as the window, the five
+  collections as tabs, every record readable and editable, new records of
+  every kind, and on the card quick entries: a line in a person's LOG, a
+  reading, a session; tick a task and it goes to the log. The fields hold the
+  same text as the window's cards (a LOG line, a task line, a link line), and
+  saving goes the same way — register, log, mirror — so both can be used on
+  the same base. A record changed on disk since the page opened it (in the
+  window, or synced from another machine) is not overwritten without asking.
+  The menu opens the health report and the body map.
+  The **link graph** is there too (*Graph* on a record, or *Link graph* in the
+  menu): the same records, shapes and springs as the window's, with Conway's
+  life first — a lit record fills with the accent and its links to other lit
+  records thicken, and a small line in the corner follows how many are lit.
+  As in the window: a generation every 1.2 s, and when the pattern dies out or
+  settles it stops there, the survivors still lit, until *Reseed* (or holding
+  a record) starts it again. Changes grow rather than
+  jump: a new middle keeps the light of the records already there, new ones
+  sprout from the record that brought them and their links grow out to them,
+  the ones that leave wither; a birth is fed by its three lit neighbours,
+  whose light flows along the (softly curved) links into it. Tap a record
+  to bring it to the middle, tap the middle to open it, hold one to flip its
+  cell (a grab that moves is a drag, never a hold), drag one to move it — its
+  neighbours follow gently and the view holds still — pinch or scroll to
+  zoom; *Life / Glow / Still* and the depth 1–3 sit
+  above it. (The replay of the logs is still only in the window.)
 - **Source**: free types (book, paper, thesis, law/bill, decisions, webpages, videos), citations in academic formats, BibTeX and CSL-JSON.
   Can import from Zotero via CSL-JSON or BibTeX without duplicating entries.
 - **Health (corpus)**: four kinds of record, each with its own fields —
@@ -154,6 +277,7 @@ python _kustos.py import zotero <export.json|.bib>
 python _kustos.py mirror | corpus | merge | history <id> | replay
 python _kustos.py logbook                  the base as a logbook (read-only)
 python _kustos.py peritia [--no-open] [--port N]   the skills panel, in the browser
+python _kustos.py web [--stay] [--no-open] [--port N]   the whole base, in the browser (phone or desk)
 ```
 
 ## Suggestion: Using Syncthing to sync

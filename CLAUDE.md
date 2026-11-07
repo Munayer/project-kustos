@@ -39,7 +39,7 @@ empty repository folder gives an empty base (and `doctor` passes on it).
 language (`tr`), common, the collections (**people** `p_`, **verba**
 `c_`/`f_` concepts and forms, **sources** `s_`, **corpus** `h_` health
 records, **notes** `n_` — shown as "drafts"), then file, register, conflicts, lock, doctor, mirror, search,
-history, migration, upgrade, citation, health report, peritia, themes, motion,
+history, migration, upgrade, citation, health report, peritia, web, themes, motion,
 the Tk `*Card` editors, `App` (the main window), `BookView` (the logbook), the
 `cmd_*` functions and `main()`, and finally the `PT` dict.
 
@@ -61,7 +61,20 @@ Ideas that span several sections:
 - **The register**: every record has a `reg` stamp and a `reg_n` number that
   never changes and is never reused (see the comment at `# ==== register`).
 - **Links** live in a top-level `edges` list (`from`, `to`, `rel`), not inside
-  records; `RELS` defines the types.
+  records; `RELS` defines the types. `write_link` adds, changes or removes one
+  link as a save of the record it comes from (the web page and the window's
+  graph both write through it; it refuses a RELS type that does not fit the two
+  records, as the doctor would). What a line shows -- family colour, age from
+  the logs (`edge_times`, cached), stroke by evidence, taper by direction -- is
+  `link_facts`, shared by both graphs. The path finder's chains come from
+  `link_paths` (breadth-first over `graph_adjacency`, `PATH_LIMIT` shortest,
+  `PATH_MAX` links at most), also shared: the web asks `web_path`, the window
+  calls it in `GraphView.show_path` (`f` opens `PathDialog`, Ctrl+click a
+  record).
+- **Monads** (`# ==== monads`): read-only view; `MonadIndex` weighs shared words
+  and links, `MonadView` draws them with no lines. `MONAD_COLLS` keeps health and
+  drafts out, also as bridges between records; keep it that way. To measure its
+  frames, time the moves themselves: `update()` does not return while two tweens run.
 - **Peritia** (`# ==== peritia`): the skills panel is a page served by
   `cmd_peritia` on 127.0.0.1 (a token in the page, the Host header checked),
   from the template `PERITIA_HTML` (strings as `@@English@@`, translated by
@@ -69,6 +82,31 @@ Ideas that span several sections:
   the panel's parameters are in `peritia`; they save, log, merge and replay
   like records but stay out of `COLLS` and the register. Test it on invented
   data with `peritia_api(...)`, no browser needed.
+- **Web** (`# ==== web`): `cmd_web` serves the whole base the same way, from
+  `WEB_HTML` (its strings come in the boot data as `T`, from `WEB_STRINGS`,
+  translated by `tr`). The page edits the text the window's cards hold and
+  `web_gather` reads it back with the same parsers (`parse_log`,
+  `parse_tasks`, `parse_edges`...), then `save_record`: a change to a card's
+  fields or to how it saves belongs in both places. Search and list rows are
+  shared with the window (`parse_search`, `search_base`, `list_row_text`).
+  Test it on invented data with `web_api(...)`, or run it with `--stay` and
+  drive the page in a headless browser. The page's link graph gets its records
+  from `web_graph` (`graph_adjacency`, `graph_ego`, as the window) and draws
+  them itself; its life, glow and still rules, its springs and the way changes
+  are drawn are the window's `GraphView` ones rewritten in JavaScript, so a
+  change to one belongs in the other. Both: life's generations last 1.2 s and
+  the run rests when the pattern settles; changes grow, wither and flow (light
+  along the links into a birth) instead of jumping; every brightness eases;
+  the springs take damped steps that keep half of the last one, and dragging
+  holds the view still -- full-temperature steps made every record shake
+  around its place, which read as flicker. The window's graph also has the
+  page's controls (`GraphView.segment`/`button`, kept in step with the state by
+  `sync_buttons`, called from `update_status`), its labels on the focus's
+  links and its curve of how many are lit. Tk draws no soft edges: its solid
+  lines are smooth polygons with a lighter rim (`RIM`) and a core never under
+  2 px (`MIN_HALF`), or Tk's fill comes and goes along them and they read as
+  dashed. Check a change to them on a big invented base (frame time) and by
+  eye, enlarged.
 - **Long texts are markdown**: `textfield(..., pages=True)` (every NOTES and the
   draft's text) gets `MarkdownKeys`, and `fit(opening=True)` paints it before
   the pages are measured. The text stored stays plain.
@@ -106,7 +144,11 @@ The rules, in order:
 1. Edit `_kustos.py` here, in the repository.
 2. Test on a **temporary copy** of the personal data (a `kustos_*` folder in
    `%TEMP%`), never on the instance itself; delete the copy, and any
-   screenshots, afterwards. Health data is sensitive.
+   screenshots, afterwards. Health data is sensitive. Or test on invented
+   records: `python tools/demo_base.py <folder>` builds the web demo's base
+   through Kustos's own save functions (`tools\demo.cmd` opens it in
+   `%TEMP%\kustos_demo`); its pictures can be shared, and it refuses a folder
+   it did not make.
 3. `python _kustos.py doctor` must report 0 errors.
 4. Commit with an English message ending in
    `Co-Authored-By: Claude <noreply@anthropic.com>`, then push.

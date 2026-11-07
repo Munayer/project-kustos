@@ -41,7 +41,11 @@ USAGE
     python _kustos.py logbook         the base as a logbook (read-only)
     python _kustos.py graph [id]      the links as a living graph (read-only)
     python _kustos.py timeline [id]   everything dated, on one line of time (read-only)
+    python _kustos.py monads [id]     what records share without links, as monads (read-only)
     python _kustos.py peritia         the skills panel, in the browser (on 127.0.0.1)
+    python _kustos.py web [--stay] [--port N] [--no-open]
+                                      the whole base in the browser, for a phone or a
+                                      desk (on 127.0.0.1; stops when the page closes)
     python _kustos.py doctor          check the structure, change nothing
     python _kustos.py real-dates [apply [order]]
                                       log entries whose text starts with a date:
@@ -3005,6 +3009,121 @@ def cmd_mirror():
 
 
 # ================================================================ search
+#
+# The search operators, shared by the window's list and the web page:
+#      p: v: f: c: d:   limit to a collection (people, verba, sources, corpus,
+#                       drafts)
+#      ^text            only the start of the name
+#      tag:x lang:de type:book sys:renal dom:law id:c_measure
+# The rest are literal terms, all required, looked up in each record's search
+# text (`_h`, made by the haystack_* functions). type: and sys: match the
+# stored key or its label in the current language.
+
+SEARCH_SCOPES = {"p:": "people", "v:": "entries", "f:": "sources",
+                 "c:": "corpus", "d:": "notes"}
+SEARCH_FIELDS = ("tag", "lang", "type", "sys", "dom", "id")
+
+
+def parse_search(text):
+    """Search text -> (scope, prefix, fields, terms)."""
+    scope, prefix, fields, terms = None, None, {}, []
+    for tok in (text or "").strip().lower().split():
+        if tok in SEARCH_SCOPES:
+            scope = SEARCH_SCOPES[tok]
+        elif tok.startswith("^") and len(tok) > 1:
+            prefix = tok[1:]
+        elif ":" in tok and tok.split(":", 1)[0] in SEARCH_FIELDS and tok.split(":", 1)[1]:
+            k, v = tok.split(":", 1)
+            fields[k] = v
+        else:
+            terms.append(tok)
+    return scope, prefix, fields, terms
+
+
+def search_field_ok(r, fields):
+    for k, v in fields.items():
+        if k == "tag" and not any(v in t.lower() for t in r.get("tags", [])):
+            return False
+        if k == "lang" and (r.get("lang") or "").lower() != v:
+            return False
+        if k == "type" and not any(v in x.lower() for x in
+                                   ((r.get("type") or ""), type_label(r.get("type")))):
+            return False
+        if k == "sys" and not any(v in x.lower() for x in
+                                  ((r.get("system") or ""), system_label(r.get("system")))):
+            return False
+        if k == "dom" and not any(v in d.lower() for d in r.get("domains", [])):
+            return False
+        if k == "id" and not r.get("id", "").lower().startswith(v):
+            return False
+    return True
+
+
+def search_base(data, text):
+    """What the search text alone finds, per collection: {coll: [records]}.
+    The records must carry their search text in `_h`."""
+    qscope, prefix, fields, terms = parse_search(text)
+
+    def ok(r):
+        if terms and not all(t in r.get("_h", "") for t in terms):
+            return False
+        if prefix and not sort_key(r.get("name", ""))[0].startswith(sort_key(prefix)[0]):
+            return False
+        return search_field_ok(r, fields) if fields else True
+
+    return {c: ([r for r in data[c] if ok(r)] if qscope in (None, c) else [])
+            for c in COLLS}
+
+
+def list_row_text(r, data, due=None):
+    """(title, subtitle) of a record in a list. `due`, a day, puts the tasks
+    due that day first (the window's calendar filter)."""
+    coll = coll_of(r.get("id", ""))
+    if coll == "notes":
+        body = r.get("_body") or ""
+        first = next((l.strip(" #>-*") for l in body.splitlines() if l.strip(" #>-*")), "")
+        return r["name"], " · ".join(x for x in (", ".join(r.get("tags", [])), first) if x)
+    if coll == "entries":
+        sub = tr(r["kind"]) + " · " + (r.get("gloss") or "")
+        return label_of(r), sub
+    if coll == "sources":
+        au = author_names(r, data)
+        sub = type_label(r.get("type") or "outro") + " · " + ", ".join(
+            a.split(",")[0] for a in au[:2]) + (f" · {year_of_source(r)}"
+                                                if year_of_source(r) else "")
+        return r.get("name") or r.get("raw", ""), sub
+    if coll == "corpus":
+        t = htype(r)
+        if t == "measure":
+            lr = last_reading(r)
+            sub = system_label(r.get("system") or "") + (
+                f" · {lr['date']} = {lr['value']} {r.get('unit', '')}" if lr
+                else " · " + tr("no readings"))
+            if lr and out_of_range(r, lr):
+                sub += "  (!)"
+        else:
+            sub = tr(HEALTH_TYPE_LABEL[t]) + " · " + " · ".join(health_facts(r, data))
+        return r["name"], sub
+    p = r
+    live = open_tasks(p)
+    dated = sorted(dated_tasks(p), key=lambda t: due_label(t))
+    if due:
+        live = [t for t in dated if t["due"] == due] or live
+    elif dated:
+        live = dated + [t for t in live if t not in dated]
+    if live:
+        when = due_label(live[0])
+        sub = "[{}] {}".format(MARK_OF.get(live[0].get("state"), " "),
+                               live[0].get("text", ""))
+        if when:
+            sub = when + "  " + sub
+        if len(live) > 1:
+            sub += f"  (+{len(live) - 1})"
+    else:
+        plain = [t for t in p.get("tags", []) if ":" not in t]
+        sub = " · ".join(plain) or one_liner(p.get("notes_raw", ""), 70)
+    return p["name"], sub
+
 
 def cmd_search(query):
     data = load_json()
@@ -3532,6 +3651,11 @@ def corpus_payload(data):
 
 
 def write_corpus_html(data):
+    CORPUS_HTML_FILE.write_text(corpus_page(data), encoding="utf-8")
+
+
+def corpus_page(data):
+    """The body map page, as HTML text."""
     payload = json.dumps({"systems": corpus_payload(data), "built": TODAY(),
                           "summary": summary(data)}, ensure_ascii=False)
     html = CORPUS_HTML.replace("/*__DATA__*/null", payload)
@@ -3540,8 +3664,7 @@ def write_corpus_html(data):
         ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
         if LANG == "pt" else
         ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]))
-    html = re.sub(r"@@(.+?)@@", lambda m: tr(m.group(1)), html)
-    CORPUS_HTML_FILE.write_text(html, encoding="utf-8")
+    return re.sub(r"@@(.+?)@@", lambda m: tr(m.group(1)), html)
 
 
 def cmd_corpus(open_it=True):
@@ -5671,6 +5794,2675 @@ if (LIVE) {
   adopt(BOOT.data); render(); setStatus();
 }
 if (location.hash === '#fundamentos') showView('fund');
+</script>
+</body>
+</html>
+"""
+
+
+# ================================================================ web
+#
+# The web version: the whole base in a browser page, laid out for a phone as
+# much as for a desk. `python _kustos.py web` serves it as Peritia is served:
+# on 127.0.0.1 only, with a token written into the page that every call to
+# /api/ must carry, and the Host header checked, so that no other page or site
+# can reach the base through it. It stops WEB_IDLE seconds after the page is
+# closed (the page pings while it is open); `--stay` keeps it up.
+#
+# The page edits the same text the window's cards hold -- a LOG line, a task
+# line, a link line ("rel target — reason") -- and the server reads it back
+# with the same parsers (parse_log, parse_tasks, parse_edges...) and saves it
+# with save_record, so a record saved here is saved as the window saves it:
+# the register, the log, the mirror. A record that changed on disk since the
+# page read it is not overwritten without asking: the answer is 409.
+
+WEB_IDLE = 120              # seconds without a request before the server stops
+WEB_ROWS = 60               # rows of the list sent at a time
+WEB_KINDS = ("person", "concept", "form", "source",
+             "measure", "medication", "activity", "event", "note")
+# what each kind of record is called on the page
+WEB_KIND_LABEL = {"person": "person", "concept": "concept", "form": "form",
+                  "source": "source", "measure": "measurement", "medication": "medication",
+                  "activity": "activity or habit", "event": "event", "note": "draft"}
+# the strings the page's script shows, translated when the page is built
+WEB_STRINGS = (
+    "People", "Verba", "Sources", "Corpus", "Drafts", "All",
+    "Search", "New", "Edit", "Save", "Cancel", "Delete", "Back", "More",
+    "Saved.", "Deleted. The previous version is in the log.", "Nothing found.",
+    "Discard the changes made here?", 'Delete "{label}"?',
+    "{n} link(s) involving this record go too.",
+    "The log keeps the previous version (Base › History).",
+    "Save yours over it?", "Kustos is not answering. Start it again: python _kustos.py web",
+    "registered {stamp}", "not registered", "updated {date}",
+    "Links", "Cited by", "Citation (ABNT)", "Copy", "Copied.",
+    "Add to the log", "Add a reading", "Add a session", "Add",
+    "Done: it went to the log.", "Health report", "Body map",
+    "Choose what to create", "show all {n}",
+    "Nothing open. Choose a record from the list.",
+    "{n} of {total}", "register order, newest first", "index, alphabetical",
+    "in range", "near the limit", "out", "no reference",
+    "file", "(the file is made on saving)", "no such record",
+    "Graph", "Link graph", "Open", "Pause", "Play", "Reseed", "Names", "Life", "Glow", "Still",
+    "Conway's life", "spreading glow", "still", "generation {n}, {k} lit", "born {b} · died {d}",
+    "paused", "{n} records, {k} links", "depth {d}", "The base has no records yet.",
+    "No links yet: write them in the card's LINKS field, one per line.",
+    "tap: to the middle · tap the middle: open · hold: flip the cell · drag: move · pinch or wheel: zoom",
+    "tap: to the middle · tap the middle: open · hold: spark · drag: move · pinch or wheel: zoom",
+    "settled at generation {n}: {k} stay lit", "died out at generation {n}", "Reseed to start again",
+    "Links", "Link", "New link", "Change link", "Type", "Reason", "Source", "Span", "Swap direction",
+    "Another link between them", "no reason or source", "written {date}", "atypical type",
+    "Link saved.", "Link deleted.", "Delete this link?", "Draw a link",
+    "Drag from one record to another to link them.", "Key", "Search the links",
+    "Needs a reason", "Atypical", "other type…", "one word, e.g. inspired_by",
+    "1609, 1618/1648, -800/400", "s_… of a source, or free text", "What a line shows",
+    "colour: its family", "with a reason or a source", "without either: needs a reason",
+    "a type outside the list (atypical)", "thick where it comes from", "written recently",
+    "written long ago", "lit, in life", "Open {name}",
+    "Path", "How are they related?", "From", "To", "Search a record", "Tap a record in the graph",
+    "Tap the record to reach.", "No chain of links joins them.", "{k} link(s) apart · {n} chain(s)",
+    "Details", "Chain {i} of {n}",
+)
+
+
+class WebConflict(Exception):
+    """The record changed (or went) on disk after the page read it."""
+
+
+def web_kind(rec):
+    """Which card the page shows for a record (one of WEB_KINDS)."""
+    coll = coll_of(rec.get("id", ""))
+    if coll == "entries":
+        return rec.get("kind", "concept") if rec.get("kind") in KINDS else "concept"
+    if coll == "corpus":
+        return htype(rec)
+    return {"people": "person", "sources": "source", "notes": "note"}[coll]
+
+
+def web_fields():
+    """The fields of each card on the page, in order: {coll: [field]}. A field
+    is {k, label, w, opts, only, hint}: w is line | text | md | choice | circles;
+    `only` lists the kinds (form, measure...) the field belongs to. Source
+    fields are shown by type, from SOURCE_FIELDS, as in the window."""
+    def f(k, label, w="line", hint="", opts=None, only=None):
+        out = {"k": k, "label": tr(label), "w": w}
+        if hint:
+            out["hint"] = tr(hint)
+        if opts is not None:
+            out["opts"] = opts
+        if only:
+            out["only"] = list(only)
+        return out
+
+    tags = f("tags", "TAGS", hint="separated by commas")
+    source = f("source", "SOURCE", hint="s_… of a source, or free text")
+    links = f("links", "URLS", "text", hint="one per line")
+    edges = f("edges", "LINKS  (rel  target  [span]  — reason  # source)", "text",
+              hint="one per line, e.g.  cites s_…  — why")
+    return {
+        "people": [
+            f("name", "NAME"),
+            f("aliases", "ALSO KNOWN AS", "text", hint="one per line;  lang: name"),
+            f("place", "DOMICILIUM"),
+            f("born", "BORN  (2024-03-11, 1890, s. XVI)"), f("died", "DIED"),
+            f("circles", "CIRCLES", "circles", opts=[[c, tr(c)] for c in CIRCLES]),
+            tags, source,
+            f("tasks", "TASKS", "text", hint="one per line:  [ ] what  ~2026-09-10"),
+            f("interactions", "LOG", "text", hint="one per line:  2026-08-01   what happened"),
+            f("notes_raw", "NOTES", "md"),
+            links,
+        ],
+        "entries": [
+            f("name", "NAME"),
+            f("lang", "LANGUAGE", only=["form"]),
+            f("roman", "ROMANIZATION", only=["form"]),
+            f("attested", "ATTESTED", only=["form"]),
+            f("status", "STATUS", "choice", only=["form"],
+              opts=[["attested", tr("attested")], ["reconstructed", tr("reconstructed")]]),
+            f("gloss", "GLOSS", "text"),
+            f("domains", "DOMAINS", hint="separated by commas"),
+            tags, source, f("notes", "NOTES", "md"), edges, links,
+        ],
+        "sources": [
+            f("type", "TYPE", "choice", opts=[[t, type_label(t)] for t in SOURCE_TYPES]),
+            f("name", "TITLE"),
+        ] + [f(k, SOURCE_FIELD_LABEL[k], "text" if k in ("authors", "extra") else "line")
+             for k in SOURCE_FIELDS["*"]] + [
+            tags, f("notes", "NOTES", "md"), edges, links,
+        ],
+        "corpus": [
+            f("ctype", "TYPE", "choice",
+              opts=[[t, tr(HEALTH_TYPE_LABEL[t])] for t in HEALTH_TYPES]),
+            f("name", "NAME"),
+            f("system", "SYSTEM", "choice",
+              opts=[["", ""]] + [[s, system_label(s)] for s in SYSTEMS]),
+            f("unit", "UNIT", only=["measure"]),
+            f("ref_low", "REF. MIN.", only=["measure"]),
+            f("ref_high", "REF. MAX.", only=["measure"]),
+            f("readings", "READINGS  (one per line:  2026-09-01 [10:30]  value  note)", "text",
+              only=["measure"]),
+            f("dose", "DOSE", only=["medication"]),
+            f("frequency", "FREQUENCY", only=["medication"]),
+            f("start", "SINCE", only=["medication"]),
+            f("end", "UNTIL", only=["medication"]),
+            f("purpose", "FOR", only=["medication"]),
+            f("prescriber", "PRESCRIBED BY  (a person's p_…, or a name)", only=["medication"]),
+            f("target", "AIM  (e.g. 3 times a week)", only=["activity"]),
+            f("sessions", "SESSIONS  (one per line:  2026-10-15  60 min  note)", "text",
+              only=["activity"]),
+            f("etype", "KIND", "choice", only=["event"],
+              opts=[["", ""]] + [[k, tr(k)] for k in EVENT_KINDS]),
+            f("date", "DATE", only=["event"]),
+            f("doctor", "WITH  (a person's p_…, or a name)", only=["event"]),
+            f("place", "PLACE", only=["event"]),
+            source, tags, f("notes", "NOTES", "md"), edges, links,
+        ],
+        "notes": [
+            f("name", "TITLE"),
+            tags,
+            f("when", "DATE OR PERIOD  (2024-03-11, 1609, 1618/1648 — for the timeline)"),
+            f("body", "TEXT  (markdown)", "md"),
+            edges,
+        ],
+    }
+
+
+def web_form(rec, data):
+    """The text of each field of a record, as the window's card shows it."""
+    coll = coll_of(rec["id"])
+    lines = "\n".join
+    out = {"name": rec.get("name", ""), "tags": ", ".join(rec.get("tags", [])),
+           "links": lines(rec.get("links", []))}
+    if coll != "people":            # a person's card has no links of its own
+        text = format_edges(edges_from(data, rec["id"]))
+        if rec.get("edge_drafts"):
+            text = lines(filter(None, [text] + list(rec["edge_drafts"])))
+        out["edges"] = text
+    if coll == "people":
+        out.update(aliases=format_aliases(rec.get("aliases")), place=rec.get("place", ""),
+                   born=rec.get("born", ""), died=rec.get("died", ""),
+                   circles=list(rec.get("circles", [])), source=rec.get("source", ""),
+                   tasks=format_tasks(rec.get("tasks")),
+                   interactions=format_log(rec.get("interactions")),
+                   notes_raw=rec.get("notes_raw", ""))
+    elif coll == "entries":
+        out.update(gloss=rec.get("gloss", ""), domains=", ".join(rec.get("domains", [])),
+                   source=rec.get("source", ""), notes=rec.get("notes", ""),
+                   lang=rec.get("lang", ""), roman=rec.get("roman", ""),
+                   attested=rec.get("attested", ""), status=rec.get("status") or "attested")
+    elif coll == "sources":
+        out["type"] = rec.get("type") or "outro"
+        for k in SOURCE_FIELDS["*"]:
+            v = rec.get(k, "")
+            out[k] = lines(v) if isinstance(v, list) else (v or "")
+        out["notes"] = rec.get("notes", "")
+    elif coll == "corpus":
+        out.update(ctype=htype(rec), system=rec.get("system", ""), source=rec.get("source", ""),
+                   notes=rec.get("notes", ""), readings=format_readings(rec.get("readings")),
+                   sessions=format_log(rec.get("sessions")), etype=rec.get("etype", ""))
+        for k in ("unit", "ref_low", "ref_high", "dose", "frequency", "start", "end",
+                  "purpose", "prescriber", "target", "date", "doctor", "place"):
+            out[k] = str(rec.get(k, "") or "")
+    else:
+        got = read_note_file(note_path(rec)) if rec.get("file") else None
+        meta = got[1] if got else {}
+        when = meta.get("period") or meta.get("date") or ""
+        out["when"] = when if isinstance(when, str) else ""
+        out["body"] = got[2] if got else ""
+    return out
+
+
+def web_blank(coll, kind):
+    """A new record of a collection, before it has a name or an id."""
+    if coll == "people":
+        rec = fix_person(blank_person())
+    elif coll == "entries":
+        rec = fix_entry({"kind": kind if kind in KINDS else "concept"})
+    elif coll == "sources":
+        rec = fix_source({})
+    elif coll == "corpus":
+        rec = fix_metric({"ctype": kind if kind in HEALTH_TYPES else "measure"})
+    else:
+        rec = fix_note({"file": ""})
+    rec["id"] = ""
+    rec.pop("updated", None)
+    return rec
+
+
+def web_gather(coll, old, form):
+    """A record from the page's form, over the record as it is on disk (or a
+    blank one): what each card's gather does in the window. A field the form
+    does not carry keeps its value."""
+    out = {k: v for k, v in old.items() if not k.startswith("_")}
+
+    def has(k):
+        return isinstance(form.get(k), str)
+
+    def text(k):
+        return form[k] if has(k) else ""
+
+    def put(k, value):
+        if has(k):
+            out[k] = value
+
+    def words(k):
+        return [t.strip() for t in text(k).split(",") if t.strip()]
+
+    def rows(k):
+        return [l.strip() for l in text(k).splitlines() if l.strip()]
+
+    put("name", text("name").strip())
+    put("tags", words("tags"))
+    put("links", rows("links"))
+    if coll == "people":
+        put("notes_raw", text("notes_raw"))
+        for k in ("place", "born", "died", "source"):
+            put(k, text(k).strip())
+        put("aliases", parse_aliases(text("aliases")))
+        put("interactions", parse_log(text("interactions")))
+        put("tasks", parse_tasks(text("tasks")))
+        if isinstance(form.get("circles"), list):
+            out["circles"] = parse_circles(form["circles"])
+        out["followup"] = None
+        out["met"] = old.get("met")
+    elif coll == "entries":
+        for k in ("gloss", "notes", "source"):
+            put(k, text(k).strip())
+        put("domains", words("domains"))
+        if out.get("kind") == "form":
+            for k in ("lang", "roman", "attested"):
+                put(k, text(k).strip())
+            if has("status"):
+                out["status"] = text("status") if text("status") in ("attested",
+                                                                      "reconstructed") \
+                    else "attested"
+    elif coll == "sources":
+        if has("type"):
+            out["type"] = type_key(text("type")) or "outro"
+        for k in SOURCE_FIELDS["*"]:
+            put(k, rows(k) if k in ("authors", "extra") else text(k).strip())
+        put("notes", text("notes").strip())
+    elif coll == "corpus":
+        if text("ctype") in HEALTH_TYPES:
+            out["ctype"] = text("ctype")
+        put("system", system_key(text("system")))
+        for k in ("unit", "source", "dose", "frequency", "start", "end", "purpose",
+                  "prescriber", "target", "date", "doctor", "place"):
+            put(k, text(k).strip())
+        for k in ("ref_low", "ref_high"):
+            put(k, text(k).strip().replace(",", "."))
+        put("notes", text("notes").strip())
+        put("readings", parse_readings(text("readings")))
+        put("sessions", parse_log(text("sessions")))
+        if has("etype"):
+            out["etype"] = text("etype") if text("etype") in EVENT_KINDS else ""
+    else:
+        if has("name"):
+            out["name"] = " ".join(text("name").split())
+        if has("tags"):
+            out["tags"] = [t.strip().lstrip("#") for t in text("tags").split(",")
+                           if t.strip().lstrip("#")]
+    return out
+
+
+def web_links(form, rid, rec):
+    """The links typed in the form: (links, lines not understood). The
+    unreadable lines are kept on the record as `edge_drafts`, as the window does."""
+    links = parse_edges(form.get("edges") if isinstance(form.get("edges"), str) else "", rid)
+    unparsed = [a["to"] for a in links if a.get("_bad")]
+    if unparsed:
+        rec["edge_drafts"] = unparsed
+    else:
+        rec.pop("edge_drafts", None)
+    return [a for a in links if not a.get("_bad")], unparsed
+
+
+def web_save(body):
+    """One record from the page: (vault, id, message). `base` is the stamp the
+    page read the record with; another stamp on disk is a WebConflict unless
+    `force`. A draft also checks its file, which Obsidian may have changed."""
+    coll = body.get("coll")
+    if coll not in COLLS:
+        raise ValueError(tr("Not found."))
+    form = body.get("form")
+    if not isinstance(form, dict):
+        raise ValueError(tr("The request could not be read."))
+    rid = str(body.get("id") or "")
+    force = body.get("force") is True
+    data = load_json()
+    old = next((r for r in data[coll] if r.get("id") == rid), None) if rid else None
+    if rid and old is None:
+        raise WebConflict(tr("This record no longer exists."))
+    if old is not None and not force and stamp_of(old) != (body.get("base") or ""):
+        raise WebConflict(tr("This record changed on disk since it was opened "
+                             "(in the window, or on another machine)."))
+    fresh = old is None
+    out = web_gather(coll, old or web_blank(coll, body.get("kind")), form)
+    if not out.get("name"):
+        raise ValueError(tr({"people": "A person needs a name.",
+                             "entries": "An entry needs a name.",
+                             "sources": "A source needs a name.",
+                             "corpus": "A measurement needs a name.",
+                             "notes": "A draft needs a title."}[coll]))
+    taken = set(by_id(data))
+    message = ""
+    if coll == "people":
+        filed = fold_finished_tasks(out)
+        if filed:
+            message = tr("{n} finished task(s) went to the log.", n=filed)
+        if fresh:
+            out["met"] = out.get("met") or TODAY()
+            out["id"] = make_id(out["name"], taken)
+        touch(out)
+        data = save_record("people", out)
+    elif coll == "notes":
+        text = form.get("body") if isinstance(form.get("body"), str) else None
+        when = " ".join(form["when"].split()) if isinstance(form.get("when"), str) else _KEEP
+        if fresh:
+            out["id"] = new_note_id(taken)
+            text = text or ""
+        elif not force and str(note_mtime(out) or "") != str(body.get("opened") or ""):
+            raise WebConflict(tr('"{file}" changed outside Kustos since it was opened '
+                                 '(in Obsidian?).', file=out.get("file", "")))
+        before = "" if fresh else note_body(out)
+        if text is None:
+            text = before
+        place_note(out)
+        links, unparsed = web_links(form, out["id"], out)
+        touch(out)
+        data = save_record("notes", out, edges=links)
+        write_note_file(by_id(data)[out["id"]], text, when)
+        if text != before:
+            log_append("text", "notes", {"id": out["id"], "text": text})
+        save_note_cache()
+        if unparsed:
+            message = tr("{n} link line(s) not understood were kept as drafts.", n=len(unparsed))
+    else:
+        if fresh:
+            if coll == "entries":
+                out["id"] = new_id(out.get("kind", "concept"), out["name"], taken)
+            elif coll == "sources":
+                out["id"] = new_source_id(out, taken)
+            else:
+                out["id"] = new_metric_id(out, taken)
+        links, unparsed = web_links(form, out["id"], out)
+        touch(out)
+        data = save_record(coll, out, edges=links)
+        if unparsed:
+            message = tr("{n} link line(s) not understood were kept as drafts.", n=len(unparsed))
+    return data, out["id"], message
+
+
+def web_delete(body):
+    """Deletes one record, as the window does: tombstone, log, and a draft's
+    file goes to notes/.deleted."""
+    rid = str(body.get("id") or "")
+    data = load_json()
+    rec = by_id(data).get(rid)
+    if rec is None:
+        raise WebConflict(tr("This record no longer exists."))
+    coll = coll_of(rid)
+    data, _ = delete_record(coll, rid, rec.get("name", ""))
+    if coll == "notes":
+        retire_note_file(rec)
+    return data
+
+
+_WEB_HAY = {}       # (id, stamp, file stamp) -> search text, kept between calls
+
+
+def web_prepare(data):
+    """Gives every record its search text (`_h`) and every draft its text
+    (`_body`), working out only what changed since the last call, as the
+    window's reload does."""
+    global _WEB_HAY
+    cache, seen = note_cache(), {}
+    for n in data["notes"]:
+        n["_body"] = note_body(n)
+        key = str(note_path(n)) if n.get("file") else ""
+        seen[n["id"]] = tuple(cache[key][0]) if key in cache else None
+    save_note_cache()
+    makers = (("people", haystack_person),
+              ("entries", lambda r: haystack_entry(r, data)),
+              ("sources", lambda r: haystack_source(r, data)),
+              ("corpus", lambda r: haystack_metric(r, data)),
+              ("notes", haystack_note))
+    fresh = {}
+    for coll, make in makers:
+        for r in data[coll]:
+            key = (r["id"], stamp_of(r), seen.get(r["id"]) if coll == "notes" else None)
+            h = _WEB_HAY.get(key)
+            if h is None:
+                h = make(r)
+            r["_h"] = fresh[key] = h
+    _WEB_HAY = fresh
+
+
+def web_list(data, q, coll, offset=0, limit=WEB_ROWS):
+    """A page of the list. Without a search or a collection it is the register,
+    newest first; otherwise the index, alphabetical, as in the window. The
+    counts are what the search alone finds in each collection."""
+    web_prepare(data)
+    base = search_base(data, q)
+    scope = parse_search(q)[0] or (coll if coll in COLLS else None)
+    filtered = bool((q or "").strip()) or scope is not None
+    if filtered:
+        rows = [r for c in COLLS if scope in (None, c) for r in base[c]]
+        rows.sort(key=lambda r: sort_key(label_any(r, data) if coll_of(r["id"]) == "sources"
+                                         else r.get("name", "")))
+    else:
+        rows = [r for c in COLLS for r in data[c]]
+        rows.sort(key=lambda r: -(r.get("reg_n") or 0))
+    out = []
+    for r in rows[offset:offset + limit]:
+        title, sub = list_row_text(r, data)
+        lr = last_reading(r) if coll_of(r["id"]) == "corpus" else None
+        out.append({"id": r["id"], "coll": coll_of(r["id"]), "kind": web_kind(r),
+                    "title": one_liner(title, 90), "sub": one_liner(sub, 140),
+                    "n": r.get("reg_n") or 0, "warn": bool(lr and out_of_range(r, lr))})
+    return {"counts": {c: len(base[c]) for c in COLLS}, "total": len(rows),
+            "offset": offset, "rows": out, "order": "index" if filtered else "register"}
+
+
+def web_md(text):
+    """Markdown as HTML for the page: md_to_html escapes the text; links keep
+    only web and mail addresses."""
+    def link(m):
+        href = m.group(1) if re.match(r"(https?:|mailto:)", m.group(1), re.I) else "#"
+        return f'<a target="_blank" rel="noopener noreferrer" href="{href}"'
+    return re.sub(r'<a href="([^"]*)"', link, md_to_html(text or ""))
+
+
+def web_record(data, rid):
+    """Everything the page shows of one record, or None."""
+    idx = by_id(data)
+    rec = idx.get(rid)
+    if rec is None:
+        return None
+    coll, kind = coll_of(rid), web_kind(rec)
+
+    def end(other):
+        o = idx.get(other)
+        return {"id": other, "coll": coll_of(other) if o else "",
+                "title": label_any(o, data) if o else other, "missing": o is None}
+
+    out = {"id": rid, "coll": coll, "kind": kind, "kind_label": tr(WEB_KIND_LABEL[kind]),
+           "title": label_any(rec, data), "base": stamp_of(rec),
+           "n": rec.get("reg_n") or 0,
+           "reg": stamp_label(rec.get("reg")) if rec.get("reg") else "",
+           "updated": rec.get("updated") or "", "form": web_form(rec, data),
+           "out": [dict(end(a["to"]), rel=rel_label(a.get("rel", "")),
+                        why=a.get("why", ""), when=a.get("when", ""))
+                   for a in edges_from(data, rid)],
+           "in": [dict(end(a["from"]), rel=rel_label(a.get("rel", "")))
+                  for a in edges_to(data, rid)],
+           "html": {}}
+    for k in ("notes_raw", "notes", "body"):
+        if out["form"].get(k):
+            out["html"][k] = web_md(out["form"][k])
+    src = (rec.get("source") or "").strip()
+    if src:
+        s, label = resolve_source(src, data)
+        out["source"] = {"id": s["id"] if s else "", "title": label}
+    if coll == "people":
+        out["tasks"] = rec.get("tasks", [])
+        out["log"] = rec.get("interactions", [])
+    elif coll == "sources":
+        try:
+            out["cite"] = cite(rec, "abnt", data)
+        except Exception:           # a citation must never keep the record from opening
+            out["cite"] = ""
+    elif coll == "corpus":
+        out["facts"] = health_facts(rec, data)
+        out["readings"] = [dict(r, status=reading_status(rec, r.get("value")))
+                           for r in rec.get("readings", [])]
+        out["sessions"] = rec.get("sessions", [])
+    elif coll == "notes":
+        out["opened"] = str(note_mtime(rec) or "")
+        out["file"] = rec.get("file", "")
+    return out
+
+
+def web_graph(data, rid, depth=2):
+    """The link graph around one record, for the page: the records up to
+    `depth` links away (graph_ego, at most GRAPH_MAX_NODES), each with its
+    shape, name, distance, the record that brought it and how recently it was
+    edited (what life mode seeds from), and the links between them with their
+    rels. Without a record, or with an unknown one, the most linked record is
+    the middle, as in the window."""
+    idx = by_id(data)
+    adj = graph_adjacency(data)
+    if rid not in idx:
+        rid = max(adj, key=lambda k: (len(adj[k]), k), default=None)
+    if rid is None and idx:
+        rid = next(iter(idx))
+    depth = depth if depth in (1, 2, 3) else 2
+    ego = graph_ego(adj, rid, depth) if rid else {}
+    now = datetime.now()
+    nodes = [{"id": n, "kind": graph_kind(idx[n]), "name": one_liner(label_any(idx[n], data), 60),
+              "dist": d, "parent": parent, "rec": round(recency(idx[n], now), 4),
+              "n": idx[n].get("reg_n") or 0}
+             for n, (d, parent) in ego.items()]
+    pairs, times, stamp = link_index(data), edge_times(), now.timestamp()
+    links = [{"a": a, "b": b, "rels": [[rel_label(rel), f] for rel, f in rels],
+              "f": link_facts(pairs.get((a, b), []), times, stamp)}
+             for a in ego for b, rels in adj.get(a, {}).items() if b in ego and a < b]
+    return {"center": rid, "depth": depth, "nodes": nodes, "links": links,
+            "records": len(idx)}
+
+
+def web_link_details(data, a, b):
+    """Everything a link card shows: the two records, every link between them
+    (both ways) and the types that fit each direction."""
+    idx = by_id(data)
+    if a not in idx or b not in idx:
+        return None
+    times = edge_times()
+
+    def end(rid):
+        r = idx[rid]
+        return {"id": rid, "title": label_any(r, data), "kind": web_kind(r)}
+
+    edges = []
+    for e in data["edges"]:
+        if {e.get("from"), e.get("to")} != {a, b}:
+            continue
+        src, label = resolve_source(e.get("source"), data)
+        t = times.get((e.get("from"), e.get("to"), e.get("rel", "")))
+        edges.append({"from": e["from"], "to": e["to"], "rel": e.get("rel", ""),
+                      "label": rel_label(e.get("rel", "")), "why": e.get("why", ""),
+                      "source": e.get("source", ""), "source_label": label if e.get("source") else "",
+                      "source_id": src["id"] if src else "", "when": e.get("when", ""),
+                      "atypical": e.get("rel") not in RELS,
+                      "written": datetime.fromtimestamp(t).date().isoformat() if t else ""})
+    rels = {}
+    for f, t in ((a, b), (b, a)):
+        rels[f"{f} {t}"] = [[r, rel_label(r)] for r in typical_rels(idx[f], idx[t])]
+    return {"a": end(a), "b": end(b), "edges": edges, "rels": rels}
+
+
+EDGE_WHEN = re.compile(r"-?\d{1,4}(?:/-?\d{0,4})?")
+
+
+def write_link(a, b, rel="", why="", source="", when="", old=None, delete=False):
+    """Adds, changes or removes ONE link, as a change of the record it comes
+    from: its links are reread, the one named by `old` ({rel, to}) is replaced
+    or removed, and the record is saved with save_record. The web page and the
+    window's graph both write links here. Returns the vault; ValueError for
+    what cannot be saved, WebConflict when the link changed meanwhile."""
+    b = norm_ref(b or "")
+    data = load_json()
+    idx = by_id(data)
+    if a not in idx:
+        raise WebConflict(tr("This record no longer exists."))
+    edges = edges_from(data, a)
+    at = len(edges)
+    if old is not None:
+        at = next((i for i, e in enumerate(edges)
+                   if e.get("rel") == old.get("rel") and e.get("to") == old.get("to")), None)
+        if at is None:
+            raise WebConflict(tr("This link changed since it was opened."))
+        edges.pop(at)
+    if not delete:
+        if b not in idx:
+            raise ValueError(tr("The other record no longer exists."))
+        if a == b:
+            raise ValueError(tr("A link needs two different records."))
+        rel = "_".join(str(rel or "").strip().lower().split())
+        if not rel or not re.fullmatch(r"[^\s#—]+", rel):
+            raise ValueError(tr("A link needs a type."))
+        why = " ".join(str(why or "").split())
+        source = " ".join(str(source or "").split())
+        when = "".join(str(when or "").split())
+        if "#" in why:
+            raise ValueError(tr("A reason cannot contain #."))
+        if when and not EDGE_WHEN.fullmatch(when):
+            raise ValueError(tr("A span is a year or two: 1609, 1618/1648, -800/400."))
+        if any(e.get("rel") == rel and e.get("to") == b for e in edges):
+            raise ValueError(tr("This link already exists."))
+        kept = old is not None and old.get("rel") == rel and old.get("to") == b
+        if rel in RELS and not kept and rel not in typical_rels(idx[a], idx[b]):
+            # what the doctor would call an error is not written (an old link keeps its type)
+            raise ValueError(tr("A “{rel}” link does not fit these two records.", rel=rel_label(rel)))
+        edges.insert(at, {"from": a, "rel": rel, "to": b, "when": when, "why": why,
+                          "source": source,
+                          "certainty": "established" if rel in RELS else "atypical"})
+    rec = {k: v for k, v in idx[a].items() if not k.startswith("_")}
+    touch(rec)
+    return save_record(coll_of(a), rec, edges=edges)
+
+
+def web_link(body):
+    """A link from the page (see write_link)."""
+    old = body.get("old") if isinstance(body.get("old"), dict) else None
+    return write_link(str(body.get("from") or ""), str(body.get("to") or ""), body.get("rel"),
+                      body.get("why"), body.get("source"), body.get("when"), old,
+                      body.get("delete") is True)
+
+
+def web_link_list(data, q="", which="", offset=0, limit=WEB_ROWS):
+    """Every link, as a list: what it joins, its type and its reason. `which`
+    narrows it to the links that need a reason or have an atypical type."""
+    idx = by_id(data)
+    words = [w for w in (q or "").lower().split() if w]
+    rows = []
+    for e in data["edges"]:
+        f, t = e.get("from"), e.get("to")
+        if f not in idx or t not in idx:
+            continue
+        founded = bool((e.get("why") or "").strip() or (e.get("source") or "").strip())
+        atypical = e.get("rel") not in RELS
+        if which == "unfounded" and founded or which == "atypical" and not atypical:
+            continue
+        row = {"a": f, "b": t, "from": label_any(idx[f], data), "to": label_any(idx[t], data),
+               "rel": e.get("rel", ""), "label": rel_label(e.get("rel", "")),
+               "why": e.get("why", ""), "founded": founded, "atypical": atypical,
+               "family": REL_FAMILY.get(e.get("rel"), "other")}
+        hay = " ".join((row["from"], row["to"], row["rel"], row["label"], row["why"],
+                        e.get("source", ""))).lower()
+        if all(w in hay for w in words):
+            rows.append(row)
+    rows.sort(key=lambda r: (sort_key(r["from"]), r["rel"], sort_key(r["to"])))
+    return {"total": len(rows), "offset": offset, "rows": rows[offset:offset + limit],
+            "counts": {"all": len(data["edges"]),
+                       "unfounded": sum(1 for e in data["edges"] if not (
+                           (e.get("why") or "").strip() or (e.get("source") or "").strip())),
+                       "atypical": sum(1 for e in data["edges"] if e.get("rel") not in RELS)}}
+
+
+def web_path(data, a, b):
+    """The path view: the records on the shortest chains from a to b, the
+    links of those chains (with what their lines show) and, step by step, the
+    links each step goes through. None when a record is missing."""
+    idx = by_id(data)
+    if a not in idx or b not in idx:
+        return None
+    adj = graph_adjacency(data)
+    paths = link_paths(adj, a, b)
+    first = {}
+    for path in paths:
+        for i, n in enumerate(path):
+            first.setdefault(n, (i, path[i - 1] if i else None))
+    now = datetime.now()
+    pairs, times = link_index(data), edge_times()
+    nodes = [{"id": n, "kind": graph_kind(idx[n]), "name": one_liner(label_any(idx[n], data), 60),
+              "dist": d, "parent": parent, "rec": round(recency(idx[n], now), 4),
+              "n": idx[n].get("reg_n") or 0} for n, (d, parent) in first.items()]
+    keys = sorted({(min(x, y), max(x, y)) for path in paths for x, y in zip(path, path[1:])})
+    links = [{"a": x, "b": y, "rels": [[rel_label(r), f] for r, f in adj[x][y]],
+              "f": link_facts(pairs.get((x, y), []), times, now.timestamp())} for x, y in keys]
+    steps = [[[{"from": e["from"], "to": e["to"], "label": rel_label(e.get("rel", "")),
+                "why": e.get("why", "")} for e in pairs.get((min(x, y), max(x, y)), [])]
+              for x, y in zip(path, path[1:])] for path in paths]
+    return {"center": a, "a": a, "b": b, "paths": paths, "steps": steps, "nodes": nodes,
+            "links": links, "titles": {n: label_any(idx[n], data) for n in first},
+            "records": len(idx)}
+
+
+def web_boot(token):
+    """What the page needs before its first call."""
+    return {"token": token, "lang": LANG, "today": TODAY(), "fields": web_fields(),
+            "sfields": SOURCE_FIELDS,
+            "colls": [[c, tr(x)] for c, x in zip(COLLS, ("People", "Verba", "Sources",
+                                                         "Corpus", "Drafts"))],
+            "kinds": {k: tr(WEB_KIND_LABEL[k]) for k in WEB_KINDS},
+            "new": [["people", "person"], ["entries", "concept"], ["entries", "form"],
+                    ["sources", "source"], ["corpus", "measure"], ["corpus", "medication"],
+                    ["corpus", "activity"], ["corpus", "event"], ["notes", "note"]],
+            "linkColours": LINK_FAMILY_COLOUR,
+            "T": {s: tr(s) for s in WEB_STRINGS}}
+
+
+def web_page(boot, data, nonce):
+    """The page, in the interface language and the theme of the window."""
+    pal = THEMES.get((data.get("ui") or {}).get("theme"), THEMES["paper"])
+    mono = '"Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, ui-monospace, monospace'
+    sans = mono if pal["mono_only"] else \
+        'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif'
+    serif = mono if pal["mono_only"] else \
+        'Georgia, "Times New Roman", "Liberation Serif", "DejaVu Serif", serif'
+    css = (f"--paper: {pal['card']}; --wash: {pal['shell']}; --rule: {pal['rule']};\n"
+           f"  --ink: {pal['ink']}; --soft: {pal['soft']}; --faint: {pal['faint']};\n"
+           f"  --accent: {pal['stamp']}; --warn: {pal['oxide']};\n"
+           f"  --selbg: {pal['selbg']}; --selfg: {pal['selfg']};\n"
+           f"  --sans: {sans};\n  --serif: {serif};\n  --mono: {mono};\n"
+           f"  color-scheme: {'dark' if pal['dark'] else 'light'};")
+    html = WEB_HTML.replace("/*__THEME__*/", css)
+    html = html.replace("@@LANG@@", "pt-BR" if LANG == "pt" else "en")
+    html = html.replace("@@NONCE@@", nonce)
+    # the data goes in last; <, > and & are escaped so no text can close the script
+    boot = dict(boot, mono=pal["mono_only"])     # one-colour themes draw links without families
+    blob = json.dumps(boot, ensure_ascii=False)
+    blob = blob.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    return html.replace("/*__BOOT__*/null", blob)
+
+
+def web_api(method, path, query, body):
+    """One call from the page: (status, answer). Writes reread the disk first,
+    like every save; a stale stamp gets 409 with the record as it is now."""
+    def arg(k, default=""):
+        return (query.get(k) or [default])[0]
+
+    try:
+        if method == "GET" and path == "/api/ping":
+            return 200, {"ok": True}
+        if method == "GET" and path == "/api/list":
+            try:
+                offset = max(0, int(arg("offset", "0")))
+                limit = max(1, min(500, int(arg("limit", str(WEB_ROWS)))))
+            except ValueError:
+                offset, limit = 0, WEB_ROWS
+            return 200, web_list(load_json(), arg("q"), arg("coll"), offset, limit)
+        if method == "GET" and path == "/api/record":
+            got = web_record(load_json(), arg("id"))
+            return (200, got) if got else (404, {"error": tr("This record no longer exists.")})
+        if method == "GET" and path == "/api/link":
+            got = web_link_details(load_json(), arg("a"), arg("b"))
+            return (200, got) if got else (404, {"error": tr("This record no longer exists.")})
+        if method == "GET" and path == "/api/links":
+            try:
+                offset = max(0, int(arg("offset", "0")))
+            except ValueError:
+                offset = 0
+            return 200, web_link_list(load_json(), arg("q"), arg("which"), offset)
+        if method == "GET" and path == "/api/path":
+            got = web_path(load_json(), arg("a"), arg("b"))
+            return (200, got) if got else (404, {"error": tr("This record no longer exists.")})
+        if method == "GET" and path == "/api/graph":
+            try:
+                depth = int(arg("depth", "2"))
+            except ValueError:
+                depth = 2
+            return 200, web_graph(load_json(), arg("id"), depth)
+        if method != "POST":
+            return 404, {"error": tr("Not found.")}
+        if path == "/api/save":
+            data, rid, message = web_save(body)
+            return 200, {"record": web_record(data, rid), "message": message, "data": data}
+        if path == "/api/delete":
+            return 200, {"ok": True, "data": web_delete(body)}
+        if path == "/api/link":
+            data = web_link(body)
+            return 200, {"link": web_link_details(data, str(body.get("from") or ""),
+                                                  norm_ref(str(body.get("to") or ""))),
+                         "data": data}
+        return 404, {"error": tr("Not found.")}
+    except WebConflict as exc:
+        rid = str(body.get("id") or "") if isinstance(body, dict) else ""
+        if path == "/api/link":
+            return 409, {"error": str(exc)}
+        return 409, {"error": str(exc), "record": web_record(load_json(), rid) if rid else None}
+    except ValueError as exc:
+        return 400, {"error": str(exc)}
+
+
+def cmd_web(rest=()):
+    """Serves the web version on 127.0.0.1 and opens it; stops by itself when
+    idle, unless --stay. --allow-host NAME accepts another Host header (a
+    proxy in front of it); --port N picks the port."""
+    import secrets
+    import threading
+    import time
+    import webbrowser
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlsplit
+
+    rest = list(rest)
+    port, extra_hosts = 0, set()
+    for i, a in enumerate(rest):
+        if a in ("--port", "--allow-host"):
+            if i + 1 >= len(rest):
+                raise SystemExit(tr("{option} needs a value", option=a))
+            if a == "--port":
+                try:
+                    port = int(rest[i + 1])
+                except ValueError:
+                    raise SystemExit(tr("--port needs a number"))
+            else:
+                extra_hosts.add(rest[i + 1].strip().lower())
+    stay = "--stay" in rest
+    # what the window does on opening: bring the base up to date, take in the
+    # other machine's conflicting copies and the new files of notes/
+    if JSON_FILE.exists() and needs_upgrade(load_json()):
+        cmd_upgrade(quiet=True)
+    absorb_conflicts()
+    try:
+        index_notes()
+    except OSError:
+        pass
+    token = secrets.token_urlsafe(24)
+    guard = threading.Lock()        # one call at a time: they all read and write the base
+    last = [time.monotonic()]
+    hosts = set()
+    mirror = {"timer": None, "blob": None}
+    mirroring = threading.Lock()    # one rebuild at a time
+
+    def rebuild_mirror():
+        with mirroring:
+            blob, mirror["blob"] = mirror["blob"], None
+            if blob is None:
+                return
+            try:
+                snapshot = marshal.loads(blob)
+                write_mirror(snapshot)
+                write_corpus_html(snapshot)
+            except (SystemExit, OSError, ValueError):
+                pass                # the mirror is a readable copy; it never blocks a save
+
+    def mirror_soon(data):
+        """The mirror and the body map, 1.5 s after the last save, in a thread,
+        from a snapshot of the data."""
+        try:
+            mirror["blob"] = marshal.dumps(data)
+        except ValueError:
+            return
+        if mirror["timer"] is not None:
+            mirror["timer"].cancel()
+        mirror["timer"] = threading.Timer(1.5, rebuild_mirror)
+        mirror["timer"].daemon = True
+        mirror["timer"].start()
+
+    class Server(ThreadingHTTPServer):
+        daemon_threads = True
+
+        def handle_error(self, request, client_address):
+            pass                    # under pythonw there is no console to print to
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "Kustos"
+
+        def log_message(self, *args):
+            pass
+
+        def answer(self, code, body, ctype="application/json; charset=utf-8", csp=None):
+            raw = (body if isinstance(body, str)
+                   else json.dumps(body, ensure_ascii=False)).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            if csp:
+                self.send_header("Content-Security-Policy", csp)
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            self.route("GET")
+
+        def do_POST(self):
+            self.route("POST")
+
+        def route(self, method):
+            last[0] = time.monotonic()
+            if self.headers.get("Host", "").lower() not in hosts:
+                return self.answer(403, {"error": tr("Not found.")})
+            url = urlsplit(self.path)
+            if method == "GET" and url.path in ("/", "/index.html"):
+                nonce = secrets.token_urlsafe(16)
+                with guard:
+                    page = web_page(web_boot(token), load_json(), nonce)
+                return self.answer(200, page, "text/html; charset=utf-8",
+                                   f"default-src 'none'; script-src 'nonce-{nonce}'; "
+                                   "style-src 'unsafe-inline'; img-src 'self' data:; "
+                                   "connect-src 'self'; base-uri 'none'; form-action 'none'")
+            if method == "GET" and url.path in ("/health", "/corpus"):
+                with guard:
+                    data = load_json()
+                    page = health_report(data) if url.path == "/health" else corpus_page(data)
+                return self.answer(200, page, "text/html; charset=utf-8")
+            if not url.path.startswith("/api/"):
+                return self.answer(404, {"error": tr("Not found.")})
+            sent = (self.headers.get("X-Kustos-Token") or "").encode("latin-1", "replace")
+            if not secrets.compare_digest(sent, token.encode("ascii")):
+                return self.answer(403, {"error": tr("This page is not the one Kustos opened: "
+                                                      "open it again from Kustos.")})
+            body = {}
+            if method == "POST":
+                if not (self.headers.get("Content-Type") or "").startswith("application/json"):
+                    return self.answer(415, {"error": tr("The request could not be read.")})
+                try:
+                    size = int(self.headers.get("Content-Length") or 0)
+                    if size > 16 * 1024 * 1024:
+                        return self.answer(413, {"error": tr("The request could not be read.")})
+                    body = json.loads(self.rfile.read(size) or b"{}")
+                except ValueError:
+                    return self.answer(400, {"error": tr("The request could not be read.")})
+                if not isinstance(body, dict):
+                    return self.answer(400, {"error": tr("The request could not be read.")})
+            try:
+                with guard:
+                    code, out = web_api(method, url.path, parse_qs(url.query), body)
+                    data = out.pop("data", None) if isinstance(out, dict) else None
+                    if data is not None:
+                        mirror_soon(data)
+            except SystemExit as exc:          # the base could not be read
+                code, out = 500, {"error": str(exc)}
+            except Exception as exc:
+                code, out = 500, {"error": f"{type(exc).__name__}: {exc}"}
+            self.answer(code, out)
+
+    server = Server(("127.0.0.1", port), Handler)
+    port = server.server_address[1]
+    hosts.update({f"127.0.0.1:{port}", f"localhost:{port}"} | extra_hosts)
+    url = f"http://127.0.0.1:{port}/"
+
+    def watch():
+        """Stops the server when idle. Once a minute, takes in what Syncthing
+        brought while it runs -- conflicting copies, new files in notes/ --
+        as the window does on opening (this may run for days)."""
+        checked = time.monotonic()
+        while stay or time.monotonic() - last[0] <= WEB_IDLE:
+            time.sleep(5)
+            if time.monotonic() - checked >= 60:
+                checked = time.monotonic()
+                with guard:
+                    try:
+                        merged = absorb_conflicts()
+                        new, moved = index_notes()
+                        if merged or new or moved:
+                            mirror_soon(load_json())
+                    except (OSError, SystemExit):
+                        pass
+        server.shutdown()
+
+    threading.Thread(target=watch, daemon=True).start()
+    if stay:
+        print(tr("Kustos on the web at {url}: it stays up until stopped (Ctrl+C).", url=url),
+              flush=True)
+    else:
+        print(tr("Kustos on the web at {url}: it stops by itself {n} minute(s) after the page "
+                 "is closed.", url=url, n=max(1, WEB_IDLE // 60)), flush=True)
+    if "--no-open" not in rest:
+        webbrowser.open(url)
+    try:
+        server.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        if mirror["timer"] is not None:
+            mirror["timer"].cancel()
+        rebuild_mirror()            # a save still waiting for its mirror gets it now
+    return 0
+
+
+WEB_HTML = r"""<!doctype html>
+<html lang="@@LANG@@">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Kustos</title>
+<style>
+:root {
+  /*__THEME__*/
+  --radius: 10px;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--wash); color: var(--ink); font: 16px/1.45 var(--sans); }
+button, input, textarea, select { font: inherit; color: inherit; }
+button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+[hidden] { display: none !important; }
+#app { min-height: 100vh; min-height: 100dvh; }
+@media (min-width: 900px) {
+  #app { display: grid; grid-template-columns: minmax(340px, 420px) 1fr; height: 100vh; height: 100dvh; }
+  #listpane { overflow-y: auto; border-right: 1px solid var(--rule); }
+  #recpane { overflow-y: auto; }
+  .back { visibility: hidden; }
+}
+@media (max-width: 899.98px) {
+  body.open #listpane { display: none; }
+  body:not(.open) #recpane { display: none; }
+}
+.top { position: sticky; top: 0; z-index: 3; background: var(--wash);
+  padding: 10px 16px 8px; padding-top: max(10px, env(safe-area-inset-top));
+  border-bottom: 1px solid var(--rule); }
+.bar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.brand { font: 600 13px/1 var(--sans); letter-spacing: .24em; text-transform: uppercase; color: var(--soft); }
+.grow { flex: 1; }
+.icon { min-width: 40px; height: 40px; border-radius: 20px; border: 1px solid var(--rule);
+  background: var(--paper); font-size: 20px; line-height: 1; display: inline-grid;
+  place-items: center; padding: 0 10px; }
+.icon.primary { background: var(--accent); color: var(--paper); border-color: var(--accent); }
+#q { width: 100%; padding: 10px 12px; font-size: 16px; border: 1px solid var(--rule);
+  border-radius: var(--radius); background: var(--paper); -webkit-appearance: none; appearance: none; }
+.tabs { display: flex; gap: 6px; overflow-x: auto; padding: 10px 16px 2px; margin: 0 -16px;
+  scrollbar-width: none; }
+.tabs::-webkit-scrollbar { display: none; }
+a { color: var(--accent); }
+@media (min-width: 900px) { .tabs { flex-wrap: wrap; overflow-x: visible; } }
+.tab { flex: none; border: 1px solid var(--rule); border-radius: 999px; background: transparent;
+  color: var(--soft); padding: 6px 12px; font-size: 14px; }
+.tab[aria-pressed="true"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+.tab .n { font: 12px var(--mono); margin-left: 6px; opacity: .75; }
+.tab.zero { opacity: .45; }
+.listinfo { padding: 8px 16px; font-size: 12px; color: var(--faint); }
+.rows { list-style: none; margin: 0; padding: 0; }
+.row { width: 100%; text-align: left; display: grid; grid-template-columns: auto 1fr auto;
+  column-gap: 10px; row-gap: 2px; align-items: baseline; padding: 12px 16px; border: 0;
+  border-bottom: 1px solid var(--rule); background: var(--paper); }
+.row[aria-current="true"] { background: var(--selbg); color: var(--selfg); }
+.row .t { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .n { font: 12px var(--mono); color: var(--faint); white-space: nowrap; }
+.row .rel { font: 12px var(--mono); color: var(--soft); font-weight: 400; }
+.row .s { grid-column: 2 / 4; font-size: 14px; color: var(--soft); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.row[aria-current="true"] .s, .row[aria-current="true"] .n { color: inherit; opacity: .8; }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; align-self: center; }
+.c-people { background: #3f7d99; } .c-entries { background: #a0783a; }
+.c-sources { background: #6f8a3a; } .c-corpus { background: #b5523b; } .c-notes { background: #7a6aa8; }
+.warn { color: var(--warn); font-weight: 700; }
+.more { padding: 16px; text-align: center; }
+.btn { border: 1px solid var(--rule); background: var(--paper); border-radius: var(--radius);
+  padding: 8px 14px; min-height: 40px; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--paper); font-weight: 600; }
+.btn.danger { color: var(--warn); }
+.btn.quiet { background: transparent; border-color: transparent; color: var(--soft); }
+.btn.quiet.primary { background: var(--accent); border-color: var(--accent); color: var(--paper); }
+.btn:disabled { opacity: .5; }
+.rechead { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 6px;
+  padding: 8px 12px; padding-top: max(8px, env(safe-area-inset-top)); background: var(--wash);
+  border-bottom: 1px solid var(--rule); }
+.card { max-width: 760px; margin: 0 auto; padding: 18px 16px 120px; }
+.kicker { font: 12px/1.4 var(--mono); color: var(--faint); letter-spacing: .03em; text-transform: uppercase; }
+h1.title { font: 600 28px/1.15 var(--serif); margin: 6px 0 4px; overflow-wrap: anywhere; }
+.sub { color: var(--soft); }
+.sec { margin-top: 22px; }
+.lbl { display: block; font: 600 11px/1.3 var(--sans); letter-spacing: .14em; text-transform: uppercase;
+  color: var(--faint); margin: 0 0 6px; }
+.val { white-space: pre-wrap; overflow-wrap: anywhere; }
+.facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 16px 20px; margin-top: 22px; }
+.mono { font-family: var(--mono); font-size: 14px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { border: 1px solid var(--rule); border-radius: 999px; padding: 2px 10px; font-size: 13px;
+  color: var(--soft); background: transparent; }
+button.chip:hover { border-color: var(--soft); }
+.md { font: 17px/1.55 var(--serif); overflow-wrap: anywhere; }
+.md h1, .md h2, .md h3, .md h4 { line-height: 1.2; margin: 1em 0 .4em; }
+.md p { margin: .5em 0; } .md ul, .md ol { padding-left: 1.4em; }
+.md pre { background: var(--wash); padding: 10px; overflow: auto; border-radius: 6px; }
+.md code { font: 14px var(--mono); }
+.md blockquote { margin: .5em 0; padding-left: 12px; border-left: 3px solid var(--rule); color: var(--soft); }
+.md a, .md .wl { color: var(--accent); } .md .wl { border-bottom: 1px dotted; cursor: pointer; }
+.log, .tasks, .links { list-style: none; margin: 0; padding: 0; }
+.log li { display: grid; grid-template-columns: 6.6em 1fr; gap: 10px; padding: 6px 0;
+  border-bottom: 1px dashed var(--rule); }
+.log .d { font: 13px/1.6 var(--mono); color: var(--faint); }
+.task { display: flex; gap: 10px; align-items: flex-start; padding: 5px 0; }
+.box { flex: none; width: 26px; height: 26px; border: 1.5px solid var(--soft); border-radius: 7px;
+  background: var(--paper); font: 14px var(--mono); display: grid; place-items: center; padding: 0; }
+.due { font: 12px var(--mono); color: var(--faint); margin-left: 8px; white-space: nowrap; }
+.links li { border-bottom: 1px dashed var(--rule); }
+.go { display: block; width: 100%; text-align: left; border: 0; background: transparent; padding: 8px 0; }
+.go .rel { font: 12px var(--mono); color: var(--faint); margin-right: 8px; }
+.go .why { display: block; font-size: 14px; color: var(--soft); }
+.missing { color: var(--warn); }
+.quick { display: flex; gap: 8px; margin-top: 16px; }
+.quick .f { flex: 1; min-width: 0; }
+.f { width: 100%; padding: 9px 11px; font-size: 16px; border: 1px solid var(--rule); border-radius: 8px;
+  background: var(--paper); }
+textarea.f { display: block; min-height: 3.2em; resize: vertical; line-height: 1.45; }
+textarea.code { font: 15px/1.45 var(--mono); }
+textarea.prose { font: 17px/1.55 var(--serif); min-height: 10em; }
+.field { margin-top: 16px; }
+.hint { font-size: 12px; color: var(--faint); margin-top: 4px; }
+.circles { display: flex; flex-wrap: wrap; gap: 6px; }
+.circles label { display: inline-flex; gap: 6px; align-items: center; border: 1px solid var(--rule);
+  border-radius: 999px; padding: 5px 12px; }
+.cite { font: 15px/1.5 var(--serif); background: var(--wash); padding: 10px 12px; border-radius: 8px;
+  white-space: pre-wrap; overflow-wrap: anywhere; }
+.readings { width: 100%; border-collapse: collapse; font-size: 14px; }
+.readings td { padding: 6px 4px; border-bottom: 1px dashed var(--rule); vertical-align: top; }
+.readings td:first-child { font: 13px var(--mono); color: var(--faint); white-space: nowrap; }
+.readings .v { font: 600 15px var(--mono); white-space: nowrap; }
+.spark { width: 100%; height: 64px; display: block; margin-bottom: 6px; }
+.st-out { color: var(--warn); font-weight: 700; } .st-near { color: var(--soft); font-style: italic; }
+.changed { box-shadow: inset 3px 0 0 var(--accent); padding-left: 12px; }
+.foot { margin-top: 28px; font: 12px var(--mono); color: var(--faint); }
+.empty { padding: 48px 16px; color: var(--faint); text-align: center; }
+.sheet { position: fixed; inset: 0; z-index: 10; background: rgba(0, 0, 0, .35); display: grid; align-items: end; }
+.panel { background: var(--paper); border-radius: 16px 16px 0 0; padding: 16px;
+  padding-bottom: max(16px, env(safe-area-inset-bottom)); max-width: 560px; width: 100%; margin: 0 auto; }
+@media (min-width: 900px) { .sheet { align-items: center; } .panel { border-radius: 16px; } }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin-top: 10px; }
+.grid .btn { text-align: left; display: flex; gap: 8px; align-items: center; text-decoration: none; color: inherit; }
+#toast { position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom)); transform: translateX(-50%);
+  background: var(--ink); color: var(--paper); padding: 10px 16px; border-radius: 999px; font-size: 14px;
+  opacity: 0; pointer-events: none; transition: opacity .2s; max-width: calc(100% - 32px); z-index: 20; }
+#toast.on { opacity: 1; }
+.graph { display: flex; flex-direction: column; height: 100vh; height: 100dvh; background: var(--paper); }
+.gbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 8px 12px;
+  padding-top: max(8px, env(safe-area-inset-top)); background: var(--wash); border-bottom: 1px solid var(--rule); }
+.seg { display: inline-flex; border: 1px solid var(--rule); border-radius: 999px; overflow: hidden; background: var(--paper); }
+.seg button { border: 0; background: transparent; color: var(--soft); padding: 7px 12px; font-size: 14px; min-height: 36px; }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
+.grow-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; width: 100%; }
+.gicon { min-width: 40px; padding: 6px 8px; font-size: 16px; }
+.gicon[aria-pressed="true"] { color: var(--ink); text-decoration: underline; }
+.gcanvas { position: relative; flex: 1; min-height: 0; touch-action: none; user-select: none; -webkit-user-select: none; }
+.gcanvas canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.ghint { position: absolute; left: 12px; right: 130px; top: 8px; font: 11px/1.4 var(--mono); color: var(--faint); pointer-events: none; }
+.gnote { position: absolute; left: 16px; right: 16px; top: 50%; text-align: center; color: var(--soft); pointer-events: none; }
+.gstatus { display: flex; flex-wrap: wrap; gap: 4px 12px; justify-content: space-between; padding: 6px 12px;
+  padding-bottom: max(6px, env(safe-area-inset-bottom)); font: 12px/1.4 var(--mono); color: var(--soft);
+  background: var(--wash); border-top: 1px solid var(--rule); }
+.gstatus .who { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+.gfab { position: absolute; bottom: 12px; display: flex; gap: 8px; }
+.gfab.r { right: 12px; } .gfab.l { left: 12px; }
+.gfab .btn { background: var(--paper); box-shadow: 0 1px 4px rgba(0, 0, 0, .12); }
+.gfab .btn[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--paper); }
+.gpathbar { position: absolute; left: 12px; right: 12px; top: 8px; display: flex; gap: 8px; align-items: center;
+  flex-wrap: wrap; background: var(--paper); border: 1px solid var(--accent); border-radius: 12px; padding: 6px 8px 6px 12px;
+  font-size: 14px; box-shadow: 0 1px 4px rgba(0, 0, 0, .1); }
+.gpathbar .grow { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pick { list-style: none; margin: 8px 0 0; padding: 0; max-height: 45vh; overflow-y: auto; }
+.pick .row { padding: 10px 4px; }
+.lk-edge { border-top: 1px dashed var(--rule); padding: 10px 0; display: grid; gap: 4px; }
+.lk-edge .rel { font: 13px var(--mono); color: var(--soft); }
+.lk-edge .meta { font: 12px var(--mono); color: var(--faint); }
+.lk-edge .acts { display: flex; gap: 6px; justify-content: flex-end; }
+.lk-form { display: grid; gap: 6px; margin-top: 8px; }
+.lk-form .row2, .ask .row2 { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; margin-top: 8px; }
+.lk-dir { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0 4px; }
+.ask p { margin: 0 0 6px; white-space: pre-wrap; }
+.key { display: grid; grid-template-columns: 64px 1fr; gap: 8px 12px; align-items: center; margin-top: 10px; font-size: 14px; }
+.key svg { width: 64px; height: 14px; display: block; }
+#lq { width: 100%; padding: 10px 12px; font-size: 16px; border: 1px solid var(--rule); border-radius: var(--radius);
+  background: var(--paper); margin-top: 12px; -webkit-appearance: none; appearance: none; }
+@media (prefers-reduced-motion: reduce) { #toast { transition: none; } }
+</style>
+</head>
+<body>
+<div id="app">
+  <section id="listpane">
+    <header class="top">
+      <div class="bar">
+        <span class="brand">Kustos</span>
+        <span class="grow"></span>
+        <button class="icon" data-act="menu" id="menuBtn">&#8943;</button>
+        <button class="icon primary" data-act="new" id="newBtn">+</button>
+      </div>
+      <input id="q" type="search" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="search">
+      <nav class="tabs" id="tabs"></nav>
+    </header>
+    <div class="listinfo" id="listinfo"></div>
+    <ul class="rows" id="rows"></ul>
+    <div class="more"><button class="btn" data-act="more" id="moreBtn" hidden></button></div>
+  </section>
+  <section id="recpane"><div id="rec"></div></section>
+</div>
+<div class="sheet" id="sheet" data-act="close" hidden><div class="panel" id="sheetPanel"></div></div>
+<div id="toast" role="status" aria-live="polite"></div>
+<script nonce="@@NONCE@@">
+"use strict";
+const BOOT = /*__BOOT__*/null;
+const $ = (sel, el) => (el || document).querySelector(sel);
+const $$ = (sel, el) => Array.from((el || document).querySelectorAll(sel));
+function T(s, v) {
+  let x = (BOOT.T && BOOT.T[s]) || s;
+  if (v) for (const k of Object.keys(v)) x = x.split("{" + k + "}").join(String(v[k]));
+  return x;
+}
+const ESC = {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"};
+const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ESC[c]);
+const short = label => String(label).split("  ")[0];
+const S = {q: "", coll: "", rows: [], total: 0, counts: {}, order: "register", rec: null, sel: null,
+           edit: null, dirty: false, busy: false, listY: 0, fromList: false, all: {}};
+let here = location.hash;
+
+function today() {
+  const d = new Date(), p = n => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+}
+function toast(msg, ms) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.classList.add("on");
+  clearTimeout(toast.h);
+  toast.h = setTimeout(() => t.classList.remove("on"), ms || 2200);
+}
+async function api(path, body) {
+  const opt = {headers: {"X-Kustos-Token": BOOT.token}};
+  if (body !== undefined) {
+    opt.method = "POST";
+    opt.headers["Content-Type"] = "application/json";
+    opt.body = JSON.stringify(body);
+  }
+  let r;
+  try { r = await fetch(path, opt); }
+  catch (e) { const err = new Error(T("Kustos is not answering. Start it again: python _kustos.py web")); err.status = 0; throw err; }
+  let j = {};
+  try { j = await r.json(); } catch (e) { /* not JSON */ }
+  if (!r.ok) { const err = new Error(j.error || r.statusText); err.status = r.status; err.data = j; throw err; }
+  return j;
+}
+
+/* ---------------------------------------------------------------- the list */
+let listJob = null, listSeq = 0;
+function listSoon() { clearTimeout(listJob); listJob = setTimeout(() => loadList(false), 150); }
+async function loadList(more, keep) {
+  const seq = ++listSeq;
+  const offset = more ? S.rows.length : 0;
+  const limit = keep ? Math.min(500, Math.max(60, S.rows.length)) : 60;
+  let j;
+  try { j = await api("api/list?" + new URLSearchParams({q: S.q, coll: S.coll, offset, limit})); }
+  catch (e) { toast(e.message, 4000); return; }
+  if (seq !== listSeq) return;            // a later search is on its way
+  S.rows = more ? S.rows.concat(j.rows) : j.rows;
+  S.total = j.total; S.counts = j.counts; S.order = j.order;
+  renderTabs();
+  renderRows();
+}
+function renderTabs() {
+  const all = Object.values(S.counts).reduce((a, b) => a + b, 0);
+  const tabs = [["", T("All"), all]].concat(BOOT.colls.map(([c, l]) => [c, l, S.counts[c] || 0]));
+  $("#tabs").innerHTML = tabs.map(([c, l, n]) =>
+    `<button class="tab${n ? "" : " zero"}" data-act="tab" data-coll="${c}" aria-pressed="${S.coll === c}">` +
+    `${esc(l)}<span class="n">${n}</span></button>`).join("");
+}
+function renderRows() {
+  $("#rows").innerHTML = S.rows.length ? S.rows.map(r =>
+    `<li><button class="row" data-act="open" data-id="${esc(r.id)}" aria-current="${S.sel === r.id}">` +
+    `<span class="dot c-${r.coll}"></span><span class="t">${esc(r.title)}</span>` +
+    `<span class="n">${r.n ? "nº " + r.n : ""}</span>` +
+    `<span class="s">${r.warn ? '<span class="warn">!</span> ' : ""}${esc(r.sub)}</span></button></li>`).join("")
+    : `<li class="empty">${esc(T("Nothing found."))}</li>`;
+  $("#listinfo").textContent = T("{n} of {total}", {n: S.rows.length, total: S.total}) + " · " +
+    (S.order === "register" ? T("register order, newest first") : T("index, alphabetical"));
+  const more = $("#moreBtn");
+  more.hidden = S.rows.length >= S.total;
+  more.textContent = T("More");
+}
+function markSel() {
+  $$(".row").forEach(b => b.setAttribute("aria-current", String(b.dataset.id === S.sel)));
+}
+function search(text) {
+  S.q = text;
+  $("#q").value = text;
+  if (document.body.classList.contains("open")) go("");
+  loadList(false);
+}
+
+/* ---------------------------------------------------------------- moving around */
+function go(hash, replace) {
+  const url = "#" + hash;
+  if (replace) { history.replaceState(null, "", hash ? url : location.pathname); here = location.hash; route(); }
+  else if (location.hash === url || (!hash && !location.hash)) route();
+  else location.hash = hash;
+}
+function route() {
+  here = location.hash;
+  const h = decodeURIComponent(location.hash.slice(1));
+  if (h.startsWith("g/")) return showGraph(h.slice(2));
+  stopGraph();
+  if (h === "links") return showLinks();
+  if (h.startsWith("r/")) return showRecord(h.slice(2));
+  if (h.startsWith("new/")) { const p = h.split("/"); return startNew(p[1], p[2]); }
+  closeRecord();
+}
+window.addEventListener("hashchange", () => {
+  if (S.dirty && location.hash !== here && !confirm(T("Discard the changes made here?"))) {
+    history.replaceState(null, "", here || location.pathname);
+    return;
+  }
+  S.dirty = false;
+  route();
+});
+window.addEventListener("beforeunload", e => { if (S.dirty) { e.preventDefault(); e.returnValue = ""; } });
+function back() {
+  if (S.fromList && history.length > 1) history.back();
+  else go("");
+}
+
+/* ---------------------------------------------------------------- a record */
+function visible(f, coll, kind, form) {
+  if (coll === "sources") {
+    if (["type", "name", "tags", "notes", "edges", "links"].includes(f.k)) return true;
+    const t = String(form.type || "outro").toLowerCase();
+    return (BOOT.sfields[t] || BOOT.sfields["*"]).includes(f.k);
+  }
+  if (coll === "corpus" && f.only) return f.only.includes(form.ctype || "measure");
+  return !f.only || f.only.includes(kind);
+}
+function optLabel(f, v) {
+  const o = (f.opts || []).find(o => o[0] === v);
+  return o ? o[1] : v;
+}
+function head(actions) {
+  return `<div class="rechead"><button class="btn quiet back" data-act="back">&#8249; ${esc(T("Back"))}</button>` +
+         `<span class="grow"></span>${actions || ""}</div>`;
+}
+function showEmpty() {
+  $("#rec").innerHTML = `<div class="empty">${esc(T("Nothing open. Choose a record from the list."))}</div>`;
+}
+async function showRecord(id) {
+  document.body.classList.add("open");
+  S.sel = id; S.edit = null; S.dirty = false;
+  markSel();
+  try { S.rec = await api("api/record?id=" + encodeURIComponent(id)); }
+  catch (e) {
+    S.rec = null;
+    $("#rec").innerHTML = head() + `<div class="empty">${esc(e.status === 404 ? T("no such record") : e.message)}</div>`;
+    return;
+  }
+  renderRecord();
+  window.scrollTo(0, 0);
+  $("#recpane").scrollTop = 0;
+}
+function closeRecord() {
+  const wasOpen = document.body.classList.contains("open");
+  document.body.classList.remove("open");
+  S.rec = null; S.sel = null; S.edit = null; S.dirty = false; S.fromList = false;
+  document.title = "Kustos";
+  markSel();
+  showEmpty();
+  if (wasOpen) window.scrollTo(0, S.listY);
+}
+function sec(label, html) { return `<div class="sec"><span class="lbl">${esc(label)}</span>${html}</div>`; }
+
+function logHtml(items, key) {
+  const list = (items || []).slice().reverse().sort((a, b) => String(b.date).localeCompare(String(a.date)));
+  const shown = S.all[key] ? list : list.slice(0, 12);
+  return `<ul class="log">${shown.map(i => `<li><span class="d">${esc(i.date)}</span><span>${esc(i.text)}</span></li>`).join("")}</ul>` +
+    (list.length > shown.length ? `<button class="btn quiet" data-act="all" data-k="${key}">${esc(T("show all {n}", {n: list.length}))}</button>` : "");
+}
+function tasksHtml(r) {
+  const mark = {doing: "/", waiting: "&gt;", done: "&#10003;", cancelled: "&#8211;"};
+  return `<ul class="tasks">` + (r.tasks || []).map((t, i) =>
+    `<li class="task"><button class="box" data-act="task" data-i="${i}" aria-label="${esc(t.text)}">${mark[t.state] || ""}</button>` +
+    `<span>${esc(t.text)}${t.due ? `<span class="due">${esc(t.due + (t.at ? " " + t.at : ""))}</span>` : ""}</span></li>`).join("") + `</ul>`;
+}
+function readingsHtml(r) {
+  const rs = r.readings || [], f = r.form, unit = f.unit || "";
+  const pts = rs.map((x, i) => ({i, v: parseFloat(String(x.value).split("/")[0]), s: x.status}))
+    .filter(p => isFinite(p.v));
+  let svg = "";
+  if (pts.length > 1) {
+    const lo = parseFloat(f.ref_low), hi = parseFloat(f.ref_high);
+    const vals = pts.map(p => p.v).concat([lo, hi].filter(isFinite));
+    let min = Math.min(...vals), max = Math.max(...vals);
+    if (max === min) { max += 1; min -= 1; }
+    const W = 300, H = 64, pad = 6;
+    const x = i => pad + (W - 2 * pad) * (pts.length === 1 ? .5 : i / (pts.length - 1));
+    const y = v => H - pad - (H - 2 * pad) * (v - min) / (max - min);
+    let band = "";
+    if (isFinite(lo) || isFinite(hi)) {
+      const top = y(isFinite(hi) ? hi : max), bot = y(isFinite(lo) ? lo : min);
+      band = `<rect x="0" y="${top}" width="${W}" height="${Math.max(1, bot - top)}" fill="currentColor" opacity=".08"/>`;
+    }
+    const line = pts.map((p, k) => `${x(k).toFixed(1)},${y(p.v).toFixed(1)}`).join(" ");
+    const lastP = pts[pts.length - 1];
+    svg = `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">${band}` +
+      `<polyline points="${line}" fill="none" stroke="currentColor" stroke-width="1.5" vector-effect="non-scaling-stroke"/>` +
+      `<circle cx="${x(pts.length - 1)}" cy="${y(lastP.v)}" r="3" fill="currentColor" class="st-${lastP.s}"/></svg>`;
+  }
+  const rows = rs.slice().reverse().slice(0, S.all.readings ? rs.length : 12).map(x =>
+    `<tr><td>${esc(x.date)}</td><td class="v st-${esc(x.status)}">${esc(x.value)} ${esc(unit)}</td>` +
+    `<td>${esc(x.note || "")}${x.status !== "ok" && x.status !== "unknown" ? ` <span class="st-${esc(x.status)}">(${esc(T({near: "near the limit", out: "out"}[x.status] || x.status))})</span>` : ""}</td></tr>`).join("");
+  return svg + `<table class="readings">${rows}</table>` +
+    (rs.length > 12 && !S.all.readings ? `<button class="btn quiet" data-act="all" data-k="readings">${esc(T("show all {n}", {n: rs.length}))}</button>` : "");
+}
+function goItem(a, relFirst) {
+  const label = `<span class="${a.missing ? "missing" : ""}">${esc(a.title)}</span>`;
+  const rel = `<span class="rel">${esc(a.rel)}</span>`;
+  const why = [a.when, a.why].filter(Boolean).join(" — ");
+  return `<li><button class="go" data-act="open" data-id="${esc(a.id)}"${a.missing ? " disabled" : ""}>` +
+    (relFirst ? rel + label : label + " " + rel) + (why ? `<span class="why">${esc(why)}</span>` : "") + `</button></li>`;
+}
+function renderRecord(changed) {
+  const r = S.rec;
+  if (!r) return showEmpty();
+  const f = r.form, out = [], ch = new Set(changed || []);
+  document.title = r.title + " · Kustos";
+  const kicker = [r.kind_label, r.n ? "nº " + r.n : T("not registered"),
+                  r.reg ? T("registered {stamp}", {stamp: r.reg}) : ""].filter(Boolean).join(" · ");
+  out.push(`<div class="kicker">${esc(kicker)}</div><h1 class="title${ch.has("name") ? " changed" : ""}">${esc(r.title)}</h1>`);
+  if (r.facts && r.facts.length) out.push(`<div class="sub">${esc(r.facts.join(" · "))}</div>`);
+  const quick = {person: ["interactions", "Add to the log"], measure: ["readings", "Add a reading"],
+                 activity: ["sessions", "Add a session"]}[r.kind];
+  if (quick) out.push(`<form class="quick" data-quick="${quick[0]}"><input class="f" name="line" autocomplete="off" ` +
+    `enterkeyhint="done" placeholder="${esc(T(quick[1]))}"><button class="btn primary">${esc(T("Add"))}</button></form>`);
+  const facts = [];
+  const flush = () => { if (facts.length) out.push(`<div class="facts">${facts.join("")}</div>`); facts.length = 0; };
+  for (const fd of BOOT.fields[r.coll]) {
+    if (fd.k === "name" || fd.k === "edges" || !visible(fd, r.coll, r.kind, f)) continue;
+    const v = f[fd.k], label = short(fd.label), m = ch.has(fd.k);
+    const put = h => out.push(m ? h.replace('class="sec"', 'class="sec changed"') : h);
+    if (fd.w === "circles") {
+      if (v && v.length) { flush(); put(sec(label, `<div class="chips">${v.map(c => `<span class="chip">${esc(optLabel(fd, c))}</span>`).join("")}</div>`)); }
+      continue;
+    }
+    if (v == null || v === "") continue;
+    const linked = fd.k === "source" && r.source && r.source.id;
+    if ((fd.w === "line" || fd.w === "choice") && !linked && !["tags", "domains"].includes(fd.k) && String(v).length <= 48) {
+      facts.push(`<div${m ? ' class="changed"' : ""}><span class="lbl">${esc(label)}</span><div class="val">${esc(fd.w === "choice" ? optLabel(fd, v) : v)}</div></div>`);
+      continue;
+    }
+    flush();
+    if (fd.k === "tasks") put(sec(label, tasksHtml(r)));
+    else if (fd.k === "interactions") put(sec(label, logHtml(r.log, "interactions")));
+    else if (fd.k === "sessions") put(sec(label, logHtml(r.sessions, "sessions")));
+    else if (fd.k === "readings") put(sec(label, readingsHtml(r)));
+    else if (fd.w === "md") put(sec(label, `<div class="md">${r.html[fd.k] || ""}</div>`));
+    else if (fd.k === "tags" || fd.k === "domains") {
+      const op = fd.k === "tags" ? "tag:" : "dom:";
+      put(sec(label, `<div class="chips">${v.split(",").map(t => t.trim()).filter(Boolean).map(t =>
+        `<button class="chip" data-act="q" data-q="${esc(op + t.replace(/\s+/g, ""))}">${esc(t)}</button>`).join("")}</div>`));
+    } else if (fd.k === "source" && r.source && r.source.id) {
+      put(sec(label, `<ul class="links">${goItem({id: r.source.id, title: r.source.title, rel: ""}, false)}</ul>`));
+    } else if (fd.k === "links") {
+      put(sec(label, `<div class="val">${v.split("\n").map(u => /^https?:\/\//i.test(u)
+        ? `<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(u)}</a>` : esc(u)).join("<br>")}</div>`));
+    } else if (fd.w === "choice") put(sec(label, `<div class="val">${esc(optLabel(fd, v))}</div>`));
+    else put(sec(label, `<div class="val${fd.w === "text" ? " mono" : ""}">${esc(v)}</div>`));
+  }
+  flush();
+  if (r.cite) out.push(sec(T("Citation (ABNT)"), `<div class="cite">${esc(r.cite)}</div>` +
+    `<button class="btn quiet" data-act="copy">${esc(T("Copy"))}</button>`));
+  if (r.out.length) out.push(sec(T("Links"), `<ul class="links">${r.out.map(a => goItem(a, true)).join("")}</ul>`)
+    .replace('class="sec"', ch.has("edges") ? 'class="sec changed"' : 'class="sec"'));
+  if (r.in.length) out.push(sec(T("Cited by"), `<ul class="links">${r.in.map(a => goItem(a, false)).join("")}</ul>`));
+  const foot = [r.id, r.updated ? T("updated {date}", {date: r.updated}) : "",
+                r.coll === "notes" ? T("file") + ": " + (r.file || T("(the file is made on saving)")) : ""];
+  out.push(`<div class="foot">${foot.filter(Boolean).map(esc).join("<br>")}</div>`);
+  $("#rec").innerHTML = head(`<button class="btn quiet" data-act="graph">${esc(T("Graph"))}</button>` +
+                            `<button class="btn" data-act="edit">${esc(T("Edit"))}</button>`) +
+    `<div class="card">${out.join("")}</div>`;
+}
+
+/* ---------------------------------------------------------------- editing */
+function inputHtml(fd, v) {
+  const id = "f-" + fd.k;
+  if (fd.w === "choice") {
+    const opts = fd.opts.slice();
+    if (v && !opts.some(o => o[0] === v)) opts.push([v, v]);
+    return `<select class="f" id="${id}" name="${fd.k}">` + opts.map(([k, l]) =>
+      `<option value="${esc(k)}"${k === v ? " selected" : ""}>${esc(l)}</option>`).join("") + `</select>`;
+  }
+  if (fd.w === "circles") return `<div class="circles">` + fd.opts.map(([k, l]) =>
+    `<label><input type="checkbox" name="circles" value="${esc(k)}"${(v || []).includes(k) ? " checked" : ""}> ${esc(l)}</label>`).join("") + `</div>`;
+  if (fd.w === "line") return `<input class="f" id="${id}" name="${fd.k}" value="${esc(v)}" autocomplete="off">`;
+  const cls = fd.w === "md" ? "prose" : "code";
+  return `<textarea class="f ${cls}" id="${id}" name="${fd.k}" rows="${fd.w === "md" ? 8 : 2}" ` +
+         `spellcheck="${fd.w === "md"}">${esc(v)}</textarea>`;
+}
+function autosize(t) { t.style.height = "auto"; t.style.height = (t.scrollHeight + 2) + "px"; }
+function renderEdit() {
+  const r = S.rec, f = S.edit;
+  let h = head(`<button class="btn quiet" data-act="cancel">${esc(T("Cancel"))}</button>` +
+               `<button class="btn primary" data-act="save">${esc(T("Save"))}</button>`);
+  h += `<div class="card"><div class="kicker">${esc(r.kind_label)}${r.n ? " · nº " + r.n : ""}</div>` +
+       `<form id="editor" autocomplete="off">`;
+  for (const fd of BOOT.fields[r.coll]) {
+    h += `<div class="field" data-k="${fd.k}"${visible(fd, r.coll, r.kind, f) ? "" : " hidden"}>` +
+         `<label class="lbl" for="f-${fd.k}">${esc(fd.label)}</label>${inputHtml(fd, f[fd.k])}` +
+         (fd.hint ? `<div class="hint">${esc(fd.hint)}</div>` : "") + `</div>`;
+  }
+  h += `</form>`;
+  if (r.id) h += `<div class="sec"><button class="btn danger" data-act="delete">${esc(T("Delete"))}</button></div>`;
+  $("#rec").innerHTML = h + `</div>`;
+  $$("#editor textarea").forEach(autosize);
+  if (!r.id) { const n = $("#f-name"); if (n) n.focus(); }
+}
+function revisible() {
+  const r = S.rec;
+  for (const fd of BOOT.fields[r.coll]) {
+    const box = $(`.field[data-k="${fd.k}"]`);
+    if (box) box.hidden = !visible(fd, r.coll, r.kind, S.edit);
+  }
+}
+function toTop() { window.scrollTo(0, 0); $("#recpane").scrollTop = 0; }
+function startEdit() {
+  if (!S.rec) return;
+  S.edit = JSON.parse(JSON.stringify(S.rec.form));
+  S.dirty = false;
+  renderEdit();
+  toTop();
+}
+function startNew(coll, kind) {
+  if (!BOOT.fields[coll]) return go("");
+  document.body.classList.add("open");
+  S.rec = {id: "", coll, kind, kind_label: BOOT.kinds[kind] || kind, title: "", base: "", n: 0,
+           form: {}, out: [], in: [], html: {}, opened: ""};
+  const form = {};
+  for (const fd of BOOT.fields[coll]) form[fd.k] = fd.w === "circles" ? [] : "";
+  if (coll === "sources") form.type = "outro";
+  if (coll === "corpus") form.ctype = kind;
+  if (coll === "entries") form.status = "attested";
+  const q = S.q.trim();
+  if (q && !/[:^]/.test(q)) form.name = q;
+  S.edit = form; S.dirty = false; S.sel = null;
+  markSel();
+  renderEdit();
+  window.scrollTo(0, 0);
+}
+async function save(force) {
+  if (S.busy || !S.edit) return;
+  const r = S.rec;
+  S.busy = true;
+  $$('[data-act="save"]').forEach(b => { b.disabled = true; });
+  try {
+    const j = await api("api/save", {coll: r.coll, kind: r.kind, id: r.id || null, base: r.base,
+                                      opened: r.opened || "", form: S.edit, force: !!force});
+    const before = r.id ? r.form : null;
+    S.dirty = false; S.edit = null; S.rec = j.record; S.sel = j.record.id;
+    history.replaceState(null, "", "#r/" + encodeURIComponent(j.record.id));
+    here = location.hash;
+    const changed = before ? Object.keys(j.record.form).filter(k =>
+      JSON.stringify(j.record.form[k]) !== JSON.stringify(before[k])) : [];
+    renderRecord(changed);
+    const first = $(".card .changed");
+    if (first) first.scrollIntoView({block: "center"}); else toTop();
+    toast(j.message || T("Saved."));
+    loadList(false, true);
+  } catch (e) {
+    S.busy = false;
+    if (e.status === 409) {
+      if (confirm(e.message + "\n\n" + T("Save yours over it?"))) return save(true);
+      if (e.data && e.data.record) { S.rec = e.data.record; S.edit = null; S.dirty = false; renderRecord(); }
+    } else toast(e.message, 4000);
+  } finally {
+    S.busy = false;
+    $$('[data-act="save"]').forEach(b => { b.disabled = false; });
+  }
+}
+function saveWith(changes) {
+  S.edit = Object.assign(JSON.parse(JSON.stringify(S.rec.form)), changes);
+  return save(false);
+}
+function quickAdd(key, line) {
+  line = line.trim();
+  if (!line || !S.rec) return;
+  const dated = /^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2})?\s+\S/.test(line);
+  const text = (key === "interactions" || !dated) ? today() + "   " + line : line;
+  const old = String(S.rec.form[key] || "").replace(/\s+$/, "");
+  return saveWith({[key]: old ? old + "\n" + text : text});
+}
+function finishTask(i) {
+  const lines = String(S.rec.form.tasks || "").split("\n");
+  if (i >= lines.length) return;
+  lines[i] = /^\s*(?:[-*]\s*)?\[.\]/.test(lines[i]) ? lines[i].replace(/\[.\]/, "[x]") : "[x] " + lines[i];
+  return saveWith({tasks: lines.join("\n")}).then(() => { if (!S.edit) toast(T("Done: it went to the log.")); });
+}
+async function del() {
+  const r = S.rec;
+  const n = r.out.length + r.in.length;
+  let msg = T('Delete "{label}"?', {label: r.title});
+  if (n) msg += "\n\n" + T("{n} link(s) involving this record go too.", {n});
+  msg += "\n\n" + T("The log keeps the previous version (Base › History).");
+  if (!confirm(msg)) return;
+  try { await api("api/delete", {id: r.id}); }
+  catch (e) { toast(e.message, 4000); return; }
+  S.dirty = false; S.edit = null;
+  toast(T("Deleted. The previous version is in the log."));
+  go("", true);
+  loadList(false, true);
+}
+
+/* ---------------------------------------------------------------- sheets */
+function openSheet(html) { $("#sheetPanel").innerHTML = html; $("#sheet").hidden = false; }
+function closeSheet() { $("#sheet").hidden = true; if (G.on) G.selLink = null; }
+function newSheet() {
+  openSheet(`<span class="lbl">${esc(T("Choose what to create"))}</span><div class="grid">` +
+    BOOT.new.map(([c, k]) => `<button class="btn" data-act="mk" data-coll="${c}" data-kind="${k}">` +
+      `<span class="dot c-${c}"></span>${esc(BOOT.kinds[k])}</button>`).join("") + `</div>`);
+}
+function menuSheet() {
+  openSheet(`<div class="grid"><button class="btn" data-act="graph0">${esc(T("Link graph"))}</button>` +
+    `<button class="btn" data-act="links">${esc(T("Links"))}</button>` +
+    `<a class="btn" href="health" target="_blank" rel="noopener">${esc(T("Health report"))}</a>` +
+    `<a class="btn" href="corpus" target="_blank" rel="noopener">${esc(T("Body map"))}</a></div>`);
+}
+
+/* ---------------------------------------------------------------- the link graph
+   The window's graph (# ==== graph) on a canvas: the record in the middle, the
+   records one to three links away around it, springs that settle by
+   themselves, and three rules for how the records glow. Conway's life comes
+   first here: a lit record stays lit with 2 or 3 lit neighbours, a dark one
+   lights with exactly 3, the links being the neighbourhood; when the pattern
+   dies or freezes it is seeded again, the recently edited records more often.
+   As in the window, a lit record fills with the accent and its links thicken,
+   and the corner traces how many are lit, generation by generation. Unlike the
+   window, a generation lasts 1.2 s and the run stops when the pattern dies out
+   or settles (a still life, a blinker), leaving the survivors lit, instead of
+   reseeding at random: Reseed, or holding a record, starts it again. With
+   reduced motion asked for, the graph opens still.
+   Changes are drawn as growth, never as jumps: when the middle changes, the
+   records already there keep their light, new ones sprout from the record that
+   brought them (nearest first) and their links grow out to them, and the ones
+   that leave wither. In life a birth is fed by its three lit neighbours: their
+   light flows along the links and the new cell lights when it arrives. Links
+   are soft curves; every brightness eases (`vis`), so nothing flashes. */
+const G = {on: false, settled: false,
+           mode: matchMedia("(prefers-reduced-motion: reduce)").matches ? "still" : "life", depth: 2, paused: false, names: false, nodes: {}, ids: [], links: [],
+           adj: {}, center: null, hover: null, cam: [0, 0], goal: [0, 0], zoom: 1, fit: true, temp: 0,
+           frame: 0, gen: 0, stale: 0, history: [], born: 0, died: 0, pop: [], acc: 0, last: 0, raf: 0,
+           clock: 0, gone: {}, goneLinks: [], pulses: [],
+           C: null, ctx: null, w: 0, h: 0, dpr: 1, ptr: new Map(), press: null, pinch: null, hold: 0,
+           dragging: null, said: ""};
+const LINK = 90, TICK = 40, GEN_TICKS = 30, SPARK_TICKS = 30, GTOP = 26;
+const GROW_MS = 700, LEAVE_MS = 600, FLOW_MS = 900, STAGGER_MS = 110;
+const GMODES = [["life", "Conway's life", "Life"], ["glow", "spreading glow", "Glow"], ["still", "still", "Still"]];
+
+function gColors() {
+  const cs = getComputedStyle(document.documentElement);
+  const probe = document.createElement("canvas").getContext("2d");
+  const C = {};
+  for (const k of ["paper", "wash", "rule", "ink", "soft", "faint", "accent", "warn"]) {
+    probe.fillStyle = "#000000";
+    probe.fillStyle = cs.getPropertyValue("--" + k).trim() || "#000000";
+    C[k] = /^#[0-9a-f]{6}$/i.test(probe.fillStyle) ? probe.fillStyle : "#000000";
+  }
+  C.mono = cs.getPropertyValue("--mono").trim() || "monospace";
+  return C;
+}
+function mix(c0, c1, t) {
+  const a = parseInt(c0.slice(1), 16), b = parseInt(c1.slice(1), 16);
+  const ch = s => Math.round(((a >> s) & 255) + (((b >> s) & 255) - ((a >> s) & 255)) * t);
+  return `rgb(${ch(16)},${ch(8)},${ch(0)})`;
+}
+function showGraph(id) {
+  document.body.classList.add("open");
+  S.rec = null; S.edit = null; S.sel = id || null;
+  markSel();
+  if (!G.on) graphMount();
+  document.title = T("Link graph") + " · Kustos";
+  graphFetch(id);
+  window.scrollTo(0, 0);
+}
+function stopGraph() {
+  if (!G.on) return;
+  G.on = false;
+  cancelAnimationFrame(G.raf);
+  clearTimeout(G.hold);
+  G.ptr.clear(); G.press = G.pinch = G.dragging = null;
+}
+function graphMount() {
+  const tip = s => `aria-label="${esc(T(s))}" title="${esc(T(s))}"`;
+  $("#rec").innerHTML = `<div class="graph"><div class="gbar">` +
+    `<div class="grow-row"><button class="btn quiet back" data-act="back">&#8249; ${esc(T("Back"))}</button>` +
+    `<span class="grow"></span>` +
+    `<button class="btn quiet gicon" data-act="gpause" id="gpause"></button>` +
+    `<button class="btn quiet gicon" data-act="gseed" id="gseed" ${tip("Reseed")}>&#8635;</button>` +
+    `<button class="btn quiet gicon" data-act="gnames" id="gnames" ${tip("Names")}>Aa</button>` +
+    `<button class="btn" data-act="gopen">${esc(T("Open"))}</button></div>` +
+    `<div class="grow-row"><span class="seg">${GMODES.map(([m, l, short]) =>
+      `<button data-act="gmode" data-m="${m}" title="${esc(T(l))}">${esc(T(short))}</button>`).join("")}</span>` +
+    `<span class="seg">${[1, 2, 3].map(d => `<button data-act="gdepth" data-d="${d}" ${tip("depth {d}").replace(/\{d\}/g, d)}>${d}</button>`).join("")}</span></div></div>` +
+    `<div class="gcanvas" id="gbox"><canvas id="gc"></canvas><div class="ghint" id="ghint"></div>` +
+    `<div class="gnote" id="gnote"></div>` +
+    `<div class="gfab l"><button class="btn" data-act="gkey" ${tip("Key")}>?</button></div>` +
+    `<div class="gfab r"><button class="btn" data-act="gpath" id="gpathbtn">&#8674; ${esc(T("Path"))}</button>` +
+    `<button class="btn" data-act="gdraw" id="gdraw" aria-pressed="false">&#10547; ${esc(T("Link"))}</button></div>` +
+    `<div class="gpathbar" id="gpathbar" hidden></div></div>` +
+    `<div class="gstatus"><span class="who" id="gwho"></span><span id="gstate"></span></div></div>`;
+  G.on = true;
+  G.C = gColors();
+  const c = $("#gc");
+  G.ctx = c.getContext("2d");
+  c.addEventListener("pointerdown", gDown);
+  c.addEventListener("pointermove", gMove);
+  c.addEventListener("pointerup", gUp);
+  c.addEventListener("pointercancel", gUp);
+  c.addEventListener("pointerleave", e => { if (e.pointerType === "mouse" && !G.press) G.hover = null; });
+  c.addEventListener("wheel", e => { e.preventDefault(); gZoomAt(e.offsetX, e.offsetY, e.deltaY < 0 ? 1.1 : 1 / 1.1); },
+                     {passive: false});
+  c.addEventListener("contextmenu", e => e.preventDefault());
+  G.last = performance.now();
+  G.acc = 0;
+  G.gone = {}; G.goneLinks = []; G.pulses = [];
+  G.raf = requestAnimationFrame(gLoop);
+  gButtons();
+}
+async function graphFetch(id) {
+  if (G.path) leavePath(false);
+  let d;
+  try { d = await api("api/graph?" + new URLSearchParams({id: id || "", depth: G.depth})); }
+  catch (e) { toast(e.message, 4000); return; }
+  if (G.on) gLoad(d);
+}
+function gLoad(d) {
+  const old = G.nodes, c = d.center, first = !G.ids.length;
+  const o = c && old[c] ? [old[c].x, old[c].y] : [0, 0];
+  const lit = r => Math.random() < 0.35 + 0.5 * r.rec;
+  const nodes = {};
+  for (const n of d.nodes) {          // parents come before the records they bring
+    const prev = old[n.id];
+    if (prev) {
+      nodes[n.id] = Object.assign(prev, n, {x: prev.x - o[0], y: prev.y - o[1]});
+      continue;
+    }
+    let x = 0, y = 0;
+    if (n.parent && nodes[n.parent]) {  // a new record sprouts right beside the one that brought it
+      const p = nodes[n.parent], a = Math.random() * 2 * Math.PI, r = LINK * 0.15;
+      x = p.x + r * Math.cos(a); y = p.y + r * Math.sin(a);
+    }
+    const start = G.clock + STAGGER_MS * n.dist + Math.random() * 150;
+    const on = G.mode === "life" && lit(n);
+    nodes[n.id] = Object.assign({}, n, {x, y, grow: 0, start, heat: 0, vis: 0, spark: 0,
+                                        lit: on, arrive: start + GROW_MS + Math.random() * 2000});
+  }
+  if (c && nodes[c]) { nodes[c].x = 0; nodes[c].y = 0; }
+  for (const id of Object.keys(old)) {   // the ones that leave wither where they are
+    if (!nodes[id]) G.gone[id] = Object.assign(old[id], {x: old[id].x - o[0], y: old[id].y - o[1], leave: 1});
+  }
+  for (const g of Object.values(G.gone)) if (nodes[g.id]) delete G.gone[g.id];
+  const before = new Map(G.links.map(l => [l.a + " " + l.b, l]));
+  const now = new Set(d.links.map(l => l.a + " " + l.b));
+  for (const [key, l] of before) if (!now.has(key)) G.goneLinks.push(Object.assign(l, {leave: 1}));
+  G.links = d.links.map(l => {
+    const had = before.get(l.a + " " + l.b);
+    if (had) return Object.assign(had, l);
+    const A = nodes[l.a], B = nodes[l.b];
+    const from = old[l.a] ? l.a : old[l.b] ? l.b : (A.dist <= B.dist ? l.a : l.b);
+    const to = from === l.a ? B : A;
+    return Object.assign(l, {grow: 0, from, start: to.grow < 1 ? to.start : G.clock});
+  });
+  G.cam = [G.cam[0] - o[0], G.cam[1] - o[1]];
+  G.goal = [0, 0];
+  G.nodes = nodes; G.ids = Object.keys(nodes); G.center = c; G.hover = null;
+  G.adj = {};
+  G.ids.forEach(n => { G.adj[n] = []; });
+  for (const l of G.links) { G.adj[l.a].push(l.b); G.adj[l.b].push(l.a); }
+  if (c && G.mode === "glow") nodes[c].spark = 1;
+  if (G.mode === "life") {           // the neighbourhood changed: the run goes on from here
+    G.stale = 0; G.history = [];
+    if (first) { G.gen = G.born = G.died = 0; G.pop = []; }
+    if (G.settled) { G.settled = false; if (G.on) gButtons(); }
+  }
+  G.temp = Math.max(G.temp, first ? 30 : 14);
+  G.fit = true;
+  S.sel = c; markSel();
+  $("#gnote").textContent = !c ? T("The base has no records yet.")
+    : G.ids.length === 1 ? T("No links yet: write them in the card's LINKS field, one per line.") : "";
+  gStatus(true);
+}
+function gButtons() {
+  $$('[data-act="gmode"]').forEach(b => b.setAttribute("aria-pressed", String(b.dataset.m === G.mode)));
+  $$('[data-act="gdepth"]').forEach(b => b.setAttribute("aria-pressed", String(+b.dataset.d === G.depth)));
+  const pause = $("#gpause");
+  pause.innerHTML = G.paused ? "&#9654;" : "&#10074;&#10074;";
+  pause.setAttribute("aria-label", G.paused ? T("Play") : T("Pause"));
+  pause.title = pause.getAttribute("aria-label");
+  $("#gseed").hidden = G.mode !== "life";
+  $("#gseed").classList.toggle("primary", G.mode === "life" && G.settled);
+  $("#gnames").setAttribute("aria-pressed", String(G.names));
+  $("#gdraw").setAttribute("aria-pressed", String(!!G.drawing));
+  if (G.drawing) { $("#ghint").hidden = false; $("#ghint").textContent = T("Drag from one record to another to link them."); return; }
+  if (G.picking) { $("#ghint").hidden = false; $("#ghint").textContent = T("Tap the record to reach."); return; }
+  $("#ghint").textContent = G.mode === "life"
+    ? T("tap: to the middle · tap the middle: open · hold: flip the cell · drag: move · pinch or wheel: zoom")
+    : T("tap: to the middle · tap the middle: open · hold: spark · drag: move · pinch or wheel: zoom");
+}
+function gStatus(force) {
+  const c = G.nodes[G.hover] || G.nodes[G.center];
+  const who = c ? c.name + (c.n ? " · nº " + c.n : "") : "";
+  let state = T(GMODES.find(m => m[0] === G.mode)[1]);
+  if (G.mode === "life") {
+    state += " · " + T("generation {n}, {k} lit", {n: G.gen, k: G.ids.filter(n => G.nodes[n].lit).length});
+    if (G.settled) {
+      const k = G.ids.filter(n => G.nodes[n].lit).length;
+      state = T("Conway's life") + " · " + (k ? T("settled at generation {n}: {k} stay lit", {n: G.gen, k})
+                                               : T("died out at generation {n}", {n: G.gen}))
+              + " · " + T("Reseed to start again");
+    } else if (G.gen) state += " · " + T("born {b} · died {d}", {b: G.born, d: G.died});
+  }
+  if (G.paused) state += " · " + T("paused");
+  state += " · " + T("{n} records, {k} links", {n: G.ids.length, k: G.links.length}) + ", " + T("depth {d}", {d: G.depth});
+  if (!force && who + state === G.said) return;
+  G.said = who + state;
+  $("#gwho").textContent = who;
+  $("#gstate").textContent = state;
+}
+
+/* the rules, as in the window */
+function gSeed() {
+  for (const n of G.ids) {           // the lights come on one by one, not all at once
+    const r = G.nodes[n];
+    r.lit = Math.random() < 0.35 + 0.5 * r.rec;
+    r.arrive = G.clock + Math.random() * 1500;
+  }
+  G.gen = G.stale = G.born = G.died = 0;
+  G.history = []; G.pop = [];
+  G.settled = false;
+  if (G.on) gButtons();
+}
+function gGeneration() {
+  const N = G.nodes, next = {};
+  let born = 0, died = 0;
+  for (const n of G.ids) {
+    const k = G.adj[n].reduce((s, m) => s + (N[m].lit ? 1 : 0), 0);
+    next[n] = N[n].lit ? (k === 2 || k === 3) : k === 3;
+  }
+  for (const n of G.ids) {
+    if (next[n] && !N[n].lit) {      // a birth: the light of its lit neighbours flows to it
+      born++;
+      const dur = FLOW_MS * (0.7 + 0.6 * Math.random());  // each birth at its own pace
+      for (const m of G.adj[n]) if (N[m].lit) G.pulses.push({a: m, b: n, start: G.clock, dur});
+      N[n].arrive = G.clock + dur;
+    }
+    if (!next[n] && N[n].lit) { died++; N[n].dimAt = G.clock + Math.random() * 600; }  // deaths fade one by one
+  }
+  for (const n of G.ids) N[n].lit = next[n];
+  const state = G.ids.filter(n => next[n]).sort().join(" ");
+  G.stale = (!state || G.history.includes(state)) ? G.stale + 1 : 0;
+  G.history = G.history.concat([state]).slice(-2);       // still lifes and blinkers
+  G.gen++; G.born = born; G.died = died;
+  G.pop = G.pop.concat([G.ids.length ? state.split(" ").filter(Boolean).length / G.ids.length : 0]).slice(-60);
+  if (G.stale >= 3) { G.settled = true; gButtons(); }    // the window reseeds here; the page rests
+}
+function gHeat() {
+  const N = G.nodes;
+  if (G.mode === "glow") {
+    const next = {};
+    for (const n of G.ids) {
+      const nb = G.adj[n], s = nb.length ? nb.reduce((t, m) => t + N[m].heat, 0) / nb.length : 0;
+      next[n] = Math.min(1, N[n].heat * 0.95 + s * 0.045 + N[n].rec * 0.012 + N[n].spark * 0.08);
+    }
+    for (const n of G.ids) { N[n].heat = next[n]; N[n].spark *= 0.9; }
+    if (G.frame % SPARK_TICKS === 0 && G.ids.length) {   // a spark swells; it does not flash
+      const w = G.ids.map(n => N[n].rec + 0.05), total = w.reduce((a, b) => a + b, 0);
+      let r = Math.random() * total, i = 0;
+      while (i < w.length - 1 && (r -= w[i]) > 0) i++;
+      N[G.ids[i]].spark = 1;
+    }
+  } else if (G.mode === "life") {
+    if (!G.settled && G.frame % GEN_TICKS === 0) gGeneration();
+    for (const n of G.ids) {
+      const p = N[n], want = p.lit ? (G.clock >= (p.arrive || 0) ? 1 : 0)
+                                   : (G.clock < (p.dimAt || 0) ? p.heat : 0);
+      p.heat += (want - p.heat) * (want ? 0.06 : 0.04);  // lighting is quicker than fading
+    }
+  } else {
+    for (const n of G.ids) N[n].heat += (N[n].rec - N[n].heat) * 0.1;
+  }
+}
+function gLayout() {
+  const N = G.nodes, ids = G.ids, k2 = LINK * LINK, disp = {};
+  ids.forEach(n => { disp[n] = [0, 0]; });
+  for (let i = 0; i < ids.length; i++) {
+    const a = N[ids[i]], da = disp[ids[i]];
+    for (let j = i + 1; j < ids.length; j++) {
+      const b = N[ids[j]], db = disp[ids[j]];
+      let dx = a.x - b.x, dy = a.y - b.y, d2 = dx * dx + dy * dy;
+      if (d2 < 0.01) { dx = Math.random() * 2 - 1; dy = Math.random() * 2 - 1; d2 = 1; }
+      const f = k2 / d2;
+      da[0] += dx * f; da[1] += dy * f; db[0] -= dx * f; db[1] -= dy * f;
+    }
+  }
+  for (const l of G.links) {
+    const a = N[l.a], b = N[l.b], dx = a.x - b.x, dy = a.y - b.y, f = Math.sqrt(dx * dx + dy * dy) / LINK;
+    disp[l.a][0] -= dx * f; disp[l.a][1] -= dy * f; disp[l.b][0] += dx * f; disp[l.b][1] += dy * f;
+  }
+  for (const n of ids) {
+    if (n === G.center || n === G.dragging) { N[n].vx = N[n].vy = 0; continue; }
+    const p = N[n], dx = disp[n][0] - p.x * 0.05, dy = disp[n][1] - p.y * 0.05, d = Math.hypot(dx, dy);
+    if (d > 0) {
+      const s = Math.min(d * 0.06, G.temp) / d;
+      p.vx = 0.5 * ((p.vx || 0) + dx * s); p.vy = 0.5 * ((p.vy || 0) + dy * s);  // keeps half the last step
+      p.x += p.vx; p.y += p.vy;
+    }
+  }
+  G.temp *= 0.98;
+}
+const GBOTTOM = 64;          // the floating buttons at the foot of the graph
+function gMiddle() { return [G.w / 2, (G.h + GTOP - GBOTTOM) / 2]; }
+function gFit() {
+  // the whole graph in view: around the middle record, or, in a path view, around the chains
+  if (G.path) {
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+    for (const n of G.ids) {               // names are drawn to the right of their record: they count too
+      const p = G.nodes[n], name = Math.min(32, p.name.length) * (n === G.center ? 7.8 : 6.6) / Math.max(0.3, G.zoom);
+      x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x + name); y0 = Math.min(y0, p.y); y1 = Math.max(y1, p.y);
+    }
+    G.goal = [(x0 + x1) / 2, (y0 + y1) / 2];
+  }
+  const [gx, gy] = G.goal;
+  let rx = 1, ry = 1;
+  for (const n of G.ids) { rx = Math.max(rx, Math.abs(G.nodes[n].x - gx)); ry = Math.max(ry, Math.abs(G.nodes[n].y - gy)); }
+  if (G.path) for (const n of G.ids) {
+    const p = G.nodes[n];
+    rx = Math.max(rx, Math.abs(p.x + Math.min(32, p.name.length) * (n === G.center ? 7.8 : 6.6) / Math.max(0.3, G.zoom) - gx));
+  }
+  const side = G.w < 600 ? (G.path ? 24 : 70) : (G.path ? 40 : 110), tall = (G.h - GTOP - GBOTTOM) / 2;
+  const z = Math.min(1.5, Math.max(0.12, Math.min((G.w / 2 - side) / rx, (tall - 20) / ry)));
+  if (Math.abs(z - G.zoom) >= 0.002) G.zoom += (z - G.zoom) * 0.15;
+}
+function gTick() {
+  G.frame++;
+  G.clock += TICK;
+  if (G.temp > 0.2) gLayout();
+  G.cam[0] += (G.goal[0] - G.cam[0]) * 0.18;
+  G.cam[1] += (G.goal[1] - G.cam[1]) * 0.18;
+  if (G.fit && G.ids.length) gFit();
+  if (!G.paused) gHeat();
+  pathFlow();
+  for (const n of G.ids) {
+    const p = G.nodes[n];
+    if (p.grow < 1 && G.clock >= p.start) p.grow = Math.min(1, p.grow + TICK / GROW_MS);
+    if (p.grow === undefined) p.grow = 1;
+    p.vis = (p.vis ?? p.heat) + (p.heat * (p.grow ?? 1) - (p.vis ?? p.heat)) * 0.18;
+  }
+  for (const l of G.links) {
+    if (l.grow === undefined) l.grow = 1;
+    if (l.grow < 1 && G.clock >= l.start) l.grow = Math.min(1, l.grow + TICK / GROW_MS);
+  }
+  for (const id of Object.keys(G.gone)) {
+    const g = G.gone[id];
+    g.leave -= TICK / LEAVE_MS;
+    g.vis *= 0.9;
+    if (g.leave <= 0) delete G.gone[id];
+  }
+  G.goneLinks = G.goneLinks.filter(l => (l.leave -= TICK / LEAVE_MS) > 0);
+  G.pulses = G.pulses.filter(q => G.clock < q.start + q.dur && G.nodes[q.a] && G.nodes[q.b]);
+}
+function gLoop(t) {
+  if (!G.on) return;
+  G.acc += Math.min(250, t - G.last);
+  G.last = t;
+  let steps = 0;
+  while (G.acc >= TICK && steps < 6) { gTick(); G.acc -= TICK; steps++; }
+  if (steps) gStatus(false);
+  gDraw();
+  G.raf = requestAnimationFrame(gLoop);
+}
+
+/* drawing */
+function gScreen(n) {
+  const [mx, my] = gMiddle(), p = G.nodes[n];
+  return [mx + (p.x - G.cam[0]) * G.zoom, my + (p.y - G.cam[1]) * G.zoom];
+}
+function gRadius(n, rec) {
+  const p = rec || G.nodes[n], r = n === G.center ? 9 : (p.dist === 1 ? 6.5 : 5);
+  return r * Math.min(1.5, Math.max(0.7, G.zoom)) * (G.w < 600 ? 1.3 : 1);
+}
+function gShape(ctx, kind, x, y, r) {
+  ctx.beginPath();
+  if (kind === "person") { ctx.arc(x, y, r, 0, 2 * Math.PI); return; }
+  const P = {concept: [[-r, -r], [r, -r], [r, r], [-r, r]],
+             form: [[0, -1.25 * r], [1.25 * r, 0], [0, 1.25 * r], [-1.25 * r, 0]],
+             source: [[-1.3 * r, -0.8 * r], [1.3 * r, -0.8 * r], [1.3 * r, 0.8 * r], [-1.3 * r, 0.8 * r]],
+             note: [[-0.8 * r, -1.15 * r], [0.8 * r, -1.15 * r], [0.8 * r, 1.15 * r], [-0.8 * r, 1.15 * r]]}[kind]
+          || [[0, -1.2 * r], [1.1 * r, 0.8 * r], [-1.1 * r, 0.8 * r]];
+  P.forEach(([dx, dy], i) => (i ? ctx.lineTo(x + dx, y + dy) : ctx.moveTo(x + dx, y + dy)));
+  ctx.closePath();
+}
+function gLabelShown(n) {
+  if (n === G.center || n === G.hover || G.names) return true;
+  if (G.w < 600) return G.ids.length <= 12 || (G.nodes[n].dist <= 1 && G.adj[G.center].length <= 8);
+  return G.nodes[n].dist <= 1 || G.ids.length <= 40;
+}
+function gHash(key) {
+  let h = 2166136261;
+  for (let i = 0; i < key.length; i++) h = Math.imul(h ^ key.charCodeAt(i), 16777619);
+  return ((h >>> 0) % 1000) / 1000;
+}
+function gCurve(A, B, key) {
+  // a link bows a little to one side, and breathes very slowly
+  const u = gHash(key), dx = B[0] - A[0], dy = B[1] - A[1];
+  const bow = (u < 0.5 ? -1 : 1) * (0.08 + 0.1 * (u * 2 % 1)) * (1 + 0.15 * Math.sin(G.clock / 1700 + u * 6.28));
+  return [(A[0] + B[0]) / 2 - dy * bow, (A[1] + B[1]) / 2 + dx * bow];
+}
+function gAt(A, Cp, B, t) {
+  const v = 1 - t;
+  return [v * v * A[0] + 2 * v * t * Cp[0] + t * t * B[0], v * v * A[1] + 2 * v * t * Cp[1] + t * t * B[1]];
+}
+function gStroke(ctx, A, Cp, B, t0, t1) {
+  ctx.beginPath();
+  if (t0 === 0 && t1 === 1) { ctx.moveTo(...A); ctx.quadraticCurveTo(...Cp, ...B); }
+  else {
+    const steps = 12;
+    for (let i = 0; i <= steps; i++) {
+      const [x, y] = gAt(A, Cp, B, t0 + (t1 - t0) * i / steps);
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    }
+  }
+  ctx.stroke();
+}
+const ease = t => 1 - Math.pow(1 - Math.max(0, Math.min(1, t)), 3);
+function hexMix(c0, c1, t) {
+  const a = parseInt(c0.slice(1), 16), b = parseInt(c1.slice(1), 16);
+  const ch = s => Math.round(((a >> s) & 255) + (((b >> s) & 255) - ((a >> s) & 255)) * t);
+  return "#" + [ch(16), ch(8), ch(0)].map(v => v.toString(16).padStart(2, "0")).join("");
+}
+function gLinkRest(l) {
+  // colour: the family; how vivid: how recently it was written; fainter without a reason
+  const f = l.f || {}, C = G.C, founded = f.founded !== false, age = f.age || 0;
+  if (BOOT.mono) return hexMix(C.rule, C.faint, (founded ? 0.35 : 0.1) + 0.4 * age);
+  const fam = BOOT.linkColours[f.family] || BOOT.linkColours.other;
+  return hexMix(C.rule, fam, founded ? 0.4 + 0.5 * age : 0.2 + 0.3 * age);
+}
+function gLink(ctx, l, A, Cp, B, t0, t1, q) {
+  const f = l.f || {}, C = G.C, sel = G.selLink === l.a + " " + l.b;
+  const colour = mix(gLinkRest(l), C.accent, 0.85 * q);
+  if (f.founded === false || f.atypical) {  // a stroke that says it still needs a reason, or is atypical
+    ctx.setLineDash(f.atypical ? [1.5, 4] : [6, 4]);
+    ctx.strokeStyle = colour; ctx.lineWidth = sel ? 2.5 : 1.2;
+    gStroke(ctx, A, Cp, B, t0, t1);
+    ctx.setLineDash([]);
+    return;
+  }
+  const w = (1 + 2 * q) * (sel ? 1.7 : 1);
+  if (!f.from) { ctx.strokeStyle = colour; ctx.lineWidth = w; gStroke(ctx, A, Cp, B, t0, t1); return; }
+  const fromA = f.from === l.a, steps = 12, left = [], right = [];
+  for (let i = 0; i <= steps; i++) {        // tapered: thick at the record it comes from
+    const t = t0 + (t1 - t0) * i / steps, [x, y] = gAt(A, Cp, B, t);
+    const dx = 2 * (1 - t) * (Cp[0] - A[0]) + 2 * t * (B[0] - Cp[0]);
+    const dy = 2 * (1 - t) * (Cp[1] - A[1]) + 2 * t * (B[1] - Cp[1]);
+    const len = Math.hypot(dx, dy) || 1, half = w * (0.85 - 0.6 * (fromA ? t : 1 - t));
+    left.push([x - dy / len * half, y + dx / len * half]);
+    right.push([x + dy / len * half, y - dx / len * half]);
+  }
+  ctx.fillStyle = colour;
+  ctx.beginPath();
+  left.concat(right.reverse()).forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+  ctx.closePath(); ctx.fill();
+}
+function gLinkAt(x, y, slop) {
+  let best = null, bd = slop * slop;
+  for (const l of G.links) {
+    if ((l.grow ?? 1) < 1) continue;
+    const A = gScreen(l.a), B = gScreen(l.b), Cp = gCurve(A, B, l.a + l.b);
+    let P0 = A;
+    for (let i = 1; i <= 12; i++) {
+      const P1 = gAt(A, Cp, B, i / 12), vx = P1[0] - P0[0], vy = P1[1] - P0[1];
+      const k = Math.max(0, Math.min(1, ((x - P0[0]) * vx + (y - P0[1]) * vy) / (vx * vx + vy * vy || 1)));
+      const d = (P0[0] + k * vx - x) ** 2 + (P0[1] + k * vy - y) ** 2;
+      if (d < bd) { bd = d; best = l; }
+      P0 = P1;
+    }
+  }
+  return best;
+}
+function gDraw() {
+  const box = $("#gbox"), c = $("#gc");
+  if (!box || !c) return;
+  const dpr = window.devicePixelRatio || 1, w = box.clientWidth, h = box.clientHeight;
+  if (w !== G.w || h !== G.h || dpr !== G.dpr) {
+    G.w = w; G.h = h; G.dpr = dpr;
+    c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+  }
+  const ctx = G.ctx, C = G.C, N = G.nodes, GN = G.gone;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = C.paper;
+  ctx.fillRect(0, 0, w, h);
+  ctx.lineCap = "round";
+  const [mx, my] = gMiddle();
+  const scr = p => [mx + (p.x - G.cam[0]) * G.zoom, my + (p.y - G.cam[1]) * G.zoom];
+  const S = {};
+  for (const n of G.ids) S[n] = scr(N[n]);
+  for (const id of Object.keys(GN)) S[id] = S[id] || scr(GN[id]);
+  const vis = id => (N[id] || GN[id] || {vis: 0}).vis || 0;
+  for (const l of G.goneLinks) {     // links that leave fade where they were
+    if (!S[l.a] || !S[l.b]) continue;
+    ctx.globalAlpha = Math.max(0, l.leave);
+    ctx.strokeStyle = C.rule; ctx.lineWidth = 1;
+    gStroke(ctx, S[l.a], gCurve(S[l.a], S[l.b], l.a + l.b), S[l.b], 0, 1);
+  }
+  ctx.globalAlpha = 1;
+  for (const l of G.links) {
+    const q = (vis(l.a) + vis(l.b)) / 2, g = ease(l.grow ?? 1);
+    if (g <= 0) continue;
+    const A = S[l.a], B = S[l.b], Cp = gCurve(A, B, l.a + l.b);
+    const [t0, t1] = g >= 1 ? [0, 1] : l.from === l.a ? [0, g] : [1 - g, 1];   // it grows out of the record already there
+    gLink(ctx, l, A, Cp, B, t0, t1, q);
+  }
+  if (G.path) {                            // the chains found: their lines and records stand out
+    ctx.strokeStyle = C.accent; ctx.lineWidth = 3; ctx.globalAlpha = 0.55;
+    for (const l of G.links) if (G.path.keys.has(l.a + " " + l.b) && (l.grow ?? 1) >= 1)
+      gStroke(ctx, S[l.a], gCurve(S[l.a], S[l.b], l.a + l.b), S[l.b], 0, 1);
+    ctx.globalAlpha = 1;
+  }
+  if (G.rubber && S[G.rubber.from]) {        // a link being drawn
+    ctx.setLineDash([6, 5]); ctx.strokeStyle = C.accent; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(...S[G.rubber.from]); ctx.lineTo(G.rubber.x, G.rubber.y); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath(); ctx.arc(G.rubber.x, G.rubber.y, 5, 0, 2 * Math.PI); ctx.fillStyle = C.accent; ctx.fill();
+  }
+  for (const q of G.pulses) {        // light flowing along a link into a new cell
+    const l = G.links.find(l => (l.a === q.a && l.b === q.b) || (l.a === q.b && l.b === q.a));
+    if (!l || !S[q.a] || !S[q.b]) continue;
+    const A = S[l.a], B = S[l.b], Cp = gCurve(A, B, l.a + l.b);
+    const t = ease((G.clock - q.start) / q.dur), along = q.a === l.a ? t : 1 - t;
+    for (let k = 0; k < 4; k++) {
+      const tt = q.a === l.a ? along - k * 0.05 : along + k * 0.05;
+      if (tt < 0 || tt > 1) continue;
+      const [x, y] = gAt(A, Cp, B, tt);
+      ctx.globalAlpha = (0.85 - k * 0.2) * Math.sin(Math.PI * Math.min(1, t * 1.1));
+      ctx.fillStyle = C.accent;
+      ctx.beginPath(); ctx.arc(x, y, 3.2 - k * 0.6, 0, 2 * Math.PI); ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
+  const focus = G.hover || G.center;
+  if (focus && G.adj[focus] && G.adj[focus].length <= 12 && (G.w >= 600 || G.names)) {
+    ctx.font = `10px ${C.mono}`; ctx.fillStyle = C.soft; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    for (const l of G.links) {
+      if ((l.a !== focus && l.b !== focus) || (l.grow ?? 1) < 1) continue;
+      const words = l.rels.map(([rel, f]) => rel + (f === focus ? " →" : " ←")).join(" · ");
+      const [x, y] = gAt(S[l.a], gCurve(S[l.a], S[l.b], l.a + l.b), S[l.b], 0.5);
+      ctx.fillText(words, x, y - 6);
+    }
+  }
+  const node = (p, x, y, r, a) => {
+    ctx.globalAlpha = a;
+    gShape(ctx, p.kind, x, y, r);
+    ctx.fillStyle = mix(C.paper, C.accent, p.vis || 0);
+    ctx.fill();
+    if (p.id === G.center) { ctx.strokeStyle = C.warn; ctx.lineWidth = 2; }
+    else { ctx.strokeStyle = mix(C.faint, C.accent, p.vis || 0); ctx.lineWidth = 1; }
+    ctx.stroke();
+  };
+  for (const id of Object.keys(GN)) {   // withering
+    const g = GN[id], k = ease(g.leave);
+    if (k > 0) node(g, ...S[id], gRadius(id, g) * k, k);
+  }
+  for (const n of G.ids) {
+    const p = N[n], g = ease(p.grow ?? 1);
+    if (g <= 0) continue;
+    const [x, y] = S[n], r = gRadius(n) * (0.35 + 0.65 * g);
+    node(p, x, y, r, g);
+    if (n === G.hover) {
+      ctx.strokeStyle = C.ink; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(x, y, r * 1.4 + 4, 0, 2 * Math.PI); ctx.stroke();
+    }
+    if (G.path && (n === G.path.a || n === G.path.b)) {    // the two ends
+      ctx.strokeStyle = C.accent; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(x, y, r * 1.5 + 5, 0, 2 * Math.PI); ctx.stroke();
+    }
+  }
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  for (const n of G.ids) {
+    const p = N[n], g = ease(p.grow ?? 1);
+    if (g <= 0.2 || !gLabelShown(n)) continue;
+    const [x, y] = S[n], big = n === G.center;
+    ctx.globalAlpha = g;
+    ctx.font = `${big ? "600 12px" : "11px"} ${C.mono}`;
+    ctx.fillStyle = p.dist <= 1 ? C.ink : C.soft;
+    const name = p.name.length > 32 ? p.name.slice(0, 31) + "…" : p.name;
+    ctx.fillText(name, Math.round(x + gRadius(n) * 1.4 + 4), Math.round(y));
+  }
+  ctx.globalAlpha = 1;
+  if (G.mode === "life" && G.pop.length > 1) {        // how many are lit, generation by generation
+    const bw = 104, bh = 26, x0 = w - bw - 12, y0 = 10;
+    ctx.strokeStyle = C.rule; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x0, y0 + bh); ctx.lineTo(x0 + bw, y0 + bh); ctx.stroke();
+    ctx.strokeStyle = C.accent; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    G.pop.forEach((v, i) => {
+      const px = x0 + bw * i / 59, py = y0 + bh - bh * v;
+      i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    });
+    ctx.stroke();
+  }
+}
+
+/* the hand */
+function gNodeAt(x, y, slop) {
+  let best = null, bd = slop * slop;
+  for (const n of G.ids) {
+    if ((G.nodes[n].grow ?? 1) < 0.5) continue;
+    const [sx, sy] = gScreen(n), d = (sx - x) ** 2 + (sy - y) ** 2;
+    if (d < bd) { best = n; bd = d; }
+  }
+  return best;
+}
+function gZoomAt(x, y, f) {
+  const z = Math.min(3, Math.max(0.12, G.zoom * f)), [mx, my] = gMiddle();
+  G.fit = false;
+  for (const c of [G.cam, G.goal]) {
+    const wx = (x - mx) / G.zoom + c[0], wy = (y - my) / G.zoom + c[1];
+    c[0] = wx - (x - mx) / z; c[1] = wy - (y - my) / z;
+  }
+  G.zoom = z;
+}
+function gTouch(n) {
+  const p = G.nodes[n];
+  if (!p) return;
+  if (G.mode === "life") {
+    p.lit = !p.lit;
+    p.arrive = G.clock;
+    G.stale = 0;
+    if (G.settled) { G.settled = false; gButtons(); }    // a hand on it starts the run again
+  } else p.spark = 1;
+  if (navigator.vibrate) { try { navigator.vibrate(12); } catch (e) { /* not allowed here */ } }
+}
+function gDown(e) {
+  e.currentTarget.setPointerCapture(e.pointerId);
+  $("#ghint").hidden = true;
+  G.ptr.set(e.pointerId, [e.offsetX, e.offsetY]);
+  clearTimeout(G.hold);
+  if (G.ptr.size === 2) {
+    const [a, b] = [...G.ptr.values()];
+    G.pinch = {d: Math.hypot(a[0] - b[0], a[1] - b[1]) || 1, z: G.zoom};
+    G.press = null; G.dragging = null;
+    return;
+  }
+  const n = gNodeAt(e.offsetX, e.offsetY, e.pointerType === "mouse" ? 14 : 24);
+  G.press = {x: e.offsetX, y: e.offsetY, lx: e.offsetX, ly: e.offsetY, n, moved: false, held: false,
+             touch: e.pointerType !== "mouse", draw: !!(G.drawing && n)};
+  if (G.press.draw) return;             // in link mode a record is the start of a link, not a hold
+  if (n) G.hold = setTimeout(() => { if (G.press && !G.press.crept) { G.press.held = true; gTouch(n); } }, 550);
+}
+function gMove(e) {
+  if (G.ptr.has(e.pointerId)) G.ptr.set(e.pointerId, [e.offsetX, e.offsetY]);
+  if (G.pinch && G.ptr.size === 2) {
+    const [a, b] = [...G.ptr.values()], d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+    gZoomAt((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, G.pinch.z * d / G.pinch.d / G.zoom);
+    return;
+  }
+  const p = G.press;
+  if (!p) {
+    if (e.pointerType === "mouse") G.hover = gNodeAt(e.offsetX, e.offsetY, 14);
+    return;
+  }
+  const far = Math.abs(e.offsetX - p.x) + Math.abs(e.offsetY - p.y);
+  if (p.draw) {
+    if (far >= 6) p.moved = true;
+    G.rubber = p.moved ? {from: p.n, x: e.offsetX, y: e.offsetY} : null;
+    G.hover = p.moved ? gNodeAt(e.offsetX, e.offsetY, p.touch ? 24 : 14) : null;
+    return;
+  }
+  if (far >= 3 && !p.crept) { p.crept = true; clearTimeout(G.hold); }
+  if (!p.moved && far < 6) return;
+  p.moved = true;
+  const dx = (e.offsetX - p.lx) / G.zoom, dy = (e.offsetY - p.ly) / G.zoom;
+  if (p.n && p.n !== G.center) {
+    G.dragging = p.n;
+    G.nodes[p.n].x += dx; G.nodes[p.n].y += dy;
+    G.temp = Math.max(G.temp, 3);   // the neighbours follow gently
+    G.fit = false;                  // the view holds still while you arrange it
+  } else {
+    for (const c of [G.cam, G.goal]) { c[0] -= dx; c[1] -= dy; }
+  }
+  p.lx = e.offsetX; p.ly = e.offsetY;
+}
+function gUp(e) {
+  G.ptr.delete(e.pointerId);
+  clearTimeout(G.hold);
+  if (G.ptr.size < 2) G.pinch = null;
+  const p = G.press;
+  G.press = null; G.dragging = null;
+  if (p && p.draw && p.moved) {
+    const to = gNodeAt(e.offsetX, e.offsetY, p.touch ? 24 : 14);
+    G.rubber = null; G.hover = null;
+    if (to && to !== p.n) linkNew(p.n, to);
+    return;
+  }
+  G.rubber = null;
+  if (!p || p.moved || p.held) return;
+  if (G.picking && p.n) {                  // the record to reach
+    G.picking = false; gButtons();
+    if (p.n !== G.center) pathTo(p.n);
+    return;
+  }
+  if (!p.n) {                              // a tap on a line opens its card
+    const l = gLinkAt(p.x, p.y, p.touch ? 16 : 9);
+    if (l) linkCard(l.a, l.b);
+    return;
+  }
+  if (p.n === G.center) { S.fromList = true; go("r/" + p.n); }
+  else go("g/" + p.n, true);
+}
+function gShake() {
+  for (const n of G.ids) {
+    if (n === G.center) continue;
+    G.nodes[n].x += (Math.random() * 2 - 1) * LINK;
+    G.nodes[n].y += (Math.random() * 2 - 1) * LINK;
+  }
+  G.temp = 30;
+  if (G.mode === "life") gSeed();
+}
+function gKey(e) {
+  const k = e.key;
+  if (k === "m") { G.mode = GMODES[(GMODES.findIndex(m => m[0] === G.mode) + 1) % 3][0]; if (G.mode === "life") gSeed(); gButtons(); }
+  else if (k === "1" || k === "2" || k === "3") { G.depth = +k; gButtons(); graphFetch(G.center); }
+  else if (k === " ") { e.preventDefault(); G.paused = !G.paused; gButtons(); }
+  else if (k === "r") gShake();
+  else if (k === "l") { G.names = !G.names; gButtons(); }
+  else if (k === "Enter" && G.center) { S.fromList = true; go("r/" + G.center); }
+  else return false;
+  gStatus(true);
+  return true;
+}
+
+/* ---------------------------------------------------------------- links
+   A link card shows every link between two records, both ways: its type,
+   reason, source, span and when it was written; each can be changed or
+   deleted. A new link is drawn on the graph (link mode) or added from a card.
+   Every change is saved as a change of the record the link comes from. */
+const LK = {card: null, i: null, from: "", to: ""};
+const L = {q: "", which: "", rows: [], total: 0, counts: {}};
+function ask(msg, yes) {
+  return new Promise(done => {
+    openSheet(`<div class="ask"><p>${esc(msg)}</p><div class="row2">` +
+      `<button class="btn" id="askNo">${esc(T("Cancel"))}</button>` +
+      `<button class="btn primary" id="askYes">${esc(yes)}</button></div></div>`);
+    $("#askYes").onclick = () => { closeSheet(); done(true); };
+    $("#askNo").onclick = () => { closeSheet(); done(false); };
+  });
+}
+function linkTitle(id) { return id === LK.card.a.id ? LK.card.a.title : LK.card.b.title; }
+async function linkCard(a, b, d) {
+  try { LK.card = d || await api("api/link?" + new URLSearchParams({a, b})); }
+  catch (e) { toast(e.message, 4000); return; }
+  if (G.on) G.selLink = [a, b].sort().join(" ");
+  const c = LK.card;
+  openSheet(`<span class="lbl">${esc(T("Link"))}</span><div class="lk-dir">` +
+    `<button class="chip" data-act="lk-go" data-id="${esc(c.a.id)}">${esc(c.a.title)}</button>&#8644;` +
+    `<button class="chip" data-act="lk-go" data-id="${esc(c.b.id)}">${esc(c.b.title)}</button></div>` +
+    c.edges.map((e, i) => `<div class="lk-edge"><div><b>${esc(linkTitle(e.from))}</b> ` +
+      `<span class="rel">${esc(e.label)} &#8594;</span> <b>${esc(linkTitle(e.to))}</b></div>` +
+      (e.why ? `<div>${esc(e.why)}</div>` : (e.source ? "" : `<div class="warn">${esc(T("no reason or source"))}</div>`)) +
+      (e.source ? `<div class="meta">${esc(e.source_label || e.source)}</div>` : "") +
+      `<div class="meta">${[e.when, e.atypical ? T("atypical type") : "",
+                             e.written ? T("written {date}", {date: e.written}) : ""].filter(Boolean).map(esc).join(" · ")}</div>` +
+      `<div class="acts"><button class="btn quiet" data-act="lk-del" data-i="${i}">${esc(T("Delete"))}</button>` +
+      `<button class="btn" data-act="lk-edit" data-i="${i}">${esc(T("Edit"))}</button></div></div>`).join("") +
+    `<div class="lk-form"><button class="btn" data-act="lk-add">${esc(T("Another link between them"))}</button></div>`);
+}
+function linkForm() {
+  const c = LK.card, e = LK.i == null ? null : c.edges[LK.i];
+  const opts = c.rels[LK.from + " " + LK.to] || [];
+  const cur = e ? e.rel : (opts[0] || [""])[0];
+  const known = opts.some(o => o[0] === cur);
+  openSheet(`<span class="lbl">${esc(T(e ? "Change link" : "New link"))}</span>` +
+    `<div class="lk-dir"><b>${esc(linkTitle(LK.from))}</b> &#8594; <b>${esc(linkTitle(LK.to))}</b>` +
+    `<button class="btn quiet" data-act="lk-swap" aria-label="${esc(T("Swap direction"))}" title="${esc(T("Swap direction"))}">&#8644;</button></div>` +
+    `<div class="lk-form"><label class="lbl" for="lk-rel">${esc(T("Type"))}</label>` +
+    `<select class="f" id="lk-rel">${opts.map(([k, l]) => `<option value="${esc(k)}"${k === cur ? " selected" : ""}>${esc(l)}</option>`).join("")}` +
+    `<option value=""${known ? "" : " selected"}>${esc(T("other type…"))}</option></select>` +
+    `<input class="f" id="lk-other" placeholder="${esc(T("one word, e.g. inspired_by"))}" value="${esc(known ? "" : cur)}"${known ? " hidden" : ""}>` +
+    `<label class="lbl" for="lk-why">${esc(T("Reason"))}</label><textarea class="f code" id="lk-why" rows="2">${esc(e ? e.why : "")}</textarea>` +
+    `<label class="lbl" for="lk-src">${esc(T("Source"))}</label><input class="f" id="lk-src" placeholder="${esc(T("s_… of a source, or free text"))}" value="${esc(e ? e.source : "")}">` +
+    `<label class="lbl" for="lk-when">${esc(T("Span"))}</label><input class="f" id="lk-when" placeholder="${esc(T("1609, 1618/1648, -800/400"))}" value="${esc(e ? e.when : "")}">` +
+    `<div class="row2"><button class="btn quiet" data-act="lk-cancel">${esc(T("Cancel"))}</button>` +
+    `<button class="btn primary" data-act="lk-save">${esc(T("Save"))}</button></div></div>`);
+  $("#lk-rel").onchange = ev => { $("#lk-other").hidden = !!ev.target.value; };
+}
+async function linkNew(a, b) {
+  try { LK.card = await api("api/link?" + new URLSearchParams({a, b})); }
+  catch (e) { toast(e.message, 4000); return; }
+  LK.i = null; LK.from = a; LK.to = b;
+  linkForm();
+}
+async function linkSave() {
+  const e = LK.i == null ? null : LK.card.edges[LK.i];
+  const rel = $("#lk-rel").value || $("#lk-other").value.trim();
+  const body = {from: LK.from, to: LK.to, rel, why: $("#lk-why").value, source: $("#lk-src").value,
+                when: $("#lk-when").value, old: null};
+  try {
+    if (e && e.from !== LK.from) {          // turned round: it moves to the other record
+      await api("api/link", {from: e.from, to: e.to, delete: true, old: {rel: e.rel, to: e.to}});
+    } else if (e) body.old = {rel: e.rel, to: e.to};
+    const j = await api("api/link", body);
+    toast(T("Link saved."));
+    linkChanged(j.link);
+  } catch (err) { toast(err.message, 4000); }
+}
+async function linkDelete(i) {
+  const e = LK.card.edges[i];
+  if (!(await ask(T("Delete this link?") + "\n\n" + linkTitle(e.from) + " — " + e.label + " → " + linkTitle(e.to), T("Delete")))) {
+    linkCard(LK.card.a.id, LK.card.b.id, LK.card);
+    return;
+  }
+  try {
+    const j = await api("api/link", {from: e.from, to: e.to, delete: true, old: {rel: e.rel, to: e.to}});
+    toast(T("Link deleted."));
+    linkChanged(j.link);
+  } catch (err) { toast(err.message, 4000); }
+}
+function linkChanged(card) {
+  if (G.on) graphFetch(G.center);
+  if (here === "#links") loadLinks(false);
+  if (S.rec && S.rec.id && [card.a.id, card.b.id].includes(S.rec.id)) showRecord(S.rec.id);
+  if (card.edges.length) linkCard(card.a.id, card.b.id, card);
+  else { closeSheet(); if (G.on) G.selLink = null; }
+}
+function keySheet() {
+  const C = G.C || gColors(), fam = BOOT.linkColours;
+  const line = (stroke, dash, w) => `<svg viewBox="0 0 64 14" aria-hidden="true"><line x1="2" y1="7" x2="62" y2="7" stroke="${stroke}" stroke-width="${w || 2}"${dash ? ` stroke-dasharray="${dash}"` : ""} stroke-linecap="round"/></svg>`;
+  const taper = `<svg viewBox="0 0 64 14" aria-hidden="true"><path d="M2 4 L62 6.4 L62 7.6 L2 10 Z" fill="${fam.verba}"/></svg>`;
+  const rows = [
+    ...[["verba", "Verba"], ["people", "People"], ["sources", "Sources"], ["corpus", "Corpus"]].map(([k, l]) =>
+      [line(hexMix(C.rule, fam[k], 0.9)), T(l)]),
+    [line(hexMix(C.rule, fam.verba, 0.9)), T("with a reason or a source")],
+    [line(hexMix(C.rule, fam.verba, 0.4), "6 4", 1.2), T("without either: needs a reason")],
+    [line(hexMix(C.rule, fam.verba, 0.6), "1.5 4", 1.2), T("a type outside the list (atypical)")],
+    [taper, T("thick where it comes from")],
+    [line(hexMix(C.rule, fam.sources, 0.9)), T("written recently")],
+    [line(hexMix(C.rule, fam.sources, 0.4)), T("written long ago")],
+    [line(C.accent, "", 3), T("lit, in life")]];
+  openSheet(`<span class="lbl">${esc(T("What a line shows"))}</span><div class="key">` +
+    rows.map(([svg, text]) => `${svg}<span>${esc(text)}</span>`).join("") + `</div>`);
+}
+async function loadLinks(more) {
+  let j;
+  try { j = await api("api/links?" + new URLSearchParams({q: L.q, which: L.which, offset: more ? L.rows.length : 0})); }
+  catch (e) { toast(e.message, 4000); return; }
+  L.rows = more ? L.rows.concat(j.rows) : j.rows;
+  L.total = j.total; L.counts = j.counts;
+  renderLinks();
+}
+function renderLinks() {
+  const tabs = [["", T("All"), L.counts.all], ["unfounded", T("Needs a reason"), L.counts.unfounded],
+                ["atypical", T("Atypical"), L.counts.atypical]];
+  $("#ltabs").innerHTML = tabs.map(([k, l, n]) => `<button class="tab${n ? "" : " zero"}" data-act="lk-which" ` +
+    `data-k="${k}" aria-pressed="${L.which === k}">${esc(l)}<span class="n">${n || 0}</span></button>`).join("");
+  $("#lrows").innerHTML = L.rows.length ? L.rows.map(r => `<li><button class="row" data-act="lk-row" data-a="${esc(r.a)}" data-b="${esc(r.b)}">` +
+    `<span class="dot" style="background:${BOOT.linkColours[r.family] || BOOT.linkColours.other}"></span>` +
+    `<span class="t">${esc(r.from)} <span class="rel">— ${esc(r.label)} →</span> ${esc(r.to)}</span><span class="n"></span>` +
+    `<span class="s">${r.why ? esc(r.why) : `<span class="warn">${esc(T("no reason or source"))}</span>`}</span></button></li>`).join("")
+    : `<li class="empty">${esc(T("Nothing found."))}</li>`;
+  $("#lmore").hidden = L.rows.length >= L.total;
+}
+function showLinks() {
+  document.body.classList.add("open");
+  S.rec = null; S.edit = null; S.sel = null;
+  markSel();
+  document.title = T("Links") + " · Kustos";
+  $("#rec").innerHTML = head() + `<div class="card"><h1 class="title">${esc(T("Links"))}</h1>` +
+    `<input id="lq" type="search" autocomplete="off" placeholder="${esc(T("Search the links"))}" value="${esc(L.q)}">` +
+    `<nav class="tabs" id="ltabs"></nav><ul class="rows" id="lrows"></ul>` +
+    `<div class="more"><button class="btn" data-act="lk-more" id="lmore" hidden>${esc(T("More"))}</button></div></div>`;
+  loadLinks(false);
+  window.scrollTo(0, 0);
+}
+let linksJob = null;
+
+/* ---------------------------------------------------------------- the path finder
+   How are two records related? The shortest chains of links from the middle
+   to another record (link_paths): the graph shows only those, still, with a
+   light running along them from one end to the other, and their steps can be
+   read one by one. Leaving it brings the neighbourhood back. */
+let pathJob = null;
+function pathSheet() {
+  openSheet(`<span class="lbl">${esc(T("How are they related?"))}</span>` +
+    `<div class="lk-dir">${esc(T("From"))}: <b>${esc((G.nodes[G.center] || {}).name || "")}</b></div>` +
+    `<label class="lbl" for="pq">${esc(T("To"))}</label>` +
+    `<input class="f" id="pq" type="search" autocomplete="off" placeholder="${esc(T("Search a record"))}">` +
+    `<ul class="pick" id="pick"></ul>` +
+    `<div class="lk-form"><button class="btn" data-act="gpath-pick">${esc(T("Tap a record in the graph"))}</button></div>`);
+  $("#pq").focus();
+}
+async function pathSearch(q) {
+  if (!q.trim()) { $("#pick").innerHTML = ""; return; }
+  let j;
+  try { j = await api("api/list?" + new URLSearchParams({q, limit: 12})); } catch (e) { return; }
+  const box = $("#pick");
+  if (!box) return;
+  box.innerHTML = j.rows.filter(r => r.id !== G.center).map(r => `<li><button class="row" data-act="gpath-to" data-id="${esc(r.id)}">` +
+    `<span class="dot c-${r.coll}"></span><span class="t">${esc(r.title)}</span><span class="n"></span>` +
+    `<span class="s">${esc(r.sub)}</span></button></li>`).join("") || `<li class="empty">${esc(T("Nothing found."))}</li>`;
+}
+async function pathTo(b) {
+  closeSheet();
+  let d;
+  try { d = await api("api/path?" + new URLSearchParams({a: G.center, b})); }
+  catch (e) { toast(e.message, 4000); return; }
+  if (!d.paths.length) { toast(T("No chain of links joins them."), 3500); return; }
+  const keep = G.mode;
+  gLoad(d);
+  G.path = {a: d.a, b: d.b, paths: d.paths, steps: d.steps, titles: d.titles, mode: keep, next: 0,
+            keys: new Set(d.paths.flatMap(p => p.slice(1).map((n, i) => [p[i], n].sort().join(" "))))};
+  G.mode = "still";
+  gButtons();
+  const k = d.paths[0].length - 1;
+  $("#gpathbar").innerHTML = `<span class="grow"><b>${esc(d.titles[d.a])}</b> &#8674; <b>${esc(d.titles[d.b])}</b> · ` +
+    `${esc(T("{k} link(s) apart · {n} chain(s)", {k, n: d.paths.length}))}</span>` +
+    `<button class="btn quiet" data-act="gpath-steps">${esc(T("Details"))}</button>` +
+    `<button class="btn quiet" data-act="gpath-x" aria-label="${esc(T("Back"))}">&#215;</button>`;
+  $("#gpathbar").hidden = false;
+  $("#ghint").hidden = true;
+}
+function leavePath(refetch) {
+  if (!G.path) return;
+  G.mode = G.path.mode || G.mode;
+  G.path = null;
+  G.goal = [0, 0];
+  $("#gpathbar").hidden = true;
+  gButtons();
+  if (refetch) graphFetch(G.center);
+}
+function pathSteps() {
+  const P = G.path, title = id => P.titles[id] || id;
+  openSheet(`<span class="lbl">${esc(T("How are they related?"))}</span>` + P.paths.map((path, i) =>
+    `<div class="lk-edge"><span class="meta">${esc(T("Chain {i} of {n}", {i: i + 1, n: P.paths.length}))}</span>` +
+    P.steps[i].map((links, j) => `<button class="go" data-act="lk-row" data-a="${esc(path[j])}" data-b="${esc(path[j + 1])}">` +
+      links.map(l => `<b>${esc(title(l.from))}</b> <span class="rel">${esc(l.label)} &#8594;</span> <b>${esc(title(l.to))}</b>` +
+        (l.why ? `<span class="why">${esc(l.why)}</span>` : "")).join("") + `</button>`).join("") + `</div>`).join(""));
+}
+function pathFlow() {
+  // a light runs along every chain from one end to the other, step by step
+  const P = G.path;
+  if (!P || G.clock < P.next) return;
+  P.next = G.clock + 700;
+  for (const path of P.paths) {
+    const step = Math.floor(G.clock / 700) % (path.length + 1);
+    if (step < path.length - 1) G.pulses.push({a: path[step], b: path[step + 1], start: G.clock, dur: 700});
+  }
+}
+
+/* ---------------------------------------------------------------- events */
+document.addEventListener("click", e => {
+  const wl = e.target.closest(".wl");
+  if (wl) { search(wl.textContent.trim()); return; }
+  const b = e.target.closest("[data-act]");
+  if (!b) return;
+  const act = b.dataset.act;
+  if (act === "close") { if (e.target === b) closeSheet(); return; }
+  if (act === "open") {
+    if (!S.rec || !S.rec.id || b.classList.contains("row")) S.listY = window.scrollY;
+    S.fromList = true;
+    go("r/" + b.dataset.id);
+  }
+  else if (act === "tab") { S.coll = b.dataset.coll; loadList(false); }
+  else if (act === "more") loadList(true);
+  else if (act === "back") back();
+  else if (act === "edit") startEdit();
+  else if (act === "cancel") { if (!S.rec.id) { S.dirty = false; back(); } else { S.edit = null; S.dirty = false; renderRecord(); } }
+  else if (act === "save") save(false);
+  else if (act === "delete") del();
+  else if (act === "task") finishTask(+b.dataset.i);
+  else if (act === "all") { S.all[b.dataset.k] = true; renderRecord(); }
+  else if (act === "q") search(b.dataset.q);
+  else if (act === "copy") {
+    const done = () => toast(T("Copied."));
+    if (navigator.clipboard) navigator.clipboard.writeText(S.rec.cite).then(done, () => toast(S.rec.cite, 5000));
+  }
+  else if (act === "new") newSheet();
+  else if (act === "menu") menuSheet();
+  else if (act === "mk") { closeSheet(); S.fromList = true; go("new/" + b.dataset.coll + "/" + b.dataset.kind); }
+  else if (act === "graph") { S.fromList = true; go("g/" + S.rec.id); }
+  else if (act === "graph0") { closeSheet(); S.fromList = true; go("g/" + (S.sel || "")); }
+  else if (act === "gmode") { G.mode = b.dataset.m; if (G.mode === "life") gSeed(); gButtons(); gStatus(true); }
+  else if (act === "gdepth") { G.depth = +b.dataset.d; gButtons(); graphFetch(G.center); }
+  else if (act === "gpause") { G.paused = !G.paused; gButtons(); gStatus(true); }
+  else if (act === "gseed") { gSeed(); gStatus(true); }
+  else if (act === "gnames") { G.names = !G.names; gButtons(); }
+  else if (act === "gopen") { if (G.center) { S.fromList = true; go("r/" + G.center); } }
+  else if (act === "gdraw") { G.drawing = !G.drawing; gButtons(); }
+  else if (act === "gkey") keySheet();
+  else if (act === "gpath") pathSheet();
+  else if (act === "gpath-to") pathTo(b.dataset.id);
+  else if (act === "gpath-pick") { closeSheet(); G.picking = true; G.drawing = false; gButtons(); }
+  else if (act === "gpath-x") leavePath(true);
+  else if (act === "gpath-steps") pathSteps();
+  else if (act === "links") { closeSheet(); S.fromList = true; go("links"); }
+  else if (act === "lk-row") linkCard(b.dataset.a, b.dataset.b);
+  else if (act === "lk-go") { closeSheet(); S.fromList = true; go("r/" + b.dataset.id); }
+  else if (act === "lk-edit") { const e = LK.card.edges[+b.dataset.i]; LK.i = +b.dataset.i; LK.from = e.from; LK.to = e.to; linkForm(); }
+  else if (act === "lk-del") linkDelete(+b.dataset.i);
+  else if (act === "lk-add") { LK.i = null; LK.from = LK.card.a.id; LK.to = LK.card.b.id; linkForm(); }
+  else if (act === "lk-swap") { [LK.from, LK.to] = [LK.to, LK.from]; const keep = {why: $("#lk-why").value, src: $("#lk-src").value, when: $("#lk-when").value};
+                                linkForm(); $("#lk-why").value = keep.why; $("#lk-src").value = keep.src; $("#lk-when").value = keep.when; }
+  else if (act === "lk-save") linkSave();
+  else if (act === "lk-cancel") { if (LK.card.edges.length) linkCard(LK.card.a.id, LK.card.b.id, LK.card); else closeSheet(); }
+  else if (act === "lk-which") { L.which = b.dataset.k; loadLinks(false); }
+  else if (act === "lk-more") loadLinks(true);
+});
+document.addEventListener("submit", e => {
+  e.preventDefault();
+  const form = e.target;
+  if (form.dataset.quick) quickAdd(form.dataset.quick, form.elements.line.value);
+  else if (form.id === "editor") save(false);
+});
+document.addEventListener("input", e => {
+  const t = e.target;
+  if (t.id === "q") { S.q = t.value; listSoon(); return; }
+  if (t.id === "pq") { clearTimeout(pathJob); pathJob = setTimeout(() => pathSearch(t.value), 150); return; }
+  if (t.id === "lq") { L.q = t.value; clearTimeout(linksJob); linksJob = setTimeout(() => loadLinks(false), 150); return; }
+  if (!S.edit || !t.closest("#editor")) return;
+  if (t.name === "circles") S.edit.circles = $$('#editor input[name="circles"]:checked').map(x => x.value);
+  else S.edit[t.name] = t.value;
+  S.dirty = true;
+  if (t.tagName === "TEXTAREA") autosize(t);
+  if (t.name === "type" || t.name === "ctype") revisible();
+});
+document.addEventListener("change", e => {
+  const t = e.target;
+  if (S.edit && t.closest("#editor") && (t.name === "type" || t.name === "ctype" || t.name === "circles")) {
+    if (t.name === "circles") S.edit.circles = $$('#editor input[name="circles"]:checked').map(x => x.value);
+    else S.edit[t.name] = t.value;
+    S.dirty = true;
+    revisible();
+  }
+});
+document.addEventListener("keydown", e => {
+  const typing = /^(INPUT|TEXTAREA|SELECT)$/.test((document.activeElement || {}).tagName || "");
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+    if (S.edit) { e.preventDefault(); save(false); }
+    return;
+  }
+  if (e.key === "Escape") {
+    if (!$("#sheet").hidden) closeSheet();
+    else if (S.edit && S.rec && S.rec.id && (!S.dirty || confirm(T("Discard the changes made here?")))) {
+      S.edit = null; S.dirty = false; renderRecord();
+    }
+    else if (!S.edit && document.body.classList.contains("open")) back();
+    return;
+  }
+  if (typing || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (G.on && gKey(e)) return;
+  if (e.key === "/") { e.preventDefault(); if (document.body.classList.contains("open") && innerWidth < 900) go(""); $("#q").focus(); }
+  else if (e.key === "e" && S.rec && S.rec.id && !S.edit) startEdit();
+  else if (e.key === "n") newSheet();
+});
+
+/* ---------------------------------------------------------------- start */
+$("#q").placeholder = T("Search");
+$("#q").setAttribute("aria-label", T("Search"));
+$("#newBtn").setAttribute("aria-label", T("New"));
+$("#newBtn").title = T("New");
+$("#menuBtn").setAttribute("aria-label", T("More"));
+renderTabs();
+loadList(false);
+route();
+setInterval(() => { api("api/ping").catch(() => {}); }, 20000);
 </script>
 </body>
 </html>
@@ -7828,15 +10620,26 @@ HELP_READING = (
 )
 
 
+# the Help › Shortcuts lines for the monads
+HELP_MONADS = (
+    "\n  Ctrl+Shift+M    monads (second window, read-only): what the records share with"
+    "\n                  no link needed, from the words they use. No lines: the nearer"
+    "\n                  a disc, the more distinctly the one in the middle perceives"
+    "\n                  it; the rest stays as dust at the edge. Passing over a disc"
+    "\n                  shows the others from its side; a click moves there, ← and →"
+    "\n                  walk back and forward. Health and drafts stay out.\n"
+)
+
 # the Help › Shortcuts lines for the link graph
 HELP_GRAPH = (
-    "\n  Ctrl+Shift+G    link graph (second window, read-only): the open record in"
-    "\n                  the middle, its links around it, glowing with recent edits."
-    "\n                  It follows the record you open here; m switches the glow"
-    "\n                  (spreading glow, Conway's life, still), Enter opens a record"
-    "\n                  on the card. p replays the logs: the base grows on screen as"
-    "\n                  it grew, with a timeline to scrub. The keys are listed at the"
-    "\n                  top of the window.\n"
+    "\n  Ctrl+Shift+G    link graph (second window): the open record in the middle,"
+    "\n                  its links around it, glowing with recent edits. It follows"
+    "\n                  the record you open here; the buttons at the top switch the"
+    "\n                  glow (Conway's life, spreading glow, still) and the depth,"
+    "\n                  Open (or Enter) opens a record on the card, Path finds how"
+    "\n                  two records are related and Link draws a link. p replays the"
+    "\n                  logs: the base grows on screen as it grew, with a timeline to"
+    "\n                  scrub. ? shows the key of the lines and every key.\n"
 )
 
 
@@ -9240,6 +12043,8 @@ class App:
                       command=self.open_graph)
         v.add_command(label=tr("Timeline"), accelerator="Ctrl+Shift+T",
                       command=self.open_timeline)
+        v.add_command(label=tr("Monads"), accelerator="Ctrl+Shift+M",
+                      command=self.open_monads)
         v.add_command(label=tr("Skills (Peritia)"), command=self.open_peritia)
         v.add_command(label=tr("Wide card"), accelerator="F11", command=self.toggle_wide)
         v.add_command(label=tr("Read field"), accelerator="Ctrl+E", command=self.open_reader)
@@ -9301,6 +12106,7 @@ class App:
         r.bind("<Control-b>", lambda e: self.open_book())
         r.bind("<Control-G>", lambda e: self.open_graph())      # Ctrl+Shift+G
         r.bind("<Control-T>", lambda e: self.open_timeline())   # Ctrl+Shift+T
+        r.bind("<Control-M>", lambda e: self.open_monads())     # Ctrl+Shift+M
         r.bind("<F11>", lambda e: self.toggle_wide())
         r.bind("<Control-backslash>", lambda e: self.toggle_wide())
         r.bind("<Control-e>", lambda e: self.open_reader())
@@ -9416,7 +12222,44 @@ class App:
             return "break"
         win = tk.Toplevel(self.root)
         self.graph = GraphView(win, lambda: self.data, start_id=(self.current() or {}).get("id"),
-                               on_open=self.open_from_graph)
+                               on_open=self.open_from_graph, on_link=self.link_from_graph)
+        return "break"
+
+    def link_from_graph(self, a, b, rel, why="", source="", when=""):
+        """A link drawn in the graph (Shift+drag), written here: what the card
+        holds is saved first, the link is added to the record it comes from
+        (write_link, as the web page does), and both windows show it. Returns
+        what went wrong, or None."""
+        self.commit_if_dirty()
+        try:
+            data = write_link(a, b, rel, why, source, when)
+        except (ValueError, WebConflict) as exc:
+            return str(exc)
+        except SystemExit as exc:
+            return str(exc)
+        self.safe_mirror(data)
+        self.reload()
+        if self.sel in (a, b):
+            self.open_record(self.sel)
+        g = getattr(self, "graph", None)
+        if g and g.is_open():
+            g.recentre(g.center, fresh=True)
+        self.say(tr("Link saved: {a} {rel} {b}", a=label_any(by_id(self.data).get(a), self.data),
+                    rel=rel_label(rel), b=label_any(by_id(self.data).get(b), self.data)))
+        return None
+
+    def open_monads(self):
+        """Ctrl+Shift+M: what the records share without being linked, in a second
+        window, around the current record; it follows the records opened here."""
+        self.commit_if_dirty()
+        m = getattr(self, "monads", None)
+        if m and m.is_open():
+            m.root.lift()
+            m.follow((self.current() or {}).get("id"))
+            return "break"
+        win = tk.Toplevel(self.root)
+        self.monads = MonadView(win, lambda: self.data, start_id=(self.current() or {}).get("id"),
+                                on_open=self.open_from_graph)
         return "break"
 
     def open_timeline(self):
@@ -10110,62 +12953,16 @@ class App:
         self.refresh_rail()
 
     def parse_query(self):
-        """Search operators:
-             p: v: f: c: d:   limit to a collection (people, verba, sources, corpus,
-                              drafts)
-             ^text            only the start of the name
-             tag:x lang:de type:book sys:renal dom:law id:c_measure
-           The rest are literal terms, all required. type: and sys: match the
-           stored key or its label in the current language."""
-        q = self.q.get().strip().lower()
-        scope, prefix, fields, terms = None, None, {}, []
-        for tok in q.split():
-            if tok in ("p:", "v:", "f:", "c:", "d:"):
-                scope = {"p:": "people", "v:": "entries", "f:": "sources",
-                         "c:": "corpus", "d:": "notes"}[tok]
-            elif tok.startswith("^") and len(tok) > 1:
-                prefix = tok[1:]
-            elif ":" in tok and tok.split(":", 1)[0] in ("tag", "lang", "type", "sys",
-                                                          "dom", "id") and tok.split(":", 1)[1]:
-                k, v = tok.split(":", 1)
-                fields[k] = v
-            else:
-                terms.append(tok)
-        return scope, prefix, fields, terms
+        """The search box, read with the operators of parse_search."""
+        return parse_search(self.q.get())
 
     def field_ok(self, r, fields):
-        for k, v in fields.items():
-            if k == "tag" and not any(v in t.lower() for t in r.get("tags", [])):
-                return False
-            if k == "lang" and (r.get("lang") or "").lower() != v:
-                return False
-            if k == "type" and not any(v in x.lower() for x in
-                                       ((r.get("type") or ""), type_label(r.get("type")))):
-                return False
-            if k == "sys" and not any(v in x.lower() for x in
-                                      ((r.get("system") or ""), system_label(r.get("system")))):
-                return False
-            if k == "dom" and not any(v in d.lower() for d in r.get("domains", [])):
-                return False
-            if k == "id" and not r.get("id", "").lower().startswith(v):
-                return False
-        return True
+        return search_field_ok(r, fields)
 
     def query_base(self):
         """What the search text alone finds, per collection: the words, ^prefix,
         field operators and p:/v:/f:/c:, but none of the rail's filters."""
-        qscope, prefix, fields, terms = self.parse_query()
-
-        def ok(r):
-            if terms and not all(t in r.get("_h", "") for t in terms):
-                return False
-            if prefix and not sort_key(r.get("name", ""))[0].startswith(
-                    sort_key(prefix)[0]):
-                return False
-            return self.field_ok(r, fields) if fields else True
-
-        return {c: ([r for r in self.data[c] if ok(r)] if qscope in (None, c) else [])
-                for c in COLLS}
+        return search_base(self.data, self.q.get())
 
     def matches(self):
         qscope = self.parse_query()[0]
@@ -10219,51 +13016,7 @@ class App:
 
     def row_text(self, r):
         """(title, subtitle) of a record in the list."""
-        kind = self.rec_kind(r)
-        if kind == "note":
-            body = r.get("_body") or ""
-            first = next((l.strip(" #>-*") for l in body.splitlines() if l.strip(" #>-*")), "")
-            return r["name"], " · ".join(x for x in (", ".join(r.get("tags", [])), first) if x)
-        if kind == "entry":
-            sub = tr(r["kind"]) + " · " + (r.get("gloss") or "")
-            return label_of(r), sub
-        if kind == "source":
-            au = author_names(r, self.data)
-            sub = type_label(r.get("type") or "outro") + " · " + ", ".join(
-                a.split(",")[0] for a in au[:2]) + (f" · {year_of_source(r)}"
-                                                    if year_of_source(r) else "")
-            return r.get("name") or r.get("raw", ""), sub
-        if kind == "metric":
-            t = htype(r)
-            if t == "measure":
-                lr = last_reading(r)
-                sub = system_label(r.get("system") or "") + (
-                    f" · {lr['date']} = {lr['value']} {r.get('unit', '')}" if lr
-                    else " · " + tr("no readings"))
-                if lr and out_of_range(r, lr):
-                    sub += "  (!)"
-            else:
-                sub = tr(HEALTH_TYPE_LABEL[t]) + " · " + " · ".join(health_facts(r, self.data))
-            return r["name"], sub
-        p = r
-        live = open_tasks(p)
-        dated = sorted(dated_tasks(p), key=lambda t: due_label(t))
-        if self.date:
-            live = [t for t in dated if t["due"] == self.date] or live
-        elif dated:
-            live = dated + [t for t in live if t not in dated]
-        if live:
-            when = due_label(live[0])
-            sub = "[{}] {}".format(MARK_OF.get(live[0].get("state"), " "),
-                                   live[0].get("text", ""))
-            if when:
-                sub = when + "  " + sub
-            if len(live) > 1:
-                sub += f"  (+{len(live) - 1})"
-        else:
-            plain = [t for t in p.get("tags", []) if ":" not in t]
-            sub = " · ".join(plain) or one_liner(p.get("notes_raw", ""), 70)
-        return p["name"], sub
+        return list_row_text(r, self.data, self.date)
 
     def insert_row(self, r, loc):
         text, sub = self.row_text(r)
@@ -10753,9 +13506,9 @@ class App:
         self.dirty = False
         self.refit_card()
         self.front_card()
-        g = getattr(self, "graph", None)
-        if g and g.is_open():
-            g.follow(rid)
+        for view in (getattr(self, "graph", None), getattr(self, "monads", None)):
+            if view and view.is_open():
+                view.follow(rid)
 
     def goto(self, rid):
         if rid not in by_id(self.data):
@@ -11748,7 +14501,7 @@ class App:
 
     def do_help(self):
         self.show_text(tr("Shortcuts"), tr(HELP_TEXT, conflicts=CONFLICT_DIR.name, stem=STEM)
-                       + tr(HELP_READING) + tr(HELP_COPY) + tr(HELP_GRAPH)
+                       + tr(HELP_READING) + tr(HELP_COPY) + tr(HELP_GRAPH) + tr(HELP_MONADS)
                        + tr(HELP_NOTES) + tr(HELP_TIMELINE))
 
     # ------------------------------------------------------------ dialogs
@@ -12442,14 +15195,21 @@ def cmd_book():
 #   glow   light spreads along the links and fades; it is fed by how recently
 #          each record was edited and by a spark now and then (the default);
 #   life   Conway's rule on the graph: a lit record stays lit with 2 or 3 lit
-#          neighbours, a dark one lights with exactly 3; when the pattern dies
-#          or freezes, it is seeded again from the recent edits;
+#          neighbours, a dark one lights with exactly 3; a birth is fed by its
+#          lit neighbours, whose light flows along the links into it; when the
+#          pattern dies or freezes the run rests, until r seeds it again from
+#          the recent edits;
 #   still  only the recency, no motion.
 # p plays the logs back (the replay): the base grows on screen as it grew,
 # records appearing when they were first saved, links when they were written,
 # every edit a flash, with a timeline below to scrub through. Either the whole
 # base (the records touched most recently, up to the cap) or only the records
 # that were on screen when the replay began (w switches).
+# Changes grow rather than jump: records already on screen keep their place and
+# light, new ones sprout beside the record that brought them and their links grow
+# out to them, the ones that leave wither; links are soft curves that breathe;
+# every brightness eases. The springs take damped steps, and dragging a record
+# holds the view still. The web page's graph (# ==== web) moves the same way.
 # Read-only: it reads `edges`, `updated_at` and the logs, and writes nothing.
 
 GRAPH_MAX_NODES = 160        # the view stays fluid: never the whole base at once
@@ -12457,6 +15217,7 @@ GRAPH_HALF_LIFE = 21         # days for an edit's glow to halve
 GRAPH_REPLAY_SECONDS = 60    # a replay at normal speed lasts about this long
 GRAPH_MODES = ("glow", "life", "still")
 GRAPH_MODE_LABEL = {"glow": "spreading glow", "life": "Conway's life", "still": "still"}
+GRAPH_MODE_SHORT = (("life", "Life"), ("glow", "Glow"), ("still", "Still"))   # the buttons, as the web's
 
 
 def graph_adjacency(data):
@@ -12524,6 +15285,143 @@ def recency(rec, now=None):
     return 0.5 ** (max(0.0, age) / GRAPH_HALF_LIFE)
 
 
+# What a link line shows, in the window's graph and the page's alike: its
+# FAMILY as a colour (the collection its type belongs to), its AGE as how vivid
+# that colour is (when it was written, from the logs), its EVIDENCE as the
+# stroke (solid with a reason or a source, dashed without either, dotted for a
+# type outside RELS) and its DIRECTION as a taper, thick at the record it comes
+# from. Several links between the same two records share one line.
+
+REL_FAMILY = {
+    "expresses": "verba", "derives_from": "verba", "cognate_of": "verba",
+    "borrows_from": "verba", "calques": "verba", "specializes": "verba",
+    "opposes": "verba", "analogous_to": "verba", "instrument_of": "verba",
+    "requires": "verba",
+    "coined_by": "people", "used_by": "people", "about": "people",
+    "author_of": "people", "editor_of": "people", "translator_of": "people",
+    "knows": "people",
+    "cites": "sources", "attested_in": "sources", "defined_in": "sources",
+    "measured_in": "sources", "part_of": "sources", "edition_of": "sources",
+    "translates": "sources", "comments_on": "sources", "responds_to": "sources",
+    "affects": "corpus", "correlates": "corpus",
+}
+# the same hues as the collections' dots in the web page's list
+LINK_FAMILY_COLOUR = {"verba": "#a0783a", "people": "#3f7d99", "sources": "#6f8a3a",
+                      "corpus": "#b5523b", "other": "#8a8578"}
+LINK_FAMILY_LABEL = {"verba": "verba", "people": "people", "sources": "sources",
+                     "corpus": "corpus", "other": "other"}
+SYMMETRIC_RELS = {"knows", "opposes", "analogous_to", "cognate_of", "correlates"}
+LINK_HALF_LIFE = 30          # days for a written link's vividness to halve
+_EDGE_TIMES = {"key": None, "times": {}}
+
+
+def edge_times():
+    """When each link was first written, from the logs: {(from, to, rel):
+    epoch}. Links older than the logs are absent. Cached by the log files'
+    size and time, so the graph can ask on every move."""
+    try:
+        key = tuple((str(f), f.stat().st_size, f.stat().st_mtime_ns) for f in log_files())
+    except OSError:
+        key = None
+    if key is not None and key == _EDGE_TIMES["key"]:
+        return _EDGE_TIMES["times"]
+    times = {}
+    for line in read_logs():
+        if line.get("op") != "edges" or not line.get("id"):
+            continue
+        t = epoch_of(line.get("t"))
+        if t is None:
+            continue
+        for a in line.get("edges") or []:
+            k = (line["id"], norm_ref(a.get("to")), a.get("rel", ""))
+            if k not in times or t < times[k]:
+                times[k] = t
+    _EDGE_TIMES["key"], _EDGE_TIMES["times"] = key, times
+    return times
+
+
+def link_index(data):
+    """The links by pair of records: {(a, b): [edges]}, a < b."""
+    out = {}
+    for e in data.get("edges", []):
+        f, t = e.get("from"), e.get("to")
+        if f and t and f != t:
+            out.setdefault((min(f, t), max(f, t)), []).append(e)
+    return out
+
+
+def link_facts(edges, times=None, now=None):
+    """What one line shows for the links it carries: {family, from, founded,
+    atypical, age}. `from` is the record they all come from (None when they go
+    both ways or are symmetric); `founded` is False if any lacks both a reason
+    and a source."""
+    times = times or {}
+    now = now or datetime.now().timestamp()
+    rels = [e.get("rel", "") for e in edges]
+    directed = [e for e in edges if e.get("rel") not in SYMMETRIC_RELS]
+    starts = {e.get("from") for e in directed}
+    written = [times.get((e.get("from"), e.get("to"), e.get("rel", ""))) for e in edges]
+    written = [t for t in written if t]
+    last = max(written) if written else None
+    return {"family": REL_FAMILY.get(rels[0], "other") if rels else "other",
+            "from": next(iter(starts)) if len(starts) == 1 and len(directed) == len(edges) else None,
+            "founded": all((e.get("why") or "").strip() or (e.get("source") or "").strip()
+                           for e in edges),
+            "atypical": any(r not in RELS for r in rels),
+            "age": round(0.5 ** (max(0.0, now - last) / 86400 / LINK_HALF_LIFE), 3) if last else 0.0}
+
+
+def typical_rels(a, b):
+    """The types of RELS that may go from record a to record b."""
+    ka, kb = kind_of(a), kind_of(b)
+    return [r for r, (fa, fb) in RELS.items() if fa in ("*", ka) and fb in ("*", kb)]
+
+
+# The path finder: how are two records related? The shortest chains of links
+# from one to the other, the links taken either way, as both graphs show them.
+
+PATH_LIMIT = 3          # chains shown at once, all of the same (smallest) length
+PATH_MAX = 8            # links in a chain, at most
+
+
+def link_paths(adj, a, b, limit=PATH_LIMIT, max_len=PATH_MAX):
+    """The shortest chains of links from record a to record b over `adj`
+    (graph_adjacency): up to `limit`, all of the smallest length, each a list
+    of ids from a to b; [] when none is within `max_len` links."""
+    if a == b:
+        return [[a]] if a in adj else []
+    if a not in adj or b not in adj:
+        return []
+    dist, parents, frontier = {a: 0}, {a: []}, [a]
+    while frontier and b not in dist:
+        if dist[frontier[0]] >= max_len:
+            return []
+        nxt = []
+        for n in frontier:
+            for m in sorted(adj.get(n, {})):
+                if m not in dist:
+                    dist[m], parents[m] = dist[n] + 1, [n]
+                    nxt.append(m)
+                elif dist[m] == dist[n] + 1:
+                    parents[m].append(n)
+        frontier = nxt
+    if b not in dist:
+        return []
+    out = []
+
+    def walk(n, tail):
+        if len(out) >= limit:
+            return
+        if n == a:
+            out.append([a] + tail)
+            return
+        for q in parents[n]:
+            walk(q, [n] + tail)
+
+    walk(b, [])
+    return out
+
+
 def replay_timeline(data, logs):
     """The logs as a timeline for the replay, oldest first:
     [(stamp, epoch, op, id, info)], where op is "put" (info: (label, kind)),
@@ -12582,14 +15480,24 @@ class GraphView:
     IDLE_MS = 400        # while the window is minimised or hidden
     LINK = 90.0          # the length a link settles at, before zoom
     STEPS = 24           # colour steps of the glow
-    GEN_TICKS = 15       # ticks per generation in life mode
+    GEN_TICKS = 30       # ticks per generation in life mode (1.2 s)
     SPARK_TICKS = 30     # ticks between sparks in glow mode
-    TOP = 44             # the keys above the graph
+    TOP = 40             # the hint above the graph (and the lit curve, top right)
+    STATUS_H = 46        # the status, two lines at the foot
+    FAB_H = 48           # the row of floating buttons above it (? · Path · Link)
+    GROW_MS = 700        # a new record sprouting, a new link growing out to it
+    LEAVE_MS = 600       # a record or a link leaving the view, withering
+    FLOW_MS = 900        # light flowing along a link into a newborn cell
+    STAGGER_MS = 110     # each ring of records sprouts this much after the one inside it
+    RIM = 0.55           # a solid line's rim, this much of its colour on the paper: Tk
+                         # draws no soft edges, and the rim stands in for them
+    MIN_HALF = 1.0       # half the narrowest core of a line: thinner, Tk's fill comes and
+                         # goes along it and the line reads as dashed
 
-    def __init__(self, root, get_data, start_id=None, on_open=None):
-        self.root, self.get_data, self.on_open = root, get_data, on_open
+    def __init__(self, root, get_data, start_id=None, on_open=None, on_link=None):
+        self.root, self.get_data, self.on_open, self.on_link = root, get_data, on_open, on_link
         self.start = start_id
-        self.mode, self.depth = "glow", 2
+        self.mode, self.depth = "life", 2       # as the web page's graph
         self.all_labels, self.paused = False, False
         self.rng = random.Random()
         self.data = self.idx = self.adj = None
@@ -12609,6 +15517,23 @@ class GraphView:
         self.rp = None       # the replay, while it runs (see start_replay)
         self._job = self._follow = None
         self._dirty = True
+        # how changes are drawn: they grow, wither and flow instead of jumping
+        self.clock = 0.0     # ms of animation time
+        self.settled = False
+        self.grow, self.born_at, self.vis = {}, {}, {}
+        self.arrive, self.dim_at, self.sparkle = {}, {}, {}
+        self.lgrow, self.lfrom, self.lstart = {}, {}, {}
+        self.gone, self.gone_links, self.pulses = {}, [], []
+        self.vel = {}        # each record's last spring step
+        self.lfacts, self.lstyle, self.lcolour = {}, {}, {}   # what each line shows (link_facts)
+        self.sel_link = self.linking = None
+        self.show_key = False
+        self.path = None     # the path view: {a, b, paths, keys, mode, next}
+        self.rel_items = {}  # the types written on the focus's links: key -> (item, text)
+        self.drawing = False   # Link pressed: a drag from a record draws a link
+        self.hint_off = False  # the hint goes after the first click, as on the web page
+        self._said = None      # what the buttons last showed (sync_buttons)
+        self.pop = []        # life: the share of records lit, generation by generation
 
         fams = set(tkfont.families(root))
         mono = next((f for f in ("Cascadia Mono", "Consolas", "Lucida Console",
@@ -12616,28 +15541,56 @@ class GraphView:
         self.f_label = tkfont.Font(root, family=mono, size=8)
         self.f_center = tkfont.Font(root, family=mono, size=10, weight="bold")
         self.f_status = tkfont.Font(root, family=mono, size=9)
+        self.f_btn = tkfont.Font(root, family=mono, size=10)
         n = self.STEPS
         self.ramp_fill = [blend(PAPER, STAMP, i / n) for i in range(n + 1)]
         self.ramp_edge = [blend(FAINT, STAMP, i / n) for i in range(n + 1)]
         self.ramp_line = [blend(RULE, STAMP, 0.85 * i / n) for i in range(n + 1)]
 
-        root.title(tr("Kustos · link graph (read-only)"))
+        root.title(tr("Kustos · link graph") if on_link else tr("Kustos · link graph (read-only)"))
         root.configure(bg=PAPER)
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         w, h = min(1100, sw - 80), min(760, sh - 120)
         root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
         root.minsize(560, 400)
         paint_frame(root)
+        # the controls, as the web page's: the modes and depths, pause, reseed, names, Open
+        bar = tk.Frame(root, bg=SHELL, padx=12, pady=8)
+        bar.pack(fill="x")
+        tk.Frame(root, bg=RULE, height=1).pack(fill="x")
+        self.seg_mode = self.segment(bar, [(m, tr(short)) for m, short in GRAPH_MODE_SHORT], self.set_mode)
+        self.seg_mode.pack(side="left")
+        self.seg_depth = self.segment(bar, [(d, str(d)) for d in (1, 2, 3)], self.set_depth)
+        self.seg_depth.pack(side="left", padx=(6, 0))
+        self.b_open = self.button(bar, tr("Open"), lambda: self.open_in_card())
+        self.b_open.pack(side="right")
+        self.b_names = self.button(bar, "Aa", self.toggle_labels, quiet=True)
+        self.b_names.pack(side="right", padx=(0, 6))
+        self.b_seed = self.button(bar, "\u21bb", self.reseed, quiet=True)
+        self.b_seed.pack(side="right", padx=(0, 6))
+        self.b_pause = self.button(bar, "\u275a\u275a", self.toggle_pause, quiet=True)
+        self.b_pause.pack(side="right", padx=(0, 6))
         self.cv = cv = tk.Canvas(root, bg=PAPER, highlightthickness=0, bd=0)
         cv.pack(fill="both", expand=True)
-        self.t_keys = cv.create_text(12, 10, anchor="nw", font=self.f_label, fill=FAINT,
-                                     text=tr(GRAPH_KEYS))
-        self.t_left = cv.create_text(12, 0, anchor="sw", font=self.f_status, fill=SOFT)
-        self.t_right = cv.create_text(0, 0, anchor="se", font=self.f_status, fill=SOFT)
+        self.t_keys = cv.create_text(12, 10, anchor="nw", font=self.f_label, fill=FAINT)
+        self.status_bg = cv.create_rectangle(0, 0, 0, 0, fill=SHELL, outline="", tags=("chrome",))
+        self.status_rule = cv.create_line(0, 0, 0, 0, fill=RULE, tags=("chrome",))
+        self.t_left = cv.create_text(12, 0, anchor="nw", font=self.f_status, fill=INK, tags=("chrome",))
+        self.t_right = cv.create_text(12, 0, anchor="nw", font=self.f_status, fill=SOFT, tags=("chrome",))
+        # floating at the foot: the key, the path finder, drawing links
+        self.b_key = self.button(cv, "?", self.toggle_key)
+        self.b_path = self.button(cv, "\u21e2 " + tr("Path"), lambda: None if self.rp else PathDialog(self))
+        self.b_draw = self.button(cv, "\u2933 " + tr("Link"), self.toggle_drawing)
+        self.fabs = [cv.create_window(0, 0, window=w, anchor=a)
+                     for w, a in ((self.b_key, "sw"), (self.b_path, "se"), (self.b_draw, "se"))]
         self.t_notice = cv.create_text(0, 0, anchor="n", font=self.f_status, fill=SOFT)
         self.bar = cv.create_line(0, 0, 0, 0, fill=RULE, width=3, state="hidden")
         self.bar_done = cv.create_line(0, 0, 0, 0, fill=STAMP, width=3, state="hidden")
         self.ring = cv.create_oval(0, 0, 0, 0, outline=INK, width=1, state="hidden")
+        self.t_link = cv.create_text(12, 0, anchor="sw", font=self.f_status, fill=INK, state="hidden")
+        self.rubber = cv.create_line(0, 0, 0, 0, fill=STAMP, width=2, dash="-", state="hidden")
+        self.pop_rule = cv.create_line(0, 0, 0, 0, fill=RULE, width=1, state="hidden")
+        self.pop_line = cv.create_line(0, 0, 0, 0, 0, 0, fill=STAMP, width=1, state="hidden")
 
         b = root.bind
         b("<space>", lambda e: self.toggle_pause())
@@ -12659,73 +15612,214 @@ class GraphView:
         b("<End>", lambda e: self.seek(len(self.rp["events"])) if self.rp else None)
         b("<F5>", lambda e: None if self.rp else self.recentre(self.center, fresh=True))
         b("<Return>", lambda e: self.open_in_card())
-        b("<Escape>", lambda e: self.stop_replay() if self.rp else self.close())
+        b("<k>", lambda e: self.toggle_key())
+        b("<question>", lambda e: self.toggle_key())
+        b("<f>", lambda e: None if self.rp else PathDialog(self))
+        b("<Escape>", lambda e: self.select_link(None) if self.sel_link else
+          self.leave_path() if self.path else
+          (self.stop_replay() if self.rp else self.close()))
         b("<q>", lambda e: self.close())
         cv.bind("<Configure>", self.resized)
         cv.bind("<Motion>", self.motion)
         cv.bind("<ButtonPress-1>", self.press)
         cv.bind("<B1-Motion>", self.drag)
         cv.bind("<ButtonRelease-1>", self.release)
-        cv.bind("<Double-Button-1>", lambda e: self.open_in_card(self.hover or self.center))
+        cv.bind("<Double-Button-1>", self.double)
+        cv.bind("<Control-ButtonPress-1>", lambda e: "break")
+        cv.bind("<Control-ButtonRelease-1>", self.path_click)
+        cv.bind("<Shift-ButtonPress-1>", self.link_press)
+        cv.bind("<Shift-B1-Motion>", self.link_drag)
+        cv.bind("<Shift-ButtonRelease-1>", self.link_release)
         cv.bind("<Button-3>", self.touch)
         cv.bind("<MouseWheel>", lambda e: self.zoom_at(e, 1.1 if e.delta > 0 else 1 / 1.1))
         cv.bind("<Button-4>", lambda e: self.zoom_at(e, 1.1))
         cv.bind("<Button-5>", lambda e: self.zoom_at(e, 1 / 1.1))
         root.protocol("WM_DELETE_WINDOW", self.close)
+        self.show_hint()
         self.recentre(start_id, fresh=True)
         self._job = root.after(self.TICK_MS, self.tick)
 
+    # ---------------------------------------------------------- controls
+    def button(self, parent, text, cmd, quiet=False):
+        """A button drawn as the web page's: a label with a thin rule round it
+        (quiet: none), that answers a click."""
+        bg = SHELL if quiet and parent is not getattr(self, "cv", None) else PAPER
+        w = tk.Label(parent, text=text, font=self.f_btn, bg=bg, fg=SOFT if quiet else INK,
+                     padx=10, pady=5, cursor="hand2", bd=0, highlightthickness=1,
+                     highlightbackground=bg if quiet else RULE, highlightcolor=RULE)
+        w.bind("<Button-1>", lambda e: cmd())
+        w.quiet, w.rest = quiet, (bg, SOFT if quiet else INK)
+        return w
+
+    def segment(self, parent, options, cmd):
+        """Buttons side by side in one frame, one of them pressed (sync_buttons)."""
+        box = tk.Frame(parent, bg=PAPER, highlightthickness=1, highlightbackground=RULE, bd=0)
+        box.btns = {}
+        for value, text in options:
+            w = tk.Label(box, text=text, font=self.f_btn, bg=PAPER, fg=SOFT, padx=12, pady=5,
+                         cursor="hand2", bd=0)
+            w.pack(side="left")
+            w.bind("<Button-1>", lambda e, v=value: cmd(v))
+            box.btns[value] = w
+        return box
+
+    @staticmethod
+    def press_look(w, on, colour=None):
+        """A button (made by `button`) pressed -- the ink, or `colour`, behind
+        it -- or at rest."""
+        bg, fg = w.rest
+        fill = colour or INK
+        w.configure(bg=fill if on else bg, fg=PAPER if on else fg,
+                    highlightbackground=fill if on else (bg if w.quiet else RULE))
+
+    def sync_buttons(self):
+        """The buttons follow the state, whichever way it changed (a key, a click)."""
+        life = self.mode == "life"
+        said = (self.mode, self.depth, self.paused, self.all_labels, life and self.settled,
+                self.drawing, self.show_key, bool(self.rp), self.hint_off)
+        if said == self._said:
+            return
+        self._said = said
+        for m, w in self.seg_mode.btns.items():
+            w.configure(bg=INK if m == self.mode else PAPER, fg=PAPER if m == self.mode else SOFT)
+        for d, w in self.seg_depth.btns.items():
+            on = d == self.depth and not self.rp
+            w.configure(bg=INK if on else PAPER, fg=PAPER if on else (FAINT if self.rp else SOFT))
+        self.b_pause.configure(text="\u25b6" if self.paused else "\u275a\u275a")
+        if life and not self.b_seed.winfo_manager():
+            self.b_seed.pack(side="right", padx=(0, 6), after=self.b_names)
+        elif not life and self.b_seed.winfo_manager():
+            self.b_seed.pack_forget()
+        self.press_look(self.b_seed, life and self.settled, STAMP)   # once it rests, reseed
+        self.press_look(self.b_names, self.all_labels)
+        self.press_look(self.b_key, self.show_key)
+        self.press_look(self.b_draw, self.drawing, STAMP)
+        for item in self.fabs:
+            self.cv.itemconfigure(item, state="hidden" if self.rp else "normal")
+        self.show_hint()
+
+    def show_hint(self):
+        """Above the graph: what the hand does, until the first click; while
+        drawing links, how; in the replay, its keys."""
+        if self.rp:
+            text = tr(GRAPH_REPLAY_KEYS)
+        elif self.drawing:
+            text = tr("Drag from one record to another to link them.")
+        elif self.hint_off:
+            text = ""
+        else:
+            text = tr(GRAPH_HINT_LIFE if self.mode == "life" else GRAPH_HINT)
+        self.cv.itemconfigure(self.t_keys, text=text)
+
+    def set_mode(self, m):
+        if m != self.mode and m in GRAPH_MODES:
+            self.mode = m
+            if m == "life":
+                self.seed_life()
+            self.draw_pop()
+            self.update_status()
+
+    def reseed(self):
+        """The web page's reseed: life starts again, the records where they are."""
+        if self.mode == "life" and not self.rp:
+            self.seed_life()
+            self.update_status()
+
+    def toggle_drawing(self):
+        """Link: while pressed, dragging from a record to another draws a link
+        (as Shift+drag does)."""
+        self.drawing = not self.drawing and not self.rp
+        self.update_status()
+
     # ---------------------------------------------------------- content
-    def recentre(self, rid, fresh=False):
+    def recentre(self, rid, fresh=False, view=None):
         """Puts `rid` in the middle. The records already on screen keep their
-        place (the camera glides to the new middle); the new ones grow out of
-        the record that brought them."""
+        place and their light (the camera glides to the new middle); new ones
+        sprout beside the record that brought them, nearest first, and their
+        links grow out to them; the ones now out of reach wither where they are."""
+        first = not self.pos
         if fresh or self.data is None:
             self.data = self.get_data()
             self.idx = by_id(self.data)
             self.adj = graph_adjacency(self.data)
             now = datetime.now()
             self.recs = {k: recency(r, now) for k, r in self.idx.items()}
+            pairs, times = link_index(self.data), edge_times()
+            self.lfacts = {k: link_facts(v, times, now.timestamp()) for k, v in pairs.items()}
+            self.lcolour, self.shown = {}, {}   # colours are worked out again from the new facts
         if rid not in self.idx:
             rid = max(self.adj, key=lambda k: (len(self.adj[k]), k), default=None)
         if rid is None and self.idx:
             rid = next(iter(self.idx))
-        ego = graph_ego(self.adj, rid, self.depth) if rid else {}
+        if view is None and self.path:      # anything else than a path: the neighbourhood again
+            self.mode, self.path, self.goal = self.path["mode"], None, [0.0, 0.0]
+            self.cv.itemconfigure(self.t_link, state="hidden")
+            self.cv.delete("pathend")
+        ego = view[0] if view else (graph_ego(self.adj, rid, self.depth) if rid else {})
         ox, oy = self.pos.get(rid, (0.0, 0.0))
         pos = {}
         for n, (_d, parent) in ego.items():
             if n in self.pos:
                 x, y = self.pos[n]
                 pos[n] = [x - ox, y - oy]
-            elif parent is None:
+            elif parent is None or parent not in pos:
                 pos[n] = [0.0, 0.0]
             else:
                 px, py = pos[parent]
                 a = self.rng.uniform(0, 2 * math.pi)
-                r = self.LINK * self.rng.uniform(0.4, 0.9)
+                r = self.LINK * 0.15
                 pos[n] = [px + r * math.cos(a), py + r * math.sin(a)]
         if rid:
             pos[rid] = [0.0, 0.0]
         self.cam = [self.cam[0] - ox, self.cam[1] - oy]
         self.goal = [0.0, 0.0]
-        self.clear_items()
+        for g in self.gone.values():        # what is withering moves with the rest
+            g["pos"] = [g["pos"][0] - ox, g["pos"][1] - oy]
+        for n in [n for n in self.pos if n not in ego]:
+            self.drop_node(n)
+        new = [n for n in ego if n not in self.items]
         self.center, self.pos = rid, pos
         self.dist = {n: d for n, (d, _p) in ego.items()}
         self.kinds = {n: graph_kind(self.idx[n]) for n in ego}
         self.names = {n: label_any(self.idx[n], self.data) for n in ego}
         self.adjv = {n: [m for m in self.adj.get(n, {}) if m in ego] for n in ego}
-        self.heat = {n: self.heat.get(n, self.recs.get(n, 0.0) * 0.3) for n in ego}
-        self.lit = {n: self.lit.get(n, False) for n in ego}
+        for n in new:
+            self.born_at[n] = self.clock + self.STAGGER_MS * self.dist[n] + self.rng.uniform(0, 150)
+            self.grow[n] = 0.0
+            self.heat[n] = self.vis[n] = 0.0
+            self.lit[n] = self.mode == "life" and self.rng.random() < 0.35 + 0.5 * self.recs.get(n, 0.0)
+            self.arrive[n] = self.born_at[n] + self.GROW_MS + self.rng.uniform(0, 2000)
         if rid and self.mode == "glow":
-            self.heat[rid] = 1.0
-        if self.mode == "life":
-            self.seed_life()
-        for a in ego:
-            for b, rels in self.adj.get(a, {}).items():
-                if b in ego and a < b:
-                    self.add_link((a, b), rels)
+            self.sparkle[rid] = 1.0
+        if self.mode == "life":             # the neighbourhood changed: the run goes on from here
+            self.stale, self.history, self.settled = 0, [], False
+            if first:
+                self.gen = 0
+        links = view[1] if view else {(a, b): rels for a in ego for b, rels in self.adj.get(a, {}).items()
+                                      if b in ego and a < b}
+        for key in [key for key in self.links if key not in links]:
+            self.drop_link(key)
+        fresh_ones = set(new)
+        for key, rels in links.items():
+            if key in self.links:
+                self.links[key] = (rels, self.links[key][1])
+                if self.lstyle.get(key) != self.style_of(key):   # a reason was added, say: a new stroke
+                    self.cv.delete(self.links[key][1])
+                    self.links[key] = (rels, self.make_line(key))
+                    self.shown.pop(key, None)
+                continue
+            was = [e for e in key if e not in fresh_ones]
+            src = was[0] if was else min(key, key=lambda e: self.dist.get(e, 9))
+            start = max([self.born_at.get(e, self.clock) for e in key if e in fresh_ones],
+                        default=self.clock)
+            self.add_link(key, rels, src, start)
         for n in ego:
-            self.add_node(n)
+            if n in self.items:             # it stays: its name and its look follow its new place
+                self.cv.itemconfigure(self.items[n][1], text=one_liner(self.names[n], 32),
+                                      font=self.f_center if n == self.center else self.f_label)
+                self.shown.pop(n, None)
+            else:
+                self.add_node(n)
         if not self.center:
             msg = tr("The base has no records yet.")
         elif len(self.pos) == 1:
@@ -12733,52 +15827,129 @@ class GraphView:
         else:
             msg = ""
         self.cv.itemconfigure(self.t_notice, text=msg)
-        self.temp = max(self.temp, 30.0)
+        self.temp = max(self.temp, 30.0 if first else 14.0)
         self.fit = True
         self.label_states()
         self._dirty = True
         self.update_status()
 
-    # the canvas items are made once per record and per link, and only moved and
-    # recoloured on each tick; the replay adds and drops them as the base grows
     def clear_items(self):
         self.cv.delete("g")
         self.items, self.links, self.shown, self.label_on = {}, {}, {}, {}
+        self.gone, self.gone_links, self.pulses = {}, [], []
+        self.lgrow, self.lfrom, self.lstart = {}, {}, {}
+        self.grow, self.born_at, self.vis = {}, {}, {}
+        self.arrive, self.dim_at, self.sparkle = {}, {}, {}
+        self.vel = {}
+        self.lstyle, self.lcolour = {}, {}
+        self.sel_link = None
+        self.rel_items = {}
+        self.cv.itemconfigure(self.t_link, state="hidden")
         self.hover = None
 
     def add_node(self, n):
+        """A record's shape and name, made once; they start the colour of the
+        paper and grow in (draw)."""
         cv = self.cv
-        centre = n == self.center
-        opts = dict(fill=PAPER, outline=OXIDE if centre else FAINT,
-                    width=2 if centre else 1, tags=("g",))
+        if n in self.gone:                  # back while it was withering
+            for item in self.gone.pop(n)["items"]:
+                cv.delete(item)
+        self.grow.setdefault(n, 0.0)
+        self.born_at.setdefault(n, self.clock)
+        self.vis.setdefault(n, 0.0)
+        opts = dict(fill=PAPER, outline=PAPER, width=1, tags=("g", "node"))
         if self.kinds[n] == "person":
             shape = cv.create_oval(0, 0, 0, 0, **opts)
         else:
             shape = cv.create_polygon(0, 0, 0, 0, 0, 0, **opts)
         text = cv.create_text(0, 0, anchor="w", text=one_liner(self.names[n], 32),
-                              tags=("g",), font=self.f_center if centre else self.f_label,
-                              fill=INK if self.dist.get(n, 2) <= 1 else SOFT)
+                              tags=("g",), font=self.f_center if n == self.center else self.f_label,
+                              fill=PAPER)
         self.items[n] = (shape, text)
         cv.tag_raise(self.ring)
+        cv.tag_raise("chrome")
 
     def drop_node(self, n):
-        for item in self.items.pop(n, ()):
-            self.cv.delete(item)
+        """The record leaves the view: it withers where it is, then goes."""
+        items = self.items.pop(n, None)
+        if items:
+            self.cv.itemconfigure(items[1], state="hidden")     # its name goes at once
+            self.gone[n] = dict(items=items, pos=list(self.pos.get(n, (0.0, 0.0))),
+                                kind=self.kinds.get(n, "concept"), dist=self.dist.get(n, 2),
+                                vis=self.vis.get(n, 0.0), leave=1.0)
         for d in (self.pos, self.heat, self.lit, self.dist, self.adjv, self.shown,
-                  self.label_on, self.kinds, self.names):
+                  self.label_on, self.kinds, self.names, self.grow, self.born_at, self.vis,
+                  self.arrive, self.dim_at, self.sparkle, self.vel):
             d.pop(n, None)
         if self.hover == n:
             self.hover = None
 
-    def add_link(self, key, rels):
-        line = self.cv.create_line(0, 0, 0, 0, fill=RULE, width=1, tags=("g",))
-        self.cv.tag_lower(line)
+    def facts(self, key):
+        """What the line between the two records of `key` shows (link_facts);
+        in the replay, only what its types say."""
+        got = self.lfacts.get(key)
+        if got is None or self.rp:
+            rels = (self.links.get(key) or ((),))[0]
+            first = rels[0][0] if rels else ""
+            starts = {f for rel, f in rels if rel not in SYMMETRIC_RELS}
+            got = {"family": REL_FAMILY.get(first, "other"), "founded": True,
+                   "atypical": any(rel not in RELS for rel, _f in rels), "age": 0.5,
+                   "from": next(iter(starts)) if len(starts) == 1 and all(
+                       rel not in SYMMETRIC_RELS for rel, _f in rels) else None}
+        return got
+
+    def style_of(self, key):
+        f = self.facts(key)
+        if f.get("atypical"):
+            return "dotted"
+        if not f.get("founded", True):
+            return "dashed"
+        return "taper" if f.get("from") in key else "line"
+
+    def rest_colour(self, key):
+        """Colour: the family; how vivid: how recently it was written; fainter
+        without a reason. A one-colour theme keeps its own ink."""
+        f = self.facts(key)
+        founded, age = f.get("founded", True), f.get("age", 0.0)
+        if PAL["mono_only"]:
+            return blend(RULE, FAINT, (0.35 if founded else 0.1) + 0.4 * age)
+        fam = LINK_FAMILY_COLOUR.get(f.get("family"), LINK_FAMILY_COLOUR["other"])
+        return blend(RULE, fam, 0.4 + 0.5 * age if founded else 0.2 + 0.3 * age)
+
+    def make_line(self, key):
+        style = self.lstyle[key] = self.style_of(key)
+        self.lcolour.pop(key, None)
+        if style in ("taper", "line"):      # a shape, so that it has a rim
+            item = self.cv.create_polygon(0, 0, 0, 0, 0, 0, fill=PAPER, outline=PAPER, width=1,
+                                          smooth=True, tags=("g",))
+        else:   # Windows draws dashes only on one-pixel lines, and only these two patterns
+            item = self.cv.create_line(0, 0, 0, 0, fill=PAPER, width=1, smooth=True,
+                                       splinesteps=10, capstyle="round", tags=("g",),
+                                       dash={"dashed": "-", "dotted": "."}.get(style, ""))
+        self.cv.tag_lower(item)
+        return item
+
+    def add_link(self, key, rels, src=None, start=None):
+        """A link, as a soft curve (a tapered one when it has a direction); it
+        grows out of `src`, the end already there."""
+        self.links[key] = (rels, None)
+        line = self.make_line(key)
         self.links[key] = (rels, line)
+        self.lgrow[key] = 0.0
+        self.lfrom[key] = src if src in key else key[0]
+        self.lstart[key] = self.clock if start is None else start
 
     def drop_link(self, key):
+        """The link leaves the view: it fades where it is, then goes."""
         _rels, line = self.links.pop(key)
-        self.cv.delete(line)
+        self.gone_links.append(dict(line=line, key=key, leave=1.0,
+                                    poly=self.lstyle.get(key) in ("taper", "line")))
         self.shown.pop(line, None)
+        self.lstyle.pop(key, None)
+        if self.sel_link == key:
+            self.select_link(None)
+        for d in (self.lgrow, self.lfrom, self.lstart):
+            d.pop(key, None)
 
     def label_shown(self, n):
         if n == self.center or n == self.hover or self.all_labels:
@@ -12806,30 +15977,32 @@ class GraphView:
         except tk.TclError:
             return
         self.frame += 1
-        moved = self._dirty
+        self.clock += self.TICK_MS
         if self.rp and not self.paused:
             self.play()
         if self.temp > 0.2:
             self.layout_step()
-            moved = True
         gx, gy = self.goal
         if abs(self.cam[0] - gx) + abs(self.cam[1] - gy) > 0.3:
             self.cam[0] += (gx - self.cam[0]) * 0.18
             self.cam[1] += (gy - self.cam[1]) * 0.18
-            moved = True
         if self.fit and self.pos:
-            moved = self.fit_zoom() or moved
+            self.fit_zoom()
         if not self.paused:
             self.step_heat()
+        self.grow_step()
+        self.path_flow()
         if self.rp:
             self.label_states()
-        self.draw(moved)
+        self.draw(True)          # the links breathe, so every frame is drawn
         self._job = self.root.after(self.TICK_MS, self.tick)
 
     def layout_step(self):
         """One step of a spring layout (Fruchterman-Reingold): every pair
-        repels, every link pulls, a little gravity keeps the whole in view; no
-        record moves more than the temperature, which cools on every step."""
+        repels, every link pulls, a little gravity keeps the whole in view. Each
+        record moves a fraction of the way its forces point, never more than the
+        temperature, which cools on every step: the records settle instead of
+        shaking around their place."""
         P, k = self.pos, self.LINK
         k2 = k * k
         ids = list(P)
@@ -12856,35 +16029,50 @@ class GraphView:
             disp[a][1] -= dy * f
             disp[b][0] += dx * f
             disp[b][1] += dy * f
-        t = self.temp
+        t, vel = self.temp, self.vel
         for n in ids:
             if n == self.center or n == self.dragging:
+                vel.pop(n, None)
                 continue
             p = P[n]
             dx, dy = disp[n][0] - p[0] * 0.05, disp[n][1] - p[1] * 0.05
             d = math.hypot(dx, dy)
             if d > 0:
-                s = min(d, t) / d
-                p[0] += dx * s
-                p[1] += dy * s
-        self.temp *= 0.975
+                s = min(d * 0.06, t) / d
+                vx, vy = vel.get(n, (0.0, 0.0))
+                sx, sy = 0.5 * (vx + dx * s), 0.5 * (vy + dy * s)   # keeps half the last step: no back and forth
+                vel[n] = (sx, sy)
+                p[0] += sx
+                p[1] += sy
+        self.temp *= 0.98
 
     def step_heat(self):
         H, A, R = self.heat, self.adjv, self.recs
         if self.mode == "glow":
+            S = self.sparkle
             new = {}
             for n, h in H.items():
-                nb = A[n]
-                s = sum(H[m] for m in nb) / len(nb) if nb else 0.0
-                new[n] = min(1.0, h * 0.95 + s * 0.045 + R.get(n, 0.0) * 0.012)
+                nb = A.get(n, [])
+                s = sum(H.get(m, 0.0) for m in nb) / len(nb) if nb else 0.0
+                new[n] = min(1.0, h * 0.95 + s * 0.045 + R.get(n, 0.0) * 0.012
+                             + S.get(n, 0.0) * 0.08)
             self.heat = new
+            for n in list(S):               # a spark swells and ebbs; it does not flash
+                S[n] *= 0.9
+                if S[n] < 0.01:
+                    del S[n]
             if self.frame % self.SPARK_TICKS == 0 and not self.rp:
                 self.spark()      # in the replay the edits are the sparks
         elif self.mode == "life":
-            if self.frame % self.GEN_TICKS == 0:
+            if not self.settled and self.frame % self.GEN_TICKS == 0:
                 self.generation()
+            clock = self.clock
             for n in H:
-                H[n] += ((1.0 if self.lit[n] else 0.0) - H[n]) * 0.25
+                if self.lit.get(n):
+                    want = 1.0 if clock >= self.arrive.get(n, 0.0) else 0.0
+                else:
+                    want = H[n] if clock < self.dim_at.get(n, 0.0) else 0.0
+                H[n] += (want - H[n]) * (0.06 if want > H[n] else 0.04)
         else:
             for n in H:
                 H[n] += (R.get(n, 0.0) - H[n]) * 0.1
@@ -12894,28 +16082,95 @@ class GraphView:
         ids = list(self.heat)
         if ids:
             n = self.rng.choices(ids, [self.recs.get(i, 0.0) + 0.05 for i in ids])[0]
-            self.heat[n] = 1.0
+            self.sparkle[n] = 1.0
 
     def seed_life(self):
+        """A new start: the recently edited records more likely lit; the lights
+        come on one by one over a second and a half, not all at once."""
         R = self.recs
         self.lit = {n: self.rng.random() < 0.35 + 0.5 * R.get(n, 0.0) for n in self.pos}
+        self.arrive = {n: self.clock + self.rng.uniform(0, 1500) for n in self.pos}
+        self.dim_at = {}
         self.gen, self.stale, self.history = 0, 0, []
+        self.pop = []
+        self.settled = False
+        self.draw_pop()
 
     def generation(self):
-        """Conway's rule, with the links as the neighbourhood."""
+        """Conway's rule, with the links as the neighbourhood. A birth is fed
+        by its lit neighbours -- their light flows along the links and the new
+        cell lights when it arrives, each at its own pace; a death fades within
+        0.6 s of its own. When the pattern dies out or settles (a still life, a
+        blinker) the run rests, the survivors lit, until r starts it again."""
         L, A = self.lit, self.adjv
         new = {}
         for n, nb in A.items():
-            k = sum(1 for m in nb if L[m])
-            new[n] = k in (2, 3) if L[n] else k == 3
+            k = sum(1 for m in nb if L.get(m))
+            new[n] = k in (2, 3) if L.get(n) else k == 3
+        for n, v in new.items():
+            if v and not L.get(n):
+                dur = self.FLOW_MS * self.rng.uniform(0.7, 1.3)
+                for m in A[n]:
+                    if L.get(m):
+                        self.add_pulse(m, n, dur)
+                self.arrive[n] = self.clock + dur
+            elif not v and L.get(n):
+                self.dim_at[n] = self.clock + self.rng.uniform(0, 600)
         state = frozenset(n for n, v in new.items() if v)
         self.stale = self.stale + 1 if (not state or state in self.history) else 0
         self.history = (self.history + [state])[-2:]      # still lifes and blinkers
         self.lit = new
         self.gen += 1
+        self.pop = (self.pop + [len(state) / max(1, len(new))])[-60:]
+        self.draw_pop()
         if self.stale >= 3:
-            self.seed_life()
+            self.settled = True
         self.update_status()
+
+    def add_pulse(self, a, b, dur):
+        """Light flowing along the link from a to b: a bead and its trail."""
+        items = [self.cv.create_oval(0, 0, 0, 0, fill=PAPER, outline="", tags=("g",))
+                 for _ in range(3)]
+        self.pulses.append(dict(a=a, b=b, start=self.clock, dur=dur, items=items))
+
+    def grow_step(self):
+        """One tick of growth, withering, flows and the eased brightness."""
+        clock, step = self.clock, self.TICK_MS / self.GROW_MS
+        for n in self.pos:
+            g = self.grow.get(n, 1.0)
+            if g < 1.0 and clock >= self.born_at.get(n, 0.0):
+                self.grow[n] = min(1.0, g + step)
+            v = self.vis.get(n, self.heat.get(n, 0.0))
+            self.vis[n] = v + (self.heat.get(n, 0.0) * self.grow.get(n, 1.0) - v) * 0.18
+        for key in self.links:
+            g = self.lgrow.get(key, 1.0)
+            if g < 1.0 and clock >= self.lstart.get(key, 0.0):
+                self.lgrow[key] = min(1.0, g + step)
+        leave = self.TICK_MS / self.LEAVE_MS
+        for n in list(self.gone):
+            g = self.gone[n]
+            g["leave"] -= leave
+            g["vis"] *= 0.9
+            if g["leave"] <= 0:
+                for item in g["items"]:
+                    self.cv.delete(item)
+                del self.gone[n]
+        keep = []
+        for link in self.gone_links:
+            link["leave"] -= leave
+            if link["leave"] <= 0:
+                self.cv.delete(link["line"])
+            else:
+                keep.append(link)
+        self.gone_links = keep
+        alive = []
+        for q in self.pulses:
+            if clock < q["start"] + q["dur"] and q["a"] in self.pos and q["b"] in self.pos:
+                alive.append(q)
+            else:
+                for item in q["items"]:
+                    self.cv.delete(item)
+        self.pulses = alive
 
     # ---------------------------------------------------------- replay
     def toggle_replay(self):
@@ -12944,7 +16199,7 @@ class GraphView:
         self.pos, self.dist, self.adjv, self.heat, self.lit = {}, {}, {}, {}, {}
         self.kinds, self.names = {}, {}
         self.cam, self.goal, self.fit = [0.0, 0.0], [0.0, 0.0], True
-        self.cv.itemconfigure(self.t_keys, text=tr(GRAPH_REPLAY_KEYS))
+        self.drawing = False
         self.cv.itemconfigure(self.t_notice, text="")
         for item in (self.bar, self.bar_done):
             self.cv.itemconfigure(item, state="normal")
@@ -12957,10 +16212,12 @@ class GraphView:
         self.paused = False
         for item in (self.bar, self.bar_done):
             self.cv.itemconfigure(item, state="hidden")
-        self.cv.itemconfigure(self.t_keys, text=tr(GRAPH_KEYS))
+        self.clear_items()
         self.pos, self.heat, self.lit = {}, {}, {}
         self.recentre(back, fresh=True)
         self.resized()
+        self.draw_pop()
+        self.update_status()
 
     def apply(self, e, hits):
         stamp, t, op, rid, info = e
@@ -13120,19 +16377,28 @@ class GraphView:
         self.update_status()
 
     # ---------------------------------------------------------- drawing
-    def bottom(self):
-        return 46 if self.rp else 26     # the status line, and the timeline
+    def bottom(self, room=False):
+        b = self.STATUS_H + (26 if self.rp else self.FAB_H)   # the status; the timeline or the buttons
+        if room and self.path:           # in a path view, also the steps written above it
+            box = self.cv.bbox(self.t_link)
+            b += box[3] - box[1] + 8 if box else 0
+        return b
 
     def middle(self):
         cv = self.cv
-        return cv.winfo_width() / 2, (cv.winfo_height() + self.TOP - self.bottom()) / 2
+        return cv.winfo_width() / 2, (cv.winfo_height() + self.TOP - self.bottom(room=True)) / 2
 
     def fit_zoom(self):
-        """Eases the zoom so the whole graph fits the window; True if it moved."""
+        """Eases the zoom so the whole graph fits the window -- around the
+        middle record or, in a path view, around the chains; True if it moved."""
         cv = self.cv
-        w, h = cv.winfo_width(), cv.winfo_height() - self.TOP - self.bottom()
-        rx = max(abs(x) for x, _y in self.pos.values()) or 1.0
-        ry = max(abs(y) for _x, y in self.pos.values()) or 1.0
+        w, h = cv.winfo_width(), cv.winfo_height() - self.TOP - self.bottom(room=True)
+        if self.path:
+            xs, ys = [x for x, _y in self.pos.values()], [y for _x, y in self.pos.values()]
+            self.goal = [(min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2]
+        gx, gy = self.goal
+        rx = max(abs(x - gx) for x, _y in self.pos.values()) or 1.0
+        ry = max(abs(y - gy) for _x, y in self.pos.values()) or 1.0
         z = min(1.5, max(0.12, min((w / 2 - 110) / rx, (h / 2 - 20) / ry)))
         if abs(z - self.zoom) < 0.002:
             return False
@@ -13148,8 +16414,8 @@ class GraphView:
         r = 9.0 if n == self.center else (6.5 if self.dist.get(n, 2) == 1 else 5.0)
         return r * min(1.5, max(0.7, self.zoom))
 
-    def shape_at(self, n, x, y):
-        kind, r = self.kinds[n], self.radius(n)
+    def shape_at(self, n, x, y, r=None, kind=None):
+        kind, r = kind or self.kinds[n], self.radius(n) if r is None else r
         if kind == "person":
             return (x - r, y - r, x + r, y + r)
         if kind == "concept":
@@ -13165,38 +16431,159 @@ class GraphView:
                     x + r * 0.8, y + r * 1.15, x - r * 0.8, y + r * 1.15)
         return (x, y - r * 1.2, x + r * 1.1, y + r * 0.8, x - r * 1.1, y + r * 0.8)
 
+    def curve(self, a_xy, b_xy, key):
+        """The bend of a link: a little to one side, breathing very slowly."""
+        u = (hash(key) % 1000) / 1000.0
+        bow = ((-1 if u < 0.5 else 1) * (0.08 + 0.1 * (u * 2 % 1))
+               * (1 + 0.15 * math.sin(self.clock / 1700 + u * 6.28)))
+        dx, dy = b_xy[0] - a_xy[0], b_xy[1] - a_xy[1]
+        return ((a_xy[0] + b_xy[0]) / 2 - dy * bow, (a_xy[1] + b_xy[1]) / 2 + dx * bow)
+
+    def taper(self, pa, pc, pb, t0, t1, w, from_a, even=False):
+        """The outline of a tapered link: 1.7 w wide at the record it comes
+        from, 0.5 w at the other; `even`: w wide all along."""
+        left, right = [], []
+        for i in range(13):
+            t = t0 + (t1 - t0) * i / 12
+            x, y = self.along(pa, pc, pb, t)
+            dx = 2 * (1 - t) * (pc[0] - pa[0]) + 2 * t * (pb[0] - pc[0])
+            dy = 2 * (1 - t) * (pc[1] - pa[1]) + 2 * t * (pb[1] - pc[1])
+            n = math.hypot(dx, dy) or 1.0
+            half = max(self.MIN_HALF, w * 0.5 if even else w * (0.85 - 0.6 * (t if from_a else 1 - t)))
+            left.append((x - dy / n * half, y + dx / n * half))
+            right.append((x + dy / n * half, y - dx / n * half))
+        return [c for xy in left + right[::-1] for c in xy]
+
+    @staticmethod
+    def along(a_xy, c_xy, b_xy, t):
+        v = 1 - t
+        return (v * v * a_xy[0] + 2 * v * t * c_xy[0] + t * t * b_xy[0],
+                v * v * a_xy[1] + 2 * v * t * c_xy[1] + t * t * b_xy[1])
+
     def draw(self, coords):
-        cv, H, n_steps = self.cv, self.heat, self.STEPS
+        cv, V, n_steps, shown = self.cv, self.vis, self.STEPS, self.shown
+        S = self.screen = self.to_screen()
+        mx, my = self.middle()
+        z, (cx, cy) = self.zoom, self.cam
+        G = {n: (mx + (g["pos"][0] - cx) * z, my + (g["pos"][1] - cy) * z)
+             for n, g in self.gone.items()}
+
+        def ease(t):
+            return 1 - (1 - max(0.0, min(1.0, t))) ** 3
+
+        for key, (_rels, line) in self.links.items():
+            a, b = key
+            pa, pb = S[a], S[b]
+            pc = self.curve(pa, pb, key)
+            g = ease(self.lgrow.get(key, 1.0))
+            style, sel = self.lstyle.get(key, "line"), key == self.sel_link
+            q = int((V.get(a, 0.0) + V.get(b, 0.0)) * 0.5 * n_steps + 0.5)
+            if self.path and key in self.path["keys"]:
+                q = max(q, int(0.75 * n_steps))
+            w = (1 + 2 * q / n_steps) * (1.7 if sel else 1.0)
+            t0, t1 = (0.0, 1.0) if g >= 1 else (0.0, g) if self.lfrom.get(key) == a else (1 - g, 1.0)
+            if g <= 0:
+                cv.coords(line, *pa, *pa, *pa) if style in ("taper", "line") else cv.coords(line, *pa, *pa)
+            elif style in ("taper", "line"):    # thick at the record it comes from, or even
+                cv.coords(line, *self.taper(pa, pc, pb, t0, t1, w, self.facts(key).get("from") == a,
+                                            even=style == "line"))
+            elif g >= 1:
+                cv.coords(line, *pa, *pc, *pb)
+            else:                            # it grows out of the record already there
+                pts = [c for i in range(9) for c in self.along(pa, pc, pb, t0 + (t1 - t0) * i / 8)]
+                cv.coords(line, *pts)
+            look = (q, round(g * 10), sel)
+            if shown.get(line) != look:
+                shown[line] = look
+                rest = self.lcolour.get(key)
+                if rest is None:
+                    rest = self.lcolour[key] = self.rest_colour(key)
+                fill = blend(rest, STAMP, 0.85 * q / n_steps)
+                if g < 1:
+                    fill = blend(PAPER, fill, g)
+                if style in ("taper", "line"):
+                    cv.itemconfigure(line, fill=fill, outline=blend(PAPER, fill, self.RIM))
+                else:
+                    cv.itemconfigure(line, fill=fill, width=1)
+        for link in self.gone_links:         # links that leave fade where they were
+            a, b = link["key"]
+            pa, pb = S.get(a) or G.get(a), S.get(b) or G.get(b)
+            if not pa or not pb:
+                cv.coords(link["line"], 0, 0, 0, 0)
+                continue
+            pc = self.curve(pa, pb, link["key"])
+            if link.get("poly"):
+                cv.coords(link["line"], *self.taper(pa, pc, pb, 0.0, 1.0, 1.0, True, even=True))
+                fade = blend(PAPER, RULE, max(0.0, link["leave"]))
+                cv.itemconfigure(link["line"], fill=fade, outline=blend(PAPER, fade, self.RIM))
+            else:
+                cv.coords(link["line"], *pa, *pc, *pb)
+                cv.itemconfigure(link["line"], fill=blend(PAPER, RULE, max(0.0, link["leave"])), width=1)
+        for n, (shape, text) in self.items.items():
+            x, y = S[n]
+            g = ease(self.grow.get(n, 1.0))
+            r = self.radius(n) * (0.35 + 0.65 * g)
+            cv.coords(shape, *self.shape_at(n, x, y, r))
+            cv.coords(text, round(x + r * 1.4 + 4), round(y))
+            q = int(V.get(n, 0.0) * n_steps + 0.5)
+            centre, near = n == self.center, self.dist.get(n, 2) <= 1
+            look = (q, round(g * 12), centre, near)
+            if shown.get(n) != look:
+                shown[n] = look
+                fill, edge = self.ramp_fill[q], OXIDE if centre else self.ramp_edge[q]
+                ink = INK if near else SOFT
+                if g < 1:
+                    fill, edge, ink = blend(PAPER, fill, g), blend(PAPER, edge, g), blend(PAPER, ink, g)
+                cv.itemconfigure(shape, fill=fill, outline=edge, width=2 if centre else 1)
+                cv.itemconfigure(text, fill=ink)
+        for n, g in self.gone.items():       # withering
+            k = ease(g["leave"])
+            x, y = G[n]
+            r = (6.5 if g["dist"] == 1 else 5.0) * min(1.5, max(0.7, z)) * max(0.05, k)
+            shape = g["items"][0]
+            cv.coords(shape, *self.shape_at(n, x, y, r, g["kind"]))
+            q = int(g["vis"] * n_steps + 0.5)
+            cv.itemconfigure(shape, fill=blend(PAPER, self.ramp_fill[q], k),
+                             outline=blend(PAPER, FAINT, k), width=1)
+        for p in self.pulses:                # light flowing along a link into a new cell
+            key = (min(p["a"], p["b"]), max(p["a"], p["b"]))
+            if key not in self.links:
+                continue
+            pa, pb = S[key[0]], S[key[1]]
+            pc = self.curve(pa, pb, key)
+            t = ease((self.clock - p["start"]) / p["dur"])
+            fwd = p["a"] == key[0]
+            for k, item in enumerate(p["items"]):
+                tt = (t - k * 0.05) if fwd else (1 - t + k * 0.05)
+                if not 0.0 <= tt <= 1.0:
+                    cv.coords(item, 0, 0, 0, 0)
+                    continue
+                x, y = self.along(pa, pc, pb, tt)
+                rr = 3.2 - k * 0.6
+                cv.coords(item, x - rr, y - rr, x + rr, y + rr)
+                strength = (0.85 - k * 0.2) * math.sin(math.pi * min(1.0, t * 1.1))
+                cv.itemconfigure(item, fill=blend(PAPER, STAMP, max(0.0, strength)))
+        if self.path:                        # the two ends of the chains
+            for end, tag in ((self.path["a"], "pa"), (self.path["b"], "pb")):
+                if end in S:
+                    x, y = S[end]
+                    r = self.radius(end) * 1.5 + 5
+                    item = cv.find_withtag(tag)
+                    if not item:
+                        item = (cv.create_oval(0, 0, 0, 0, outline=STAMP, width=2, tags=("g", "pathend", tag)),)
+                    cv.coords(item[0], x - r, y - r, x + r, y + r)
+        if self.linking:                     # a link being drawn (Shift+drag)
+            x0, y0 = S.get(self.linking[0], (0, 0))
+            cv.coords(self.rubber, x0, y0, *self.linking[1])
         if coords:
-            S = self.screen = self.to_screen()
-            for (a, b), (_rels, line) in self.links.items():
-                cv.coords(line, *S[a], *S[b])
-            for n, (shape, text) in self.items.items():
-                x, y = S[n]
-                cv.coords(shape, *self.shape_at(n, x, y))
-                cv.coords(text, x + self.radius(n) * 1.4 + 4, y)
             self.draw_hover()
             self._dirty = False
-        shown = self.shown
-        for n, (shape, _text) in self.items.items():
-            q = int(H[n] * n_steps + 0.5)
-            if shown.get(n) != q:
-                shown[n] = q
-                if n == self.center:
-                    cv.itemconfigure(shape, fill=self.ramp_fill[q])
-                else:
-                    cv.itemconfigure(shape, fill=self.ramp_fill[q], outline=self.ramp_edge[q])
-        for (a, b), (_rels, line) in self.links.items():
-            q = int((H[a] + H[b]) * 0.5 * n_steps + 0.5)
-            if shown.get(line) != q:
-                shown[line] = q
-                cv.itemconfigure(line, fill=self.ramp_line[q], width=1 + 2 * q // n_steps)
         if self.rp:
             self.draw_timeline()
 
     def bar_span(self):
         cv = self.cv
-        return 12, cv.winfo_width() - 12, cv.winfo_height() - 34
+        return 12, cv.winfo_width() - 12, cv.winfo_height() - self.STATUS_H - 14
 
     def draw_timeline(self):
         x0, x1, y = self.bar_span()
@@ -13206,36 +16593,89 @@ class GraphView:
         self.cv.coords(self.bar_done, x0, y, done, y)
 
     def draw_hover(self):
-        cv = self.cv
-        cv.delete("rel")
+        """The ring around the record under the pointer, and the types of the
+        links of the record in focus -- that one, else the middle one --
+        written on their lines, as the web page does: when it has at most a
+        dozen links in view, in a window wide enough or with all the names on."""
+        cv, S = self.cv, self.screen
         n = self.hover
-        if not n or n not in self.screen:
+        if n and n in S:
+            x, y = S[n]
+            r = self.radius(n) * 1.4 + 4
+            cv.coords(self.ring, x - r, y - r, x + r, y + r)
+            cv.itemconfigure(self.ring, state="normal")
+        else:
             cv.itemconfigure(self.ring, state="hidden")
+        focus, want = n or self.center, {}
+        near = self.adjv.get(focus, ()) if focus in S else ()
+        if near and len(near) <= 12 and (cv.winfo_width() >= 600 or self.all_labels):
+            for m in near:
+                key = (min(focus, m), max(focus, m))
+                if key not in self.links or m not in S or self.lgrow.get(key, 1.0) < 1:
+                    continue
+                words = " · ".join(rel_label(rel) + (" →" if f == focus else " ←")
+                                   for rel, f in self.links[key][0])
+                pa, pb = S[key[0]], S[key[1]]
+                mx, my = self.along(pa, self.curve(pa, pb, key), pb, 0.5)
+                want[key] = (words, round(mx), round(my) - 6)
+        R = self.rel_items
+        for key in [k for k in R if k not in want]:
+            cv.delete(R.pop(key)[0])
+        for key, (words, x, y) in want.items():
+            if key not in R:                 # over the lines, under the records
+                item = cv.create_text(x, y, text=words, fill=SOFT, font=self.f_label, tags=("g", "rel"))
+                if cv.find_withtag("node"):
+                    cv.tag_lower(item, "node")
+                R[key] = (item, words)
+            item, said = R[key]
+            cv.coords(item, x, y)
+            if said != words:
+                cv.itemconfigure(item, text=words)
+                R[key] = (item, words)
+
+    def draw_pop(self):
+        """Life: how many are lit, generation by generation (the last sixty),
+        a small line at the top right -- as on the web page."""
+        cv, P = self.cv, self.pop
+        on = self.mode == "life" and len(P) > 1 and not self.rp
+        for item in (self.pop_rule, self.pop_line):
+            cv.itemconfigure(item, state="normal" if on else "hidden")
+        if not on:
             return
-        x, y = self.screen[n]
-        r = self.radius(n) * 1.4 + 4
-        cv.coords(self.ring, x - r, y - r, x + r, y + r)
-        cv.itemconfigure(self.ring, state="normal")
-        for m in self.adjv.get(n, []):
-            mx, my = self.screen[m]
-            rels = self.links[(min(n, m), max(n, m))][0]
-            words = [rel_label(rel) + (" →" if f == n else " ←") for rel, f in rels]
-            cv.create_text((x + mx) / 2, (y + my) / 2, text=" · ".join(words), fill=SOFT,
-                           font=self.f_label, tags=("g", "rel"))
+        bw, bh = 104, 26
+        x0, y0 = cv.winfo_width() - bw - 12, self.TOP - bh - 8
+        cv.coords(self.pop_rule, x0, y0 + bh, x0 + bw, y0 + bh)
+        cv.coords(self.pop_line, *[c for i, v in enumerate(P) for c in (x0 + bw * i / 59, y0 + bh - bh * v)])
 
     def resized(self, _e=None):
         cv = self.cv
         w, h = cv.winfo_width(), cv.winfo_height()
-        cv.coords(self.t_left, 12, h - 6)
-        cv.coords(self.t_right, w - 12, h - 6)
+        top = h - self.STATUS_H
+        cv.coords(self.status_bg, 0, top, w, h)
+        cv.coords(self.status_rule, 0, top, w, top)
+        cv.coords(self.t_left, 12, top + 7)
+        cv.coords(self.t_right, 12, top + 25)
+        y = top - 10
+        cv.coords(self.fabs[0], 12, y)
+        cv.coords(self.fabs[2], w - 12, y)
+        cv.coords(self.fabs[1], w - 20 - self.b_draw.winfo_reqwidth(), y)
         cv.coords(self.t_notice, w / 2, h / 2 + 28)
-        cv.itemconfigure(self.t_keys, width=w - 24)
+        cv.coords(self.t_link, 12, h - self.bottom() - 4)
+        if self.show_key:
+            self.show_key = False
+            self.toggle_key()
+        cv.itemconfigure(self.t_keys, width=w - 150)
+        self.draw_pop()
         self._dirty = True
 
     def update_status(self, flash=None):
         rp = self.rp
         rid = self.hover or self.center
         rec = self.idx.get(rid) if rid else None
+        if flash:            # a message stays three seconds, whatever else updates the line
+            self._flash = (flash, self.clock + 3000)
+        elif getattr(self, "_flash", None) and self.clock < self._flash[1]:
+            flash = self._flash[0]
         if flash:
             left = flash
         elif rid and rid in self.names:
@@ -13248,8 +16688,13 @@ class GraphView:
             left = ""
         right = tr(GRAPH_MODE_LABEL[self.mode])
         if self.mode == "life":
-            right += " · " + tr("generation {n}, {k} lit", n=self.gen,
-                                k=sum(1 for v in self.lit.values() if v))
+            k = sum(1 for v in self.lit.values() if v)
+            if self.settled:
+                right += " · " + (tr("settled at generation {n}: {k} stay lit", n=self.gen, k=k) if k
+                                  else tr("died out at generation {n}", n=self.gen))
+                right += " · " + tr("r: start again")
+            else:
+                right += " · " + tr("generation {n}, {k} lit", n=self.gen, k=k)
         if rp:
             speed = rp["speed"]
             right += " · ×" + (f"{speed:g}" if speed >= 1 else f"1/{1 / speed:g}")
@@ -13262,11 +16707,14 @@ class GraphView:
             right += ", " + tr("depth {d}", d=self.depth)
         self.cv.itemconfigure(self.t_left, text=one_liner(left, 90))
         self.cv.itemconfigure(self.t_right, text=right)
+        self.sync_buttons()
 
     # ---------------------------------------------------------- the hand
     def node_at(self, x, y):
         best, bd = None, 14 * 14
         for n, (sx, sy) in self.screen.items():
+            if self.grow.get(n, 1.0) < 0.5:
+                continue                     # still sprouting
             d = (sx - x) ** 2 + (sy - y) ** 2
             if d < bd:
                 best, bd = n, d
@@ -13290,6 +16738,13 @@ class GraphView:
 
     def press(self, e):
         self.cv.focus_set()
+        if not self.hint_off and not self.rp:
+            self.hint_off = True
+            self.update_status()
+        if self.drawing and not self.rp:
+            self.link_press(e)
+            if self.linking:
+                return
         self.press_at = self.last = (e.x, e.y)
         self.press_node, self.moved = self.node_at(e.x, e.y), False
         self.scrubbing = bool(self.on_bar(e))
@@ -13297,6 +16752,8 @@ class GraphView:
             self.scrub(e)
 
     def drag(self, e):
+        if self.linking:
+            return self.link_drag(e)
         if not self.press_at:
             return
         if self.scrubbing:
@@ -13311,7 +16768,8 @@ class GraphView:
             p = self.pos[n]
             p[0] += (e.x - self.last[0]) / z
             p[1] += (e.y - self.last[1]) / z
-            self.temp = max(self.temp, 8.0)
+            self.temp = max(self.temp, 3.0)      # the neighbours follow gently
+            self.fit = False                     # the view holds still while you arrange it
         else:
             for c in (self.cam, self.goal):
                 c[0] -= (e.x - self.last[0]) / z
@@ -13319,24 +16777,219 @@ class GraphView:
         self.last = (e.x, e.y)
         self._dirty = True
 
-    def release(self, _e):
+    def link_at(self, x, y, slop=7):
+        """The line under (x, y): the nearest within `slop` pixels, or None."""
+        best, bd = None, slop * slop
+        for key in self.links:
+            if self.lgrow.get(key, 1.0) < 1 or key[0] not in self.screen or key[1] not in self.screen:
+                continue
+            pa, pb = self.screen[key[0]], self.screen[key[1]]
+            pc = self.curve(pa, pb, key)
+            p0 = pa
+            for i in range(1, 13):
+                p1 = self.along(pa, pc, pb, i / 12)
+                vx, vy = p1[0] - p0[0], p1[1] - p0[1]
+                k = max(0.0, min(1.0, ((x - p0[0]) * vx + (y - p0[1]) * vy) / ((vx * vx + vy * vy) or 1)))
+                d = (p0[0] + k * vx - x) ** 2 + (p0[1] + k * vy - y) ** 2
+                if d < bd:
+                    best, bd = key, d
+                p0 = p1
+        return best
+
+    def select_link(self, key):
+        """A line clicked: it thickens and its links are written out above the
+        status line -- type, reason, source, span, when written."""
+        self.sel_link = key
+        if not key or not self.data:
+            self.cv.itemconfigure(self.t_link, state="hidden")
+            return
+        idx, times = by_id(self.data), edge_times()
+        lines = []
+        for e in self.data.get("edges", []):
+            if (min(e.get("from", ""), e.get("to", "")), max(e.get("from", ""), e.get("to", ""))) != key:
+                continue
+            a, b = idx.get(e["from"]), idx.get(e["to"])
+            bits = [f"{label_any(a, self.data) if a else e['from']}  —{rel_label(e.get('rel', ''))}→  "
+                    f"{label_any(b, self.data) if b else e['to']}"]
+            bits.append(e.get("why") or ("" if e.get("source") else tr("no reason or source")))
+            if e.get("source"):
+                bits.append(resolve_source(e["source"], self.data)[1])
+            if e.get("when"):
+                bits.append(e["when"])
+            if e.get("rel") not in RELS:
+                bits.append(tr("atypical type"))
+            t = times.get((e["from"], e["to"], e.get("rel", "")))
+            if t:
+                bits.append(tr("written {date}", date=datetime.fromtimestamp(t).date().isoformat()))
+            lines.append(" · ".join(one_liner(x, 80) for x in bits if x))
+        lines.append(tr("double-click: open where it comes from, on the card · Esc: close"))
+        self.cv.itemconfigure(self.t_link, text="\n".join(lines), state="normal")
+        self.cv.tag_raise(self.t_link)
+        self.shown.clear()
+
+    def double(self, e):
+        """Double-click: a record opens on the card; a line opens the record it
+        comes from, whose LINKS field holds it."""
+        n = self.node_at(e.x, e.y)
+        if n:
+            return self.open_in_card(n)
+        key = self.link_at(e.x, e.y)
+        if key:
+            f = self.facts(key).get("from") or next(
+                (x.get("from") for x in self.data.get("edges", [])
+                 if (min(x.get("from", ""), x.get("to", "")), max(x.get("from", ""), x.get("to", ""))) == key), key[0])
+            return self.open_in_card(f)
+        return self.open_in_card(self.hover or self.center)
+
+    def link_press(self, e):
+        n = self.node_at(e.x, e.y)
+        self.linking = (n, (e.x, e.y)) if n and not self.rp else None
+        if self.linking:
+            self.cv.itemconfigure(self.rubber, state="normal")
+            self.cv.tag_raise(self.rubber)
+
+    def link_drag(self, e):
+        if self.linking:
+            self.linking = (self.linking[0], (e.x, e.y))
+            n = self.node_at(e.x, e.y)
+            if n != self.hover:
+                self.hover = n
+                self.label_states()
+
+    def link_release(self, e):
+        """Shift+drag from a record to another: a new link between them, saved
+        through the main window (the graph by itself writes nothing)."""
+        start, self.linking = self.linking, None
+        self.cv.itemconfigure(self.rubber, state="hidden")
+        if not start:
+            return
+        to = self.node_at(e.x, e.y)
+        if not to or to == start[0]:
+            return
+        if not self.on_link:
+            self.update_status(flash=tr("Read-only here: open the graph from Kustos "
+                                        "(Ctrl+Shift+G) to draw links."))
+            return
+        LinkDialog(self, start[0], to)
+
+    def path_click(self, e):
+        """Ctrl+click on a record: the path to it from the middle."""
+        n = self.node_at(e.x, e.y)
+        if n and n != self.center and not self.rp:
+            self.show_path(n)
+        return "break"
+
+    def show_path(self, b):
+        """How the middle record and `b` are related: the shortest chains of
+        links between them (link_paths), shown alone and still, a light running
+        along them, their steps written above the status line."""
+        if self.data is None or b not in self.idx:
+            return
+        a = self.center
+        paths = link_paths(self.adj, a, b)
+        if not paths:
+            self.update_status(flash=tr("No chain of links joins them."))
+            return
+        first = {}
+        for path in paths:
+            for i, n in enumerate(path):
+                first.setdefault(n, (i, path[i - 1] if i else None))
+        keys = {(min(x, y), max(x, y)) for path in paths for x, y in zip(path, path[1:])}
+        mode = self.path["mode"] if self.path else self.mode
+        self.recentre(a, view=(first, {k: self.adj[k[0]][k[1]] for k in keys}))
+        self.path = dict(a=a, b=b, paths=paths, keys=keys, mode=mode, next=0.0)
+        self.mode = "still"
+        self.fit = True
+        self.cv.delete("pathend")
+        pairs = link_index(self.data)
+        name = lambda r: one_liner(label_any(self.idx[r], self.data), 40)
+        lines = [tr("{a} ⇢ {b}", a=name(a), b=name(b)) + " · "
+                 + tr("{k} link(s) apart · {n} chain(s)", k=len(paths[0]) - 1, n=len(paths))]
+        for x, y in zip(paths[0], paths[0][1:]):
+            for e in pairs.get((min(x, y), max(x, y)), []):
+                lines.append(f"{name(e['from'])}  —{rel_label(e.get('rel', ''))}→  {name(e['to'])}"
+                             + (f" · {one_liner(e['why'], 60)}" if e.get("why") else ""))
+        lines.append(tr("Esc: back to the graph"))
+        self.sel_link = None
+        self.cv.itemconfigure(self.t_link, text="\n".join(lines), state="normal")
+        self.cv.tag_raise(self.t_link)
+        self.update_status()
+
+    def leave_path(self):
+        """Esc in a path view: the neighbourhood of the middle record again."""
+        if self.path:
+            self.recentre(self.center)
+
+    def path_flow(self):
+        """A light runs along every chain, from one end to the other, step by step."""
+        P = self.path
+        if not P or self.clock < P["next"]:
+            return
+        P["next"] = self.clock + 700
+        for path in P["paths"]:
+            step = int(self.clock // 700) % (len(path) + 1)
+            if step < len(path) - 1:
+                self.add_pulse(path[step], path[step + 1], 700)
+
+    def toggle_key(self):
+        """k: the key of the lines -- what their colour, stroke and taper say."""
+        self.show_key = not self.show_key
+        cv = self.cv
+        cv.delete("key")
+        self.update_status()
+        if not self.show_key:
+            return
+        x0, y0 = cv.winfo_width() - 330, self.TOP + 8
+        rows = [(LINK_FAMILY_COLOUR[k], "", tr(l)) for k, l in
+                (("verba", "Verba"), ("people", "People"), ("sources", "Sources"), ("corpus", "Corpus"))]
+        fam = LINK_FAMILY_COLOUR["verba"]
+        rows += [(blend(RULE, fam, 0.9), "", tr("with a reason or a source")),
+                 (blend(RULE, fam, 0.4), "-", tr("without either: needs a reason")),
+                 (blend(RULE, fam, 0.6), ".", tr("a type outside the list (atypical)")),
+                 (None, "", tr("thick where it comes from")),
+                 (blend(RULE, LINK_FAMILY_COLOUR["sources"], 0.9), "", tr("written recently")),
+                 (blend(RULE, LINK_FAMILY_COLOUR["sources"], 0.4), "", tr("written long ago")),
+                 (STAMP, "", tr("lit, in life"))]
+        keys = cv.create_text(x0, y0 + 18 * len(rows) + 8, anchor="nw", width=318, text=tr(GRAPH_KEYS),
+                              fill=SOFT, font=self.f_label, tags=("key",))
+        box = cv.create_rectangle(x0 - 10, y0 - 6, x0 + 318, cv.bbox(keys)[3] + 8, fill=PAPER,
+                                  outline=RULE, tags=("key",))
+        cv.tag_raise(keys, box)
+        for i, (colour, dash, text) in enumerate(rows):
+            y = y0 + 8 + 18 * i
+            if colour is None:
+                cv.create_polygon(x0, y - 3, x0 + 44, y - 0.6, x0 + 44, y + 0.6, x0, y + 3,
+                                  fill=fam, outline="", tags=("key",))
+            else:
+                cv.create_line(x0, y, x0 + 44, y, fill=colour, width=1 if dash else 2, dash=dash,
+                               tags=("key",))
+            cv.create_text(x0 + 56, y, anchor="w", text=text, fill=INK, font=self.f_label,
+                           tags=("key",))
+
+    def release(self, e):
+        if self.linking:
+            return self.link_release(e)
         n = self.press_node
         if n and not self.moved and not self.scrubbing and not self.rp and n != self.center:
             self.recentre(n)
+        elif not n and not self.moved and not self.scrubbing and self.press_at:
+            self.select_link(self.link_at(*self.press_at))
         self.press_at = self.press_node = self.dragging = None
         self.scrubbing = False
 
     def touch(self, e):
-        """Right-click: in glow mode a spark; in life mode the cell flips."""
+        """Right-click: in glow mode a spark; in life mode the cell flips (and a
+        run that had settled starts again)."""
         n = self.node_at(e.x, e.y)
         if not n:
             return
         if self.mode == "life":
-            self.lit[n] = not self.lit[n]
-            self.stale = 0
+            self.lit[n] = not self.lit.get(n)
+            self.arrive[n] = self.clock
+            self.stale, self.settled = 0, False
             self.update_status()
         else:
-            self.heat[n] = 1.0
+            self.sparkle[n] = 1.0
 
     def zoom_at(self, e, f):
         z = min(3.0, max(0.12, self.zoom * f))
@@ -13359,6 +17012,7 @@ class GraphView:
         self.mode = GRAPH_MODES[(GRAPH_MODES.index(self.mode) + 1) % len(GRAPH_MODES)]
         if self.mode == "life":
             self.seed_life()
+        self.draw_pop()
         self.update_status()
 
     def set_depth(self, d):
@@ -13369,6 +17023,7 @@ class GraphView:
     def toggle_labels(self):
         self.all_labels = not self.all_labels
         self.label_states()
+        self.sync_buttons()
 
     def shake(self):
         for n, p in self.pos.items():
@@ -13431,11 +17086,150 @@ class GraphView:
         self.root.destroy()
 
 
-GRAPH_KEYS = ("click: to the middle · double-click / Enter: open on the card · "
-              "right-click: spark (in life: flip the cell) · drag: move · wheel: zoom · "
+
+class PathDialog:
+    """f in the graph: the record to reach from the middle one, found by
+    typing a few letters of its name; Enter or a double-click shows the path."""
+
+    def __init__(self, view):
+        self.view = view
+        self.win = win = tk.Toplevel(view.root)
+        win.title(tr("Path to:"))
+        win.configure(bg=PAPER)
+        win.transient(view.root)
+        name = one_liner(label_any(view.idx.get(view.center), view.data), 50) if view.center else ""
+        tk.Label(win, text=tr("How are they related?") + "  " + tr("From") + ": " + name, bg=PAPER,
+                 fg=INK, font=view.f_center).pack(anchor="w", padx=14, pady=(10, 4))
+        self.v_q = tk.StringVar()
+        entry = ttk.Entry(win, textvariable=self.v_q, width=56)
+        entry.pack(fill="x", padx=14)
+        self.box = tk.Listbox(win, height=10, font=view.f_status, bg=PAPER, fg=INK, relief="flat",
+                              highlightthickness=1, highlightbackground=RULE, selectbackground=SELBG,
+                              selectforeground=SELFG, activestyle="none")
+        self.box.pack(fill="both", expand=True, padx=14, pady=10)
+        self.v_q.trace_add("write", lambda *a: self.fill())
+        win.bind("<Return>", lambda e: self.choose())
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.bind("<Down>", lambda e: self.move(1))
+        win.bind("<Up>", lambda e: self.move(-1))
+        self.box.bind("<Double-Button-1>", lambda e: self.choose())
+        self.ids = []
+        self.fill()
+        entry.focus_set()
+
+    def fill(self):
+        q = sort_key(self.v_q.get().strip())[0]
+        data, center = self.view.data, self.view.center
+        hits = []
+        for rid, rec in self.view.idx.items():
+            if rid == center or rid.startswith("__"):
+                continue
+            label = label_any(rec, data)
+            if q and q not in sort_key(label)[0]:
+                continue
+            hits.append((sort_key(label), rid, label))
+        hits.sort()
+        self.ids = [rid for _k, rid, _l in hits[:40]]
+        self.box.delete(0, "end")
+        for _k, _rid, label in hits[:40]:
+            self.box.insert("end", one_liner(label, 70))
+        if self.ids:
+            self.box.selection_set(0)
+
+    def move(self, d):
+        cur = self.box.curselection()
+        i = max(0, min(len(self.ids) - 1, (cur[0] if cur else 0) + d))
+        self.box.selection_clear(0, "end")
+        self.box.selection_set(i)
+        self.box.see(i)
+
+    def choose(self):
+        cur = self.box.curselection()
+        if not self.ids:
+            return
+        rid = self.ids[cur[0] if cur else 0]
+        self.win.destroy()
+        self.view.show_path(rid)
+
+
+class LinkDialog:
+    """Shift+drag in the graph: a new link from one record to another -- its
+    type (those that fit the two kinds first), reason, source and span. Saved
+    through the main window's write (write_link); what cannot be saved is said
+    here and the dialog stays."""
+
+    def __init__(self, view, a, b):
+        self.view, self.a, self.b = view, a, b
+        self.win = win = tk.Toplevel(view.root)
+        win.title(tr("New link"))
+        win.configure(bg=PAPER)
+        win.transient(view.root)
+        win.resizable(False, False)
+        pad = dict(padx=14, pady=(8, 0), sticky="w")
+        self.l_dir = tk.Label(win, bg=PAPER, fg=INK, font=view.f_center, justify="left")
+        self.l_dir.grid(row=0, column=0, columnspan=2, **pad)
+        ttk.Button(win, text="⇄  " + tr("Swap direction"), command=self.swap).grid(
+            row=0, column=2, padx=14, pady=(8, 0), sticky="e")
+        self.v_rel, self.v_why, self.v_src, self.v_when = (tk.StringVar() for _ in range(4))
+        rows = ((tr("Type"), self.v_rel), (tr("Reason"), self.v_why), (tr("Source"), self.v_src),
+                (tr("Span"), self.v_when))
+        self.boxes = []
+        for i, (label, var) in enumerate(rows, start=1):
+            tk.Label(win, text=label, bg=PAPER, fg=SOFT, font=view.f_label).grid(row=i, column=0, **pad)
+            if var is self.v_rel:
+                box = ttk.Combobox(win, textvariable=var, width=44)
+                self.rel_box = box
+            else:
+                box = ttk.Entry(win, textvariable=var, width=46)
+            box.grid(row=i, column=1, columnspan=2, padx=14, pady=(8, 0), sticky="we")
+            self.boxes.append(box)
+        tk.Label(win, text=tr("s_… of a source, or free text") + "   ·   " + tr("1609, 1618/1648, -800/400"),
+                 bg=PAPER, fg=FAINT, font=view.f_label).grid(row=5, column=1, columnspan=2, padx=14, sticky="w")
+        self.msg = tk.Label(win, text="", bg=PAPER, fg=OXIDE, font=view.f_label, wraplength=420, justify="left")
+        self.msg.grid(row=6, column=0, columnspan=3, padx=14, pady=(6, 0), sticky="w")
+        foot = tk.Frame(win, bg=PAPER)
+        foot.grid(row=7, column=0, columnspan=3, padx=14, pady=12, sticky="e")
+        ttk.Button(foot, text=tr("Cancel"), command=win.destroy).pack(side="right")
+        ttk.Button(foot, text=tr("Save"), command=self.save).pack(side="right", padx=(0, 8))
+        win.bind("<Return>", lambda e: self.save())
+        win.bind("<Escape>", lambda e: win.destroy())
+        self.fill()
+        self.boxes[1].focus_set()
+
+    def fill(self):
+        idx = by_id(self.view.data)
+        name = lambda r: one_liner(label_any(idx[r], self.view.data), 40)
+        self.l_dir.configure(text=f"{name(self.a)}  →  {name(self.b)}")
+        self.types = typical_rels(idx[self.a], idx[self.b])
+        self.rel_box.configure(values=[rel_label(r) for r in self.types])
+        if self.types and self.v_rel.get().strip() in ("",) + tuple(rel_label(r) for r in RELS):
+            self.v_rel.set(rel_label(self.types[0]))
+
+    def swap(self):
+        self.a, self.b = self.b, self.a
+        self.v_rel.set("")
+        self.fill()
+
+    def save(self):
+        typed = self.v_rel.get().strip()
+        rel = next((r for r in RELS if rel_label(r) == typed), typed)   # a label back to its type
+        problem = self.view.on_link(self.a, self.b, rel, self.v_why.get(), self.v_src.get(),
+                                    self.v_when.get())
+        if problem:
+            self.msg.configure(text=problem)
+            return
+        self.win.destroy()
+
+GRAPH_KEYS = ("click: to the middle (on a line: its links) · double-click / Enter: open on the card · "
+              "right-click: spark (in life: flip the cell) · drag: move · Shift+drag: draw a link · "
+              "? or k: key of the lines · f or Ctrl+click: path to a record · wheel: zoom · "
               "m: glow / life / still · 1-3: depth · l: all names · space: pause · "
               "r: shake · c: copy id · p: replay the logs · Home: back to the start · "
               "F5: reread · Esc: close")
+GRAPH_HINT_LIFE = ("click: to the middle · double-click: open · right-click: flip the cell · drag: move · "
+                   "Shift+drag: draw a link · Ctrl+click: path · wheel: zoom · ?: the key and every key")
+GRAPH_HINT = ("click: to the middle · double-click: open · right-click: spark · drag: move · "
+              "Shift+drag: draw a link · Ctrl+click: path · wheel: zoom · ?: the key and every key")
 GRAPH_REPLAY_KEYS = ("REPLAY OF THE LOGS · space: pause / play · + / -: faster / slower · "
                      "← / →: back / ahead · Home / End: start / today · click or drag the "
                      "timeline: go to that moment · w: whole base / around the record · "
@@ -13456,6 +17250,551 @@ def cmd_graph(open_id=None):
     root = tk.Tk()
     set_window_icon(root)
     root.graph = GraphView(root, load_json, start_id=open_id)
+    root.mainloop()
+    return 0
+
+
+# ================================================================ monads
+#
+# The base as Leibniz's monads (Ctrl+Shift+M, View › Monads, or `python _kustos.py
+# monads`). The link graph draws what you wrote; this finds what you did not:
+# nobody has to link one record to another. Each record is a disc and no line is
+# ever drawn, since monads have no windows. What two records share is computed
+# from the words they use, the rarer the word the more it counts, and from the
+# links that exist, when they do. Distance is the order of clarity: near the middle
+# is what the monad there perceives best; the rest stays as dust at the edge, confused
+# but present (§60-62). The dots inside a disc are the universe as seen from it,
+# each in the direction of what it perceives. Passing over a monad tints the
+# others from its side, the same city seen from another place (§57). All the rims
+# breathe on one clock and nothing passes between them: the harmony is
+# pre-established. Health and drafts stay out, also as a way into other records.
+# Read-only: nothing it computes is saved.
+
+MONAD_COLLS = ("people", "entries", "sources")
+MONAD_KINDS = ("all", "person", "concept", "form", "source")
+MONAD_SHOWN = (24, 40, 64)   # keys 1-3: how many monads, the view stays fluid
+MONAD_DUST = 260             # at most this many points of dust
+MONAD_TERMS = 60             # the rarest terms of a record: a long note stays cheap
+MONAD_MOVE_MS = 520          # the universe rearranges around another monad
+MONAD_TINT_MS = 160          # the view passes to the monad under the pointer
+MONAD_BREATH_MS = 6000       # one breath of the rims
+MONAD_WORD = re.compile(r"[^\W\d_]{4,}")
+MONAD_STOP = set("""
+    about after again also among because been before being between both cannot
+    could does down during each even every from have here into just like made many
+    more most much must never only other over same should some such than that their
+    them then there these they this those through under very were what when where
+    which while will with within without would your
+    ainda alem antes aqui assim cada coisa como contra depois desde dessa desse
+    dessas desses dest esta este estes estas entre essa esse essas esses fazer
+    foram isso isto mais mesma mesmo muita muito nada nessa nesse nesta neste
+    outra outro para pela pelas pelo pelos pode porque quais qual quando quanto
+    quem seja sem sempre sendo seus suas sobre somente tambem tem tendo tenho toda
+    todas todo todos tudo uma umas uns vez
+""".split())
+
+
+def monad_words(rec):
+    """The words of a record, folded, without the most common ones."""
+    parts = [str(rec.get(k) or "") for k in ("name", "gloss", "notes", "notes_raw", "raw")]
+    parts += [str(x) for k in ("authors", "tags") for x in rec.get(k) or []]
+    folded = unicodedata.normalize("NFKD", " ".join(parts).casefold())
+    folded = "".join(c for c in folded if not unicodedata.combining(c))
+    return set(MONAD_WORD.findall(folded)) - MONAD_STOP
+
+
+class MonadIndex:
+    """What each record has in common with the others, as weighted terms: its
+    words, and "@id" for each record it is linked to, so that two records meet
+    through a third. A term only one record has, or too many, says nothing."""
+
+    def __init__(self, data):
+        self.recs = {r["id"]: r for c in MONAD_COLLS for r in data.get(c, [])
+                     if not r["id"].startswith("__")}
+        terms = {rid: monad_words(r) for rid, r in self.recs.items()}
+        for a in data.get("edges", []):
+            f, t = a.get("from"), a.get("to")
+            if f != t and f in terms and t in terms:
+                terms[f] |= {"@" + f, "@" + t}
+                terms[t] |= {"@" + f, "@" + t}
+        count = {}
+        for words in terms.values():
+            for w in words:
+                count[w] = count.get(w, 0) + 1
+        n = len(terms)
+        most = max(8, n * 0.05)
+        self.vec, self.who, self.seen = {}, {}, {}
+        for rid, words in terms.items():
+            kept = sorted((w for w in words if 2 <= count[w] <= most),
+                          key=lambda w: (count[w], w))[:MONAD_TERMS]
+            v = {w: math.log(1 + n / count[w]) for w in kept}
+            size = math.sqrt(sum(x * x for x in v.values())) or 1.0
+            self.vec[rid] = {w: x / size for w, x in v.items()}
+            for w, x in self.vec[rid].items():
+                self.who.setdefault(w, []).append((rid, x))
+
+    def richest(self):
+        return max(self.vec, key=lambda k: (len(self.vec[k]), k), default=None)
+
+    def perceive(self, rid):
+        """[(other, clarity)], the clearest first; clarity goes from 0 to 1."""
+        if rid not in self.seen:
+            score = {}
+            for w, x in self.vec.get(rid, {}).items():
+                for other, y in self.who[w]:
+                    if other != rid:
+                        score[other] = score.get(other, 0.0) + x * y
+            self.seen[rid] = sorted(score.items(), key=lambda kv: (-kv[1], kv[0]))
+        return self.seen[rid]
+
+    def shared(self, a, b):
+        """The terms a and b have in common, the ones that weigh most first."""
+        va, vb = self.vec.get(a, {}), self.vec.get(b, {})
+        both = (w for w in va if w in vb and w not in ("@" + a, "@" + b))
+        return sorted(both, key=lambda w: (-va[w] * vb[w], w))
+
+    def term(self, w):
+        """A term as it is shown: a word, or the name of a record."""
+        return label_any(self.recs[w[1:]]) if w.startswith("@") else w
+
+
+class MonadView:
+    TOP, BOTTOM = 44, 26       # the keys above, the status below
+    CENTRE_R = 46.0
+    STEPS = 24                 # colour steps of the discs
+
+    def __init__(self, root, get_data, start_id=None, on_open=None):
+        self.root, self.get_data, self.on_open = root, get_data, on_open
+        self.data = self.u = None
+        self.center = self.hover = None
+        self.m, self.screen = {}, {}
+        self.back, self.ahead = [], []
+        self.kind, self.breadth = "all", 1
+        self.all_names, self.still = False, False
+        self.zoom, self.cam = 1.0, [0.0, 0.0]
+        self.press_at = self.press_node = None
+        self.last, self.moved = (0, 0), False
+        self.move, self.tint = {}, {}          # the states of the two tweens
+        self.goal, self.todo = {}, []          # where they go, whose dots are pending
+        self.fill, self.far = {}, 0            # the timer of those dots, the dust
+        self._breath = self._follow = None
+        self.dust, self.rim = [], None
+
+        fams = set(tkfont.families(root))
+        mono = next((f for f in ("Cascadia Mono", "Consolas", "Lucida Console",
+                                 "DejaVu Sans Mono", "Courier New") if f in fams), "Courier")
+        self.f_label = tkfont.Font(root, family=mono, size=8)
+        self.f_center = tkfont.Font(root, family=mono, size=10, weight="bold")
+        self.f_status = tkfont.Font(root, family=mono, size=9)
+        n = self.STEPS
+        self.ramp = [mix(PAPER, STAMP, 0.5 * i / n) for i in range(n + 1)]
+        self.rims = [mix(FAINT, OXIDE, i / 12) for i in range(13)]
+
+        root.title(tr("Kustos · monads (read-only)"))
+        root.configure(bg=PAPER)
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = min(1100, sw - 80), min(760, sh - 120)
+        root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
+        root.minsize(560, 400)
+        paint_frame(root)
+        self.cv = cv = tk.Canvas(root, bg=PAPER, highlightthickness=0, bd=0)
+        cv.pack(fill="both", expand=True)
+        self.t_keys = cv.create_text(12, 10, anchor="nw", font=self.f_label, fill=FAINT,
+                                     text=tr(MONAD_KEYS))
+        self.t_left = cv.create_text(12, 0, anchor="sw", font=self.f_status, fill=SOFT)
+        self.t_right = cv.create_text(0, 0, anchor="se", font=self.f_status, fill=SOFT)
+        self.t_notice = cv.create_text(0, 0, anchor="n", font=self.f_status, fill=SOFT)
+
+        b = root.bind
+        b("<Left>", lambda e: self.walk(self.back, self.ahead))
+        b("<BackSpace>", lambda e: self.walk(self.back, self.ahead))
+        b("<Right>", lambda e: self.walk(self.ahead, self.back))
+        b("<Home>", self.home)
+        for i in range(3):
+            b(str(i + 1), lambda e, i=i: self.set_breadth(i))
+        b("<k>", lambda e: self.next_kind())
+        b("<l>", lambda e: self.toggle_names())
+        b("<c>", lambda e: self.copy_id())
+        b("<space>", lambda e: self.toggle_still())
+        b("<F5>", lambda e: self.recentre(self.center, fresh=True, trail=False))
+        b("<Return>", lambda e: self.open_in_card())
+        b("<Escape>", lambda e: self.close())
+        b("<q>", lambda e: self.close())
+        cv.bind("<Configure>", self.resized)
+        cv.bind("<Motion>", self.motion)
+        cv.bind("<ButtonPress-1>", self.press)
+        cv.bind("<B1-Motion>", self.drag)
+        cv.bind("<ButtonRelease-1>", self.release)
+        cv.bind("<Double-Button-1>", lambda e: self.open_in_card(self.hover or self.center))
+        cv.bind("<MouseWheel>", lambda e: self.zoom_at(e, 1.1 if e.delta > 0 else 1 / 1.1))
+        cv.bind("<Button-4>", lambda e: self.zoom_at(e, 1.1))
+        cv.bind("<Button-5>", lambda e: self.zoom_at(e, 1 / 1.1))
+        root.protocol("WM_DELETE_WINDOW", self.close)
+        self.recentre(start_id, fresh=True, trail=False)
+        self.breathe()
+
+    # ---------------------------------------------------------- content
+    def fits(self, rid):
+        return self.kind == "all" or graph_kind(self.u.recs[rid]) == self.kind
+
+    def recentre(self, rid, fresh=False, trail=True):
+        """Puts `rid` in the middle and lets the others find their distance from
+        it. What it perceives through the same word sits on the same side."""
+        if fresh:
+            data = self.get_data()
+            if data is not self.data or self.u is None:
+                self.data, self.u = data, MonadIndex(data)
+        u = self.u
+        if rid not in u.recs:
+            rid = self.center if self.center in u.recs else u.richest()
+        if rid is None:
+            self.cv.itemconfigure(self.t_notice, text=tr("The base has no records yet."))
+            return
+        if trail and self.center and rid != self.center:
+            self.back.append(self.center)
+            self.ahead.clear()
+        self.center, self.hover = rid, None
+        seen = [(o, c) for o, c in u.perceive(rid) if self.fits(o)]
+        seen = seen[:MONAD_SHOWN[self.breadth]]
+        top = seen[0][1] if seen else 1.0
+        sides = {}
+        for o, c in seen:
+            sides.setdefault(next(iter(u.shared(rid, o)), ""), []).append((o, c))
+        ranked = sorted(sides.values(), key=lambda g: -sum(c for _o, c in g))
+        order = [row for group in ranked for row in group]
+        place = {o: i for i, (o, _c) in enumerate(seen)}
+        goal = {rid: (0.0, 0.0, self.CENTRE_R, 1.0)}
+        for i, (o, c) in enumerate(order):
+            k = c / top
+            a = 2 * math.pi * i / len(order) - math.pi / 2
+            rho = 0.34 + 0.62 * (place[o] / max(1, len(order) - 1)) ** 0.8
+            goal[o] = (rho * math.cos(a), rho * math.sin(a), 7 + 13 * k, k)
+        for n, m in self.m.items():
+            m["from"] = (m["x"], m["y"], m["r"])
+            m["gone"] = n not in goal
+            if m["gone"]:
+                m["to"] = (m["x"] * 1.6, m["y"] * 1.6, 0.0)
+        for n, (x, y, r, k) in goal.items():
+            m = self.m.get(n) or self.add_monad(n, x * 1.9, y * 1.9)
+            m["to"], m["k"] = (x, y, r), k
+        halt(self.cv, self.fill)
+        self.goal, self.todo = goal, [n for n in goal if n != rid]
+        self.mirror(rid)
+        self.cv.tag_raise(self.m[rid]["disc"])
+        self.lay_dust(order)
+        self.cv.itemconfigure(self.t_notice, text="" if order else tr(
+            "Nothing in common with the rest yet: it needs more words of its own, or a link."))
+        self.retint()
+        self.update_status()
+        tween(self.cv, self.move, MONAD_MOVE_MS, self.step, self.landed, ease_both)
+
+    def add_monad(self, n, x, y):
+        cv = self.cv
+        disc = cv.create_oval(0, 0, 0, 0, fill=PAPER, width=1, outline=self.rims[self.rim or 0],
+                              tags=("m", "rim"))
+        text = cv.create_text(0, 0, anchor="n", tags=("m",), font=self.f_label, state="hidden",
+                              text=one_liner(label_any(self.u.recs[n], self.data), 30))
+        m = self.m[n] = {"x": x, "y": y, "r": 0.0, "from": (x, y, 0.0), "gone": False,
+                         "disc": disc, "text": text, "dots": [], "k": 0.0, "q": 0.0, "s": -1}
+        return m
+
+    def mirror(self, n):
+        """The dots inside a disc: what this monad perceives among those on
+        screen, each on the side where it is."""
+        cv, m = self.cv, self.m[n]
+        for item, _t, _f in m["dots"]:
+            cv.delete(item)
+        want = 9 if n == self.center else 3
+        rows = [(o, c) for o, c in self.u.perceive(n) if o in self.goal][:want]
+        top = rows[0][1] if rows else 1.0
+        m["dots"] = [(cv.create_oval(-9, -9, -9, -9, fill=INK, outline=""), o, c / top)
+                     for o, c in rows]
+
+    def lay_dust(self, order=None):
+        """The rest of the base, at the edge: confused, not absent."""
+        cv = self.cv
+        if order is not None:
+            self.far = max(0, len(self.u.recs) - len(order) - 1)
+        w, h = cv.winfo_width(), cv.winfo_height()
+        mx, my = self.middle()
+        want = min(self.far, MONAD_DUST)
+        while len(self.dust) < want:
+            self.dust.append(cv.create_oval(-9, -9, -9, -9, fill=FAINT, outline=""))
+            cv.tag_lower(self.dust[-1])
+        rng = random.Random(self.center)       # each monad has its own sky
+        for i, item in enumerate(self.dust):
+            if i >= want:
+                cv.coords(item, -9, -9, -9, -9)
+                continue
+            a, rho = rng.uniform(0, 2 * math.pi), rng.uniform(0.9, 1.3)
+            x, y = mx + rho * (w / 2) * math.cos(a), my + rho * (h / 2) * math.sin(a)
+            cv.coords(item, x, y, x + 1.6, y + 1.6)
+
+    # ---------------------------------------------------------- drawing
+    def middle(self):
+        cv = self.cv
+        return cv.winfo_width() / 2, (cv.winfo_height() + self.TOP - self.BOTTOM) / 2
+
+    def step(self, k):
+        for m in self.m.values():
+            (x0, y0, r0), (x1, y1, r1) = m["from"], m["to"]
+            m["x"], m["y"], m["r"] = x0 + (x1 - x0) * k, y0 + (y1 - y0) * k, r0 + (r1 - r0) * k
+        if self.todo:
+            self.mirror(self.todo.pop())
+        self.draw()
+
+    def drain(self):
+        """The dots the move had no time for, one a frame: a click never waits."""
+        self.fill["job"] = None
+        if self.todo:
+            self.mirror(self.todo.pop())
+            self.draw()
+            self.fill["job"] = self.cv.after(FRAME_MS, self.drain)
+
+    def landed(self):
+        for n in [n for n, m in self.m.items() if m["gone"]]:
+            m = self.m.pop(n)
+            self.cv.delete(m["disc"], m["text"], *[d[0] for d in m["dots"]])
+        self.draw()
+        self.drain()
+
+    def draw(self):
+        cv, S = self.cv, {}
+        mx, my = self.middle()
+        rx, ry = cv.winfo_width() / 2 - 70, (cv.winfo_height() - self.TOP - self.BOTTOM) / 2 - 30
+        z, (cx, cy) = self.zoom, self.cam
+        size = min(1.6, max(0.6, z))
+        for n, m in self.m.items():
+            S[n] = (mx + m["x"] * rx * z + cx, my + m["y"] * ry * z + cy, m["r"] * size)
+        self.screen = S
+        for n, m in self.m.items():
+            x, y, r = S[n]
+            cv.coords(m["disc"], x - r, y - r, x + r, y + r)
+            cv.coords(m["text"], x, y + r + 3)
+            d = 2.2 if n == self.center else 1.5
+            for item, other, f in m["dots"]:
+                if r < 9 or other not in S:
+                    cv.coords(item, -9, -9, -9, -9)
+                    continue
+                dx, dy = S[other][0] - x, S[other][1] - y
+                far = math.hypot(dx, dy) or 1.0
+                px, py = x + dx / far * r * (0.25 + 0.55 * f), y + dy / far * r * (0.25 + 0.55 * f)
+                cv.coords(item, px - d, py - d, px + d, py + d)
+
+    def retint(self):
+        """Colours the discs as the monad under the pointer, or the one in the
+        middle, sees them, and names what it sees distinctly."""
+        view = self.hover or self.center
+        seen = {o: c for o, c in self.u.perceive(view) if o in self.m}
+        top = max(seen.values(), default=1.0)
+        for n, m in self.m.items():
+            m["q0"] = m["q"]
+            m["k"] = 1.0 if n == view else seen.get(n, 0.0) / top
+            lit = m["k"] >= 0.5
+            named = self.all_names or lit or n == self.center
+            self.cv.itemconfigure(m["text"], state="normal" if named else "hidden",
+                                  fill=INK if lit else SOFT,
+                                  font=self.f_center if n == view else self.f_label)
+        if view in self.m:
+            self.cv.tag_raise(self.m[view]["text"])
+
+        def step(k):
+            for m in self.m.values():
+                m["q"] = m["q0"] + (m["k"] - m["q0"]) * k
+                q = int(m["q"] * self.STEPS + 0.5)
+                if q != m["s"]:
+                    m["s"] = q
+                    self.cv.itemconfigure(m["disc"], fill=self.ramp[q])
+
+        tween(self.cv, self.tint, MONAD_TINT_MS, step)
+
+    def breathe(self):
+        """One clock for every rim: one change of colour, on a tag."""
+        self._breath = None
+        if self.still or not self.root.winfo_exists():
+            return
+        k = time.perf_counter() * 1000 % MONAD_BREATH_MS / MONAD_BREATH_MS
+        q = round(ease_both(abs(2 * k - 1)) * 12)
+        if q != self.rim:
+            self.rim = q
+            self.cv.itemconfigure("rim", outline=self.rims[q])
+        hidden = self.root.state() != "normal" and self.root.state() != "zoomed"
+        self._breath = self.root.after(1000 if hidden else 200, self.breathe)
+
+    def resized(self, _e=None):
+        cv = self.cv
+        w, h = cv.winfo_width(), cv.winfo_height()
+        cv.coords(self.t_left, 12, h - 6)
+        cv.coords(self.t_right, w - 12, h - 6)
+        cv.coords(self.t_notice, w / 2, h / 2 + 70)
+        cv.itemconfigure(self.t_keys, width=w - 24)
+        if self.center:
+            self.lay_dust()
+            self.draw()
+
+    def update_status(self, flash=None):
+        cv, u = self.cv, self.u
+        n = self.hover
+        if flash:
+            left = flash
+        elif n and n != self.center:
+            words = [u.term(w) for w in u.shared(self.center, n)[:5]]
+            left = tr("{name} · in common: {words}", name=label_any(u.recs[n], self.data),
+                      words=", ".join(words) if words else "—")
+        else:
+            trail = self.back[-3:] + [self.center]
+            left = " › ".join(one_liner(label_any(u.recs[t], self.data), 22)
+                              for t in trail if t in u.recs)
+        cv.itemconfigure(self.t_left, text=one_liner(left, 110))
+        kind = tr(self.kind) + " · " if self.kind != "all" else ""
+        cv.itemconfigure(self.t_right, text=kind + tr(
+            "{n} near · {far} at the edge", n=len(self.m) - 1, far=self.far))
+
+    # ---------------------------------------------------------- the hand
+    def node_at(self, x, y):
+        best, bd = None, None
+        for n, (sx, sy, r) in self.screen.items():
+            d = math.hypot(sx - x, sy - y)
+            if d <= r + 5 and not self.m[n]["gone"] and (bd is None or d < bd):
+                best, bd = n, d
+        return best
+
+    def motion(self, e):
+        n = self.node_at(e.x, e.y)
+        if n != self.hover:
+            self.hover = n
+            self.retint()
+            self.update_status()
+
+    def press(self, e):
+        self.cv.focus_set()
+        self.press_at = self.last = (e.x, e.y)
+        self.press_node, self.moved = self.node_at(e.x, e.y), False
+
+    def drag(self, e):
+        if not self.press_at:
+            return
+        if not self.moved and abs(e.x - self.press_at[0]) + abs(e.y - self.press_at[1]) < 4:
+            return
+        self.moved = True
+        self.cam[0] += e.x - self.last[0]
+        self.cam[1] += e.y - self.last[1]
+        self.last = (e.x, e.y)
+        self.draw()
+
+    def release(self, _e):
+        n = self.press_node
+        if n and not self.moved and n != self.center:
+            self.recentre(n)
+        self.press_at = self.press_node = None
+
+    def zoom_at(self, e, f):
+        z = min(3.0, max(0.4, self.zoom * f))
+        mx, my = self.middle()
+        for i, p, q in ((0, e.x, mx), (1, e.y, my)):
+            self.cam[i] = (p - q) - (p - q - self.cam[i]) * z / self.zoom
+        self.zoom = z
+        self.draw()
+
+    def walk(self, frm, to):
+        """Back and forward along the monads visited."""
+        while frm and frm[-1] not in self.u.recs:
+            frm.pop()
+        if frm:
+            to.append(self.center)
+            self.recentre(frm.pop(), trail=False)
+
+    def home(self, _e=None):
+        self.zoom, self.cam = 1.0, [0.0, 0.0]
+        self.resized()
+
+    def set_breadth(self, i):
+        self.breadth = i
+        self.recentre(self.center, trail=False)
+
+    def next_kind(self):
+        self.kind = MONAD_KINDS[(MONAD_KINDS.index(self.kind) + 1) % len(MONAD_KINDS)]
+        self.recentre(self.center, trail=False)
+
+    def toggle_names(self):
+        self.all_names = not self.all_names
+        self.retint()
+
+    def toggle_still(self):
+        self.still = not self.still
+        if not self.still and not self._breath:
+            self.breathe()
+
+    def copy_id(self):
+        rid = self.hover or self.center
+        if rid:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(rid)
+            self.update_status(flash=tr("Copied: {value}", value=rid))
+
+    def open_in_card(self, rid=None):
+        rid = rid or self.hover or self.center
+        if rid and self.on_open:
+            self.on_open(rid)
+        elif rid:
+            self.update_status(flash=tr("Read-only here: open the monads from Kustos "
+                                        "(Ctrl+Shift+M) to send records to the card."))
+
+    def follow(self, rid):
+        """The main window opened another record: the monads move to it, a
+        moment later, if it is one of them."""
+        if rid == self.center:
+            return
+        if self._follow:
+            self.root.after_cancel(self._follow)
+        self._follow = self.root.after(250, lambda: self._do_follow(rid))
+
+    def _do_follow(self, rid):
+        self._follow = None
+        if rid in self.u.recs:                  # F5 rereads what was edited since
+            self.recentre(rid)
+        elif rid and coll_of(rid) in MONAD_COLLS and rid in by_id(self.get_data()):
+            self.recentre(rid, fresh=True)
+
+    def is_open(self):
+        try:
+            return bool(self.root.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def close(self):
+        halt(self.cv, self.move)
+        halt(self.cv, self.tint)
+        halt(self.cv, self.fill)
+        for job in (self._breath, self._follow):
+            if job:
+                try:
+                    self.root.after_cancel(job)
+                except tk.TclError:
+                    pass
+        self._breath = self._follow = None
+        self.root.destroy()
+
+
+MONAD_KEYS = ("click: to the middle · double-click / Enter: open on the card · "
+              "← / →: back / forward · drag: move · wheel: zoom · Home: recentre the view · "
+              "1-3: how many · k: kind · l: all names · c: copy id · space: still · "
+              "F5: reread · Esc: close")
+
+
+def cmd_monads(open_id=None):
+    """Opens the monads by themselves, read-only."""
+    global tk, tkfont, ttk
+    try:
+        import tkinter as _tk
+        from tkinter import font as _tkfont, ttk as _ttk
+    except ImportError:
+        raise SystemExit(tr("This Python came without Tkinter. Reinstall it with tcl/tk."))
+    tk, tkfont, ttk = _tk, _tkfont, _ttk
+    load_palette((load_json().get("ui") or {}).get("theme", "paper"))
+    root = tk.Tk()
+    set_window_icon(root)
+    root.monads = MonadView(root, load_json, start_id=open_id)
     root.mainloop()
     return 0
 
@@ -14074,8 +18413,12 @@ def main():
         return cmd_graph(rest[0] if rest else None)
     if cmd == "timeline":
         return cmd_timeline(rest[0] if rest else None)
+    if cmd == "monads":
+        return cmd_monads(rest[0] if rest else None)
     if cmd == "peritia":
         return cmd_peritia(rest)
+    if cmd == "web":
+        return cmd_web(rest)
     if cmd == "migrate":
         return cmd_migrate()
     if cmd == "merge":
@@ -15212,6 +19555,8 @@ PT = {
         "Grafo de ligações",
     "Kustos · link graph (read-only)":
         "Kustos · grafo de ligações (só leitura)",
+    "Kustos · link graph":
+        "Kustos · grafo de ligações",
     "spreading glow":
         "brilho que se espalha",
     "Conway's life":
@@ -15245,11 +19590,36 @@ PT = {
     "Nothing yet at this point of the logs.":
         "Ainda nada neste ponto dos logs.",
     GRAPH_KEYS:
-        "clique: ao centro · duplo clique / Enter: abrir no cartão · botão direito: faísca (na vida: vira a célula) · arrastar: mover · roda: zoom · m: brilho / vida / parado · 1-3: profundidade · l: todos os nomes · espaço: pausa · r: sacudir · c: copiar id · p: reproduzir os logs · Home: voltar ao início · F5: reler · Esc: fechar",
+        "clique: ao centro (numa linha: suas ligações) · duplo clique / Enter: abrir no cartão · botão direito: faísca (na vida: vira a célula) · arrastar: mover · Shift+arrastar: desenhar uma ligação · ? ou k: legenda das linhas · f ou Ctrl+clique: caminho até um registro · roda: zoom · m: brilho / vida / parado · 1-3: profundidade · l: todos os nomes · espaço: pausa · r: sacudir · c: copiar id · p: reproduzir os logs · Home: voltar ao início · F5: reler · Esc: fechar",
+    GRAPH_HINT_LIFE:
+        "clique: ao centro · duplo clique: abrir · botão direito: vira a célula · arrastar: mover · Shift+arrastar: desenhar uma ligação · Ctrl+clique: caminho · roda: zoom · ?: a legenda e todas as teclas",
+    GRAPH_HINT:
+        "clique: ao centro · duplo clique: abrir · botão direito: faísca · arrastar: mover · Shift+arrastar: desenhar uma ligação · Ctrl+clique: caminho · roda: zoom · ?: a legenda e todas as teclas",
     GRAPH_REPLAY_KEYS:
         "REPRODUÇÃO DOS LOGS · espaço: pausa / continua · + / -: mais rápido / mais lento · ← / →: voltar / avançar · Home / End: início / hoje · clicar ou arrastar a linha do tempo: ir àquele momento · w: base inteira / em volta do registro · m: brilho / vida / parado · duplo clique: abrir no cartão · Esc ou p: voltar ao grafo vivo",
+    MONAD_KEYS:
+        "clique: ao centro · duplo clique / Enter: abrir no cartão · ← / →: voltar / avançar · arrastar: mover · roda: zoom · Home: recentrar a vista · 1-3: quantas · k: tipo · l: todos os nomes · c: copiar id · espaço: imóvel · F5: reler · Esc: fechar",
+    HELP_MONADS:
+        "\n  Ctrl+Shift+M    mônadas (segunda janela, só leitura): o que os registros têm em"
+        "\n                  comum sem precisar de ligação, pelas palavras que usam. Sem"
+        "\n                  linhas: quanto mais perto o disco, mais distintamente o do"
+        "\n                  centro o percebe; o resto fica como poeira na borda. Passar"
+        "\n                  sobre um disco mostra os outros do lado dele; um clique vai"
+        "\n                  até ele, ← e → voltam e avançam. Saúde e rascunhos ficam de fora.\n",
+    "Monads":
+        "Mônadas",
+    "Kustos · monads (read-only)":
+        "Kustos · mônadas (só leitura)",
+    "Nothing in common with the rest yet: it needs more words of its own, or a link.":
+        "Ainda nada em comum com o resto: precisa de mais palavras próprias, ou de uma ligação.",
+    "{name} · in common: {words}":
+        "{name} · em comum: {words}",
+    "{n} near · {far} at the edge":
+        "{n} perto · {far} na borda",
+    "Read-only here: open the monads from Kustos (Ctrl+Shift+M) to send records to the card.":
+        "Aqui é só leitura: abra as mônadas pelo Kustos (Ctrl+Shift+M) para levar registros ao cartão.",
     HELP_GRAPH:
-        "\n  Ctrl+Shift+G    grafo de ligações (segunda janela, só leitura): o registro aberto\n                  no centro, suas ligações em volta, brilhando com as edições recentes.\n                  Ele segue o registro que você abre aqui; m troca o brilho\n                  (brilho que se espalha, vida de Conway, parado), Enter abre um registro\n                  no cartão. p reproduz os logs: a base cresce na tela como cresceu,\n                  com uma linha do tempo para percorrer. As teclas estão no alto\n                  da janela.\n",
+        "\n  Ctrl+Shift+G    grafo de ligações (segunda janela): o registro aberto no centro,\n                  suas ligações em volta, brilhando com as edições recentes. Ele\n                  segue o registro que você abre aqui; os botões no alto trocam o\n                  brilho (vida de Conway, brilho que se espalha, parado) e a\n                  profundidade, Abrir (ou Enter) abre um registro no cartão,\n                  Caminho mostra como dois registros se ligam e Ligação desenha\n                  uma ligação. p reproduz os logs: a base cresce na tela como\n                  cresceu, com uma linha do tempo para percorrer. ? mostra a\n                  legenda das linhas e todas as teclas.\n",
     "drafts":
         "rascunhos",
     "Drafts":
@@ -15817,6 +20187,236 @@ PT = {
         "O Peritia abre no navegador.",
     "Peritia did not start: {why}":
         "O Peritia não abriu: {why}",
+    "Add a reading":
+        "Acrescentar leitura",
+    "Add a session":
+        "Acrescentar sessão",
+    "Add to the log":
+        "Acrescentar ao registro",
+    "All":
+        "Tudo",
+    "Body map":
+        "Mapa do corpo",
+    "Choose what to create":
+        "Escolha o que criar",
+    "Citation (ABNT)":
+        "Citação (ABNT)",
+    "Copied.":
+        "Copiado.",
+    "Copy":
+        "Copiar",
+    "Discard the changes made here?":
+        "Descartar as alterações feitas aqui?",
+    "Done: it went to the log.":
+        "Feito: foi para o registro.",
+    "Kustos is not answering. Start it again: python _kustos.py web":
+        "O Kustos não está respondendo. Abra de novo: python _kustos.py web",
+    "Kustos on the web at {url}: it stays up until stopped (Ctrl+C).":
+        "Kustos na web em {url}: fica no ar até ser parado (Ctrl+C).",
+    "Kustos on the web at {url}: it stops by itself {n} minute(s) after the page is closed.":
+        "Kustos na web em {url}: para sozinho {n} minuto(s) depois que a página é fechada.",
+    "Links":
+        "Ligações",
+    "More":
+        "Mais",
+    "New":
+        "Novo",
+    "Nothing open. Choose a record from the list.":
+        "Nada aberto. Escolha um registro na lista.",
+    "Save yours over it?":
+        "Gravar a sua versão por cima?",
+    "Saved.":
+        "Gravado.",
+    "Search":
+        "Buscar",
+    "This page is not the one Kustos opened: open it again from Kustos.":
+        "Esta página não é a que o Kustos abriu: abra de novo pelo Kustos.",
+    "This record changed on disk since it was opened (in the window, or on another machine).":
+        "Este registro mudou no disco desde que foi aberto (na janela, ou em outra máquina).",
+    "This record no longer exists.":
+        "Este registro não existe mais.",
+    "attested":
+        "atestada",
+    "reconstructed":
+        "reconstruída",
+    "file":
+        "arquivo",
+    "index, alphabetical":
+        "índice, em ordem alfabética",
+    "no such record":
+        "registro inexistente",
+    "one per line":
+        "um por linha",
+    "one per line, e.g.  cites s_…  — why":
+        "uma por linha, p. ex.  cites s_…  — motivo",
+    "one per line:  2026-08-01   what happened":
+        "uma por linha:  2026-08-01   o que aconteceu",
+    "one per line:  [ ] what  ~2026-09-10":
+        "uma por linha:  [ ] o quê  ~2026-09-10",
+    "one per line;  lang: name":
+        "um por linha;  língua: nome",
+    "register order, newest first":
+        "ordem do registro, mais novos primeiro",
+    "registered {stamp}":
+        "registrado em {stamp}",
+    "s_… of a source, or free text":
+        "s_… de uma fonte, ou texto livre",
+    "separated by commas":
+        "separadas por vírgulas",
+    "show all {n}":
+        "mostrar todos os {n}",
+    "updated {date}":
+        "atualizado em {date}",
+    "{option} needs a value":
+        "{option} precisa de um valor",
+    "Graph":
+        "Grafo",
+    "Open":
+        "Abrir",
+    "Pause":
+        "Pausar",
+    "Play":
+        "Continuar",
+    "Reseed":
+        "Semear de novo",
+    "Life":
+        "Vida",
+    "settled at generation {n}: {k} stay lit":
+        "assentou na geração {n}: {k} seguem acesas",
+    "died out at generation {n}":
+        "apagou-se na geração {n}",
+    "Reseed to start again":
+        "Semear de novo para recomeçar",
+    "r: start again":
+        "r: recomeçar",
+    "Path to:":
+        "Caminho até:",
+    "{a} ⇢ {b}":
+        "{a} ⇢ {b}",
+    "Esc: back to the graph":
+        "Esc: voltar ao grafo",
+    "Path":
+        "Caminho",
+    "How are they related?":
+        "Como se ligam?",
+    "From":
+        "De",
+    "To":
+        "Para",
+    "Search a record":
+        "Buscar um registro",
+    "Tap a record in the graph":
+        "Tocar num registro do grafo",
+    "Tap the record to reach.":
+        "Toque no registro a alcançar.",
+    "No chain of links joins them.":
+        "Nenhuma cadeia de ligações os une.",
+    "{k} link(s) apart · {n} chain(s)":
+        "a {k} ligação(ões) · {n} cadeia(s)",
+    "Details":
+        "Detalhes",
+    "Chain {i} of {n}":
+        "Cadeia {i} de {n}",
+    "A “{rel}” link does not fit these two records.":
+        "Uma ligação “{rel}” não cabe entre estes dois registros.",
+    "double-click: open where it comes from, on the card · Esc: close":
+        "duplo clique: abrir de onde parte, no cartão · Esc: fechar",
+    "Read-only here: open the graph from Kustos (Ctrl+Shift+G) to draw links.":
+        "Só leitura aqui: abra o grafo pelo Kustos (Ctrl+Shift+G) para desenhar ligações.",
+    "Link saved: {a} {rel} {b}":
+        "Ligação gravada: {a} {rel} {b}",
+    "Link":
+        "Ligação",
+    "New link":
+        "Nova ligação",
+    "Change link":
+        "Mudar ligação",
+    "Type":
+        "Tipo",
+    "Reason":
+        "Motivo",
+    "Span":
+        "Período",
+    "Swap direction":
+        "Inverter o sentido",
+    "Another link between them":
+        "Outra ligação entre os dois",
+    "no reason or source":
+        "sem motivo nem fonte",
+    "written {date}":
+        "escrita em {date}",
+    "atypical type":
+        "tipo atípico",
+    "Link saved.":
+        "Ligação gravada.",
+    "Link deleted.":
+        "Ligação apagada.",
+    "Delete this link?":
+        "Apagar esta ligação?",
+    "Draw a link":
+        "Desenhar uma ligação",
+    "Drag from one record to another to link them.":
+        "Arraste de um registro a outro para ligá-los.",
+    "Key":
+        "Legenda",
+    "Search the links":
+        "Buscar nas ligações",
+    "Needs a reason":
+        "Falta motivo",
+    "Atypical":
+        "Atípicas",
+    "other type…":
+        "outro tipo…",
+    "one word, e.g. inspired_by":
+        "uma palavra, p. ex. inspired_by",
+    "1609, 1618/1648, -800/400":
+        "1609, 1618/1648, -800/400",
+    "What a line shows":
+        "O que uma linha mostra",
+    "colour: its family":
+        "cor: a família",
+    "with a reason or a source":
+        "com motivo ou fonte",
+    "without either: needs a reason":
+        "sem nenhum dos dois: falta motivo",
+    "a type outside the list (atypical)":
+        "um tipo fora da lista (atípico)",
+    "thick where it comes from":
+        "grossa de onde parte",
+    "written recently":
+        "escrita há pouco",
+    "written long ago":
+        "escrita há muito",
+    "lit, in life":
+        "acesa, na vida",
+    "Open {name}":
+        "Abrir {name}",
+    "This link changed since it was opened.":
+        "Esta ligação mudou desde que foi aberta.",
+    "The other record no longer exists.":
+        "O outro registro não existe mais.",
+    "A link needs two different records.":
+        "Uma ligação precisa de dois registros diferentes.",
+    "A link needs a type.":
+        "Uma ligação precisa de um tipo.",
+    "A reason cannot contain #.":
+        "Um motivo não pode conter #.",
+    "A span is a year or two: 1609, 1618/1648, -800/400.":
+        "Um período é um ano ou dois: 1609, 1618/1648, -800/400.",
+    "This link already exists.":
+        "Esta ligação já existe.",
+    "Glow":
+        "Brilho",
+    "Still":
+        "Parado",
+    "Names":
+        "Nomes",
+    "born {b} · died {d}":
+        "nasceram {b} · morreram {d}",
+    "tap: to the middle · tap the middle: open · hold: flip the cell · drag: move · pinch or wheel: zoom":
+        "toque: ao centro · toque no centro: abrir · segure: inverte a célula · arraste: mover · pinça ou roda: zoom",
+    "tap: to the middle · tap the middle: open · hold: spark · drag: move · pinch or wheel: zoom":
+        "toque: ao centro · toque no centro: abrir · segure: faísca · arraste: mover · pinça ou roda: zoom",
 }
 
 if __name__ == "__main__":
