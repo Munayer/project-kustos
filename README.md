@@ -104,9 +104,11 @@ updating of files and conflicts if used any syncing app or cloud sync.
   The menu opens the health report and the body map.
   The **link graph** is there too (*Graph* on a record, or *Link graph* in the
   menu): the same records, shapes and springs as the window's, with Conway's
-  life first — a lit record fills with the accent and swells, its links to
-  other lit records thicken, a birth rings outward, a death fades with a rust
-  edge, and a small line in the corner follows how many are lit. Tap a record
+  life first — a lit record fills with the accent and its links to other lit
+  records thicken, and a small line in the corner follows how many are lit.
+  It runs calmer than the window's: a generation every 1.2 s, and when the
+  pattern dies out or settles it stops there, the survivors still lit, until
+  *Reseed* (or holding a record) starts it again. Tap a record
   to bring it to the middle, tap the middle to open it, hold one to flip its
   cell, pinch or scroll to zoom; *Life / Glow / Still* and the depth 1–3 sit
   above it. (The replay of the logs is still only in the window.)

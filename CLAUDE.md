@@ -80,7 +80,9 @@ Ideas that span several sections:
   drive the page in a headless browser. The page's link graph gets its records
   from `web_graph` (`graph_adjacency`, `graph_ego`, as the window) and draws
   them itself; its life, glow and still rules are the window's `GraphView`
-  ones rewritten in JavaScript, so a change to one belongs in the other.
+  ones rewritten in JavaScript, so a change to one belongs in the other. Two
+  differences are on purpose: the page's generations are slower, and its life
+  stops when the pattern settles instead of reseeding at random.
 - **Long texts are markdown**: `textfield(..., pages=True)` (every NOTES and the
   draft's text) gets `MarkdownKeys`, and `fit(opening=True)` paints it before
   the pages are measured. The text stored stays plain.

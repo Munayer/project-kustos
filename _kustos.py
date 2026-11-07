@@ -5847,6 +5847,7 @@ WEB_STRINGS = (
     "No links yet: write them in the card's LINKS field, one per line.",
     "tap: to the middle · tap the middle: open · hold: flip the cell · drag: move · pinch or wheel: zoom",
     "tap: to the middle · tap the middle: open · hold: spark · drag: move · pinch or wheel: zoom",
+    "settled at generation {n}: {k} stay lit", "died out at generation {n}", "Reseed to start again",
 )
 
 
@@ -6734,6 +6735,7 @@ textarea.prose { font: 17px/1.55 var(--serif); min-height: 10em; }
 .readings .v { font: 600 15px var(--mono); white-space: nowrap; }
 .spark { width: 100%; height: 64px; display: block; margin-bottom: 6px; }
 .st-out { color: var(--warn); font-weight: 700; } .st-near { color: var(--soft); font-style: italic; }
+.changed { box-shadow: inset 3px 0 0 var(--accent); padding-left: 12px; }
 .foot { margin-top: 28px; font: 12px var(--mono); color: var(--faint); }
 .empty { padding: 48px 16px; color: var(--faint); text-align: center; }
 .sheet { position: fixed; inset: 0; z-index: 10; background: rgba(0, 0, 0, .35); display: grid; align-items: end; }
@@ -7002,14 +7004,14 @@ function goItem(a, relFirst) {
   return `<li><button class="go" data-act="open" data-id="${esc(a.id)}"${a.missing ? " disabled" : ""}>` +
     (relFirst ? rel + label : label + " " + rel) + (why ? `<span class="why">${esc(why)}</span>` : "") + `</button></li>`;
 }
-function renderRecord() {
+function renderRecord(changed) {
   const r = S.rec;
   if (!r) return showEmpty();
-  const f = r.form, out = [];
+  const f = r.form, out = [], ch = new Set(changed || []);
   document.title = r.title + " · Kustos";
   const kicker = [r.kind_label, r.n ? "nº " + r.n : T("not registered"),
                   r.reg ? T("registered {stamp}", {stamp: r.reg}) : ""].filter(Boolean).join(" · ");
-  out.push(`<div class="kicker">${esc(kicker)}</div><h1 class="title">${esc(r.title)}</h1>`);
+  out.push(`<div class="kicker">${esc(kicker)}</div><h1 class="title${ch.has("name") ? " changed" : ""}">${esc(r.title)}</h1>`);
   if (r.facts && r.facts.length) out.push(`<div class="sub">${esc(r.facts.join(" · "))}</div>`);
   const quick = {person: ["interactions", "Add to the log"], measure: ["readings", "Add a reading"],
                  activity: ["sessions", "Add a session"]}[r.kind];
@@ -7019,39 +7021,41 @@ function renderRecord() {
   const flush = () => { if (facts.length) out.push(`<div class="facts">${facts.join("")}</div>`); facts.length = 0; };
   for (const fd of BOOT.fields[r.coll]) {
     if (fd.k === "name" || fd.k === "edges" || !visible(fd, r.coll, r.kind, f)) continue;
-    const v = f[fd.k], label = short(fd.label);
+    const v = f[fd.k], label = short(fd.label), m = ch.has(fd.k);
+    const put = h => out.push(m ? h.replace('class="sec"', 'class="sec changed"') : h);
     if (fd.w === "circles") {
-      if (v && v.length) { flush(); out.push(sec(label, `<div class="chips">${v.map(c => `<span class="chip">${esc(optLabel(fd, c))}</span>`).join("")}</div>`)); }
+      if (v && v.length) { flush(); put(sec(label, `<div class="chips">${v.map(c => `<span class="chip">${esc(optLabel(fd, c))}</span>`).join("")}</div>`)); }
       continue;
     }
     if (v == null || v === "") continue;
     const linked = fd.k === "source" && r.source && r.source.id;
     if ((fd.w === "line" || fd.w === "choice") && !linked && !["tags", "domains"].includes(fd.k) && String(v).length <= 48) {
-      facts.push(`<div><span class="lbl">${esc(label)}</span><div class="val">${esc(fd.w === "choice" ? optLabel(fd, v) : v)}</div></div>`);
+      facts.push(`<div${m ? ' class="changed"' : ""}><span class="lbl">${esc(label)}</span><div class="val">${esc(fd.w === "choice" ? optLabel(fd, v) : v)}</div></div>`);
       continue;
     }
     flush();
-    if (fd.k === "tasks") out.push(sec(label, tasksHtml(r)));
-    else if (fd.k === "interactions") out.push(sec(label, logHtml(r.log, "interactions")));
-    else if (fd.k === "sessions") out.push(sec(label, logHtml(r.sessions, "sessions")));
-    else if (fd.k === "readings") out.push(sec(label, readingsHtml(r)));
-    else if (fd.w === "md") out.push(sec(label, `<div class="md">${r.html[fd.k] || ""}</div>`));
+    if (fd.k === "tasks") put(sec(label, tasksHtml(r)));
+    else if (fd.k === "interactions") put(sec(label, logHtml(r.log, "interactions")));
+    else if (fd.k === "sessions") put(sec(label, logHtml(r.sessions, "sessions")));
+    else if (fd.k === "readings") put(sec(label, readingsHtml(r)));
+    else if (fd.w === "md") put(sec(label, `<div class="md">${r.html[fd.k] || ""}</div>`));
     else if (fd.k === "tags" || fd.k === "domains") {
       const op = fd.k === "tags" ? "tag:" : "dom:";
-      out.push(sec(label, `<div class="chips">${v.split(",").map(t => t.trim()).filter(Boolean).map(t =>
+      put(sec(label, `<div class="chips">${v.split(",").map(t => t.trim()).filter(Boolean).map(t =>
         `<button class="chip" data-act="q" data-q="${esc(op + t.replace(/\s+/g, ""))}">${esc(t)}</button>`).join("")}</div>`));
     } else if (fd.k === "source" && r.source && r.source.id) {
-      out.push(sec(label, `<ul class="links">${goItem({id: r.source.id, title: r.source.title, rel: ""}, false)}</ul>`));
+      put(sec(label, `<ul class="links">${goItem({id: r.source.id, title: r.source.title, rel: ""}, false)}</ul>`));
     } else if (fd.k === "links") {
-      out.push(sec(label, `<div class="val">${v.split("\n").map(u => /^https?:\/\//i.test(u)
+      put(sec(label, `<div class="val">${v.split("\n").map(u => /^https?:\/\//i.test(u)
         ? `<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(u)}</a>` : esc(u)).join("<br>")}</div>`));
-    } else if (fd.w === "choice") out.push(sec(label, `<div class="val">${esc(optLabel(fd, v))}</div>`));
-    else out.push(sec(label, `<div class="val${fd.w === "text" ? " mono" : ""}">${esc(v)}</div>`));
+    } else if (fd.w === "choice") put(sec(label, `<div class="val">${esc(optLabel(fd, v))}</div>`));
+    else put(sec(label, `<div class="val${fd.w === "text" ? " mono" : ""}">${esc(v)}</div>`));
   }
   flush();
   if (r.cite) out.push(sec(T("Citation (ABNT)"), `<div class="cite">${esc(r.cite)}</div>` +
     `<button class="btn quiet" data-act="copy">${esc(T("Copy"))}</button>`));
-  if (r.out.length) out.push(sec(T("Links"), `<ul class="links">${r.out.map(a => goItem(a, true)).join("")}</ul>`));
+  if (r.out.length) out.push(sec(T("Links"), `<ul class="links">${r.out.map(a => goItem(a, true)).join("")}</ul>`)
+    .replace('class="sec"', ch.has("edges") ? 'class="sec changed"' : 'class="sec"'));
   if (r.in.length) out.push(sec(T("Cited by"), `<ul class="links">${r.in.map(a => goItem(a, false)).join("")}</ul>`));
   const foot = [r.id, r.updated ? T("updated {date}", {date: r.updated}) : "",
                 r.coll === "notes" ? T("file") + ": " + (r.file || T("(the file is made on saving)")) : ""];
@@ -7102,11 +7106,13 @@ function revisible() {
     if (box) box.hidden = !visible(fd, r.coll, r.kind, S.edit);
   }
 }
+function toTop() { window.scrollTo(0, 0); $("#recpane").scrollTop = 0; }
 function startEdit() {
   if (!S.rec) return;
   S.edit = JSON.parse(JSON.stringify(S.rec.form));
   S.dirty = false;
   renderEdit();
+  toTop();
 }
 function startNew(coll, kind) {
   if (!BOOT.fields[coll]) return go("");
@@ -7133,10 +7139,15 @@ async function save(force) {
   try {
     const j = await api("api/save", {coll: r.coll, kind: r.kind, id: r.id || null, base: r.base,
                                       opened: r.opened || "", form: S.edit, force: !!force});
+    const before = r.id ? r.form : null;
     S.dirty = false; S.edit = null; S.rec = j.record; S.sel = j.record.id;
     history.replaceState(null, "", "#r/" + encodeURIComponent(j.record.id));
     here = location.hash;
-    renderRecord();
+    const changed = before ? Object.keys(j.record.form).filter(k =>
+      JSON.stringify(j.record.form[k]) !== JSON.stringify(before[k])) : [];
+    renderRecord(changed);
+    const first = $(".card .changed");
+    if (first) first.scrollIntoView({block: "center"}); else toTop();
     toast(j.message || T("Saved."));
     loadList(false, true);
   } catch (e) {
@@ -7204,15 +7215,19 @@ function menuSheet() {
    first here: a lit record stays lit with 2 or 3 lit neighbours, a dark one
    lights with exactly 3, the links being the neighbourhood; when the pattern
    dies or freezes it is seeded again, the recently edited records more often.
-   As in the window, a lit record fills with the accent and its links thicken;
-   here a birth also rings outward, a death fades with a rust edge, and the
-   corner traces how many are lit, generation by generation. */
-const G = {on: false, mode: "life", depth: 2, paused: false, names: false, nodes: {}, ids: [], links: [],
+   As in the window, a lit record fills with the accent and its links thicken,
+   and the corner traces how many are lit, generation by generation. Unlike the
+   window, a generation lasts 1.2 s and the run stops when the pattern dies out
+   or settles (a still life, a blinker), leaving the survivors lit, instead of
+   reseeding at random: Reseed, or holding a record, starts it again. With
+   reduced motion asked for, the graph opens still. */
+const G = {on: false, settled: false,
+           mode: matchMedia("(prefers-reduced-motion: reduce)").matches ? "still" : "life", depth: 2, paused: false, names: false, nodes: {}, ids: [], links: [],
            adj: {}, center: null, hover: null, cam: [0, 0], goal: [0, 0], zoom: 1, fit: true, temp: 0,
            frame: 0, gen: 0, stale: 0, history: [], born: 0, died: 0, pop: [], acc: 0, last: 0, raf: 0,
            C: null, ctx: null, w: 0, h: 0, dpr: 1, ptr: new Map(), press: null, pinch: null, hold: 0,
            dragging: null, said: ""};
-const LINK = 90, TICK = 40, GEN_TICKS = 15, SPARK_TICKS = 30, GTOP = 26;
+const LINK = 90, TICK = 40, GEN_TICKS = 30, SPARK_TICKS = 30, GTOP = 26;
 const GMODES = [["life", "Conway's life", "Life"], ["glow", "spreading glow", "Glow"], ["still", "still", "Still"]];
 
 function gColors() {
@@ -7298,8 +7313,7 @@ function gLoad(d) {
       const p = nodes[n.parent], a = Math.random() * 2 * Math.PI, r = LINK * (0.4 + 0.5 * Math.random());
       x = p.x + r * Math.cos(a); y = p.y + r * Math.sin(a);
     }
-    nodes[n.id] = Object.assign({}, n, {x, y, heat: prev ? prev.heat : n.rec * 0.3, lit: prev ? prev.lit : false,
-                                        ring: 0, die: 0});
+    nodes[n.id] = Object.assign({}, n, {x, y, heat: prev ? prev.heat : n.rec * 0.3, lit: prev ? prev.lit : false});
   }
   if (c && nodes[c]) { nodes[c].x = 0; nodes[c].y = 0; }
   G.cam = [G.cam[0] - o[0], G.cam[1] - o[1]];
@@ -7325,6 +7339,7 @@ function gButtons() {
   pause.setAttribute("aria-label", G.paused ? T("Play") : T("Pause"));
   pause.title = pause.getAttribute("aria-label");
   $("#gseed").hidden = G.mode !== "life";
+  $("#gseed").classList.toggle("primary", G.mode === "life" && G.settled);
   $("#gnames").setAttribute("aria-pressed", String(G.names));
   $("#ghint").textContent = G.mode === "life"
     ? T("tap: to the middle · tap the middle: open · hold: flip the cell · drag: move · pinch or wheel: zoom")
@@ -7336,7 +7351,12 @@ function gStatus(force) {
   let state = T(GMODES.find(m => m[0] === G.mode)[1]);
   if (G.mode === "life") {
     state += " · " + T("generation {n}, {k} lit", {n: G.gen, k: G.ids.filter(n => G.nodes[n].lit).length});
-    if (G.gen) state += " · " + T("born {b} · died {d}", {b: G.born, d: G.died});
+    if (G.settled) {
+      const k = G.ids.filter(n => G.nodes[n].lit).length;
+      state = T("Conway's life") + " · " + (k ? T("settled at generation {n}: {k} stay lit", {n: G.gen, k})
+                                               : T("died out at generation {n}", {n: G.gen}))
+              + " · " + T("Reseed to start again");
+    } else if (G.gen) state += " · " + T("born {b} · died {d}", {b: G.born, d: G.died});
   }
   if (G.paused) state += " · " + T("paused");
   state += " · " + T("{n} records, {k} links", {n: G.ids.length, k: G.links.length}) + ", " + T("depth {d}", {d: G.depth});
@@ -7348,9 +7368,11 @@ function gStatus(force) {
 
 /* the rules, as in the window */
 function gSeed() {
-  for (const n of G.ids) { const r = G.nodes[n]; r.lit = Math.random() < 0.35 + 0.5 * r.rec; r.ring = r.die = 0; }
+  for (const n of G.ids) { const r = G.nodes[n]; r.lit = Math.random() < 0.35 + 0.5 * r.rec; }
   G.gen = G.stale = G.born = G.died = 0;
   G.history = []; G.pop = [];
+  G.settled = false;
+  if (G.on) gButtons();
 }
 function gGeneration() {
   const N = G.nodes, next = {};
@@ -7360,8 +7382,8 @@ function gGeneration() {
     next[n] = N[n].lit ? (k === 2 || k === 3) : k === 3;
   }
   for (const n of G.ids) {
-    if (next[n] && !N[n].lit) { born++; N[n].ring = 1; }
-    if (!next[n] && N[n].lit) { died++; N[n].die = 1; }
+    if (next[n] && !N[n].lit) born++;
+    if (!next[n] && N[n].lit) died++;
     N[n].lit = next[n];
   }
   const state = G.ids.filter(n => next[n]).sort().join(" ");
@@ -7369,7 +7391,7 @@ function gGeneration() {
   G.history = G.history.concat([state]).slice(-2);       // still lifes and blinkers
   G.gen++; G.born = born; G.died = died;
   G.pop = G.pop.concat([G.ids.length ? state.split(" ").filter(Boolean).length / G.ids.length : 0]).slice(-60);
-  if (G.stale >= 3) gSeed();
+  if (G.stale >= 3) { G.settled = true; gButtons(); }    // the window reseeds here; the page rests
 }
 function gHeat() {
   const N = G.nodes;
@@ -7387,8 +7409,8 @@ function gHeat() {
       N[G.ids[i]].heat = 1;
     }
   } else if (G.mode === "life") {
-    if (G.frame % GEN_TICKS === 0) gGeneration();
-    for (const n of G.ids) N[n].heat += ((N[n].lit ? 1 : 0) - N[n].heat) * 0.25;
+    if (!G.settled && G.frame % GEN_TICKS === 0) gGeneration();
+    for (const n of G.ids) N[n].heat += ((N[n].lit ? 1 : 0) - N[n].heat) * 0.12;
   } else {
     for (const n of G.ids) N[n].heat += (N[n].rec - N[n].heat) * 0.1;
   }
@@ -7432,7 +7454,6 @@ function gTick() {
   G.cam[1] += (G.goal[1] - G.cam[1]) * 0.18;
   if (G.fit && G.ids.length) gFit();
   if (!G.paused) gHeat();
-  for (const n of G.ids) { const r = G.nodes[n]; r.ring = Math.max(0, r.ring - 0.06); r.die = Math.max(0, r.die - 0.05); }
 }
 function gLoop(t) {
   if (!G.on) return;
@@ -7452,8 +7473,7 @@ function gScreen(n) {
 }
 function gRadius(n) {
   const p = G.nodes[n], r = n === G.center ? 9 : (p.dist === 1 ? 6.5 : 5);
-  return r * Math.min(1.5, Math.max(0.7, G.zoom)) * (G.w < 600 ? 1.3 : 1) *
-         (G.mode === "life" ? 1 + 0.35 * p.heat : 1);
+  return r * Math.min(1.5, Math.max(0.7, G.zoom)) * (G.w < 600 ? 1.3 : 1);
 }
 function gShape(ctx, kind, x, y, r) {
   ctx.beginPath();
@@ -7502,16 +7522,10 @@ function gDraw() {
   }
   for (const n of G.ids) {
     const [x, y] = S[n], r = gRadius(n), p = N[n];
-    if (p.ring > 0) {            // a birth rings outward
-      ctx.strokeStyle = C.accent; ctx.globalAlpha = p.ring; ctx.lineWidth = 1.5;
-      ctx.beginPath(); ctx.arc(x, y, r * 1.4 + (1 - p.ring) * 16, 0, 2 * Math.PI); ctx.stroke();
-      ctx.globalAlpha = 1;
-    }
     gShape(ctx, p.kind, x, y, r);
     ctx.fillStyle = mix(C.paper, C.accent, p.heat);
     ctx.fill();
     if (n === G.center) { ctx.strokeStyle = C.warn; ctx.lineWidth = 2; }
-    else if (p.die > 0) { ctx.strokeStyle = mix(C.faint, C.warn, p.die); ctx.lineWidth = 1 + p.die; }
     else { ctx.strokeStyle = mix(C.faint, C.accent, p.heat); ctx.lineWidth = 1; }
     ctx.stroke();
     if (n === G.hover) {
@@ -7565,8 +7579,8 @@ function gTouch(n) {
   if (!p) return;
   if (G.mode === "life") {
     p.lit = !p.lit;
-    if (p.lit) p.ring = 1; else p.die = 1;
     G.stale = 0;
+    if (G.settled) { G.settled = false; gButtons(); }    // a hand on it starts the run again
   } else p.heat = 1;
   if (navigator.vibrate) { try { navigator.vibrate(12); } catch (e) { /* not allowed here */ } }
 }
@@ -17889,6 +17903,12 @@ PT = {
         "Semear de novo",
     "Life":
         "Vida",
+    "settled at generation {n}: {k} stay lit":
+        "assentou na geração {n}: {k} seguem acesas",
+    "died out at generation {n}":
+        "apagou-se na geração {n}",
+    "Reseed to start again":
+        "Semear de novo para recomeçar",
     "Glow":
         "Brilho",
     "Still":
