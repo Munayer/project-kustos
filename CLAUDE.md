@@ -61,7 +61,12 @@ Ideas that span several sections:
 - **The register**: every record has a `reg` stamp and a `reg_n` number that
   never changes and is never reused (see the comment at `# ==== register`).
 - **Links** live in a top-level `edges` list (`from`, `to`, `rel`), not inside
-  records; `RELS` defines the types.
+  records; `RELS` defines the types. `write_link` adds, changes or removes one
+  link as a save of the record it comes from (the web page and the window's
+  graph both write through it; it refuses a RELS type that does not fit the two
+  records, as the doctor would). What a line shows -- family colour, age from
+  the logs (`edge_times`, cached), stroke by evidence, taper by direction -- is
+  `link_facts`, shared by both graphs.
 - **Peritia** (`# ==== peritia`): the skills panel is a page served by
   `cmd_peritia` on 127.0.0.1 (a token in the page, the Host header checked),
   from the template `PERITIA_HTML` (strings as `@@English@@`, translated by

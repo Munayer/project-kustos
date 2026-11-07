@@ -5848,6 +5848,15 @@ WEB_STRINGS = (
     "tap: to the middle · tap the middle: open · hold: flip the cell · drag: move · pinch or wheel: zoom",
     "tap: to the middle · tap the middle: open · hold: spark · drag: move · pinch or wheel: zoom",
     "settled at generation {n}: {k} stay lit", "died out at generation {n}", "Reseed to start again",
+    "Links", "Link", "New link", "Change link", "Type", "Reason", "Source", "Span", "Swap direction",
+    "Another link between them", "no reason or source", "written {date}", "atypical type",
+    "Link saved.", "Link deleted.", "Delete this link?", "Draw a link",
+    "Drag from one record to another to link them.", "Key", "Search the links",
+    "Needs a reason", "Atypical", "other type…", "one word, e.g. inspired_by",
+    "1609, 1618/1648, -800/400", "s_… of a source, or free text", "What a line shows",
+    "colour: its family", "with a reason or a source", "without either: needs a reason",
+    "a type outside the list (atypical)", "thick where it comes from", "written recently",
+    "written long ago", "lit, in life", "Open {name}",
 )
 
 
@@ -6329,10 +6338,131 @@ def web_graph(data, rid, depth=2):
               "dist": d, "parent": parent, "rec": round(recency(idx[n], now), 4),
               "n": idx[n].get("reg_n") or 0}
              for n, (d, parent) in ego.items()]
-    links = [{"a": a, "b": b, "rels": [[rel_label(rel), f] for rel, f in rels]}
+    pairs, times, stamp = link_index(data), edge_times(), now.timestamp()
+    links = [{"a": a, "b": b, "rels": [[rel_label(rel), f] for rel, f in rels],
+              "f": link_facts(pairs.get((a, b), []), times, stamp)}
              for a in ego for b, rels in adj.get(a, {}).items() if b in ego and a < b]
     return {"center": rid, "depth": depth, "nodes": nodes, "links": links,
             "records": len(idx)}
+
+
+def web_link_details(data, a, b):
+    """Everything a link card shows: the two records, every link between them
+    (both ways) and the types that fit each direction."""
+    idx = by_id(data)
+    if a not in idx or b not in idx:
+        return None
+    times = edge_times()
+
+    def end(rid):
+        r = idx[rid]
+        return {"id": rid, "title": label_any(r, data), "kind": web_kind(r)}
+
+    edges = []
+    for e in data["edges"]:
+        if {e.get("from"), e.get("to")} != {a, b}:
+            continue
+        src, label = resolve_source(e.get("source"), data)
+        t = times.get((e.get("from"), e.get("to"), e.get("rel", "")))
+        edges.append({"from": e["from"], "to": e["to"], "rel": e.get("rel", ""),
+                      "label": rel_label(e.get("rel", "")), "why": e.get("why", ""),
+                      "source": e.get("source", ""), "source_label": label if e.get("source") else "",
+                      "source_id": src["id"] if src else "", "when": e.get("when", ""),
+                      "atypical": e.get("rel") not in RELS,
+                      "written": datetime.fromtimestamp(t).date().isoformat() if t else ""})
+    rels = {}
+    for f, t in ((a, b), (b, a)):
+        rels[f"{f} {t}"] = [[r, rel_label(r)] for r in typical_rels(idx[f], idx[t])]
+    return {"a": end(a), "b": end(b), "edges": edges, "rels": rels}
+
+
+EDGE_WHEN = re.compile(r"-?\d{1,4}(?:/-?\d{0,4})?")
+
+
+def write_link(a, b, rel="", why="", source="", when="", old=None, delete=False):
+    """Adds, changes or removes ONE link, as a change of the record it comes
+    from: its links are reread, the one named by `old` ({rel, to}) is replaced
+    or removed, and the record is saved with save_record. The web page and the
+    window's graph both write links here. Returns the vault; ValueError for
+    what cannot be saved, WebConflict when the link changed meanwhile."""
+    b = norm_ref(b or "")
+    data = load_json()
+    idx = by_id(data)
+    if a not in idx:
+        raise WebConflict(tr("This record no longer exists."))
+    edges = edges_from(data, a)
+    at = len(edges)
+    if old is not None:
+        at = next((i for i, e in enumerate(edges)
+                   if e.get("rel") == old.get("rel") and e.get("to") == old.get("to")), None)
+        if at is None:
+            raise WebConflict(tr("This link changed since it was opened."))
+        edges.pop(at)
+    if not delete:
+        if b not in idx:
+            raise ValueError(tr("The other record no longer exists."))
+        if a == b:
+            raise ValueError(tr("A link needs two different records."))
+        rel = "_".join(str(rel or "").strip().lower().split())
+        if not rel or not re.fullmatch(r"[^\s#—]+", rel):
+            raise ValueError(tr("A link needs a type."))
+        why = " ".join(str(why or "").split())
+        source = " ".join(str(source or "").split())
+        when = "".join(str(when or "").split())
+        if "#" in why:
+            raise ValueError(tr("A reason cannot contain #."))
+        if when and not EDGE_WHEN.fullmatch(when):
+            raise ValueError(tr("A span is a year or two: 1609, 1618/1648, -800/400."))
+        if any(e.get("rel") == rel and e.get("to") == b for e in edges):
+            raise ValueError(tr("This link already exists."))
+        kept = old is not None and old.get("rel") == rel and old.get("to") == b
+        if rel in RELS and not kept and rel not in typical_rels(idx[a], idx[b]):
+            # what the doctor would call an error is not written (an old link keeps its type)
+            raise ValueError(tr("A “{rel}” link does not fit these two records.", rel=rel_label(rel)))
+        edges.insert(at, {"from": a, "rel": rel, "to": b, "when": when, "why": why,
+                          "source": source,
+                          "certainty": "established" if rel in RELS else "atypical"})
+    rec = {k: v for k, v in idx[a].items() if not k.startswith("_")}
+    touch(rec)
+    return save_record(coll_of(a), rec, edges=edges)
+
+
+def web_link(body):
+    """A link from the page (see write_link)."""
+    old = body.get("old") if isinstance(body.get("old"), dict) else None
+    return write_link(str(body.get("from") or ""), str(body.get("to") or ""), body.get("rel"),
+                      body.get("why"), body.get("source"), body.get("when"), old,
+                      body.get("delete") is True)
+
+
+def web_link_list(data, q="", which="", offset=0, limit=WEB_ROWS):
+    """Every link, as a list: what it joins, its type and its reason. `which`
+    narrows it to the links that need a reason or have an atypical type."""
+    idx = by_id(data)
+    words = [w for w in (q or "").lower().split() if w]
+    rows = []
+    for e in data["edges"]:
+        f, t = e.get("from"), e.get("to")
+        if f not in idx or t not in idx:
+            continue
+        founded = bool((e.get("why") or "").strip() or (e.get("source") or "").strip())
+        atypical = e.get("rel") not in RELS
+        if which == "unfounded" and founded or which == "atypical" and not atypical:
+            continue
+        row = {"a": f, "b": t, "from": label_any(idx[f], data), "to": label_any(idx[t], data),
+               "rel": e.get("rel", ""), "label": rel_label(e.get("rel", "")),
+               "why": e.get("why", ""), "founded": founded, "atypical": atypical,
+               "family": REL_FAMILY.get(e.get("rel"), "other")}
+        hay = " ".join((row["from"], row["to"], row["rel"], row["label"], row["why"],
+                        e.get("source", ""))).lower()
+        if all(w in hay for w in words):
+            rows.append(row)
+    rows.sort(key=lambda r: (sort_key(r["from"]), r["rel"], sort_key(r["to"])))
+    return {"total": len(rows), "offset": offset, "rows": rows[offset:offset + limit],
+            "counts": {"all": len(data["edges"]),
+                       "unfounded": sum(1 for e in data["edges"] if not (
+                           (e.get("why") or "").strip() or (e.get("source") or "").strip())),
+                       "atypical": sum(1 for e in data["edges"] if e.get("rel") not in RELS)}}
 
 
 def web_boot(token):
@@ -6345,6 +6475,7 @@ def web_boot(token):
             "new": [["people", "person"], ["entries", "concept"], ["entries", "form"],
                     ["sources", "source"], ["corpus", "measure"], ["corpus", "medication"],
                     ["corpus", "activity"], ["corpus", "event"], ["notes", "note"]],
+            "linkColours": LINK_FAMILY_COLOUR,
             "T": {s: tr(s) for s in WEB_STRINGS}}
 
 
@@ -6366,6 +6497,7 @@ def web_page(boot, data, nonce):
     html = html.replace("@@LANG@@", "pt-BR" if LANG == "pt" else "en")
     html = html.replace("@@NONCE@@", nonce)
     # the data goes in last; <, > and & are escaped so no text can close the script
+    boot = dict(boot, mono=pal["mono_only"])     # one-colour themes draw links without families
     blob = json.dumps(boot, ensure_ascii=False)
     blob = blob.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     return html.replace("/*__BOOT__*/null", blob)
@@ -6390,6 +6522,15 @@ def web_api(method, path, query, body):
         if method == "GET" and path == "/api/record":
             got = web_record(load_json(), arg("id"))
             return (200, got) if got else (404, {"error": tr("This record no longer exists.")})
+        if method == "GET" and path == "/api/link":
+            got = web_link_details(load_json(), arg("a"), arg("b"))
+            return (200, got) if got else (404, {"error": tr("This record no longer exists.")})
+        if method == "GET" and path == "/api/links":
+            try:
+                offset = max(0, int(arg("offset", "0")))
+            except ValueError:
+                offset = 0
+            return 200, web_link_list(load_json(), arg("q"), arg("which"), offset)
         if method == "GET" and path == "/api/graph":
             try:
                 depth = int(arg("depth", "2"))
@@ -6403,9 +6544,16 @@ def web_api(method, path, query, body):
             return 200, {"record": web_record(data, rid), "message": message, "data": data}
         if path == "/api/delete":
             return 200, {"ok": True, "data": web_delete(body)}
+        if path == "/api/link":
+            data = web_link(body)
+            return 200, {"link": web_link_details(data, str(body.get("from") or ""),
+                                                  norm_ref(str(body.get("to") or ""))),
+                         "data": data}
         return 404, {"error": tr("Not found.")}
     except WebConflict as exc:
         rid = str(body.get("id") or "") if isinstance(body, dict) else ""
+        if path == "/api/link":
+            return 409, {"error": str(exc)}
         return 409, {"error": str(exc), "record": web_record(load_json(), rid) if rid else None}
     except ValueError as exc:
         return 400, {"error": str(exc)}
@@ -6664,6 +6812,7 @@ a { color: var(--accent); }
 .row[aria-current="true"] { background: var(--selbg); color: var(--selfg); }
 .row .t { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row .n { font: 12px var(--mono); color: var(--faint); white-space: nowrap; }
+.row .rel { font: 12px var(--mono); color: var(--soft); font-weight: 400; }
 .row .s { grid-column: 2 / 4; font-size: 14px; color: var(--soft); overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; }
 .row[aria-current="true"] .s, .row[aria-current="true"] .n { color: inherit; opacity: .8; }
@@ -6765,6 +6914,22 @@ textarea.prose { font: 17px/1.55 var(--serif); min-height: 10em; }
   padding-bottom: max(6px, env(safe-area-inset-bottom)); font: 12px/1.4 var(--mono); color: var(--soft);
   background: var(--wash); border-top: 1px solid var(--rule); }
 .gstatus .who { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+.gfab { position: absolute; bottom: 12px; display: flex; gap: 8px; }
+.gfab.r { right: 12px; } .gfab.l { left: 12px; }
+.gfab .btn { background: var(--paper); box-shadow: 0 1px 4px rgba(0, 0, 0, .12); }
+.gfab .btn[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--paper); }
+.lk-edge { border-top: 1px dashed var(--rule); padding: 10px 0; display: grid; gap: 4px; }
+.lk-edge .rel { font: 13px var(--mono); color: var(--soft); }
+.lk-edge .meta { font: 12px var(--mono); color: var(--faint); }
+.lk-edge .acts { display: flex; gap: 6px; justify-content: flex-end; }
+.lk-form { display: grid; gap: 6px; margin-top: 8px; }
+.lk-form .row2, .ask .row2 { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; margin-top: 8px; }
+.lk-dir { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0 4px; }
+.ask p { margin: 0 0 6px; white-space: pre-wrap; }
+.key { display: grid; grid-template-columns: 64px 1fr; gap: 8px 12px; align-items: center; margin-top: 10px; font-size: 14px; }
+.key svg { width: 64px; height: 14px; display: block; }
+#lq { width: 100%; padding: 10px 12px; font-size: 16px; border: 1px solid var(--rule); border-radius: var(--radius);
+  background: var(--paper); margin-top: 12px; -webkit-appearance: none; appearance: none; }
 @media (prefers-reduced-motion: reduce) { #toast { transition: none; } }
 </style>
 </head>
@@ -6891,6 +7056,7 @@ function route() {
   const h = decodeURIComponent(location.hash.slice(1));
   if (h.startsWith("g/")) return showGraph(h.slice(2));
   stopGraph();
+  if (h === "links") return showLinks();
   if (h.startsWith("r/")) return showRecord(h.slice(2));
   if (h.startsWith("new/")) { const p = h.split("/"); return startNew(p[1], p[2]); }
   closeRecord();
@@ -7196,7 +7362,7 @@ async function del() {
 
 /* ---------------------------------------------------------------- sheets */
 function openSheet(html) { $("#sheetPanel").innerHTML = html; $("#sheet").hidden = false; }
-function closeSheet() { $("#sheet").hidden = true; }
+function closeSheet() { $("#sheet").hidden = true; if (G.on) G.selLink = null; }
 function newSheet() {
   openSheet(`<span class="lbl">${esc(T("Choose what to create"))}</span><div class="grid">` +
     BOOT.new.map(([c, k]) => `<button class="btn" data-act="mk" data-coll="${c}" data-kind="${k}">` +
@@ -7204,6 +7370,7 @@ function newSheet() {
 }
 function menuSheet() {
   openSheet(`<div class="grid"><button class="btn" data-act="graph0">${esc(T("Link graph"))}</button>` +
+    `<button class="btn" data-act="links">${esc(T("Links"))}</button>` +
     `<a class="btn" href="health" target="_blank" rel="noopener">${esc(T("Health report"))}</a>` +
     `<a class="btn" href="corpus" target="_blank" rel="noopener">${esc(T("Body map"))}</a></div>`);
 }
@@ -7284,7 +7451,9 @@ function graphMount() {
       `<button data-act="gmode" data-m="${m}" title="${esc(T(l))}">${esc(T(short))}</button>`).join("")}</span>` +
     `<span class="seg">${[1, 2, 3].map(d => `<button data-act="gdepth" data-d="${d}" ${tip("depth {d}").replace(/\{d\}/g, d)}>${d}</button>`).join("")}</span></div></div>` +
     `<div class="gcanvas" id="gbox"><canvas id="gc"></canvas><div class="ghint" id="ghint"></div>` +
-    `<div class="gnote" id="gnote"></div></div>` +
+    `<div class="gnote" id="gnote"></div>` +
+    `<div class="gfab l"><button class="btn" data-act="gkey" ${tip("Key")}>?</button></div>` +
+    `<div class="gfab r"><button class="btn" data-act="gdraw" id="gdraw" aria-pressed="false">&#10547; ${esc(T("Link"))}</button></div></div>` +
     `<div class="gstatus"><span class="who" id="gwho"></span><span id="gstate"></span></div></div>`;
   G.on = true;
   G.C = gColors();
@@ -7376,6 +7545,8 @@ function gButtons() {
   $("#gseed").hidden = G.mode !== "life";
   $("#gseed").classList.toggle("primary", G.mode === "life" && G.settled);
   $("#gnames").setAttribute("aria-pressed", String(G.names));
+  $("#gdraw").setAttribute("aria-pressed", String(!!G.drawing));
+  if (G.drawing) { $("#ghint").hidden = false; $("#ghint").textContent = T("Drag from one record to another to link them."); return; }
   $("#ghint").textContent = G.mode === "life"
     ? T("tap: to the middle · tap the middle: open · hold: flip the cell · drag: move · pinch or wheel: zoom")
     : T("tap: to the middle · tap the middle: open · hold: spark · drag: move · pinch or wheel: zoom");
@@ -7590,6 +7761,60 @@ function gStroke(ctx, A, Cp, B, t0, t1) {
   ctx.stroke();
 }
 const ease = t => 1 - Math.pow(1 - Math.max(0, Math.min(1, t)), 3);
+function hexMix(c0, c1, t) {
+  const a = parseInt(c0.slice(1), 16), b = parseInt(c1.slice(1), 16);
+  const ch = s => Math.round(((a >> s) & 255) + (((b >> s) & 255) - ((a >> s) & 255)) * t);
+  return "#" + [ch(16), ch(8), ch(0)].map(v => v.toString(16).padStart(2, "0")).join("");
+}
+function gLinkRest(l) {
+  // colour: the family; how vivid: how recently it was written; fainter without a reason
+  const f = l.f || {}, C = G.C, founded = f.founded !== false, age = f.age || 0;
+  if (BOOT.mono) return hexMix(C.rule, C.faint, (founded ? 0.35 : 0.1) + 0.4 * age);
+  const fam = BOOT.linkColours[f.family] || BOOT.linkColours.other;
+  return hexMix(C.rule, fam, founded ? 0.4 + 0.5 * age : 0.2 + 0.3 * age);
+}
+function gLink(ctx, l, A, Cp, B, t0, t1, q) {
+  const f = l.f || {}, C = G.C, sel = G.selLink === l.a + " " + l.b;
+  const colour = mix(gLinkRest(l), C.accent, 0.85 * q);
+  if (f.founded === false || f.atypical) {  // a stroke that says it still needs a reason, or is atypical
+    ctx.setLineDash(f.atypical ? [1.5, 4] : [6, 4]);
+    ctx.strokeStyle = colour; ctx.lineWidth = sel ? 2.5 : 1.2;
+    gStroke(ctx, A, Cp, B, t0, t1);
+    ctx.setLineDash([]);
+    return;
+  }
+  const w = (1 + 2 * q) * (sel ? 1.7 : 1);
+  if (!f.from) { ctx.strokeStyle = colour; ctx.lineWidth = w; gStroke(ctx, A, Cp, B, t0, t1); return; }
+  const fromA = f.from === l.a, steps = 12, left = [], right = [];
+  for (let i = 0; i <= steps; i++) {        // tapered: thick at the record it comes from
+    const t = t0 + (t1 - t0) * i / steps, [x, y] = gAt(A, Cp, B, t);
+    const dx = 2 * (1 - t) * (Cp[0] - A[0]) + 2 * t * (B[0] - Cp[0]);
+    const dy = 2 * (1 - t) * (Cp[1] - A[1]) + 2 * t * (B[1] - Cp[1]);
+    const len = Math.hypot(dx, dy) || 1, half = w * (0.85 - 0.6 * (fromA ? t : 1 - t));
+    left.push([x - dy / len * half, y + dx / len * half]);
+    right.push([x + dy / len * half, y - dx / len * half]);
+  }
+  ctx.fillStyle = colour;
+  ctx.beginPath();
+  left.concat(right.reverse()).forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+  ctx.closePath(); ctx.fill();
+}
+function gLinkAt(x, y, slop) {
+  let best = null, bd = slop * slop;
+  for (const l of G.links) {
+    if ((l.grow ?? 1) < 1) continue;
+    const A = gScreen(l.a), B = gScreen(l.b), Cp = gCurve(A, B, l.a + l.b);
+    let P0 = A;
+    for (let i = 1; i <= 12; i++) {
+      const P1 = gAt(A, Cp, B, i / 12), vx = P1[0] - P0[0], vy = P1[1] - P0[1];
+      const k = Math.max(0, Math.min(1, ((x - P0[0]) * vx + (y - P0[1]) * vy) / (vx * vx + vy * vy || 1)));
+      const d = (P0[0] + k * vx - x) ** 2 + (P0[1] + k * vy - y) ** 2;
+      if (d < bd) { bd = d; best = l; }
+      P0 = P1;
+    }
+  }
+  return best;
+}
 function gDraw() {
   const box = $("#gbox"), c = $("#gc");
   if (!box || !c) return;
@@ -7619,12 +7844,15 @@ function gDraw() {
   for (const l of G.links) {
     const q = (vis(l.a) + vis(l.b)) / 2, g = ease(l.grow ?? 1);
     if (g <= 0) continue;
-    ctx.strokeStyle = mix(C.rule, C.accent, 0.85 * q);
-    ctx.lineWidth = 1 + 2 * q;
     const A = S[l.a], B = S[l.b], Cp = gCurve(A, B, l.a + l.b);
-    if (g >= 1) gStroke(ctx, A, Cp, B, 0, 1);
-    else if (l.from === l.a) gStroke(ctx, A, Cp, B, 0, g);      // it grows out of the record already there
-    else gStroke(ctx, A, Cp, B, 1 - g, 1);
+    const [t0, t1] = g >= 1 ? [0, 1] : l.from === l.a ? [0, g] : [1 - g, 1];   // it grows out of the record already there
+    gLink(ctx, l, A, Cp, B, t0, t1, q);
+  }
+  if (G.rubber && S[G.rubber.from]) {        // a link being drawn
+    ctx.setLineDash([6, 5]); ctx.strokeStyle = C.accent; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(...S[G.rubber.from]); ctx.lineTo(G.rubber.x, G.rubber.y); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath(); ctx.arc(G.rubber.x, G.rubber.y, 5, 0, 2 * Math.PI); ctx.fillStyle = C.accent; ctx.fill();
   }
   for (const q of G.pulses) {        // light flowing along a link into a new cell
     const l = G.links.find(l => (l.a === q.a && l.b === q.b) || (l.a === q.b && l.b === q.a));
@@ -7742,7 +7970,9 @@ function gDown(e) {
     return;
   }
   const n = gNodeAt(e.offsetX, e.offsetY, e.pointerType === "mouse" ? 14 : 24);
-  G.press = {x: e.offsetX, y: e.offsetY, lx: e.offsetX, ly: e.offsetY, n, moved: false, held: false};
+  G.press = {x: e.offsetX, y: e.offsetY, lx: e.offsetX, ly: e.offsetY, n, moved: false, held: false,
+             touch: e.pointerType !== "mouse", draw: !!(G.drawing && n)};
+  if (G.press.draw) return;             // in link mode a record is the start of a link, not a hold
   if (n) G.hold = setTimeout(() => { if (G.press && !G.press.crept) { G.press.held = true; gTouch(n); } }, 550);
 }
 function gMove(e) {
@@ -7758,6 +7988,12 @@ function gMove(e) {
     return;
   }
   const far = Math.abs(e.offsetX - p.x) + Math.abs(e.offsetY - p.y);
+  if (p.draw) {
+    if (far >= 6) p.moved = true;
+    G.rubber = p.moved ? {from: p.n, x: e.offsetX, y: e.offsetY} : null;
+    G.hover = p.moved ? gNodeAt(e.offsetX, e.offsetY, p.touch ? 24 : 14) : null;
+    return;
+  }
   if (far >= 3 && !p.crept) { p.crept = true; clearTimeout(G.hold); }
   if (!p.moved && far < 6) return;
   p.moved = true;
@@ -7778,7 +8014,19 @@ function gUp(e) {
   if (G.ptr.size < 2) G.pinch = null;
   const p = G.press;
   G.press = null; G.dragging = null;
-  if (!p || p.moved || p.held || !p.n) return;
+  if (p && p.draw && p.moved) {
+    const to = gNodeAt(e.offsetX, e.offsetY, p.touch ? 24 : 14);
+    G.rubber = null; G.hover = null;
+    if (to && to !== p.n) linkNew(p.n, to);
+    return;
+  }
+  G.rubber = null;
+  if (!p || p.moved || p.held) return;
+  if (!p.n) {                              // a tap on a line opens its card
+    const l = gLinkAt(p.x, p.y, p.touch ? 16 : 9);
+    if (l) linkCard(l.a, l.b);
+    return;
+  }
   if (p.n === G.center) { S.fromList = true; go("r/" + p.n); }
   else go("g/" + p.n, true);
 }
@@ -7803,6 +8051,150 @@ function gKey(e) {
   gStatus(true);
   return true;
 }
+
+/* ---------------------------------------------------------------- links
+   A link card shows every link between two records, both ways: its type,
+   reason, source, span and when it was written; each can be changed or
+   deleted. A new link is drawn on the graph (link mode) or added from a card.
+   Every change is saved as a change of the record the link comes from. */
+const LK = {card: null, i: null, from: "", to: ""};
+const L = {q: "", which: "", rows: [], total: 0, counts: {}};
+function ask(msg, yes) {
+  return new Promise(done => {
+    openSheet(`<div class="ask"><p>${esc(msg)}</p><div class="row2">` +
+      `<button class="btn" id="askNo">${esc(T("Cancel"))}</button>` +
+      `<button class="btn primary" id="askYes">${esc(yes)}</button></div></div>`);
+    $("#askYes").onclick = () => { closeSheet(); done(true); };
+    $("#askNo").onclick = () => { closeSheet(); done(false); };
+  });
+}
+function linkTitle(id) { return id === LK.card.a.id ? LK.card.a.title : LK.card.b.title; }
+async function linkCard(a, b, d) {
+  try { LK.card = d || await api("api/link?" + new URLSearchParams({a, b})); }
+  catch (e) { toast(e.message, 4000); return; }
+  if (G.on) G.selLink = [a, b].sort().join(" ");
+  const c = LK.card;
+  openSheet(`<span class="lbl">${esc(T("Link"))}</span><div class="lk-dir">` +
+    `<button class="chip" data-act="lk-go" data-id="${esc(c.a.id)}">${esc(c.a.title)}</button>&#8644;` +
+    `<button class="chip" data-act="lk-go" data-id="${esc(c.b.id)}">${esc(c.b.title)}</button></div>` +
+    c.edges.map((e, i) => `<div class="lk-edge"><div><b>${esc(linkTitle(e.from))}</b> ` +
+      `<span class="rel">${esc(e.label)} &#8594;</span> <b>${esc(linkTitle(e.to))}</b></div>` +
+      (e.why ? `<div>${esc(e.why)}</div>` : (e.source ? "" : `<div class="warn">${esc(T("no reason or source"))}</div>`)) +
+      (e.source ? `<div class="meta">${esc(e.source_label || e.source)}</div>` : "") +
+      `<div class="meta">${[e.when, e.atypical ? T("atypical type") : "",
+                             e.written ? T("written {date}", {date: e.written}) : ""].filter(Boolean).map(esc).join(" · ")}</div>` +
+      `<div class="acts"><button class="btn quiet" data-act="lk-del" data-i="${i}">${esc(T("Delete"))}</button>` +
+      `<button class="btn" data-act="lk-edit" data-i="${i}">${esc(T("Edit"))}</button></div></div>`).join("") +
+    `<div class="lk-form"><button class="btn" data-act="lk-add">${esc(T("Another link between them"))}</button></div>`);
+}
+function linkForm() {
+  const c = LK.card, e = LK.i == null ? null : c.edges[LK.i];
+  const opts = c.rels[LK.from + " " + LK.to] || [];
+  const cur = e ? e.rel : (opts[0] || [""])[0];
+  const known = opts.some(o => o[0] === cur);
+  openSheet(`<span class="lbl">${esc(T(e ? "Change link" : "New link"))}</span>` +
+    `<div class="lk-dir"><b>${esc(linkTitle(LK.from))}</b> &#8594; <b>${esc(linkTitle(LK.to))}</b>` +
+    `<button class="btn quiet" data-act="lk-swap" aria-label="${esc(T("Swap direction"))}" title="${esc(T("Swap direction"))}">&#8644;</button></div>` +
+    `<div class="lk-form"><label class="lbl" for="lk-rel">${esc(T("Type"))}</label>` +
+    `<select class="f" id="lk-rel">${opts.map(([k, l]) => `<option value="${esc(k)}"${k === cur ? " selected" : ""}>${esc(l)}</option>`).join("")}` +
+    `<option value=""${known ? "" : " selected"}>${esc(T("other type…"))}</option></select>` +
+    `<input class="f" id="lk-other" placeholder="${esc(T("one word, e.g. inspired_by"))}" value="${esc(known ? "" : cur)}"${known ? " hidden" : ""}>` +
+    `<label class="lbl" for="lk-why">${esc(T("Reason"))}</label><textarea class="f code" id="lk-why" rows="2">${esc(e ? e.why : "")}</textarea>` +
+    `<label class="lbl" for="lk-src">${esc(T("Source"))}</label><input class="f" id="lk-src" placeholder="${esc(T("s_… of a source, or free text"))}" value="${esc(e ? e.source : "")}">` +
+    `<label class="lbl" for="lk-when">${esc(T("Span"))}</label><input class="f" id="lk-when" placeholder="${esc(T("1609, 1618/1648, -800/400"))}" value="${esc(e ? e.when : "")}">` +
+    `<div class="row2"><button class="btn quiet" data-act="lk-cancel">${esc(T("Cancel"))}</button>` +
+    `<button class="btn primary" data-act="lk-save">${esc(T("Save"))}</button></div></div>`);
+  $("#lk-rel").onchange = ev => { $("#lk-other").hidden = !!ev.target.value; };
+}
+async function linkNew(a, b) {
+  try { LK.card = await api("api/link?" + new URLSearchParams({a, b})); }
+  catch (e) { toast(e.message, 4000); return; }
+  LK.i = null; LK.from = a; LK.to = b;
+  linkForm();
+}
+async function linkSave() {
+  const e = LK.i == null ? null : LK.card.edges[LK.i];
+  const rel = $("#lk-rel").value || $("#lk-other").value.trim();
+  const body = {from: LK.from, to: LK.to, rel, why: $("#lk-why").value, source: $("#lk-src").value,
+                when: $("#lk-when").value, old: null};
+  try {
+    if (e && e.from !== LK.from) {          // turned round: it moves to the other record
+      await api("api/link", {from: e.from, to: e.to, delete: true, old: {rel: e.rel, to: e.to}});
+    } else if (e) body.old = {rel: e.rel, to: e.to};
+    const j = await api("api/link", body);
+    toast(T("Link saved."));
+    linkChanged(j.link);
+  } catch (err) { toast(err.message, 4000); }
+}
+async function linkDelete(i) {
+  const e = LK.card.edges[i];
+  if (!(await ask(T("Delete this link?") + "\n\n" + linkTitle(e.from) + " — " + e.label + " → " + linkTitle(e.to), T("Delete")))) {
+    linkCard(LK.card.a.id, LK.card.b.id, LK.card);
+    return;
+  }
+  try {
+    const j = await api("api/link", {from: e.from, to: e.to, delete: true, old: {rel: e.rel, to: e.to}});
+    toast(T("Link deleted."));
+    linkChanged(j.link);
+  } catch (err) { toast(err.message, 4000); }
+}
+function linkChanged(card) {
+  if (G.on) graphFetch(G.center);
+  if (here === "#links") loadLinks(false);
+  if (S.rec && S.rec.id && [card.a.id, card.b.id].includes(S.rec.id)) showRecord(S.rec.id);
+  if (card.edges.length) linkCard(card.a.id, card.b.id, card);
+  else { closeSheet(); if (G.on) G.selLink = null; }
+}
+function keySheet() {
+  const C = G.C || gColors(), fam = BOOT.linkColours;
+  const line = (stroke, dash, w) => `<svg viewBox="0 0 64 14" aria-hidden="true"><line x1="2" y1="7" x2="62" y2="7" stroke="${stroke}" stroke-width="${w || 2}"${dash ? ` stroke-dasharray="${dash}"` : ""} stroke-linecap="round"/></svg>`;
+  const taper = `<svg viewBox="0 0 64 14" aria-hidden="true"><path d="M2 4 L62 6.4 L62 7.6 L2 10 Z" fill="${fam.verba}"/></svg>`;
+  const rows = [
+    ...[["verba", "Verba"], ["people", "People"], ["sources", "Sources"], ["corpus", "Corpus"]].map(([k, l]) =>
+      [line(hexMix(C.rule, fam[k], 0.9)), T(l)]),
+    [line(hexMix(C.rule, fam.verba, 0.9)), T("with a reason or a source")],
+    [line(hexMix(C.rule, fam.verba, 0.4), "6 4", 1.2), T("without either: needs a reason")],
+    [line(hexMix(C.rule, fam.verba, 0.6), "1.5 4", 1.2), T("a type outside the list (atypical)")],
+    [taper, T("thick where it comes from")],
+    [line(hexMix(C.rule, fam.sources, 0.9)), T("written recently")],
+    [line(hexMix(C.rule, fam.sources, 0.4)), T("written long ago")],
+    [line(C.accent, "", 3), T("lit, in life")]];
+  openSheet(`<span class="lbl">${esc(T("What a line shows"))}</span><div class="key">` +
+    rows.map(([svg, text]) => `${svg}<span>${esc(text)}</span>`).join("") + `</div>`);
+}
+async function loadLinks(more) {
+  let j;
+  try { j = await api("api/links?" + new URLSearchParams({q: L.q, which: L.which, offset: more ? L.rows.length : 0})); }
+  catch (e) { toast(e.message, 4000); return; }
+  L.rows = more ? L.rows.concat(j.rows) : j.rows;
+  L.total = j.total; L.counts = j.counts;
+  renderLinks();
+}
+function renderLinks() {
+  const tabs = [["", T("All"), L.counts.all], ["unfounded", T("Needs a reason"), L.counts.unfounded],
+                ["atypical", T("Atypical"), L.counts.atypical]];
+  $("#ltabs").innerHTML = tabs.map(([k, l, n]) => `<button class="tab${n ? "" : " zero"}" data-act="lk-which" ` +
+    `data-k="${k}" aria-pressed="${L.which === k}">${esc(l)}<span class="n">${n || 0}</span></button>`).join("");
+  $("#lrows").innerHTML = L.rows.length ? L.rows.map(r => `<li><button class="row" data-act="lk-row" data-a="${esc(r.a)}" data-b="${esc(r.b)}">` +
+    `<span class="dot" style="background:${BOOT.linkColours[r.family] || BOOT.linkColours.other}"></span>` +
+    `<span class="t">${esc(r.from)} <span class="rel">— ${esc(r.label)} →</span> ${esc(r.to)}</span><span class="n"></span>` +
+    `<span class="s">${r.why ? esc(r.why) : `<span class="warn">${esc(T("no reason or source"))}</span>`}</span></button></li>`).join("")
+    : `<li class="empty">${esc(T("Nothing found."))}</li>`;
+  $("#lmore").hidden = L.rows.length >= L.total;
+}
+function showLinks() {
+  document.body.classList.add("open");
+  S.rec = null; S.edit = null; S.sel = null;
+  markSel();
+  document.title = T("Links") + " · Kustos";
+  $("#rec").innerHTML = head() + `<div class="card"><h1 class="title">${esc(T("Links"))}</h1>` +
+    `<input id="lq" type="search" autocomplete="off" placeholder="${esc(T("Search the links"))}" value="${esc(L.q)}">` +
+    `<nav class="tabs" id="ltabs"></nav><ul class="rows" id="lrows"></ul>` +
+    `<div class="more"><button class="btn" data-act="lk-more" id="lmore" hidden>${esc(T("More"))}</button></div></div>`;
+  loadLinks(false);
+  window.scrollTo(0, 0);
+}
+let linksJob = null;
 
 /* ---------------------------------------------------------------- events */
 document.addEventListener("click", e => {
@@ -7842,6 +8234,20 @@ document.addEventListener("click", e => {
   else if (act === "gseed") { gSeed(); gStatus(true); }
   else if (act === "gnames") { G.names = !G.names; gButtons(); }
   else if (act === "gopen") { if (G.center) { S.fromList = true; go("r/" + G.center); } }
+  else if (act === "gdraw") { G.drawing = !G.drawing; gButtons(); }
+  else if (act === "gkey") keySheet();
+  else if (act === "links") { closeSheet(); S.fromList = true; go("links"); }
+  else if (act === "lk-row") linkCard(b.dataset.a, b.dataset.b);
+  else if (act === "lk-go") { closeSheet(); S.fromList = true; go("r/" + b.dataset.id); }
+  else if (act === "lk-edit") { const e = LK.card.edges[+b.dataset.i]; LK.i = +b.dataset.i; LK.from = e.from; LK.to = e.to; linkForm(); }
+  else if (act === "lk-del") linkDelete(+b.dataset.i);
+  else if (act === "lk-add") { LK.i = null; LK.from = LK.card.a.id; LK.to = LK.card.b.id; linkForm(); }
+  else if (act === "lk-swap") { [LK.from, LK.to] = [LK.to, LK.from]; const keep = {why: $("#lk-why").value, src: $("#lk-src").value, when: $("#lk-when").value};
+                                linkForm(); $("#lk-why").value = keep.why; $("#lk-src").value = keep.src; $("#lk-when").value = keep.when; }
+  else if (act === "lk-save") linkSave();
+  else if (act === "lk-cancel") { if (LK.card.edges.length) linkCard(LK.card.a.id, LK.card.b.id, LK.card); else closeSheet(); }
+  else if (act === "lk-which") { L.which = b.dataset.k; loadLinks(false); }
+  else if (act === "lk-more") loadLinks(true);
 });
 document.addEventListener("submit", e => {
   e.preventDefault();
@@ -7852,6 +8258,7 @@ document.addEventListener("submit", e => {
 document.addEventListener("input", e => {
   const t = e.target;
   if (t.id === "q") { S.q = t.value; listSoon(); return; }
+  if (t.id === "lq") { L.q = t.value; clearTimeout(linksJob); linksJob = setTimeout(() => loadLinks(false), 150); return; }
   if (!S.edit || !t.closest("#editor")) return;
   if (t.name === "circles") S.edit.circles = $$('#editor input[name="circles"]:checked').map(x => x.value);
   else S.edit[t.name] = t.value;
@@ -11644,8 +12051,31 @@ class App:
             return "break"
         win = tk.Toplevel(self.root)
         self.graph = GraphView(win, lambda: self.data, start_id=(self.current() or {}).get("id"),
-                               on_open=self.open_from_graph)
+                               on_open=self.open_from_graph, on_link=self.link_from_graph)
         return "break"
+
+    def link_from_graph(self, a, b, rel, why="", source="", when=""):
+        """A link drawn in the graph (Shift+drag), written here: what the card
+        holds is saved first, the link is added to the record it comes from
+        (write_link, as the web page does), and both windows show it. Returns
+        what went wrong, or None."""
+        self.commit_if_dirty()
+        try:
+            data = write_link(a, b, rel, why, source, when)
+        except (ValueError, WebConflict) as exc:
+            return str(exc)
+        except SystemExit as exc:
+            return str(exc)
+        self.safe_mirror(data)
+        self.reload()
+        if self.sel in (a, b):
+            self.open_record(self.sel)
+        g = getattr(self, "graph", None)
+        if g and g.is_open():
+            g.recentre(g.center, fresh=True)
+        self.say(tr("Link saved: {a} {rel} {b}", a=label_any(by_id(self.data).get(a), self.data),
+                    rel=rel_label(rel), b=label_any(by_id(self.data).get(b), self.data)))
+        return None
 
     def open_timeline(self):
         """Ctrl+Shift+T: everything dated, on one line of time, in a second
@@ -14669,6 +15099,98 @@ def recency(rec, now=None):
     return 0.5 ** (max(0.0, age) / GRAPH_HALF_LIFE)
 
 
+# What a link line shows, in the window's graph and the page's alike: its
+# FAMILY as a colour (the collection its type belongs to), its AGE as how vivid
+# that colour is (when it was written, from the logs), its EVIDENCE as the
+# stroke (solid with a reason or a source, dashed without either, dotted for a
+# type outside RELS) and its DIRECTION as a taper, thick at the record it comes
+# from. Several links between the same two records share one line.
+
+REL_FAMILY = {
+    "expresses": "verba", "derives_from": "verba", "cognate_of": "verba",
+    "borrows_from": "verba", "calques": "verba", "specializes": "verba",
+    "opposes": "verba", "analogous_to": "verba", "instrument_of": "verba",
+    "requires": "verba",
+    "coined_by": "people", "used_by": "people", "about": "people",
+    "author_of": "people", "editor_of": "people", "translator_of": "people",
+    "knows": "people",
+    "cites": "sources", "attested_in": "sources", "defined_in": "sources",
+    "measured_in": "sources", "part_of": "sources", "edition_of": "sources",
+    "translates": "sources", "comments_on": "sources", "responds_to": "sources",
+    "affects": "corpus", "correlates": "corpus",
+}
+# the same hues as the collections' dots in the web page's list
+LINK_FAMILY_COLOUR = {"verba": "#a0783a", "people": "#3f7d99", "sources": "#6f8a3a",
+                      "corpus": "#b5523b", "other": "#8a8578"}
+LINK_FAMILY_LABEL = {"verba": "verba", "people": "people", "sources": "sources",
+                     "corpus": "corpus", "other": "other"}
+SYMMETRIC_RELS = {"knows", "opposes", "analogous_to", "cognate_of", "correlates"}
+LINK_HALF_LIFE = 30          # days for a written link's vividness to halve
+_EDGE_TIMES = {"key": None, "times": {}}
+
+
+def edge_times():
+    """When each link was first written, from the logs: {(from, to, rel):
+    epoch}. Links older than the logs are absent. Cached by the log files'
+    size and time, so the graph can ask on every move."""
+    try:
+        key = tuple((str(f), f.stat().st_size, f.stat().st_mtime_ns) for f in log_files())
+    except OSError:
+        key = None
+    if key is not None and key == _EDGE_TIMES["key"]:
+        return _EDGE_TIMES["times"]
+    times = {}
+    for line in read_logs():
+        if line.get("op") != "edges" or not line.get("id"):
+            continue
+        t = epoch_of(line.get("t"))
+        if t is None:
+            continue
+        for a in line.get("edges") or []:
+            k = (line["id"], norm_ref(a.get("to")), a.get("rel", ""))
+            if k not in times or t < times[k]:
+                times[k] = t
+    _EDGE_TIMES["key"], _EDGE_TIMES["times"] = key, times
+    return times
+
+
+def link_index(data):
+    """The links by pair of records: {(a, b): [edges]}, a < b."""
+    out = {}
+    for e in data.get("edges", []):
+        f, t = e.get("from"), e.get("to")
+        if f and t and f != t:
+            out.setdefault((min(f, t), max(f, t)), []).append(e)
+    return out
+
+
+def link_facts(edges, times=None, now=None):
+    """What one line shows for the links it carries: {family, from, founded,
+    atypical, age}. `from` is the record they all come from (None when they go
+    both ways or are symmetric); `founded` is False if any lacks both a reason
+    and a source."""
+    times = times or {}
+    now = now or datetime.now().timestamp()
+    rels = [e.get("rel", "") for e in edges]
+    directed = [e for e in edges if e.get("rel") not in SYMMETRIC_RELS]
+    starts = {e.get("from") for e in directed}
+    written = [times.get((e.get("from"), e.get("to"), e.get("rel", ""))) for e in edges]
+    written = [t for t in written if t]
+    last = max(written) if written else None
+    return {"family": REL_FAMILY.get(rels[0], "other") if rels else "other",
+            "from": next(iter(starts)) if len(starts) == 1 and len(directed) == len(edges) else None,
+            "founded": all((e.get("why") or "").strip() or (e.get("source") or "").strip()
+                           for e in edges),
+            "atypical": any(r not in RELS for r in rels),
+            "age": round(0.5 ** (max(0.0, now - last) / 86400 / LINK_HALF_LIFE), 3) if last else 0.0}
+
+
+def typical_rels(a, b):
+    """The types of RELS that may go from record a to record b."""
+    ka, kb = kind_of(a), kind_of(b)
+    return [r for r, (fa, fb) in RELS.items() if fa in ("*", ka) and fb in ("*", kb)]
+
+
 def replay_timeline(data, logs):
     """The logs as a timeline for the replay, oldest first:
     [(stamp, epoch, op, id, info)], where op is "put" (info: (label, kind)),
@@ -14735,8 +15257,8 @@ class GraphView:
     FLOW_MS = 900        # light flowing along a link into a newborn cell
     STAGGER_MS = 110     # each ring of records sprouts this much after the one inside it
 
-    def __init__(self, root, get_data, start_id=None, on_open=None):
-        self.root, self.get_data, self.on_open = root, get_data, on_open
+    def __init__(self, root, get_data, start_id=None, on_open=None, on_link=None):
+        self.root, self.get_data, self.on_open, self.on_link = root, get_data, on_open, on_link
         self.start = start_id
         self.mode, self.depth = "life", 2       # as the web page's graph
         self.all_labels, self.paused = False, False
@@ -14766,6 +15288,9 @@ class GraphView:
         self.lgrow, self.lfrom, self.lstart = {}, {}, {}
         self.gone, self.gone_links, self.pulses = {}, [], []
         self.vel = {}        # each record's last spring step
+        self.lfacts, self.lstyle, self.lcolour = {}, {}, {}   # what each line shows (link_facts)
+        self.sel_link = self.linking = None
+        self.show_key = False
 
         fams = set(tkfont.families(root))
         mono = next((f for f in ("Cascadia Mono", "Consolas", "Lucida Console",
@@ -14795,6 +15320,8 @@ class GraphView:
         self.bar = cv.create_line(0, 0, 0, 0, fill=RULE, width=3, state="hidden")
         self.bar_done = cv.create_line(0, 0, 0, 0, fill=STAMP, width=3, state="hidden")
         self.ring = cv.create_oval(0, 0, 0, 0, outline=INK, width=1, state="hidden")
+        self.t_link = cv.create_text(12, 0, anchor="sw", font=self.f_status, fill=INK, state="hidden")
+        self.rubber = cv.create_line(0, 0, 0, 0, fill=STAMP, width=2, dash="-", state="hidden")
 
         b = root.bind
         b("<space>", lambda e: self.toggle_pause())
@@ -14816,14 +15343,19 @@ class GraphView:
         b("<End>", lambda e: self.seek(len(self.rp["events"])) if self.rp else None)
         b("<F5>", lambda e: None if self.rp else self.recentre(self.center, fresh=True))
         b("<Return>", lambda e: self.open_in_card())
-        b("<Escape>", lambda e: self.stop_replay() if self.rp else self.close())
+        b("<k>", lambda e: self.toggle_key())
+        b("<Escape>", lambda e: self.select_link(None) if self.sel_link else
+          (self.stop_replay() if self.rp else self.close()))
         b("<q>", lambda e: self.close())
         cv.bind("<Configure>", self.resized)
         cv.bind("<Motion>", self.motion)
         cv.bind("<ButtonPress-1>", self.press)
         cv.bind("<B1-Motion>", self.drag)
         cv.bind("<ButtonRelease-1>", self.release)
-        cv.bind("<Double-Button-1>", lambda e: self.open_in_card(self.hover or self.center))
+        cv.bind("<Double-Button-1>", self.double)
+        cv.bind("<Shift-ButtonPress-1>", self.link_press)
+        cv.bind("<Shift-B1-Motion>", self.link_drag)
+        cv.bind("<Shift-ButtonRelease-1>", self.link_release)
         cv.bind("<Button-3>", self.touch)
         cv.bind("<MouseWheel>", lambda e: self.zoom_at(e, 1.1 if e.delta > 0 else 1 / 1.1))
         cv.bind("<Button-4>", lambda e: self.zoom_at(e, 1.1))
@@ -14845,6 +15377,9 @@ class GraphView:
             self.adj = graph_adjacency(self.data)
             now = datetime.now()
             self.recs = {k: recency(r, now) for k, r in self.idx.items()}
+            pairs, times = link_index(self.data), edge_times()
+            self.lfacts = {k: link_facts(v, times, now.timestamp()) for k, v in pairs.items()}
+            self.lcolour, self.shown = {}, {}   # colours are worked out again from the new facts
         if rid not in self.idx:
             rid = max(self.adj, key=lambda k: (len(self.adj[k]), k), default=None)
         if rid is None and self.idx:
@@ -14897,6 +15432,10 @@ class GraphView:
         for key, rels in links.items():
             if key in self.links:
                 self.links[key] = (rels, self.links[key][1])
+                if self.lstyle.get(key) != self.style_of(key):   # a reason was added, say: a new stroke
+                    self.cv.delete(self.links[key][1])
+                    self.links[key] = (rels, self.make_line(key))
+                    self.shown.pop(key, None)
                 continue
             was = [e for e in key if e not in fresh_ones]
             src = was[0] if was else min(key, key=lambda e: self.dist.get(e, 9))
@@ -14931,6 +15470,9 @@ class GraphView:
         self.grow, self.born_at, self.vis = {}, {}, {}
         self.arrive, self.dim_at, self.sparkle = {}, {}, {}
         self.vel = {}
+        self.lstyle, self.lcolour = {}, {}
+        self.sel_link = None
+        self.cv.itemconfigure(self.t_link, state="hidden")
         self.hover = None
 
     def add_node(self, n):
@@ -14969,11 +15511,56 @@ class GraphView:
         if self.hover == n:
             self.hover = None
 
+    def facts(self, key):
+        """What the line between the two records of `key` shows (link_facts);
+        in the replay, only what its types say."""
+        got = self.lfacts.get(key)
+        if got is None or self.rp:
+            rels = (self.links.get(key) or ((),))[0]
+            first = rels[0][0] if rels else ""
+            starts = {f for rel, f in rels if rel not in SYMMETRIC_RELS}
+            got = {"family": REL_FAMILY.get(first, "other"), "founded": True,
+                   "atypical": any(rel not in RELS for rel, _f in rels), "age": 0.5,
+                   "from": next(iter(starts)) if len(starts) == 1 and all(
+                       rel not in SYMMETRIC_RELS for rel, _f in rels) else None}
+        return got
+
+    def style_of(self, key):
+        f = self.facts(key)
+        if f.get("atypical"):
+            return "dotted"
+        if not f.get("founded", True):
+            return "dashed"
+        return "taper" if f.get("from") in key else "line"
+
+    def rest_colour(self, key):
+        """Colour: the family; how vivid: how recently it was written; fainter
+        without a reason. A one-colour theme keeps its own ink."""
+        f = self.facts(key)
+        founded, age = f.get("founded", True), f.get("age", 0.0)
+        if PAL["mono_only"]:
+            return blend(RULE, FAINT, (0.35 if founded else 0.1) + 0.4 * age)
+        fam = LINK_FAMILY_COLOUR.get(f.get("family"), LINK_FAMILY_COLOUR["other"])
+        return blend(RULE, fam, 0.4 + 0.5 * age if founded else 0.2 + 0.3 * age)
+
+    def make_line(self, key):
+        style = self.lstyle[key] = self.style_of(key)
+        self.lcolour.pop(key, None)
+        if style == "taper":
+            item = self.cv.create_polygon(0, 0, 0, 0, 0, 0, fill=PAPER, outline="", smooth=True,
+                                          tags=("g",))
+        else:   # Windows draws dashes only on one-pixel lines, and only these two patterns
+            item = self.cv.create_line(0, 0, 0, 0, fill=PAPER, width=1, smooth=True,
+                                       splinesteps=10, capstyle="round", tags=("g",),
+                                       dash={"dashed": "-", "dotted": "."}.get(style, ""))
+        self.cv.tag_lower(item)
+        return item
+
     def add_link(self, key, rels, src=None, start=None):
-        """A link, as a soft curve; it grows out of `src`, the end already there."""
-        line = self.cv.create_line(0, 0, 0, 0, fill=PAPER, width=1, smooth=True,
-                                   splinesteps=10, capstyle="round", tags=("g",))
-        self.cv.tag_lower(line)
+        """A link, as a soft curve (a tapered one when it has a direction); it
+        grows out of `src`, the end already there."""
+        self.links[key] = (rels, None)
+        line = self.make_line(key)
         self.links[key] = (rels, line)
         self.lgrow[key] = 0.0
         self.lfrom[key] = src if src in key else key[0]
@@ -14982,8 +15569,11 @@ class GraphView:
     def drop_link(self, key):
         """The link leaves the view: it fades where it is, then goes."""
         _rels, line = self.links.pop(key)
-        self.gone_links.append(dict(line=line, key=key, leave=1.0))
+        self.gone_links.append(dict(line=line, key=key, leave=1.0, poly=self.lstyle.get(key) == "taper"))
         self.shown.pop(line, None)
+        self.lstyle.pop(key, None)
+        if self.sel_link == key:
+            self.select_link(None)
         for d in (self.lgrow, self.lfrom, self.lstart):
             d.pop(key, None)
 
@@ -15460,6 +16050,21 @@ class GraphView:
         dx, dy = b_xy[0] - a_xy[0], b_xy[1] - a_xy[1]
         return ((a_xy[0] + b_xy[0]) / 2 - dy * bow, (a_xy[1] + b_xy[1]) / 2 + dx * bow)
 
+    def taper(self, pa, pc, pb, t0, t1, w, from_a):
+        """The outline of a tapered link: 1.7 w wide at the record it comes
+        from, 0.5 w at the other."""
+        left, right = [], []
+        for i in range(13):
+            t = t0 + (t1 - t0) * i / 12
+            x, y = self.along(pa, pc, pb, t)
+            dx = 2 * (1 - t) * (pc[0] - pa[0]) + 2 * t * (pb[0] - pc[0])
+            dy = 2 * (1 - t) * (pc[1] - pa[1]) + 2 * t * (pb[1] - pc[1])
+            n = math.hypot(dx, dy) or 1.0
+            half = w * (0.85 - 0.6 * (t if from_a else 1 - t))
+            left.append((x - dy / n * half, y + dx / n * half))
+            right.append((x + dy / n * half, y - dx / n * half))
+        return [c for xy in left + right[::-1] for c in xy]
+
     @staticmethod
     def along(a_xy, c_xy, b_xy, t):
         v = 1 - t
@@ -15482,28 +16087,47 @@ class GraphView:
             pa, pb = S[a], S[b]
             pc = self.curve(pa, pb, key)
             g = ease(self.lgrow.get(key, 1.0))
-            if g >= 1:
+            style, sel = self.lstyle.get(key, "line"), key == self.sel_link
+            q = int((V.get(a, 0.0) + V.get(b, 0.0)) * 0.5 * n_steps + 0.5)
+            w = (1 + 2 * q / n_steps) * (1.7 if sel else 1.0)
+            t0, t1 = (0.0, 1.0) if g >= 1 else (0.0, g) if self.lfrom.get(key) == a else (1 - g, 1.0)
+            if g <= 0:
+                cv.coords(line, *pa, *pa, *pa) if style == "taper" else cv.coords(line, *pa, *pa)
+            elif style == "taper":           # thick at the record it comes from
+                cv.coords(line, *self.taper(pa, pc, pb, t0, t1, w, self.facts(key).get("from") == a))
+            elif g >= 1:
                 cv.coords(line, *pa, *pc, *pb)
-            elif g <= 0:
-                cv.coords(line, *pa, *pa)
             else:                            # it grows out of the record already there
-                t0, t1 = (0.0, g) if self.lfrom.get(key) == a else (1 - g, 1.0)
                 pts = [c for i in range(9) for c in self.along(pa, pc, pb, t0 + (t1 - t0) * i / 8)]
                 cv.coords(line, *pts)
-            q = int((V.get(a, 0.0) + V.get(b, 0.0)) * 0.5 * n_steps + 0.5)
-            look = (q, round(g * 10))
+            look = (q, round(g * 10), sel)
             if shown.get(line) != look:
                 shown[line] = look
-                fill = self.ramp_line[q] if g >= 1 else blend(PAPER, self.ramp_line[q], g)
-                cv.itemconfigure(line, fill=fill, width=1 + 2 * q // n_steps)
+                rest = self.lcolour.get(key)
+                if rest is None:
+                    rest = self.lcolour[key] = self.rest_colour(key)
+                fill = blend(rest, STAMP, 0.85 * q / n_steps)
+                if g < 1:
+                    fill = blend(PAPER, fill, g)
+                if style == "taper":
+                    cv.itemconfigure(line, fill=fill)
+                elif style == "line":
+                    cv.itemconfigure(line, fill=fill, width=round(w))
+                else:
+                    cv.itemconfigure(line, fill=fill, width=1)
         for link in self.gone_links:         # links that leave fade where they were
             a, b = link["key"]
             pa, pb = S.get(a) or G.get(a), S.get(b) or G.get(b)
             if not pa or not pb:
                 cv.coords(link["line"], 0, 0, 0, 0)
                 continue
-            cv.coords(link["line"], *pa, *self.curve(pa, pb, link["key"]), *pb)
-            cv.itemconfigure(link["line"], fill=blend(PAPER, RULE, max(0.0, link["leave"])), width=1)
+            pc = self.curve(pa, pb, link["key"])
+            if link.get("poly"):
+                cv.coords(link["line"], *self.taper(pa, pc, pb, 0.0, 1.0, 1.0, True))
+                cv.itemconfigure(link["line"], fill=blend(PAPER, RULE, max(0.0, link["leave"])))
+            else:
+                cv.coords(link["line"], *pa, *pc, *pb)
+                cv.itemconfigure(link["line"], fill=blend(PAPER, RULE, max(0.0, link["leave"])), width=1)
         for n, (shape, text) in self.items.items():
             x, y = S[n]
             g = ease(self.grow.get(n, 1.0))
@@ -15548,6 +16172,9 @@ class GraphView:
                 cv.coords(item, x - rr, y - rr, x + rr, y + rr)
                 strength = (0.85 - k * 0.2) * math.sin(math.pi * min(1.0, t * 1.1))
                 cv.itemconfigure(item, fill=blend(PAPER, STAMP, max(0.0, strength)))
+        if self.linking:                     # a link being drawn (Shift+drag)
+            x0, y0 = S.get(self.linking[0], (0, 0))
+            cv.coords(self.rubber, x0, y0, *self.linking[1])
         if coords:
             self.draw_hover()
             self._dirty = False
@@ -15593,6 +16220,10 @@ class GraphView:
         cv.coords(self.t_left, 12, h - 6)
         cv.coords(self.t_right, w - 12, h - 6)
         cv.coords(self.t_notice, w / 2, h / 2 + 28)
+        cv.coords(self.t_link, 12, h - self.bottom() - 4)
+        if self.show_key:
+            self.show_key = False
+            self.toggle_key()
         cv.itemconfigure(self.t_keys, width=w - 24)
         self._dirty = True
 
@@ -15691,10 +16322,138 @@ class GraphView:
         self.last = (e.x, e.y)
         self._dirty = True
 
+    def link_at(self, x, y, slop=7):
+        """The line under (x, y): the nearest within `slop` pixels, or None."""
+        best, bd = None, slop * slop
+        for key in self.links:
+            if self.lgrow.get(key, 1.0) < 1 or key[0] not in self.screen or key[1] not in self.screen:
+                continue
+            pa, pb = self.screen[key[0]], self.screen[key[1]]
+            pc = self.curve(pa, pb, key)
+            p0 = pa
+            for i in range(1, 13):
+                p1 = self.along(pa, pc, pb, i / 12)
+                vx, vy = p1[0] - p0[0], p1[1] - p0[1]
+                k = max(0.0, min(1.0, ((x - p0[0]) * vx + (y - p0[1]) * vy) / ((vx * vx + vy * vy) or 1)))
+                d = (p0[0] + k * vx - x) ** 2 + (p0[1] + k * vy - y) ** 2
+                if d < bd:
+                    best, bd = key, d
+                p0 = p1
+        return best
+
+    def select_link(self, key):
+        """A line clicked: it thickens and its links are written out above the
+        status line -- type, reason, source, span, when written."""
+        self.sel_link = key
+        if not key or not self.data:
+            self.cv.itemconfigure(self.t_link, state="hidden")
+            return
+        idx, times = by_id(self.data), edge_times()
+        lines = []
+        for e in self.data.get("edges", []):
+            if (min(e.get("from", ""), e.get("to", "")), max(e.get("from", ""), e.get("to", ""))) != key:
+                continue
+            a, b = idx.get(e["from"]), idx.get(e["to"])
+            bits = [f"{label_any(a, self.data) if a else e['from']}  —{rel_label(e.get('rel', ''))}→  "
+                    f"{label_any(b, self.data) if b else e['to']}"]
+            bits.append(e.get("why") or ("" if e.get("source") else tr("no reason or source")))
+            if e.get("source"):
+                bits.append(resolve_source(e["source"], self.data)[1])
+            if e.get("when"):
+                bits.append(e["when"])
+            if e.get("rel") not in RELS:
+                bits.append(tr("atypical type"))
+            t = times.get((e["from"], e["to"], e.get("rel", "")))
+            if t:
+                bits.append(tr("written {date}", date=datetime.fromtimestamp(t).date().isoformat()))
+            lines.append(" · ".join(one_liner(x, 80) for x in bits if x))
+        lines.append(tr("double-click: open where it comes from, on the card · Esc: close"))
+        self.cv.itemconfigure(self.t_link, text="\n".join(lines), state="normal")
+        self.cv.tag_raise(self.t_link)
+        self.shown.clear()
+
+    def double(self, e):
+        """Double-click: a record opens on the card; a line opens the record it
+        comes from, whose LINKS field holds it."""
+        n = self.node_at(e.x, e.y)
+        if n:
+            return self.open_in_card(n)
+        key = self.link_at(e.x, e.y)
+        if key:
+            f = self.facts(key).get("from") or next(
+                (x.get("from") for x in self.data.get("edges", [])
+                 if (min(x.get("from", ""), x.get("to", "")), max(x.get("from", ""), x.get("to", ""))) == key), key[0])
+            return self.open_in_card(f)
+        return self.open_in_card(self.hover or self.center)
+
+    def link_press(self, e):
+        n = self.node_at(e.x, e.y)
+        self.linking = (n, (e.x, e.y)) if n and not self.rp else None
+        if self.linking:
+            self.cv.itemconfigure(self.rubber, state="normal")
+            self.cv.tag_raise(self.rubber)
+
+    def link_drag(self, e):
+        if self.linking:
+            self.linking = (self.linking[0], (e.x, e.y))
+            n = self.node_at(e.x, e.y)
+            if n != self.hover:
+                self.hover = n
+                self.label_states()
+
+    def link_release(self, e):
+        """Shift+drag from a record to another: a new link between them, saved
+        through the main window (the graph by itself writes nothing)."""
+        start, self.linking = self.linking, None
+        self.cv.itemconfigure(self.rubber, state="hidden")
+        if not start:
+            return
+        to = self.node_at(e.x, e.y)
+        if not to or to == start[0]:
+            return
+        if not self.on_link:
+            self.update_status(flash=tr("Read-only here: open the graph from Kustos "
+                                        "(Ctrl+Shift+G) to draw links."))
+            return
+        LinkDialog(self, start[0], to)
+
+    def toggle_key(self):
+        """k: the key of the lines -- what their colour, stroke and taper say."""
+        self.show_key = not self.show_key
+        cv = self.cv
+        cv.delete("key")
+        if not self.show_key:
+            return
+        x0, y0 = cv.winfo_width() - 330, self.TOP + 8
+        rows = [(LINK_FAMILY_COLOUR[k], "", tr(l)) for k, l in
+                (("verba", "Verba"), ("people", "People"), ("sources", "Sources"), ("corpus", "Corpus"))]
+        fam = LINK_FAMILY_COLOUR["verba"]
+        rows += [(blend(RULE, fam, 0.9), "", tr("with a reason or a source")),
+                 (blend(RULE, fam, 0.4), "-", tr("without either: needs a reason")),
+                 (blend(RULE, fam, 0.6), ".", tr("a type outside the list (atypical)")),
+                 (None, "", tr("thick where it comes from")),
+                 (blend(RULE, LINK_FAMILY_COLOUR["sources"], 0.9), "", tr("written recently")),
+                 (blend(RULE, LINK_FAMILY_COLOUR["sources"], 0.4), "", tr("written long ago")),
+                 (STAMP, "", tr("lit, in life"))]
+        cv.create_rectangle(x0 - 10, y0 - 6, x0 + 318, y0 + 18 * len(rows) + 4, fill=PAPER,
+                            outline=RULE, tags=("key",))
+        for i, (colour, dash, text) in enumerate(rows):
+            y = y0 + 8 + 18 * i
+            if colour is None:
+                cv.create_polygon(x0, y - 3, x0 + 44, y - 0.6, x0 + 44, y + 0.6, x0, y + 3,
+                                  fill=fam, outline="", tags=("key",))
+            else:
+                cv.create_line(x0, y, x0 + 44, y, fill=colour, width=1 if dash else 2, dash=dash,
+                               tags=("key",))
+            cv.create_text(x0 + 56, y, anchor="w", text=text, fill=INK, font=self.f_label,
+                           tags=("key",))
+
     def release(self, _e):
         n = self.press_node
         if n and not self.moved and not self.scrubbing and not self.rp and n != self.center:
             self.recentre(n)
+        elif not n and not self.moved and not self.scrubbing and self.press_at:
+            self.select_link(self.link_at(*self.press_at))
         self.press_at = self.press_node = self.dragging = None
         self.scrubbing = False
 
@@ -15805,8 +16564,78 @@ class GraphView:
         self.root.destroy()
 
 
-GRAPH_KEYS = ("click: to the middle · double-click / Enter: open on the card · "
-              "right-click: spark (in life: flip the cell) · drag: move · wheel: zoom · "
+
+class LinkDialog:
+    """Shift+drag in the graph: a new link from one record to another -- its
+    type (those that fit the two kinds first), reason, source and span. Saved
+    through the main window's write (write_link); what cannot be saved is said
+    here and the dialog stays."""
+
+    def __init__(self, view, a, b):
+        self.view, self.a, self.b = view, a, b
+        self.win = win = tk.Toplevel(view.root)
+        win.title(tr("New link"))
+        win.configure(bg=PAPER)
+        win.transient(view.root)
+        win.resizable(False, False)
+        pad = dict(padx=14, pady=(8, 0), sticky="w")
+        self.l_dir = tk.Label(win, bg=PAPER, fg=INK, font=view.f_center, justify="left")
+        self.l_dir.grid(row=0, column=0, columnspan=2, **pad)
+        ttk.Button(win, text="⇄  " + tr("Swap direction"), command=self.swap).grid(
+            row=0, column=2, padx=14, pady=(8, 0), sticky="e")
+        self.v_rel, self.v_why, self.v_src, self.v_when = (tk.StringVar() for _ in range(4))
+        rows = ((tr("Type"), self.v_rel), (tr("Reason"), self.v_why), (tr("Source"), self.v_src),
+                (tr("Span"), self.v_when))
+        self.boxes = []
+        for i, (label, var) in enumerate(rows, start=1):
+            tk.Label(win, text=label, bg=PAPER, fg=SOFT, font=view.f_label).grid(row=i, column=0, **pad)
+            if var is self.v_rel:
+                box = ttk.Combobox(win, textvariable=var, width=44)
+                self.rel_box = box
+            else:
+                box = ttk.Entry(win, textvariable=var, width=46)
+            box.grid(row=i, column=1, columnspan=2, padx=14, pady=(8, 0), sticky="we")
+            self.boxes.append(box)
+        tk.Label(win, text=tr("s_… of a source, or free text") + "   ·   " + tr("1609, 1618/1648, -800/400"),
+                 bg=PAPER, fg=FAINT, font=view.f_label).grid(row=5, column=1, columnspan=2, padx=14, sticky="w")
+        self.msg = tk.Label(win, text="", bg=PAPER, fg=OXIDE, font=view.f_label, wraplength=420, justify="left")
+        self.msg.grid(row=6, column=0, columnspan=3, padx=14, pady=(6, 0), sticky="w")
+        foot = tk.Frame(win, bg=PAPER)
+        foot.grid(row=7, column=0, columnspan=3, padx=14, pady=12, sticky="e")
+        ttk.Button(foot, text=tr("Cancel"), command=win.destroy).pack(side="right")
+        ttk.Button(foot, text=tr("Save"), command=self.save).pack(side="right", padx=(0, 8))
+        win.bind("<Return>", lambda e: self.save())
+        win.bind("<Escape>", lambda e: win.destroy())
+        self.fill()
+        self.boxes[1].focus_set()
+
+    def fill(self):
+        idx = by_id(self.view.data)
+        name = lambda r: one_liner(label_any(idx[r], self.view.data), 40)
+        self.l_dir.configure(text=f"{name(self.a)}  →  {name(self.b)}")
+        self.types = typical_rels(idx[self.a], idx[self.b])
+        self.rel_box.configure(values=[rel_label(r) for r in self.types])
+        if self.types and self.v_rel.get().strip() in ("",) + tuple(rel_label(r) for r in RELS):
+            self.v_rel.set(rel_label(self.types[0]))
+
+    def swap(self):
+        self.a, self.b = self.b, self.a
+        self.v_rel.set("")
+        self.fill()
+
+    def save(self):
+        typed = self.v_rel.get().strip()
+        rel = next((r for r in RELS if rel_label(r) == typed), typed)   # a label back to its type
+        problem = self.view.on_link(self.a, self.b, rel, self.v_why.get(), self.v_src.get(),
+                                    self.v_when.get())
+        if problem:
+            self.msg.configure(text=problem)
+            return
+        self.win.destroy()
+
+GRAPH_KEYS = ("click: to the middle (on a line: its links) · double-click / Enter: open on the card · "
+              "right-click: spark (in life: flip the cell) · drag: move · Shift+drag: draw a link · "
+              "k: key of the lines · wheel: zoom · "
               "m: glow / life / still · 1-3: depth · l: all names · space: pause · "
               "r: shake · c: copy id · p: replay the logs · Home: back to the start · "
               "F5: reread · Esc: close")
@@ -18295,6 +19124,94 @@ PT = {
         "Semear de novo para recomeçar",
     "r: start again":
         "r: recomeçar",
+    "A “{rel}” link does not fit these two records.":
+        "Uma ligação “{rel}” não cabe entre estes dois registros.",
+    "double-click: open where it comes from, on the card · Esc: close":
+        "duplo clique: abrir de onde parte, no cartão · Esc: fechar",
+    "Read-only here: open the graph from Kustos (Ctrl+Shift+G) to draw links.":
+        "Só leitura aqui: abra o grafo pelo Kustos (Ctrl+Shift+G) para desenhar ligações.",
+    "Link saved: {a} {rel} {b}":
+        "Ligação gravada: {a} {rel} {b}",
+    "Link":
+        "Ligação",
+    "New link":
+        "Nova ligação",
+    "Change link":
+        "Mudar ligação",
+    "Type":
+        "Tipo",
+    "Reason":
+        "Motivo",
+    "Span":
+        "Período",
+    "Swap direction":
+        "Inverter o sentido",
+    "Another link between them":
+        "Outra ligação entre os dois",
+    "no reason or source":
+        "sem motivo nem fonte",
+    "written {date}":
+        "escrita em {date}",
+    "atypical type":
+        "tipo atípico",
+    "Link saved.":
+        "Ligação gravada.",
+    "Link deleted.":
+        "Ligação apagada.",
+    "Delete this link?":
+        "Apagar esta ligação?",
+    "Draw a link":
+        "Desenhar uma ligação",
+    "Drag from one record to another to link them.":
+        "Arraste de um registro a outro para ligá-los.",
+    "Key":
+        "Legenda",
+    "Search the links":
+        "Buscar nas ligações",
+    "Needs a reason":
+        "Falta motivo",
+    "Atypical":
+        "Atípicas",
+    "other type…":
+        "outro tipo…",
+    "one word, e.g. inspired_by":
+        "uma palavra, p. ex. inspired_by",
+    "1609, 1618/1648, -800/400":
+        "1609, 1618/1648, -800/400",
+    "What a line shows":
+        "O que uma linha mostra",
+    "colour: its family":
+        "cor: a família",
+    "with a reason or a source":
+        "com motivo ou fonte",
+    "without either: needs a reason":
+        "sem nenhum dos dois: falta motivo",
+    "a type outside the list (atypical)":
+        "um tipo fora da lista (atípico)",
+    "thick where it comes from":
+        "grossa de onde parte",
+    "written recently":
+        "escrita há pouco",
+    "written long ago":
+        "escrita há muito",
+    "lit, in life":
+        "acesa, na vida",
+    "Open {name}":
+        "Abrir {name}",
+    "This link changed since it was opened.":
+        "Esta ligação mudou desde que foi aberta.",
+    "The other record no longer exists.":
+        "O outro registro não existe mais.",
+    "A link needs two different records.":
+        "Uma ligação precisa de dois registros diferentes.",
+    "A link needs a type.":
+        "Uma ligação precisa de um tipo.",
+    "A reason cannot contain #.":
+        "Um motivo não pode conter #.",
+    "A span is a year or two: 1609, 1618/1648, -800/400.":
+        "Um período é um ano ou dois: 1609, 1618/1648, -800/400.",
+    "This link already exists.":
+        "Esta ligação já existe.",
     "Glow":
         "Brilho",
     "Still":

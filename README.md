@@ -69,6 +69,22 @@ updating of files and conflicts if used any syncing app or cloud sync.
   the whole base (what was being worked on, and what it links to) and only the
   records that were on screen when the replay began. Records saved before
   there were logs open the timeline. `Esc` goes back to the live graph.
+- **What a link line shows**, in the graph (window and web alike): its
+  *colour* is the family of its type (verba, people, sources, corpus), *how
+  vivid* it is says how recently it was written (from the logs), its *stroke*
+  says what backs it — solid with a reason or a source, dashed with neither
+  (a link that still needs a reason), dotted for a type outside the list — and
+  a *taper*, thick at the record it comes from, gives its direction (two-way
+  types like *knows* stay even). `k` in the window, **?** on the web, shows the
+  key. Click a line (tap, on the web) to read its links: type, reason, source,
+  span, when written. In the window, double-click the line to open the record
+  it comes from on the card, and Shift+drag from one record to another to draw
+  a new link (type, reason, source, span; only the types that fit the two
+  records are offered, and one that does not fit is refused). On the web the
+  link card edits and deletes links too, **Link** turns dragging into drawing
+  links, and **⋯ › Links** lists every link, with *Needs a reason* and
+  *Atypical* as filters. A link is always saved as a change of the record it
+  comes from, with its log line, as when typed in its LINKS field.
 - **Timeline** (`Ctrl+Shift+T`, **View › Timeline**, or `python _kustos.py
   timeline [id]`): everything dated on one line of time, in lanes — the
   people's LOG (the facts of a life), births and deaths (`BORN` / `DIED` on the
