@@ -84,6 +84,18 @@ It refuses any folder it did not make, so it never touches a real base.
   are read again.
 - **Linked entries** between any registers (`author_of`, `cites`,
   `attested_in`, `defined_in`, `translates`, `measured_in`…). Labels outside of the table are accepted and marked as atypical.
+- **Monads** (`Ctrl+Shift+M`, **View › Monads**, or `python _kustos.py monads [id]`):
+  a second, read-only window that shows what records share with no link written,
+  after Leibniz. Each person, concept, form or source is a disc and no line is
+  drawn: what they have in common comes from the words they use (the rarer, the
+  more it counts) and from the links that exist. The nearer a disc, the more
+  clearly the one in the middle perceives it; the rest of the base stays as dust
+  at the edge. The dots inside a disc are what it perceives, on the side where
+  each is. Passing over a disc shows the others from its side and says what it
+  shares with the middle; a click moves there, `←` `→` walk back and forward, the
+  wheel zooms, `k` filters by kind, `1`-`3` show more or fewer, Enter opens the
+  record on the card. All the rims breathe on one clock. Health and drafts stay
+  out, and nothing it computes is saved; `F5` rereads what was edited since.
 - **Link graph** (`Ctrl+Shift+G`, **View › Link graph**, or `python _kustos.py graph [id]`):
   a second window with the open record in the middle and the records
   one to three links away around it, laid out by springs that settle by

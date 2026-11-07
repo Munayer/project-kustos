@@ -71,6 +71,10 @@ Ideas that span several sections:
   `PATH_MAX` links at most), also shared: the web asks `web_path`, the window
   calls it in `GraphView.show_path` (`f` opens `PathDialog`, Ctrl+click a
   record).
+- **Monads** (`# ==== monads`): read-only view; `MonadIndex` weighs shared words
+  and links, `MonadView` draws them with no lines. `MONAD_COLLS` keeps health and
+  drafts out, also as bridges between records; keep it that way. To measure its
+  frames, time the moves themselves: `update()` does not return while two tweens run.
 - **Peritia** (`# ==== peritia`): the skills panel is a page served by
   `cmd_peritia` on 127.0.0.1 (a token in the page, the Host header checked),
   from the template `PERITIA_HTML` (strings as `@@English@@`, translated by

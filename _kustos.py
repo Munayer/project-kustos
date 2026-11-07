@@ -41,6 +41,7 @@ USAGE
     python _kustos.py logbook         the base as a logbook (read-only)
     python _kustos.py graph [id]      the links as a living graph (read-only)
     python _kustos.py timeline [id]   everything dated, on one line of time (read-only)
+    python _kustos.py monads [id]     what records share without links, as monads (read-only)
     python _kustos.py peritia         the skills panel, in the browser (on 127.0.0.1)
     python _kustos.py web [--stay] [--port N] [--no-open]
                                       the whole base in the browser, for a phone or a
@@ -10619,6 +10620,16 @@ HELP_READING = (
 )
 
 
+# the Help › Shortcuts lines for the monads
+HELP_MONADS = (
+    "\n  Ctrl+Shift+M    monads (second window, read-only): what the records share with"
+    "\n                  no link needed, from the words they use. No lines: the nearer"
+    "\n                  a disc, the more distinctly the one in the middle perceives"
+    "\n                  it; the rest stays as dust at the edge. Passing over a disc"
+    "\n                  shows the others from its side; a click moves there, ← and →"
+    "\n                  walk back and forward. Health and drafts stay out.\n"
+)
+
 # the Help › Shortcuts lines for the link graph
 HELP_GRAPH = (
     "\n  Ctrl+Shift+G    link graph (second window): the open record in the middle,"
@@ -12032,6 +12043,8 @@ class App:
                       command=self.open_graph)
         v.add_command(label=tr("Timeline"), accelerator="Ctrl+Shift+T",
                       command=self.open_timeline)
+        v.add_command(label=tr("Monads"), accelerator="Ctrl+Shift+M",
+                      command=self.open_monads)
         v.add_command(label=tr("Skills (Peritia)"), command=self.open_peritia)
         v.add_command(label=tr("Wide card"), accelerator="F11", command=self.toggle_wide)
         v.add_command(label=tr("Read field"), accelerator="Ctrl+E", command=self.open_reader)
@@ -12093,6 +12106,7 @@ class App:
         r.bind("<Control-b>", lambda e: self.open_book())
         r.bind("<Control-G>", lambda e: self.open_graph())      # Ctrl+Shift+G
         r.bind("<Control-T>", lambda e: self.open_timeline())   # Ctrl+Shift+T
+        r.bind("<Control-M>", lambda e: self.open_monads())     # Ctrl+Shift+M
         r.bind("<F11>", lambda e: self.toggle_wide())
         r.bind("<Control-backslash>", lambda e: self.toggle_wide())
         r.bind("<Control-e>", lambda e: self.open_reader())
@@ -12233,6 +12247,20 @@ class App:
         self.say(tr("Link saved: {a} {rel} {b}", a=label_any(by_id(self.data).get(a), self.data),
                     rel=rel_label(rel), b=label_any(by_id(self.data).get(b), self.data)))
         return None
+
+    def open_monads(self):
+        """Ctrl+Shift+M: what the records share without being linked, in a second
+        window, around the current record; it follows the records opened here."""
+        self.commit_if_dirty()
+        m = getattr(self, "monads", None)
+        if m and m.is_open():
+            m.root.lift()
+            m.follow((self.current() or {}).get("id"))
+            return "break"
+        win = tk.Toplevel(self.root)
+        self.monads = MonadView(win, lambda: self.data, start_id=(self.current() or {}).get("id"),
+                                on_open=self.open_from_graph)
+        return "break"
 
     def open_timeline(self):
         """Ctrl+Shift+T: everything dated, on one line of time, in a second
@@ -13478,9 +13506,9 @@ class App:
         self.dirty = False
         self.refit_card()
         self.front_card()
-        g = getattr(self, "graph", None)
-        if g and g.is_open():
-            g.follow(rid)
+        for view in (getattr(self, "graph", None), getattr(self, "monads", None)):
+            if view and view.is_open():
+                view.follow(rid)
 
     def goto(self, rid):
         if rid not in by_id(self.data):
@@ -14473,7 +14501,7 @@ class App:
 
     def do_help(self):
         self.show_text(tr("Shortcuts"), tr(HELP_TEXT, conflicts=CONFLICT_DIR.name, stem=STEM)
-                       + tr(HELP_READING) + tr(HELP_COPY) + tr(HELP_GRAPH)
+                       + tr(HELP_READING) + tr(HELP_COPY) + tr(HELP_GRAPH) + tr(HELP_MONADS)
                        + tr(HELP_NOTES) + tr(HELP_TIMELINE))
 
     # ------------------------------------------------------------ dialogs
@@ -17226,6 +17254,551 @@ def cmd_graph(open_id=None):
     return 0
 
 
+# ================================================================ monads
+#
+# The base as Leibniz's monads (Ctrl+Shift+M, View › Monads, or `python _kustos.py
+# monads`). The link graph draws what you wrote; this finds what you did not:
+# nobody has to link one record to another. Each record is a disc and no line is
+# ever drawn, since monads have no windows. What two records share is computed
+# from the words they use, the rarer the word the more it counts, and from the
+# links that exist, when they do. Distance is the order of clarity: near the middle
+# is what the monad there perceives best; the rest stays as dust at the edge, confused
+# but present (§60-62). The dots inside a disc are the universe as seen from it,
+# each in the direction of what it perceives. Passing over a monad tints the
+# others from its side, the same city seen from another place (§57). All the rims
+# breathe on one clock and nothing passes between them: the harmony is
+# pre-established. Health and drafts stay out, also as a way into other records.
+# Read-only: nothing it computes is saved.
+
+MONAD_COLLS = ("people", "entries", "sources")
+MONAD_KINDS = ("all", "person", "concept", "form", "source")
+MONAD_SHOWN = (24, 40, 64)   # keys 1-3: how many monads, the view stays fluid
+MONAD_DUST = 260             # at most this many points of dust
+MONAD_TERMS = 60             # the rarest terms of a record: a long note stays cheap
+MONAD_MOVE_MS = 520          # the universe rearranges around another monad
+MONAD_TINT_MS = 160          # the view passes to the monad under the pointer
+MONAD_BREATH_MS = 6000       # one breath of the rims
+MONAD_WORD = re.compile(r"[^\W\d_]{4,}")
+MONAD_STOP = set("""
+    about after again also among because been before being between both cannot
+    could does down during each even every from have here into just like made many
+    more most much must never only other over same should some such than that their
+    them then there these they this those through under very were what when where
+    which while will with within without would your
+    ainda alem antes aqui assim cada coisa como contra depois desde dessa desse
+    dessas desses dest esta este estes estas entre essa esse essas esses fazer
+    foram isso isto mais mesma mesmo muita muito nada nessa nesse nesta neste
+    outra outro para pela pelas pelo pelos pode porque quais qual quando quanto
+    quem seja sem sempre sendo seus suas sobre somente tambem tem tendo tenho toda
+    todas todo todos tudo uma umas uns vez
+""".split())
+
+
+def monad_words(rec):
+    """The words of a record, folded, without the most common ones."""
+    parts = [str(rec.get(k) or "") for k in ("name", "gloss", "notes", "notes_raw", "raw")]
+    parts += [str(x) for k in ("authors", "tags") for x in rec.get(k) or []]
+    folded = unicodedata.normalize("NFKD", " ".join(parts).casefold())
+    folded = "".join(c for c in folded if not unicodedata.combining(c))
+    return set(MONAD_WORD.findall(folded)) - MONAD_STOP
+
+
+class MonadIndex:
+    """What each record has in common with the others, as weighted terms: its
+    words, and "@id" for each record it is linked to, so that two records meet
+    through a third. A term only one record has, or too many, says nothing."""
+
+    def __init__(self, data):
+        self.recs = {r["id"]: r for c in MONAD_COLLS for r in data.get(c, [])
+                     if not r["id"].startswith("__")}
+        terms = {rid: monad_words(r) for rid, r in self.recs.items()}
+        for a in data.get("edges", []):
+            f, t = a.get("from"), a.get("to")
+            if f != t and f in terms and t in terms:
+                terms[f] |= {"@" + f, "@" + t}
+                terms[t] |= {"@" + f, "@" + t}
+        count = {}
+        for words in terms.values():
+            for w in words:
+                count[w] = count.get(w, 0) + 1
+        n = len(terms)
+        most = max(8, n * 0.05)
+        self.vec, self.who, self.seen = {}, {}, {}
+        for rid, words in terms.items():
+            kept = sorted((w for w in words if 2 <= count[w] <= most),
+                          key=lambda w: (count[w], w))[:MONAD_TERMS]
+            v = {w: math.log(1 + n / count[w]) for w in kept}
+            size = math.sqrt(sum(x * x for x in v.values())) or 1.0
+            self.vec[rid] = {w: x / size for w, x in v.items()}
+            for w, x in self.vec[rid].items():
+                self.who.setdefault(w, []).append((rid, x))
+
+    def richest(self):
+        return max(self.vec, key=lambda k: (len(self.vec[k]), k), default=None)
+
+    def perceive(self, rid):
+        """[(other, clarity)], the clearest first; clarity goes from 0 to 1."""
+        if rid not in self.seen:
+            score = {}
+            for w, x in self.vec.get(rid, {}).items():
+                for other, y in self.who[w]:
+                    if other != rid:
+                        score[other] = score.get(other, 0.0) + x * y
+            self.seen[rid] = sorted(score.items(), key=lambda kv: (-kv[1], kv[0]))
+        return self.seen[rid]
+
+    def shared(self, a, b):
+        """The terms a and b have in common, the ones that weigh most first."""
+        va, vb = self.vec.get(a, {}), self.vec.get(b, {})
+        both = (w for w in va if w in vb and w not in ("@" + a, "@" + b))
+        return sorted(both, key=lambda w: (-va[w] * vb[w], w))
+
+    def term(self, w):
+        """A term as it is shown: a word, or the name of a record."""
+        return label_any(self.recs[w[1:]]) if w.startswith("@") else w
+
+
+class MonadView:
+    TOP, BOTTOM = 44, 26       # the keys above, the status below
+    CENTRE_R = 46.0
+    STEPS = 24                 # colour steps of the discs
+
+    def __init__(self, root, get_data, start_id=None, on_open=None):
+        self.root, self.get_data, self.on_open = root, get_data, on_open
+        self.data = self.u = None
+        self.center = self.hover = None
+        self.m, self.screen = {}, {}
+        self.back, self.ahead = [], []
+        self.kind, self.breadth = "all", 1
+        self.all_names, self.still = False, False
+        self.zoom, self.cam = 1.0, [0.0, 0.0]
+        self.press_at = self.press_node = None
+        self.last, self.moved = (0, 0), False
+        self.move, self.tint = {}, {}          # the states of the two tweens
+        self.goal, self.todo = {}, []          # where they go, whose dots are pending
+        self.fill, self.far = {}, 0            # the timer of those dots, the dust
+        self._breath = self._follow = None
+        self.dust, self.rim = [], None
+
+        fams = set(tkfont.families(root))
+        mono = next((f for f in ("Cascadia Mono", "Consolas", "Lucida Console",
+                                 "DejaVu Sans Mono", "Courier New") if f in fams), "Courier")
+        self.f_label = tkfont.Font(root, family=mono, size=8)
+        self.f_center = tkfont.Font(root, family=mono, size=10, weight="bold")
+        self.f_status = tkfont.Font(root, family=mono, size=9)
+        n = self.STEPS
+        self.ramp = [mix(PAPER, STAMP, 0.5 * i / n) for i in range(n + 1)]
+        self.rims = [mix(FAINT, OXIDE, i / 12) for i in range(13)]
+
+        root.title(tr("Kustos · monads (read-only)"))
+        root.configure(bg=PAPER)
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = min(1100, sw - 80), min(760, sh - 120)
+        root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
+        root.minsize(560, 400)
+        paint_frame(root)
+        self.cv = cv = tk.Canvas(root, bg=PAPER, highlightthickness=0, bd=0)
+        cv.pack(fill="both", expand=True)
+        self.t_keys = cv.create_text(12, 10, anchor="nw", font=self.f_label, fill=FAINT,
+                                     text=tr(MONAD_KEYS))
+        self.t_left = cv.create_text(12, 0, anchor="sw", font=self.f_status, fill=SOFT)
+        self.t_right = cv.create_text(0, 0, anchor="se", font=self.f_status, fill=SOFT)
+        self.t_notice = cv.create_text(0, 0, anchor="n", font=self.f_status, fill=SOFT)
+
+        b = root.bind
+        b("<Left>", lambda e: self.walk(self.back, self.ahead))
+        b("<BackSpace>", lambda e: self.walk(self.back, self.ahead))
+        b("<Right>", lambda e: self.walk(self.ahead, self.back))
+        b("<Home>", self.home)
+        for i in range(3):
+            b(str(i + 1), lambda e, i=i: self.set_breadth(i))
+        b("<k>", lambda e: self.next_kind())
+        b("<l>", lambda e: self.toggle_names())
+        b("<c>", lambda e: self.copy_id())
+        b("<space>", lambda e: self.toggle_still())
+        b("<F5>", lambda e: self.recentre(self.center, fresh=True, trail=False))
+        b("<Return>", lambda e: self.open_in_card())
+        b("<Escape>", lambda e: self.close())
+        b("<q>", lambda e: self.close())
+        cv.bind("<Configure>", self.resized)
+        cv.bind("<Motion>", self.motion)
+        cv.bind("<ButtonPress-1>", self.press)
+        cv.bind("<B1-Motion>", self.drag)
+        cv.bind("<ButtonRelease-1>", self.release)
+        cv.bind("<Double-Button-1>", lambda e: self.open_in_card(self.hover or self.center))
+        cv.bind("<MouseWheel>", lambda e: self.zoom_at(e, 1.1 if e.delta > 0 else 1 / 1.1))
+        cv.bind("<Button-4>", lambda e: self.zoom_at(e, 1.1))
+        cv.bind("<Button-5>", lambda e: self.zoom_at(e, 1 / 1.1))
+        root.protocol("WM_DELETE_WINDOW", self.close)
+        self.recentre(start_id, fresh=True, trail=False)
+        self.breathe()
+
+    # ---------------------------------------------------------- content
+    def fits(self, rid):
+        return self.kind == "all" or graph_kind(self.u.recs[rid]) == self.kind
+
+    def recentre(self, rid, fresh=False, trail=True):
+        """Puts `rid` in the middle and lets the others find their distance from
+        it. What it perceives through the same word sits on the same side."""
+        if fresh:
+            data = self.get_data()
+            if data is not self.data or self.u is None:
+                self.data, self.u = data, MonadIndex(data)
+        u = self.u
+        if rid not in u.recs:
+            rid = self.center if self.center in u.recs else u.richest()
+        if rid is None:
+            self.cv.itemconfigure(self.t_notice, text=tr("The base has no records yet."))
+            return
+        if trail and self.center and rid != self.center:
+            self.back.append(self.center)
+            self.ahead.clear()
+        self.center, self.hover = rid, None
+        seen = [(o, c) for o, c in u.perceive(rid) if self.fits(o)]
+        seen = seen[:MONAD_SHOWN[self.breadth]]
+        top = seen[0][1] if seen else 1.0
+        sides = {}
+        for o, c in seen:
+            sides.setdefault(next(iter(u.shared(rid, o)), ""), []).append((o, c))
+        ranked = sorted(sides.values(), key=lambda g: -sum(c for _o, c in g))
+        order = [row for group in ranked for row in group]
+        place = {o: i for i, (o, _c) in enumerate(seen)}
+        goal = {rid: (0.0, 0.0, self.CENTRE_R, 1.0)}
+        for i, (o, c) in enumerate(order):
+            k = c / top
+            a = 2 * math.pi * i / len(order) - math.pi / 2
+            rho = 0.34 + 0.62 * (place[o] / max(1, len(order) - 1)) ** 0.8
+            goal[o] = (rho * math.cos(a), rho * math.sin(a), 7 + 13 * k, k)
+        for n, m in self.m.items():
+            m["from"] = (m["x"], m["y"], m["r"])
+            m["gone"] = n not in goal
+            if m["gone"]:
+                m["to"] = (m["x"] * 1.6, m["y"] * 1.6, 0.0)
+        for n, (x, y, r, k) in goal.items():
+            m = self.m.get(n) or self.add_monad(n, x * 1.9, y * 1.9)
+            m["to"], m["k"] = (x, y, r), k
+        halt(self.cv, self.fill)
+        self.goal, self.todo = goal, [n for n in goal if n != rid]
+        self.mirror(rid)
+        self.cv.tag_raise(self.m[rid]["disc"])
+        self.lay_dust(order)
+        self.cv.itemconfigure(self.t_notice, text="" if order else tr(
+            "Nothing in common with the rest yet: it needs more words of its own, or a link."))
+        self.retint()
+        self.update_status()
+        tween(self.cv, self.move, MONAD_MOVE_MS, self.step, self.landed, ease_both)
+
+    def add_monad(self, n, x, y):
+        cv = self.cv
+        disc = cv.create_oval(0, 0, 0, 0, fill=PAPER, width=1, outline=self.rims[self.rim or 0],
+                              tags=("m", "rim"))
+        text = cv.create_text(0, 0, anchor="n", tags=("m",), font=self.f_label, state="hidden",
+                              text=one_liner(label_any(self.u.recs[n], self.data), 30))
+        m = self.m[n] = {"x": x, "y": y, "r": 0.0, "from": (x, y, 0.0), "gone": False,
+                         "disc": disc, "text": text, "dots": [], "k": 0.0, "q": 0.0, "s": -1}
+        return m
+
+    def mirror(self, n):
+        """The dots inside a disc: what this monad perceives among those on
+        screen, each on the side where it is."""
+        cv, m = self.cv, self.m[n]
+        for item, _t, _f in m["dots"]:
+            cv.delete(item)
+        want = 9 if n == self.center else 3
+        rows = [(o, c) for o, c in self.u.perceive(n) if o in self.goal][:want]
+        top = rows[0][1] if rows else 1.0
+        m["dots"] = [(cv.create_oval(-9, -9, -9, -9, fill=INK, outline=""), o, c / top)
+                     for o, c in rows]
+
+    def lay_dust(self, order=None):
+        """The rest of the base, at the edge: confused, not absent."""
+        cv = self.cv
+        if order is not None:
+            self.far = max(0, len(self.u.recs) - len(order) - 1)
+        w, h = cv.winfo_width(), cv.winfo_height()
+        mx, my = self.middle()
+        want = min(self.far, MONAD_DUST)
+        while len(self.dust) < want:
+            self.dust.append(cv.create_oval(-9, -9, -9, -9, fill=FAINT, outline=""))
+            cv.tag_lower(self.dust[-1])
+        rng = random.Random(self.center)       # each monad has its own sky
+        for i, item in enumerate(self.dust):
+            if i >= want:
+                cv.coords(item, -9, -9, -9, -9)
+                continue
+            a, rho = rng.uniform(0, 2 * math.pi), rng.uniform(0.9, 1.3)
+            x, y = mx + rho * (w / 2) * math.cos(a), my + rho * (h / 2) * math.sin(a)
+            cv.coords(item, x, y, x + 1.6, y + 1.6)
+
+    # ---------------------------------------------------------- drawing
+    def middle(self):
+        cv = self.cv
+        return cv.winfo_width() / 2, (cv.winfo_height() + self.TOP - self.BOTTOM) / 2
+
+    def step(self, k):
+        for m in self.m.values():
+            (x0, y0, r0), (x1, y1, r1) = m["from"], m["to"]
+            m["x"], m["y"], m["r"] = x0 + (x1 - x0) * k, y0 + (y1 - y0) * k, r0 + (r1 - r0) * k
+        if self.todo:
+            self.mirror(self.todo.pop())
+        self.draw()
+
+    def drain(self):
+        """The dots the move had no time for, one a frame: a click never waits."""
+        self.fill["job"] = None
+        if self.todo:
+            self.mirror(self.todo.pop())
+            self.draw()
+            self.fill["job"] = self.cv.after(FRAME_MS, self.drain)
+
+    def landed(self):
+        for n in [n for n, m in self.m.items() if m["gone"]]:
+            m = self.m.pop(n)
+            self.cv.delete(m["disc"], m["text"], *[d[0] for d in m["dots"]])
+        self.draw()
+        self.drain()
+
+    def draw(self):
+        cv, S = self.cv, {}
+        mx, my = self.middle()
+        rx, ry = cv.winfo_width() / 2 - 70, (cv.winfo_height() - self.TOP - self.BOTTOM) / 2 - 30
+        z, (cx, cy) = self.zoom, self.cam
+        size = min(1.6, max(0.6, z))
+        for n, m in self.m.items():
+            S[n] = (mx + m["x"] * rx * z + cx, my + m["y"] * ry * z + cy, m["r"] * size)
+        self.screen = S
+        for n, m in self.m.items():
+            x, y, r = S[n]
+            cv.coords(m["disc"], x - r, y - r, x + r, y + r)
+            cv.coords(m["text"], x, y + r + 3)
+            d = 2.2 if n == self.center else 1.5
+            for item, other, f in m["dots"]:
+                if r < 9 or other not in S:
+                    cv.coords(item, -9, -9, -9, -9)
+                    continue
+                dx, dy = S[other][0] - x, S[other][1] - y
+                far = math.hypot(dx, dy) or 1.0
+                px, py = x + dx / far * r * (0.25 + 0.55 * f), y + dy / far * r * (0.25 + 0.55 * f)
+                cv.coords(item, px - d, py - d, px + d, py + d)
+
+    def retint(self):
+        """Colours the discs as the monad under the pointer, or the one in the
+        middle, sees them, and names what it sees distinctly."""
+        view = self.hover or self.center
+        seen = {o: c for o, c in self.u.perceive(view) if o in self.m}
+        top = max(seen.values(), default=1.0)
+        for n, m in self.m.items():
+            m["q0"] = m["q"]
+            m["k"] = 1.0 if n == view else seen.get(n, 0.0) / top
+            lit = m["k"] >= 0.5
+            named = self.all_names or lit or n == self.center
+            self.cv.itemconfigure(m["text"], state="normal" if named else "hidden",
+                                  fill=INK if lit else SOFT,
+                                  font=self.f_center if n == view else self.f_label)
+        if view in self.m:
+            self.cv.tag_raise(self.m[view]["text"])
+
+        def step(k):
+            for m in self.m.values():
+                m["q"] = m["q0"] + (m["k"] - m["q0"]) * k
+                q = int(m["q"] * self.STEPS + 0.5)
+                if q != m["s"]:
+                    m["s"] = q
+                    self.cv.itemconfigure(m["disc"], fill=self.ramp[q])
+
+        tween(self.cv, self.tint, MONAD_TINT_MS, step)
+
+    def breathe(self):
+        """One clock for every rim: one change of colour, on a tag."""
+        self._breath = None
+        if self.still or not self.root.winfo_exists():
+            return
+        k = time.perf_counter() * 1000 % MONAD_BREATH_MS / MONAD_BREATH_MS
+        q = round(ease_both(abs(2 * k - 1)) * 12)
+        if q != self.rim:
+            self.rim = q
+            self.cv.itemconfigure("rim", outline=self.rims[q])
+        hidden = self.root.state() != "normal" and self.root.state() != "zoomed"
+        self._breath = self.root.after(1000 if hidden else 200, self.breathe)
+
+    def resized(self, _e=None):
+        cv = self.cv
+        w, h = cv.winfo_width(), cv.winfo_height()
+        cv.coords(self.t_left, 12, h - 6)
+        cv.coords(self.t_right, w - 12, h - 6)
+        cv.coords(self.t_notice, w / 2, h / 2 + 70)
+        cv.itemconfigure(self.t_keys, width=w - 24)
+        if self.center:
+            self.lay_dust()
+            self.draw()
+
+    def update_status(self, flash=None):
+        cv, u = self.cv, self.u
+        n = self.hover
+        if flash:
+            left = flash
+        elif n and n != self.center:
+            words = [u.term(w) for w in u.shared(self.center, n)[:5]]
+            left = tr("{name} · in common: {words}", name=label_any(u.recs[n], self.data),
+                      words=", ".join(words) if words else "—")
+        else:
+            trail = self.back[-3:] + [self.center]
+            left = " › ".join(one_liner(label_any(u.recs[t], self.data), 22)
+                              for t in trail if t in u.recs)
+        cv.itemconfigure(self.t_left, text=one_liner(left, 110))
+        kind = tr(self.kind) + " · " if self.kind != "all" else ""
+        cv.itemconfigure(self.t_right, text=kind + tr(
+            "{n} near · {far} at the edge", n=len(self.m) - 1, far=self.far))
+
+    # ---------------------------------------------------------- the hand
+    def node_at(self, x, y):
+        best, bd = None, None
+        for n, (sx, sy, r) in self.screen.items():
+            d = math.hypot(sx - x, sy - y)
+            if d <= r + 5 and not self.m[n]["gone"] and (bd is None or d < bd):
+                best, bd = n, d
+        return best
+
+    def motion(self, e):
+        n = self.node_at(e.x, e.y)
+        if n != self.hover:
+            self.hover = n
+            self.retint()
+            self.update_status()
+
+    def press(self, e):
+        self.cv.focus_set()
+        self.press_at = self.last = (e.x, e.y)
+        self.press_node, self.moved = self.node_at(e.x, e.y), False
+
+    def drag(self, e):
+        if not self.press_at:
+            return
+        if not self.moved and abs(e.x - self.press_at[0]) + abs(e.y - self.press_at[1]) < 4:
+            return
+        self.moved = True
+        self.cam[0] += e.x - self.last[0]
+        self.cam[1] += e.y - self.last[1]
+        self.last = (e.x, e.y)
+        self.draw()
+
+    def release(self, _e):
+        n = self.press_node
+        if n and not self.moved and n != self.center:
+            self.recentre(n)
+        self.press_at = self.press_node = None
+
+    def zoom_at(self, e, f):
+        z = min(3.0, max(0.4, self.zoom * f))
+        mx, my = self.middle()
+        for i, p, q in ((0, e.x, mx), (1, e.y, my)):
+            self.cam[i] = (p - q) - (p - q - self.cam[i]) * z / self.zoom
+        self.zoom = z
+        self.draw()
+
+    def walk(self, frm, to):
+        """Back and forward along the monads visited."""
+        while frm and frm[-1] not in self.u.recs:
+            frm.pop()
+        if frm:
+            to.append(self.center)
+            self.recentre(frm.pop(), trail=False)
+
+    def home(self, _e=None):
+        self.zoom, self.cam = 1.0, [0.0, 0.0]
+        self.resized()
+
+    def set_breadth(self, i):
+        self.breadth = i
+        self.recentre(self.center, trail=False)
+
+    def next_kind(self):
+        self.kind = MONAD_KINDS[(MONAD_KINDS.index(self.kind) + 1) % len(MONAD_KINDS)]
+        self.recentre(self.center, trail=False)
+
+    def toggle_names(self):
+        self.all_names = not self.all_names
+        self.retint()
+
+    def toggle_still(self):
+        self.still = not self.still
+        if not self.still and not self._breath:
+            self.breathe()
+
+    def copy_id(self):
+        rid = self.hover or self.center
+        if rid:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(rid)
+            self.update_status(flash=tr("Copied: {value}", value=rid))
+
+    def open_in_card(self, rid=None):
+        rid = rid or self.hover or self.center
+        if rid and self.on_open:
+            self.on_open(rid)
+        elif rid:
+            self.update_status(flash=tr("Read-only here: open the monads from Kustos "
+                                        "(Ctrl+Shift+M) to send records to the card."))
+
+    def follow(self, rid):
+        """The main window opened another record: the monads move to it, a
+        moment later, if it is one of them."""
+        if rid == self.center:
+            return
+        if self._follow:
+            self.root.after_cancel(self._follow)
+        self._follow = self.root.after(250, lambda: self._do_follow(rid))
+
+    def _do_follow(self, rid):
+        self._follow = None
+        if rid in self.u.recs:                  # F5 rereads what was edited since
+            self.recentre(rid)
+        elif rid and coll_of(rid) in MONAD_COLLS and rid in by_id(self.get_data()):
+            self.recentre(rid, fresh=True)
+
+    def is_open(self):
+        try:
+            return bool(self.root.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def close(self):
+        halt(self.cv, self.move)
+        halt(self.cv, self.tint)
+        halt(self.cv, self.fill)
+        for job in (self._breath, self._follow):
+            if job:
+                try:
+                    self.root.after_cancel(job)
+                except tk.TclError:
+                    pass
+        self._breath = self._follow = None
+        self.root.destroy()
+
+
+MONAD_KEYS = ("click: to the middle · double-click / Enter: open on the card · "
+              "← / →: back / forward · drag: move · wheel: zoom · Home: recentre the view · "
+              "1-3: how many · k: kind · l: all names · c: copy id · space: still · "
+              "F5: reread · Esc: close")
+
+
+def cmd_monads(open_id=None):
+    """Opens the monads by themselves, read-only."""
+    global tk, tkfont, ttk
+    try:
+        import tkinter as _tk
+        from tkinter import font as _tkfont, ttk as _ttk
+    except ImportError:
+        raise SystemExit(tr("This Python came without Tkinter. Reinstall it with tcl/tk."))
+    tk, tkfont, ttk = _tk, _tkfont, _ttk
+    load_palette((load_json().get("ui") or {}).get("theme", "paper"))
+    root = tk.Tk()
+    set_window_icon(root)
+    root.monads = MonadView(root, load_json, start_id=open_id)
+    root.mainloop()
+    return 0
+
+
 # ================================================================ timeline
 #
 # Everything with a date on one line of time (Ctrl+Shift+T, View › Timeline,
@@ -17840,6 +18413,8 @@ def main():
         return cmd_graph(rest[0] if rest else None)
     if cmd == "timeline":
         return cmd_timeline(rest[0] if rest else None)
+    if cmd == "monads":
+        return cmd_monads(rest[0] if rest else None)
     if cmd == "peritia":
         return cmd_peritia(rest)
     if cmd == "web":
@@ -19022,6 +19597,27 @@ PT = {
         "clique: ao centro · duplo clique: abrir · botão direito: faísca · arrastar: mover · Shift+arrastar: desenhar uma ligação · Ctrl+clique: caminho · roda: zoom · ?: a legenda e todas as teclas",
     GRAPH_REPLAY_KEYS:
         "REPRODUÇÃO DOS LOGS · espaço: pausa / continua · + / -: mais rápido / mais lento · ← / →: voltar / avançar · Home / End: início / hoje · clicar ou arrastar a linha do tempo: ir àquele momento · w: base inteira / em volta do registro · m: brilho / vida / parado · duplo clique: abrir no cartão · Esc ou p: voltar ao grafo vivo",
+    MONAD_KEYS:
+        "clique: ao centro · duplo clique / Enter: abrir no cartão · ← / →: voltar / avançar · arrastar: mover · roda: zoom · Home: recentrar a vista · 1-3: quantas · k: tipo · l: todos os nomes · c: copiar id · espaço: imóvel · F5: reler · Esc: fechar",
+    HELP_MONADS:
+        "\n  Ctrl+Shift+M    mônadas (segunda janela, só leitura): o que os registros têm em"
+        "\n                  comum sem precisar de ligação, pelas palavras que usam. Sem"
+        "\n                  linhas: quanto mais perto o disco, mais distintamente o do"
+        "\n                  centro o percebe; o resto fica como poeira na borda. Passar"
+        "\n                  sobre um disco mostra os outros do lado dele; um clique vai"
+        "\n                  até ele, ← e → voltam e avançam. Saúde e rascunhos ficam de fora.\n",
+    "Monads":
+        "Mônadas",
+    "Kustos · monads (read-only)":
+        "Kustos · mônadas (só leitura)",
+    "Nothing in common with the rest yet: it needs more words of its own, or a link.":
+        "Ainda nada em comum com o resto: precisa de mais palavras próprias, ou de uma ligação.",
+    "{name} · in common: {words}":
+        "{name} · em comum: {words}",
+    "{n} near · {far} at the edge":
+        "{n} perto · {far} na borda",
+    "Read-only here: open the monads from Kustos (Ctrl+Shift+M) to send records to the card.":
+        "Aqui é só leitura: abra as mônadas pelo Kustos (Ctrl+Shift+M) para levar registros ao cartão.",
     HELP_GRAPH:
         "\n  Ctrl+Shift+G    grafo de ligações (segunda janela): o registro aberto no centro,\n                  suas ligações em volta, brilhando com as edições recentes. Ele\n                  segue o registro que você abre aqui; os botões no alto trocam o\n                  brilho (vida de Conway, brilho que se espalha, parado) e a\n                  profundidade, Abrir (ou Enter) abre um registro no cartão,\n                  Caminho mostra como dois registros se ligam e Ligação desenha\n                  uma ligação. p reproduz os logs: a base cresce na tela como\n                  cresceu, com uma linha do tempo para percorrer. ? mostra a\n                  legenda das linhas e todas as teclas.\n",
     "drafts":
