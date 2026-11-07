@@ -194,6 +194,9 @@ Force pushes are run by the owner, not by Claude.
   that scrolls inside (Continuous, `ui.max_rows`) does the same; `text_wheel`
   replaces Tk's own Text wheel so a card's field never scrolls by itself, and
   a `TCombobox` has no wheel at all -- it changed a record's type in passing.
+  What a machine's wheel or touchpad really sends, and what each signal does,
+  is recorded by `python tools/wheel_probe.py` (invented records, written to
+  `wheel_probe.txt`, ignored by git): ask for it before guessing again.
 - Patching with shell heredocs mangles backslashes; write patch scripts to a
   file and `compile()` the result before writing it.
 
