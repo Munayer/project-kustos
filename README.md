@@ -102,6 +102,14 @@ updating of files and conflicts if used any syncing app or cloud sync.
   the same base. A record changed on disk since the page opened it (in the
   window, or synced from another machine) is not overwritten without asking.
   The menu opens the health report and the body map.
+  The **link graph** is there too (*Graph* on a record, or *Link graph* in the
+  menu): the same records, shapes and springs as the window's, with Conway's
+  life first — a lit record fills with the accent and swells, its links to
+  other lit records thicken, a birth rings outward, a death fades with a rust
+  edge, and a small line in the corner follows how many are lit. Tap a record
+  to bring it to the middle, tap the middle to open it, hold one to flip its
+  cell, pinch or scroll to zoom; *Life / Glow / Still* and the depth 1–3 sit
+  above it. (The replay of the logs is still only in the window.)
 - **Source**: free types (book, paper, thesis, law/bill, decisions, webpages, videos), citations in academic formats, BibTeX and CSL-JSON.
   Can import from Zotero via CSL-JSON or BibTeX without duplicating entries.
 - **Health (corpus)**: four kinds of record, each with its own fields —

@@ -5841,6 +5841,12 @@ WEB_STRINGS = (
     "{n} of {total}", "register order, newest first", "index, alphabetical",
     "in range", "near the limit", "out", "no reference",
     "file", "(the file is made on saving)", "no such record",
+    "Graph", "Link graph", "Open", "Pause", "Play", "Reseed", "Names", "Life", "Glow", "Still",
+    "Conway's life", "spreading glow", "still", "generation {n}, {k} lit", "born {b} · died {d}",
+    "paused", "{n} records, {k} links", "depth {d}", "The base has no records yet.",
+    "No links yet: write them in the card's LINKS field, one per line.",
+    "tap: to the middle · tap the middle: open · hold: flip the cell · drag: move · pinch or wheel: zoom",
+    "tap: to the middle · tap the middle: open · hold: spark · drag: move · pinch or wheel: zoom",
 )
 
 
@@ -6302,6 +6308,32 @@ def web_record(data, rid):
     return out
 
 
+def web_graph(data, rid, depth=2):
+    """The link graph around one record, for the page: the records up to
+    `depth` links away (graph_ego, at most GRAPH_MAX_NODES), each with its
+    shape, name, distance, the record that brought it and how recently it was
+    edited (what life mode seeds from), and the links between them with their
+    rels. Without a record, or with an unknown one, the most linked record is
+    the middle, as in the window."""
+    idx = by_id(data)
+    adj = graph_adjacency(data)
+    if rid not in idx:
+        rid = max(adj, key=lambda k: (len(adj[k]), k), default=None)
+    if rid is None and idx:
+        rid = next(iter(idx))
+    depth = depth if depth in (1, 2, 3) else 2
+    ego = graph_ego(adj, rid, depth) if rid else {}
+    now = datetime.now()
+    nodes = [{"id": n, "kind": graph_kind(idx[n]), "name": one_liner(label_any(idx[n], data), 60),
+              "dist": d, "parent": parent, "rec": round(recency(idx[n], now), 4),
+              "n": idx[n].get("reg_n") or 0}
+             for n, (d, parent) in ego.items()]
+    links = [{"a": a, "b": b, "rels": [[rel_label(rel), f] for rel, f in rels]}
+             for a in ego for b, rels in adj.get(a, {}).items() if b in ego and a < b]
+    return {"center": rid, "depth": depth, "nodes": nodes, "links": links,
+            "records": len(idx)}
+
+
 def web_boot(token):
     """What the page needs before its first call."""
     return {"token": token, "lang": LANG, "today": TODAY(), "fields": web_fields(),
@@ -6357,6 +6389,12 @@ def web_api(method, path, query, body):
         if method == "GET" and path == "/api/record":
             got = web_record(load_json(), arg("id"))
             return (200, got) if got else (404, {"error": tr("This record no longer exists.")})
+        if method == "GET" and path == "/api/graph":
+            try:
+                depth = int(arg("depth", "2"))
+            except ValueError:
+                depth = 2
+            return 200, web_graph(load_json(), arg("id"), depth)
         if method != "POST":
             return 404, {"error": tr("Not found.")}
         if path == "/api/save":
@@ -6708,6 +6746,23 @@ textarea.prose { font: 17px/1.55 var(--serif); min-height: 10em; }
   background: var(--ink); color: var(--paper); padding: 10px 16px; border-radius: 999px; font-size: 14px;
   opacity: 0; pointer-events: none; transition: opacity .2s; max-width: calc(100% - 32px); z-index: 20; }
 #toast.on { opacity: 1; }
+.graph { display: flex; flex-direction: column; height: 100vh; height: 100dvh; background: var(--paper); }
+.gbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 8px 12px;
+  padding-top: max(8px, env(safe-area-inset-top)); background: var(--wash); border-bottom: 1px solid var(--rule); }
+.seg { display: inline-flex; border: 1px solid var(--rule); border-radius: 999px; overflow: hidden; background: var(--paper); }
+.seg button { border: 0; background: transparent; color: var(--soft); padding: 7px 12px; font-size: 14px; min-height: 36px; }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
+.grow-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; width: 100%; }
+.gicon { min-width: 40px; padding: 6px 8px; font-size: 16px; }
+.gicon[aria-pressed="true"] { color: var(--ink); text-decoration: underline; }
+.gcanvas { position: relative; flex: 1; min-height: 0; touch-action: none; user-select: none; -webkit-user-select: none; }
+.gcanvas canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.ghint { position: absolute; left: 12px; right: 130px; top: 8px; font: 11px/1.4 var(--mono); color: var(--faint); pointer-events: none; }
+.gnote { position: absolute; left: 16px; right: 16px; top: 50%; text-align: center; color: var(--soft); pointer-events: none; }
+.gstatus { display: flex; flex-wrap: wrap; gap: 4px 12px; justify-content: space-between; padding: 6px 12px;
+  padding-bottom: max(6px, env(safe-area-inset-bottom)); font: 12px/1.4 var(--mono); color: var(--soft);
+  background: var(--wash); border-top: 1px solid var(--rule); }
+.gstatus .who { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
 @media (prefers-reduced-motion: reduce) { #toast { transition: none; } }
 </style>
 </head>
@@ -6832,6 +6887,8 @@ function go(hash, replace) {
 function route() {
   here = location.hash;
   const h = decodeURIComponent(location.hash.slice(1));
+  if (h.startsWith("g/")) return showGraph(h.slice(2));
+  stopGraph();
   if (h.startsWith("r/")) return showRecord(h.slice(2));
   if (h.startsWith("new/")) { const p = h.split("/"); return startNew(p[1], p[2]); }
   closeRecord();
@@ -6999,7 +7056,8 @@ function renderRecord() {
   const foot = [r.id, r.updated ? T("updated {date}", {date: r.updated}) : "",
                 r.coll === "notes" ? T("file") + ": " + (r.file || T("(the file is made on saving)")) : ""];
   out.push(`<div class="foot">${foot.filter(Boolean).map(esc).join("<br>")}</div>`);
-  $("#rec").innerHTML = head(`<button class="btn" data-act="edit">${esc(T("Edit"))}</button>`) +
+  $("#rec").innerHTML = head(`<button class="btn quiet" data-act="graph">${esc(T("Graph"))}</button>` +
+                            `<button class="btn" data-act="edit">${esc(T("Edit"))}</button>`) +
     `<div class="card">${out.join("")}</div>`;
 }
 
@@ -7134,8 +7192,454 @@ function newSheet() {
       `<span class="dot c-${c}"></span>${esc(BOOT.kinds[k])}</button>`).join("") + `</div>`);
 }
 function menuSheet() {
-  openSheet(`<div class="grid"><a class="btn" href="health" target="_blank" rel="noopener">${esc(T("Health report"))}</a>` +
+  openSheet(`<div class="grid"><button class="btn" data-act="graph0">${esc(T("Link graph"))}</button>` +
+    `<a class="btn" href="health" target="_blank" rel="noopener">${esc(T("Health report"))}</a>` +
     `<a class="btn" href="corpus" target="_blank" rel="noopener">${esc(T("Body map"))}</a></div>`);
+}
+
+/* ---------------------------------------------------------------- the link graph
+   The window's graph (# ==== graph) on a canvas: the record in the middle, the
+   records one to three links away around it, springs that settle by
+   themselves, and three rules for how the records glow. Conway's life comes
+   first here: a lit record stays lit with 2 or 3 lit neighbours, a dark one
+   lights with exactly 3, the links being the neighbourhood; when the pattern
+   dies or freezes it is seeded again, the recently edited records more often.
+   As in the window, a lit record fills with the accent and its links thicken;
+   here a birth also rings outward, a death fades with a rust edge, and the
+   corner traces how many are lit, generation by generation. */
+const G = {on: false, mode: "life", depth: 2, paused: false, names: false, nodes: {}, ids: [], links: [],
+           adj: {}, center: null, hover: null, cam: [0, 0], goal: [0, 0], zoom: 1, fit: true, temp: 0,
+           frame: 0, gen: 0, stale: 0, history: [], born: 0, died: 0, pop: [], acc: 0, last: 0, raf: 0,
+           C: null, ctx: null, w: 0, h: 0, dpr: 1, ptr: new Map(), press: null, pinch: null, hold: 0,
+           dragging: null, said: ""};
+const LINK = 90, TICK = 40, GEN_TICKS = 15, SPARK_TICKS = 30, GTOP = 26;
+const GMODES = [["life", "Conway's life", "Life"], ["glow", "spreading glow", "Glow"], ["still", "still", "Still"]];
+
+function gColors() {
+  const cs = getComputedStyle(document.documentElement);
+  const probe = document.createElement("canvas").getContext("2d");
+  const C = {};
+  for (const k of ["paper", "wash", "rule", "ink", "soft", "faint", "accent", "warn"]) {
+    probe.fillStyle = "#000000";
+    probe.fillStyle = cs.getPropertyValue("--" + k).trim() || "#000000";
+    C[k] = /^#[0-9a-f]{6}$/i.test(probe.fillStyle) ? probe.fillStyle : "#000000";
+  }
+  C.mono = cs.getPropertyValue("--mono").trim() || "monospace";
+  return C;
+}
+function mix(c0, c1, t) {
+  const a = parseInt(c0.slice(1), 16), b = parseInt(c1.slice(1), 16);
+  const ch = s => Math.round(((a >> s) & 255) + (((b >> s) & 255) - ((a >> s) & 255)) * t);
+  return `rgb(${ch(16)},${ch(8)},${ch(0)})`;
+}
+function showGraph(id) {
+  document.body.classList.add("open");
+  S.rec = null; S.edit = null; S.sel = id || null;
+  markSel();
+  if (!G.on) graphMount();
+  document.title = T("Link graph") + " · Kustos";
+  graphFetch(id);
+  window.scrollTo(0, 0);
+}
+function stopGraph() {
+  if (!G.on) return;
+  G.on = false;
+  cancelAnimationFrame(G.raf);
+  clearTimeout(G.hold);
+  G.ptr.clear(); G.press = G.pinch = G.dragging = null;
+}
+function graphMount() {
+  const tip = s => `aria-label="${esc(T(s))}" title="${esc(T(s))}"`;
+  $("#rec").innerHTML = `<div class="graph"><div class="gbar">` +
+    `<div class="grow-row"><button class="btn quiet back" data-act="back">&#8249; ${esc(T("Back"))}</button>` +
+    `<span class="grow"></span>` +
+    `<button class="btn quiet gicon" data-act="gpause" id="gpause"></button>` +
+    `<button class="btn quiet gicon" data-act="gseed" id="gseed" ${tip("Reseed")}>&#8635;</button>` +
+    `<button class="btn quiet gicon" data-act="gnames" id="gnames" ${tip("Names")}>Aa</button>` +
+    `<button class="btn" data-act="gopen">${esc(T("Open"))}</button></div>` +
+    `<div class="grow-row"><span class="seg">${GMODES.map(([m, l, short]) =>
+      `<button data-act="gmode" data-m="${m}" title="${esc(T(l))}">${esc(T(short))}</button>`).join("")}</span>` +
+    `<span class="seg">${[1, 2, 3].map(d => `<button data-act="gdepth" data-d="${d}" ${tip("depth {d}").replace(/\{d\}/g, d)}>${d}</button>`).join("")}</span></div></div>` +
+    `<div class="gcanvas" id="gbox"><canvas id="gc"></canvas><div class="ghint" id="ghint"></div>` +
+    `<div class="gnote" id="gnote"></div></div>` +
+    `<div class="gstatus"><span class="who" id="gwho"></span><span id="gstate"></span></div></div>`;
+  G.on = true;
+  G.C = gColors();
+  const c = $("#gc");
+  G.ctx = c.getContext("2d");
+  c.addEventListener("pointerdown", gDown);
+  c.addEventListener("pointermove", gMove);
+  c.addEventListener("pointerup", gUp);
+  c.addEventListener("pointercancel", gUp);
+  c.addEventListener("pointerleave", e => { if (e.pointerType === "mouse" && !G.press) G.hover = null; });
+  c.addEventListener("wheel", e => { e.preventDefault(); gZoomAt(e.offsetX, e.offsetY, e.deltaY < 0 ? 1.1 : 1 / 1.1); },
+                     {passive: false});
+  c.addEventListener("contextmenu", e => e.preventDefault());
+  G.last = performance.now();
+  G.acc = 0;
+  G.raf = requestAnimationFrame(gLoop);
+  gButtons();
+}
+async function graphFetch(id) {
+  let d;
+  try { d = await api("api/graph?" + new URLSearchParams({id: id || "", depth: G.depth})); }
+  catch (e) { toast(e.message, 4000); return; }
+  if (G.on) gLoad(d);
+}
+function gLoad(d) {
+  const old = G.nodes, c = d.center;
+  const o = c && old[c] ? [old[c].x, old[c].y] : [0, 0];
+  const nodes = {};
+  for (const n of d.nodes) {          // parents come before the records they bring
+    const prev = old[n.id];
+    let x = 0, y = 0;
+    if (prev) { x = prev.x - o[0]; y = prev.y - o[1]; }
+    else if (n.parent && nodes[n.parent]) {
+      const p = nodes[n.parent], a = Math.random() * 2 * Math.PI, r = LINK * (0.4 + 0.5 * Math.random());
+      x = p.x + r * Math.cos(a); y = p.y + r * Math.sin(a);
+    }
+    nodes[n.id] = Object.assign({}, n, {x, y, heat: prev ? prev.heat : n.rec * 0.3, lit: prev ? prev.lit : false,
+                                        ring: 0, die: 0});
+  }
+  if (c && nodes[c]) { nodes[c].x = 0; nodes[c].y = 0; }
+  G.cam = [G.cam[0] - o[0], G.cam[1] - o[1]];
+  G.goal = [0, 0];
+  G.nodes = nodes; G.ids = Object.keys(nodes); G.center = c; G.links = d.links; G.hover = null;
+  G.adj = {};
+  G.ids.forEach(n => { G.adj[n] = []; });
+  for (const l of d.links) { G.adj[l.a].push(l.b); G.adj[l.b].push(l.a); }
+  if (c && G.mode === "glow") nodes[c].heat = 1;
+  if (G.mode === "life") gSeed();
+  G.temp = Math.max(G.temp, 30);
+  G.fit = true;
+  S.sel = c; markSel();
+  $("#gnote").textContent = !c ? T("The base has no records yet.")
+    : G.ids.length === 1 ? T("No links yet: write them in the card's LINKS field, one per line.") : "";
+  gStatus(true);
+}
+function gButtons() {
+  $$('[data-act="gmode"]').forEach(b => b.setAttribute("aria-pressed", String(b.dataset.m === G.mode)));
+  $$('[data-act="gdepth"]').forEach(b => b.setAttribute("aria-pressed", String(+b.dataset.d === G.depth)));
+  const pause = $("#gpause");
+  pause.innerHTML = G.paused ? "&#9654;" : "&#10074;&#10074;";
+  pause.setAttribute("aria-label", G.paused ? T("Play") : T("Pause"));
+  pause.title = pause.getAttribute("aria-label");
+  $("#gseed").hidden = G.mode !== "life";
+  $("#gnames").setAttribute("aria-pressed", String(G.names));
+  $("#ghint").textContent = G.mode === "life"
+    ? T("tap: to the middle · tap the middle: open · hold: flip the cell · drag: move · pinch or wheel: zoom")
+    : T("tap: to the middle · tap the middle: open · hold: spark · drag: move · pinch or wheel: zoom");
+}
+function gStatus(force) {
+  const c = G.nodes[G.hover] || G.nodes[G.center];
+  const who = c ? c.name + (c.n ? " · nº " + c.n : "") : "";
+  let state = T(GMODES.find(m => m[0] === G.mode)[1]);
+  if (G.mode === "life") {
+    state += " · " + T("generation {n}, {k} lit", {n: G.gen, k: G.ids.filter(n => G.nodes[n].lit).length});
+    if (G.gen) state += " · " + T("born {b} · died {d}", {b: G.born, d: G.died});
+  }
+  if (G.paused) state += " · " + T("paused");
+  state += " · " + T("{n} records, {k} links", {n: G.ids.length, k: G.links.length}) + ", " + T("depth {d}", {d: G.depth});
+  if (!force && who + state === G.said) return;
+  G.said = who + state;
+  $("#gwho").textContent = who;
+  $("#gstate").textContent = state;
+}
+
+/* the rules, as in the window */
+function gSeed() {
+  for (const n of G.ids) { const r = G.nodes[n]; r.lit = Math.random() < 0.35 + 0.5 * r.rec; r.ring = r.die = 0; }
+  G.gen = G.stale = G.born = G.died = 0;
+  G.history = []; G.pop = [];
+}
+function gGeneration() {
+  const N = G.nodes, next = {};
+  let born = 0, died = 0;
+  for (const n of G.ids) {
+    const k = G.adj[n].reduce((s, m) => s + (N[m].lit ? 1 : 0), 0);
+    next[n] = N[n].lit ? (k === 2 || k === 3) : k === 3;
+  }
+  for (const n of G.ids) {
+    if (next[n] && !N[n].lit) { born++; N[n].ring = 1; }
+    if (!next[n] && N[n].lit) { died++; N[n].die = 1; }
+    N[n].lit = next[n];
+  }
+  const state = G.ids.filter(n => next[n]).sort().join(" ");
+  G.stale = (!state || G.history.includes(state)) ? G.stale + 1 : 0;
+  G.history = G.history.concat([state]).slice(-2);       // still lifes and blinkers
+  G.gen++; G.born = born; G.died = died;
+  G.pop = G.pop.concat([G.ids.length ? state.split(" ").filter(Boolean).length / G.ids.length : 0]).slice(-60);
+  if (G.stale >= 3) gSeed();
+}
+function gHeat() {
+  const N = G.nodes;
+  if (G.mode === "glow") {
+    const next = {};
+    for (const n of G.ids) {
+      const nb = G.adj[n], s = nb.length ? nb.reduce((t, m) => t + N[m].heat, 0) / nb.length : 0;
+      next[n] = Math.min(1, N[n].heat * 0.95 + s * 0.045 + N[n].rec * 0.012);
+    }
+    for (const n of G.ids) N[n].heat = next[n];
+    if (G.frame % SPARK_TICKS === 0 && G.ids.length) {
+      const w = G.ids.map(n => N[n].rec + 0.05), total = w.reduce((a, b) => a + b, 0);
+      let r = Math.random() * total, i = 0;
+      while (i < w.length - 1 && (r -= w[i]) > 0) i++;
+      N[G.ids[i]].heat = 1;
+    }
+  } else if (G.mode === "life") {
+    if (G.frame % GEN_TICKS === 0) gGeneration();
+    for (const n of G.ids) N[n].heat += ((N[n].lit ? 1 : 0) - N[n].heat) * 0.25;
+  } else {
+    for (const n of G.ids) N[n].heat += (N[n].rec - N[n].heat) * 0.1;
+  }
+}
+function gLayout() {
+  const N = G.nodes, ids = G.ids, k2 = LINK * LINK, disp = {};
+  ids.forEach(n => { disp[n] = [0, 0]; });
+  for (let i = 0; i < ids.length; i++) {
+    const a = N[ids[i]], da = disp[ids[i]];
+    for (let j = i + 1; j < ids.length; j++) {
+      const b = N[ids[j]], db = disp[ids[j]];
+      let dx = a.x - b.x, dy = a.y - b.y, d2 = dx * dx + dy * dy;
+      if (d2 < 0.01) { dx = Math.random() * 2 - 1; dy = Math.random() * 2 - 1; d2 = 1; }
+      const f = k2 / d2;
+      da[0] += dx * f; da[1] += dy * f; db[0] -= dx * f; db[1] -= dy * f;
+    }
+  }
+  for (const l of G.links) {
+    const a = N[l.a], b = N[l.b], dx = a.x - b.x, dy = a.y - b.y, f = Math.sqrt(dx * dx + dy * dy) / LINK;
+    disp[l.a][0] -= dx * f; disp[l.a][1] -= dy * f; disp[l.b][0] += dx * f; disp[l.b][1] += dy * f;
+  }
+  for (const n of ids) {
+    if (n === G.center || n === G.dragging) continue;
+    const p = N[n], dx = disp[n][0] - p.x * 0.05, dy = disp[n][1] - p.y * 0.05, d = Math.hypot(dx, dy);
+    if (d > 0) { const s = Math.min(d, G.temp) / d; p.x += dx * s; p.y += dy * s; }
+  }
+  G.temp *= 0.975;
+}
+function gMiddle() { return [G.w / 2, (G.h + GTOP) / 2]; }
+function gFit() {
+  let rx = 1, ry = 1;
+  for (const n of G.ids) { rx = Math.max(rx, Math.abs(G.nodes[n].x)); ry = Math.max(ry, Math.abs(G.nodes[n].y)); }
+  const side = G.w < 600 ? 70 : 110;
+  const z = Math.min(1.5, Math.max(0.12, Math.min((G.w / 2 - side) / rx, (G.h - GTOP) / 2 / ry - 20 / ry)));
+  if (Math.abs(z - G.zoom) >= 0.002) G.zoom += (z - G.zoom) * 0.15;
+}
+function gTick() {
+  G.frame++;
+  if (G.temp > 0.2) gLayout();
+  G.cam[0] += (G.goal[0] - G.cam[0]) * 0.18;
+  G.cam[1] += (G.goal[1] - G.cam[1]) * 0.18;
+  if (G.fit && G.ids.length) gFit();
+  if (!G.paused) gHeat();
+  for (const n of G.ids) { const r = G.nodes[n]; r.ring = Math.max(0, r.ring - 0.06); r.die = Math.max(0, r.die - 0.05); }
+}
+function gLoop(t) {
+  if (!G.on) return;
+  G.acc += Math.min(250, t - G.last);
+  G.last = t;
+  let steps = 0;
+  while (G.acc >= TICK && steps < 6) { gTick(); G.acc -= TICK; steps++; }
+  if (steps) gStatus(false);
+  gDraw();
+  G.raf = requestAnimationFrame(gLoop);
+}
+
+/* drawing */
+function gScreen(n) {
+  const [mx, my] = gMiddle(), p = G.nodes[n];
+  return [mx + (p.x - G.cam[0]) * G.zoom, my + (p.y - G.cam[1]) * G.zoom];
+}
+function gRadius(n) {
+  const p = G.nodes[n], r = n === G.center ? 9 : (p.dist === 1 ? 6.5 : 5);
+  return r * Math.min(1.5, Math.max(0.7, G.zoom)) * (G.w < 600 ? 1.3 : 1) *
+         (G.mode === "life" ? 1 + 0.35 * p.heat : 1);
+}
+function gShape(ctx, kind, x, y, r) {
+  ctx.beginPath();
+  if (kind === "person") { ctx.arc(x, y, r, 0, 2 * Math.PI); return; }
+  const P = {concept: [[-r, -r], [r, -r], [r, r], [-r, r]],
+             form: [[0, -1.25 * r], [1.25 * r, 0], [0, 1.25 * r], [-1.25 * r, 0]],
+             source: [[-1.3 * r, -0.8 * r], [1.3 * r, -0.8 * r], [1.3 * r, 0.8 * r], [-1.3 * r, 0.8 * r]],
+             note: [[-0.8 * r, -1.15 * r], [0.8 * r, -1.15 * r], [0.8 * r, 1.15 * r], [-0.8 * r, 1.15 * r]]}[kind]
+          || [[0, -1.2 * r], [1.1 * r, 0.8 * r], [-1.1 * r, 0.8 * r]];
+  P.forEach(([dx, dy], i) => (i ? ctx.lineTo(x + dx, y + dy) : ctx.moveTo(x + dx, y + dy)));
+  ctx.closePath();
+}
+function gLabelShown(n) {
+  if (n === G.center || n === G.hover || G.names) return true;
+  if (G.w < 600) return G.ids.length <= 12 || (G.nodes[n].dist <= 1 && G.adj[G.center].length <= 8);
+  return G.nodes[n].dist <= 1 || G.ids.length <= 40;
+}
+function gDraw() {
+  const box = $("#gbox"), c = $("#gc");
+  if (!box || !c) return;
+  const dpr = window.devicePixelRatio || 1, w = box.clientWidth, h = box.clientHeight;
+  if (w !== G.w || h !== G.h || dpr !== G.dpr) {
+    G.w = w; G.h = h; G.dpr = dpr;
+    c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+  }
+  const ctx = G.ctx, C = G.C, N = G.nodes;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = C.paper;
+  ctx.fillRect(0, 0, w, h);
+  const S = {};
+  for (const n of G.ids) S[n] = gScreen(n);
+  for (const l of G.links) {
+    const q = (N[l.a].heat + N[l.b].heat) / 2;
+    ctx.strokeStyle = mix(C.rule, C.accent, 0.85 * q);
+    ctx.lineWidth = 1 + 2 * q;
+    ctx.beginPath(); ctx.moveTo(...S[l.a]); ctx.lineTo(...S[l.b]); ctx.stroke();
+  }
+  const focus = G.hover || G.center;
+  if (focus && G.adj[focus] && G.adj[focus].length <= 12 && (G.w >= 600 || G.names)) {
+    ctx.font = `10px ${C.mono}`; ctx.fillStyle = C.soft; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    for (const l of G.links) {
+      if (l.a !== focus && l.b !== focus) continue;
+      const words = l.rels.map(([rel, f]) => rel + (f === focus ? " →" : " ←")).join(" · ");
+      ctx.fillText(words, (S[l.a][0] + S[l.b][0]) / 2, (S[l.a][1] + S[l.b][1]) / 2 - 6);
+    }
+  }
+  for (const n of G.ids) {
+    const [x, y] = S[n], r = gRadius(n), p = N[n];
+    if (p.ring > 0) {            // a birth rings outward
+      ctx.strokeStyle = C.accent; ctx.globalAlpha = p.ring; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(x, y, r * 1.4 + (1 - p.ring) * 16, 0, 2 * Math.PI); ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+    gShape(ctx, p.kind, x, y, r);
+    ctx.fillStyle = mix(C.paper, C.accent, p.heat);
+    ctx.fill();
+    if (n === G.center) { ctx.strokeStyle = C.warn; ctx.lineWidth = 2; }
+    else if (p.die > 0) { ctx.strokeStyle = mix(C.faint, C.warn, p.die); ctx.lineWidth = 1 + p.die; }
+    else { ctx.strokeStyle = mix(C.faint, C.accent, p.heat); ctx.lineWidth = 1; }
+    ctx.stroke();
+    if (n === G.hover) {
+      ctx.strokeStyle = C.ink; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(x, y, r * 1.4 + 4, 0, 2 * Math.PI); ctx.stroke();
+    }
+  }
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  for (const n of G.ids) {
+    if (!gLabelShown(n)) continue;
+    const [x, y] = S[n], p = N[n], big = n === G.center;
+    ctx.font = `${big ? "600 12px" : "11px"} ${C.mono}`;
+    ctx.fillStyle = p.dist <= 1 ? C.ink : C.soft;
+    const name = p.name.length > 32 ? p.name.slice(0, 31) + "…" : p.name;
+    ctx.fillText(name, x + gRadius(n) * 1.4 + 4, y);
+  }
+  if (G.mode === "life" && G.pop.length > 1) {        // how many are lit, generation by generation
+    const bw = 104, bh = 26, x0 = w - bw - 12, y0 = 10;
+    ctx.strokeStyle = C.rule; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x0, y0 + bh); ctx.lineTo(x0 + bw, y0 + bh); ctx.stroke();
+    ctx.strokeStyle = C.accent; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    G.pop.forEach((v, i) => {
+      const px = x0 + bw * i / 59, py = y0 + bh - bh * v;
+      i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    });
+    ctx.stroke();
+  }
+}
+
+/* the hand */
+function gNodeAt(x, y, slop) {
+  let best = null, bd = slop * slop;
+  for (const n of G.ids) {
+    const [sx, sy] = gScreen(n), d = (sx - x) ** 2 + (sy - y) ** 2;
+    if (d < bd) { best = n; bd = d; }
+  }
+  return best;
+}
+function gZoomAt(x, y, f) {
+  const z = Math.min(3, Math.max(0.12, G.zoom * f)), [mx, my] = gMiddle();
+  G.fit = false;
+  for (const c of [G.cam, G.goal]) {
+    const wx = (x - mx) / G.zoom + c[0], wy = (y - my) / G.zoom + c[1];
+    c[0] = wx - (x - mx) / z; c[1] = wy - (y - my) / z;
+  }
+  G.zoom = z;
+}
+function gTouch(n) {
+  const p = G.nodes[n];
+  if (!p) return;
+  if (G.mode === "life") {
+    p.lit = !p.lit;
+    if (p.lit) p.ring = 1; else p.die = 1;
+    G.stale = 0;
+  } else p.heat = 1;
+  if (navigator.vibrate) { try { navigator.vibrate(12); } catch (e) { /* not allowed here */ } }
+}
+function gDown(e) {
+  e.currentTarget.setPointerCapture(e.pointerId);
+  $("#ghint").hidden = true;
+  G.ptr.set(e.pointerId, [e.offsetX, e.offsetY]);
+  clearTimeout(G.hold);
+  if (G.ptr.size === 2) {
+    const [a, b] = [...G.ptr.values()];
+    G.pinch = {d: Math.hypot(a[0] - b[0], a[1] - b[1]) || 1, z: G.zoom};
+    G.press = null; G.dragging = null;
+    return;
+  }
+  const n = gNodeAt(e.offsetX, e.offsetY, e.pointerType === "mouse" ? 14 : 24);
+  G.press = {x: e.offsetX, y: e.offsetY, lx: e.offsetX, ly: e.offsetY, n, moved: false, held: false};
+  if (n) G.hold = setTimeout(() => { if (G.press && !G.press.moved) { G.press.held = true; gTouch(n); } }, 450);
+}
+function gMove(e) {
+  if (G.ptr.has(e.pointerId)) G.ptr.set(e.pointerId, [e.offsetX, e.offsetY]);
+  if (G.pinch && G.ptr.size === 2) {
+    const [a, b] = [...G.ptr.values()], d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+    gZoomAt((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, G.pinch.z * d / G.pinch.d / G.zoom);
+    return;
+  }
+  const p = G.press;
+  if (!p) {
+    if (e.pointerType === "mouse") G.hover = gNodeAt(e.offsetX, e.offsetY, 14);
+    return;
+  }
+  if (!p.moved && Math.abs(e.offsetX - p.x) + Math.abs(e.offsetY - p.y) < 6) return;
+  p.moved = true;
+  clearTimeout(G.hold);
+  const dx = (e.offsetX - p.lx) / G.zoom, dy = (e.offsetY - p.ly) / G.zoom;
+  if (p.n && p.n !== G.center) {
+    G.dragging = p.n;
+    G.nodes[p.n].x += dx; G.nodes[p.n].y += dy;
+    G.temp = Math.max(G.temp, 8);
+  } else {
+    for (const c of [G.cam, G.goal]) { c[0] -= dx; c[1] -= dy; }
+  }
+  p.lx = e.offsetX; p.ly = e.offsetY;
+}
+function gUp(e) {
+  G.ptr.delete(e.pointerId);
+  clearTimeout(G.hold);
+  if (G.ptr.size < 2) G.pinch = null;
+  const p = G.press;
+  G.press = null; G.dragging = null;
+  if (!p || p.moved || p.held || !p.n) return;
+  if (p.n === G.center) { S.fromList = true; go("r/" + p.n); }
+  else go("g/" + p.n, true);
+}
+function gShake() {
+  for (const n of G.ids) {
+    if (n === G.center) continue;
+    G.nodes[n].x += (Math.random() * 2 - 1) * LINK;
+    G.nodes[n].y += (Math.random() * 2 - 1) * LINK;
+  }
+  G.temp = 30;
+  if (G.mode === "life") gSeed();
+}
+function gKey(e) {
+  const k = e.key;
+  if (k === "m") { G.mode = GMODES[(GMODES.findIndex(m => m[0] === G.mode) + 1) % 3][0]; if (G.mode === "life") gSeed(); gButtons(); }
+  else if (k === "1" || k === "2" || k === "3") { G.depth = +k; gButtons(); graphFetch(G.center); }
+  else if (k === " ") { e.preventDefault(); G.paused = !G.paused; gButtons(); }
+  else if (k === "r") gShake();
+  else if (k === "l") { G.names = !G.names; gButtons(); }
+  else if (k === "Enter" && G.center) { S.fromList = true; go("r/" + G.center); }
+  else return false;
+  gStatus(true);
+  return true;
 }
 
 /* ---------------------------------------------------------------- events */
@@ -7168,6 +7672,14 @@ document.addEventListener("click", e => {
   else if (act === "new") newSheet();
   else if (act === "menu") menuSheet();
   else if (act === "mk") { closeSheet(); S.fromList = true; go("new/" + b.dataset.coll + "/" + b.dataset.kind); }
+  else if (act === "graph") { S.fromList = true; go("g/" + S.rec.id); }
+  else if (act === "graph0") { closeSheet(); S.fromList = true; go("g/" + (S.sel || "")); }
+  else if (act === "gmode") { G.mode = b.dataset.m; if (G.mode === "life") gSeed(); gButtons(); gStatus(true); }
+  else if (act === "gdepth") { G.depth = +b.dataset.d; gButtons(); graphFetch(G.center); }
+  else if (act === "gpause") { G.paused = !G.paused; gButtons(); gStatus(true); }
+  else if (act === "gseed") { gSeed(); gStatus(true); }
+  else if (act === "gnames") { G.names = !G.names; gButtons(); }
+  else if (act === "gopen") { if (G.center) { S.fromList = true; go("r/" + G.center); } }
 });
 document.addEventListener("submit", e => {
   e.preventDefault();
@@ -7209,6 +7721,7 @@ document.addEventListener("keydown", e => {
     return;
   }
   if (typing || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (G.on && gKey(e)) return;
   if (e.key === "/") { e.preventDefault(); if (document.body.classList.contains("open") && innerWidth < 900) go(""); $("#q").focus(); }
   else if (e.key === "e" && S.rec && S.rec.id && !S.edit) startEdit();
   else if (e.key === "n") newSheet();
@@ -17364,6 +17877,30 @@ PT = {
         "atualizado em {date}",
     "{option} needs a value":
         "{option} precisa de um valor",
+    "Graph":
+        "Grafo",
+    "Open":
+        "Abrir",
+    "Pause":
+        "Pausar",
+    "Play":
+        "Continuar",
+    "Reseed":
+        "Semear de novo",
+    "Life":
+        "Vida",
+    "Glow":
+        "Brilho",
+    "Still":
+        "Parado",
+    "Names":
+        "Nomes",
+    "born {b} · died {d}":
+        "nasceram {b} · morreram {d}",
+    "tap: to the middle · tap the middle: open · hold: flip the cell · drag: move · pinch or wheel: zoom":
+        "toque: ao centro · toque no centro: abrir · segure: inverte a célula · arraste: mover · pinça ou roda: zoom",
+    "tap: to the middle · tap the middle: open · hold: spark · drag: move · pinch or wheel: zoom":
+        "toque: ao centro · toque no centro: abrir · segure: faísca · arraste: mover · pinça ou roda: zoom",
 }
 
 if __name__ == "__main__":

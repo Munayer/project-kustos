@@ -77,7 +77,10 @@ Ideas that span several sections:
   fields or to how it saves belongs in both places. Search and list rows are
   shared with the window (`parse_search`, `search_base`, `list_row_text`).
   Test it on invented data with `web_api(...)`, or run it with `--stay` and
-  drive the page in a headless browser.
+  drive the page in a headless browser. The page's link graph gets its records
+  from `web_graph` (`graph_adjacency`, `graph_ego`, as the window) and draws
+  them itself; its life, glow and still rules are the window's `GraphView`
+  ones rewritten in JavaScript, so a change to one belongs in the other.
 - **Long texts are markdown**: `textfield(..., pages=True)` (every NOTES and the
   draft's text) gets `MarkdownKeys`, and `fit(opening=True)` paints it before
   the pages are measured. The text stored stays plain.
