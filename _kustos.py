@@ -6861,6 +6861,7 @@ a { color: var(--accent); }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--paper); font-weight: 600; }
 .btn.danger { color: var(--warn); }
 .btn.quiet { background: transparent; border-color: transparent; color: var(--soft); }
+.btn.quiet.primary { background: var(--accent); border-color: var(--accent); color: var(--paper); }
 .btn:disabled { opacity: .5; }
 .rechead { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 6px;
   padding: 8px 12px; padding-top: max(8px, env(safe-area-inset-top)); background: var(--wash);
@@ -10620,13 +10621,14 @@ HELP_READING = (
 
 # the Help › Shortcuts lines for the link graph
 HELP_GRAPH = (
-    "\n  Ctrl+Shift+G    link graph (second window, read-only): the open record in"
-    "\n                  the middle, its links around it, glowing with recent edits."
-    "\n                  It follows the record you open here; m switches the glow"
-    "\n                  (spreading glow, Conway's life, still), Enter opens a record"
-    "\n                  on the card. p replays the logs: the base grows on screen as"
-    "\n                  it grew, with a timeline to scrub. The keys are listed at the"
-    "\n                  top of the window.\n"
+    "\n  Ctrl+Shift+G    link graph (second window): the open record in the middle,"
+    "\n                  its links around it, glowing with recent edits. It follows"
+    "\n                  the record you open here; the buttons at the top switch the"
+    "\n                  glow (Conway's life, spreading glow, still) and the depth,"
+    "\n                  Open (or Enter) opens a record on the card, Path finds how"
+    "\n                  two records are related and Link draws a link. p replays the"
+    "\n                  logs: the base grows on screen as it grew, with a timeline to"
+    "\n                  scrub. ? shows the key of the lines and every key.\n"
 )
 
 
@@ -15187,6 +15189,7 @@ GRAPH_HALF_LIFE = 21         # days for an edit's glow to halve
 GRAPH_REPLAY_SECONDS = 60    # a replay at normal speed lasts about this long
 GRAPH_MODES = ("glow", "life", "still")
 GRAPH_MODE_LABEL = {"glow": "spreading glow", "life": "Conway's life", "still": "still"}
+GRAPH_MODE_SHORT = (("life", "Life"), ("glow", "Glow"), ("still", "Still"))   # the buttons, as the web's
 
 
 def graph_adjacency(data):
@@ -15451,11 +15454,17 @@ class GraphView:
     STEPS = 24           # colour steps of the glow
     GEN_TICKS = 30       # ticks per generation in life mode (1.2 s)
     SPARK_TICKS = 30     # ticks between sparks in glow mode
-    TOP = 44             # the keys above the graph
+    TOP = 40             # the hint above the graph (and the lit curve, top right)
+    STATUS_H = 46        # the status, two lines at the foot
+    FAB_H = 48           # the row of floating buttons above it (? · Path · Link)
     GROW_MS = 700        # a new record sprouting, a new link growing out to it
     LEAVE_MS = 600       # a record or a link leaving the view, withering
     FLOW_MS = 900        # light flowing along a link into a newborn cell
     STAGGER_MS = 110     # each ring of records sprouts this much after the one inside it
+    RIM = 0.55           # a solid line's rim, this much of its colour on the paper: Tk
+                         # draws no soft edges, and the rim stands in for them
+    MIN_HALF = 1.0       # half the narrowest core of a line: thinner, Tk's fill comes and
+                         # goes along it and the line reads as dashed
 
     def __init__(self, root, get_data, start_id=None, on_open=None, on_link=None):
         self.root, self.get_data, self.on_open, self.on_link = root, get_data, on_open, on_link
@@ -15492,6 +15501,11 @@ class GraphView:
         self.sel_link = self.linking = None
         self.show_key = False
         self.path = None     # the path view: {a, b, paths, keys, mode, next}
+        self.rel_items = {}  # the types written on the focus's links: key -> (item, text)
+        self.drawing = False   # Link pressed: a drag from a record draws a link
+        self.hint_off = False  # the hint goes after the first click, as on the web page
+        self._said = None      # what the buttons last showed (sync_buttons)
+        self.pop = []        # life: the share of records lit, generation by generation
 
         fams = set(tkfont.families(root))
         mono = next((f for f in ("Cascadia Mono", "Consolas", "Lucida Console",
@@ -15499,30 +15513,56 @@ class GraphView:
         self.f_label = tkfont.Font(root, family=mono, size=8)
         self.f_center = tkfont.Font(root, family=mono, size=10, weight="bold")
         self.f_status = tkfont.Font(root, family=mono, size=9)
+        self.f_btn = tkfont.Font(root, family=mono, size=10)
         n = self.STEPS
         self.ramp_fill = [blend(PAPER, STAMP, i / n) for i in range(n + 1)]
         self.ramp_edge = [blend(FAINT, STAMP, i / n) for i in range(n + 1)]
         self.ramp_line = [blend(RULE, STAMP, 0.85 * i / n) for i in range(n + 1)]
 
-        root.title(tr("Kustos · link graph (read-only)"))
+        root.title(tr("Kustos · link graph") if on_link else tr("Kustos · link graph (read-only)"))
         root.configure(bg=PAPER)
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         w, h = min(1100, sw - 80), min(760, sh - 120)
         root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
         root.minsize(560, 400)
         paint_frame(root)
+        # the controls, as the web page's: the modes and depths, pause, reseed, names, Open
+        bar = tk.Frame(root, bg=SHELL, padx=12, pady=8)
+        bar.pack(fill="x")
+        tk.Frame(root, bg=RULE, height=1).pack(fill="x")
+        self.seg_mode = self.segment(bar, [(m, tr(short)) for m, short in GRAPH_MODE_SHORT], self.set_mode)
+        self.seg_mode.pack(side="left")
+        self.seg_depth = self.segment(bar, [(d, str(d)) for d in (1, 2, 3)], self.set_depth)
+        self.seg_depth.pack(side="left", padx=(6, 0))
+        self.b_open = self.button(bar, tr("Open"), lambda: self.open_in_card())
+        self.b_open.pack(side="right")
+        self.b_names = self.button(bar, "Aa", self.toggle_labels, quiet=True)
+        self.b_names.pack(side="right", padx=(0, 6))
+        self.b_seed = self.button(bar, "\u21bb", self.reseed, quiet=True)
+        self.b_seed.pack(side="right", padx=(0, 6))
+        self.b_pause = self.button(bar, "\u275a\u275a", self.toggle_pause, quiet=True)
+        self.b_pause.pack(side="right", padx=(0, 6))
         self.cv = cv = tk.Canvas(root, bg=PAPER, highlightthickness=0, bd=0)
         cv.pack(fill="both", expand=True)
-        self.t_keys = cv.create_text(12, 10, anchor="nw", font=self.f_label, fill=FAINT,
-                                     text=tr(GRAPH_KEYS))
-        self.t_left = cv.create_text(12, 0, anchor="sw", font=self.f_status, fill=SOFT)
-        self.t_right = cv.create_text(0, 0, anchor="se", font=self.f_status, fill=SOFT)
+        self.t_keys = cv.create_text(12, 10, anchor="nw", font=self.f_label, fill=FAINT)
+        self.status_bg = cv.create_rectangle(0, 0, 0, 0, fill=SHELL, outline="", tags=("chrome",))
+        self.status_rule = cv.create_line(0, 0, 0, 0, fill=RULE, tags=("chrome",))
+        self.t_left = cv.create_text(12, 0, anchor="nw", font=self.f_status, fill=INK, tags=("chrome",))
+        self.t_right = cv.create_text(12, 0, anchor="nw", font=self.f_status, fill=SOFT, tags=("chrome",))
+        # floating at the foot: the key, the path finder, drawing links
+        self.b_key = self.button(cv, "?", self.toggle_key)
+        self.b_path = self.button(cv, "\u21e2 " + tr("Path"), lambda: None if self.rp else PathDialog(self))
+        self.b_draw = self.button(cv, "\u2933 " + tr("Link"), self.toggle_drawing)
+        self.fabs = [cv.create_window(0, 0, window=w, anchor=a)
+                     for w, a in ((self.b_key, "sw"), (self.b_path, "se"), (self.b_draw, "se"))]
         self.t_notice = cv.create_text(0, 0, anchor="n", font=self.f_status, fill=SOFT)
         self.bar = cv.create_line(0, 0, 0, 0, fill=RULE, width=3, state="hidden")
         self.bar_done = cv.create_line(0, 0, 0, 0, fill=STAMP, width=3, state="hidden")
         self.ring = cv.create_oval(0, 0, 0, 0, outline=INK, width=1, state="hidden")
         self.t_link = cv.create_text(12, 0, anchor="sw", font=self.f_status, fill=INK, state="hidden")
         self.rubber = cv.create_line(0, 0, 0, 0, fill=STAMP, width=2, dash="-", state="hidden")
+        self.pop_rule = cv.create_line(0, 0, 0, 0, fill=RULE, width=1, state="hidden")
+        self.pop_line = cv.create_line(0, 0, 0, 0, 0, 0, fill=STAMP, width=1, state="hidden")
 
         b = root.bind
         b("<space>", lambda e: self.toggle_pause())
@@ -15545,6 +15585,7 @@ class GraphView:
         b("<F5>", lambda e: None if self.rp else self.recentre(self.center, fresh=True))
         b("<Return>", lambda e: self.open_in_card())
         b("<k>", lambda e: self.toggle_key())
+        b("<question>", lambda e: self.toggle_key())
         b("<f>", lambda e: None if self.rp else PathDialog(self))
         b("<Escape>", lambda e: self.select_link(None) if self.sel_link else
           self.leave_path() if self.path else
@@ -15566,8 +15607,101 @@ class GraphView:
         cv.bind("<Button-4>", lambda e: self.zoom_at(e, 1.1))
         cv.bind("<Button-5>", lambda e: self.zoom_at(e, 1 / 1.1))
         root.protocol("WM_DELETE_WINDOW", self.close)
+        self.show_hint()
         self.recentre(start_id, fresh=True)
         self._job = root.after(self.TICK_MS, self.tick)
+
+    # ---------------------------------------------------------- controls
+    def button(self, parent, text, cmd, quiet=False):
+        """A button drawn as the web page's: a label with a thin rule round it
+        (quiet: none), that answers a click."""
+        bg = SHELL if quiet and parent is not getattr(self, "cv", None) else PAPER
+        w = tk.Label(parent, text=text, font=self.f_btn, bg=bg, fg=SOFT if quiet else INK,
+                     padx=10, pady=5, cursor="hand2", bd=0, highlightthickness=1,
+                     highlightbackground=bg if quiet else RULE, highlightcolor=RULE)
+        w.bind("<Button-1>", lambda e: cmd())
+        w.quiet, w.rest = quiet, (bg, SOFT if quiet else INK)
+        return w
+
+    def segment(self, parent, options, cmd):
+        """Buttons side by side in one frame, one of them pressed (sync_buttons)."""
+        box = tk.Frame(parent, bg=PAPER, highlightthickness=1, highlightbackground=RULE, bd=0)
+        box.btns = {}
+        for value, text in options:
+            w = tk.Label(box, text=text, font=self.f_btn, bg=PAPER, fg=SOFT, padx=12, pady=5,
+                         cursor="hand2", bd=0)
+            w.pack(side="left")
+            w.bind("<Button-1>", lambda e, v=value: cmd(v))
+            box.btns[value] = w
+        return box
+
+    @staticmethod
+    def press_look(w, on, colour=None):
+        """A button (made by `button`) pressed -- the ink, or `colour`, behind
+        it -- or at rest."""
+        bg, fg = w.rest
+        fill = colour or INK
+        w.configure(bg=fill if on else bg, fg=PAPER if on else fg,
+                    highlightbackground=fill if on else (bg if w.quiet else RULE))
+
+    def sync_buttons(self):
+        """The buttons follow the state, whichever way it changed (a key, a click)."""
+        life = self.mode == "life"
+        said = (self.mode, self.depth, self.paused, self.all_labels, life and self.settled,
+                self.drawing, self.show_key, bool(self.rp), self.hint_off)
+        if said == self._said:
+            return
+        self._said = said
+        for m, w in self.seg_mode.btns.items():
+            w.configure(bg=INK if m == self.mode else PAPER, fg=PAPER if m == self.mode else SOFT)
+        for d, w in self.seg_depth.btns.items():
+            on = d == self.depth and not self.rp
+            w.configure(bg=INK if on else PAPER, fg=PAPER if on else (FAINT if self.rp else SOFT))
+        self.b_pause.configure(text="\u25b6" if self.paused else "\u275a\u275a")
+        if life and not self.b_seed.winfo_manager():
+            self.b_seed.pack(side="right", padx=(0, 6), after=self.b_names)
+        elif not life and self.b_seed.winfo_manager():
+            self.b_seed.pack_forget()
+        self.press_look(self.b_seed, life and self.settled, STAMP)   # once it rests, reseed
+        self.press_look(self.b_names, self.all_labels)
+        self.press_look(self.b_key, self.show_key)
+        self.press_look(self.b_draw, self.drawing, STAMP)
+        for item in self.fabs:
+            self.cv.itemconfigure(item, state="hidden" if self.rp else "normal")
+        self.show_hint()
+
+    def show_hint(self):
+        """Above the graph: what the hand does, until the first click; while
+        drawing links, how; in the replay, its keys."""
+        if self.rp:
+            text = tr(GRAPH_REPLAY_KEYS)
+        elif self.drawing:
+            text = tr("Drag from one record to another to link them.")
+        elif self.hint_off:
+            text = ""
+        else:
+            text = tr(GRAPH_HINT_LIFE if self.mode == "life" else GRAPH_HINT)
+        self.cv.itemconfigure(self.t_keys, text=text)
+
+    def set_mode(self, m):
+        if m != self.mode and m in GRAPH_MODES:
+            self.mode = m
+            if m == "life":
+                self.seed_life()
+            self.draw_pop()
+            self.update_status()
+
+    def reseed(self):
+        """The web page's reseed: life starts again, the records where they are."""
+        if self.mode == "life" and not self.rp:
+            self.seed_life()
+            self.update_status()
+
+    def toggle_drawing(self):
+        """Link: while pressed, dragging from a record to another draws a link
+        (as Shift+drag does)."""
+        self.drawing = not self.drawing and not self.rp
+        self.update_status()
 
     # ---------------------------------------------------------- content
     def recentre(self, rid, fresh=False, view=None):
@@ -15681,6 +15815,7 @@ class GraphView:
         self.vel = {}
         self.lstyle, self.lcolour = {}, {}
         self.sel_link = None
+        self.rel_items = {}
         self.cv.itemconfigure(self.t_link, state="hidden")
         self.hover = None
 
@@ -15694,7 +15829,7 @@ class GraphView:
         self.grow.setdefault(n, 0.0)
         self.born_at.setdefault(n, self.clock)
         self.vis.setdefault(n, 0.0)
-        opts = dict(fill=PAPER, outline=PAPER, width=1, tags=("g",))
+        opts = dict(fill=PAPER, outline=PAPER, width=1, tags=("g", "node"))
         if self.kinds[n] == "person":
             shape = cv.create_oval(0, 0, 0, 0, **opts)
         else:
@@ -15704,6 +15839,7 @@ class GraphView:
                               fill=PAPER)
         self.items[n] = (shape, text)
         cv.tag_raise(self.ring)
+        cv.tag_raise("chrome")
 
     def drop_node(self, n):
         """The record leaves the view: it withers where it is, then goes."""
@@ -15755,9 +15891,9 @@ class GraphView:
     def make_line(self, key):
         style = self.lstyle[key] = self.style_of(key)
         self.lcolour.pop(key, None)
-        if style == "taper":
-            item = self.cv.create_polygon(0, 0, 0, 0, 0, 0, fill=PAPER, outline="", smooth=True,
-                                          tags=("g",))
+        if style in ("taper", "line"):      # a shape, so that it has a rim
+            item = self.cv.create_polygon(0, 0, 0, 0, 0, 0, fill=PAPER, outline=PAPER, width=1,
+                                          smooth=True, tags=("g",))
         else:   # Windows draws dashes only on one-pixel lines, and only these two patterns
             item = self.cv.create_line(0, 0, 0, 0, fill=PAPER, width=1, smooth=True,
                                        splinesteps=10, capstyle="round", tags=("g",),
@@ -15778,7 +15914,8 @@ class GraphView:
     def drop_link(self, key):
         """The link leaves the view: it fades where it is, then goes."""
         _rels, line = self.links.pop(key)
-        self.gone_links.append(dict(line=line, key=key, leave=1.0, poly=self.lstyle.get(key) == "taper"))
+        self.gone_links.append(dict(line=line, key=key, leave=1.0,
+                                    poly=self.lstyle.get(key) in ("taper", "line")))
         self.shown.pop(line, None)
         self.lstyle.pop(key, None)
         if self.sel_link == key:
@@ -15927,7 +16064,9 @@ class GraphView:
         self.arrive = {n: self.clock + self.rng.uniform(0, 1500) for n in self.pos}
         self.dim_at = {}
         self.gen, self.stale, self.history = 0, 0, []
+        self.pop = []
         self.settled = False
+        self.draw_pop()
 
     def generation(self):
         """Conway's rule, with the links as the neighbourhood. A birth is fed
@@ -15954,6 +16093,8 @@ class GraphView:
         self.history = (self.history + [state])[-2:]      # still lifes and blinkers
         self.lit = new
         self.gen += 1
+        self.pop = (self.pop + [len(state) / max(1, len(new))])[-60:]
+        self.draw_pop()
         if self.stale >= 3:
             self.settled = True
         self.update_status()
@@ -16030,7 +16171,7 @@ class GraphView:
         self.pos, self.dist, self.adjv, self.heat, self.lit = {}, {}, {}, {}, {}
         self.kinds, self.names = {}, {}
         self.cam, self.goal, self.fit = [0.0, 0.0], [0.0, 0.0], True
-        self.cv.itemconfigure(self.t_keys, text=tr(GRAPH_REPLAY_KEYS))
+        self.drawing = False
         self.cv.itemconfigure(self.t_notice, text="")
         for item in (self.bar, self.bar_done):
             self.cv.itemconfigure(item, state="normal")
@@ -16043,11 +16184,12 @@ class GraphView:
         self.paused = False
         for item in (self.bar, self.bar_done):
             self.cv.itemconfigure(item, state="hidden")
-        self.cv.itemconfigure(self.t_keys, text=tr(GRAPH_KEYS))
         self.clear_items()
         self.pos, self.heat, self.lit = {}, {}, {}
         self.recentre(back, fresh=True)
         self.resized()
+        self.draw_pop()
+        self.update_status()
 
     def apply(self, e, hits):
         stamp, t, op, rid, info = e
@@ -16208,7 +16350,7 @@ class GraphView:
 
     # ---------------------------------------------------------- drawing
     def bottom(self, room=False):
-        b = 46 if self.rp else 26        # the status line, and the timeline
+        b = self.STATUS_H + (26 if self.rp else self.FAB_H)   # the status; the timeline or the buttons
         if room and self.path:           # in a path view, also the steps written above it
             box = self.cv.bbox(self.t_link)
             b += box[3] - box[1] + 8 if box else 0
@@ -16269,9 +16411,9 @@ class GraphView:
         dx, dy = b_xy[0] - a_xy[0], b_xy[1] - a_xy[1]
         return ((a_xy[0] + b_xy[0]) / 2 - dy * bow, (a_xy[1] + b_xy[1]) / 2 + dx * bow)
 
-    def taper(self, pa, pc, pb, t0, t1, w, from_a):
+    def taper(self, pa, pc, pb, t0, t1, w, from_a, even=False):
         """The outline of a tapered link: 1.7 w wide at the record it comes
-        from, 0.5 w at the other."""
+        from, 0.5 w at the other; `even`: w wide all along."""
         left, right = [], []
         for i in range(13):
             t = t0 + (t1 - t0) * i / 12
@@ -16279,7 +16421,7 @@ class GraphView:
             dx = 2 * (1 - t) * (pc[0] - pa[0]) + 2 * t * (pb[0] - pc[0])
             dy = 2 * (1 - t) * (pc[1] - pa[1]) + 2 * t * (pb[1] - pc[1])
             n = math.hypot(dx, dy) or 1.0
-            half = w * (0.85 - 0.6 * (t if from_a else 1 - t))
+            half = max(self.MIN_HALF, w * 0.5 if even else w * (0.85 - 0.6 * (t if from_a else 1 - t)))
             left.append((x - dy / n * half, y + dx / n * half))
             right.append((x + dy / n * half, y - dx / n * half))
         return [c for xy in left + right[::-1] for c in xy]
@@ -16313,9 +16455,10 @@ class GraphView:
             w = (1 + 2 * q / n_steps) * (1.7 if sel else 1.0)
             t0, t1 = (0.0, 1.0) if g >= 1 else (0.0, g) if self.lfrom.get(key) == a else (1 - g, 1.0)
             if g <= 0:
-                cv.coords(line, *pa, *pa, *pa) if style == "taper" else cv.coords(line, *pa, *pa)
-            elif style == "taper":           # thick at the record it comes from
-                cv.coords(line, *self.taper(pa, pc, pb, t0, t1, w, self.facts(key).get("from") == a))
+                cv.coords(line, *pa, *pa, *pa) if style in ("taper", "line") else cv.coords(line, *pa, *pa)
+            elif style in ("taper", "line"):    # thick at the record it comes from, or even
+                cv.coords(line, *self.taper(pa, pc, pb, t0, t1, w, self.facts(key).get("from") == a,
+                                            even=style == "line"))
             elif g >= 1:
                 cv.coords(line, *pa, *pc, *pb)
             else:                            # it grows out of the record already there
@@ -16330,10 +16473,8 @@ class GraphView:
                 fill = blend(rest, STAMP, 0.85 * q / n_steps)
                 if g < 1:
                     fill = blend(PAPER, fill, g)
-                if style == "taper":
-                    cv.itemconfigure(line, fill=fill)
-                elif style == "line":
-                    cv.itemconfigure(line, fill=fill, width=round(w))
+                if style in ("taper", "line"):
+                    cv.itemconfigure(line, fill=fill, outline=blend(PAPER, fill, self.RIM))
                 else:
                     cv.itemconfigure(line, fill=fill, width=1)
         for link in self.gone_links:         # links that leave fade where they were
@@ -16344,8 +16485,9 @@ class GraphView:
                 continue
             pc = self.curve(pa, pb, link["key"])
             if link.get("poly"):
-                cv.coords(link["line"], *self.taper(pa, pc, pb, 0.0, 1.0, 1.0, True))
-                cv.itemconfigure(link["line"], fill=blend(PAPER, RULE, max(0.0, link["leave"])))
+                cv.coords(link["line"], *self.taper(pa, pc, pb, 0.0, 1.0, 1.0, True, even=True))
+                fade = blend(PAPER, RULE, max(0.0, link["leave"]))
+                cv.itemconfigure(link["line"], fill=fade, outline=blend(PAPER, fade, self.RIM))
             else:
                 cv.coords(link["line"], *pa, *pc, *pb)
                 cv.itemconfigure(link["line"], fill=blend(PAPER, RULE, max(0.0, link["leave"])), width=1)
@@ -16413,7 +16555,7 @@ class GraphView:
 
     def bar_span(self):
         cv = self.cv
-        return 12, cv.winfo_width() - 12, cv.winfo_height() - 34
+        return 12, cv.winfo_width() - 12, cv.winfo_height() - self.STATUS_H - 14
 
     def draw_timeline(self):
         x0, x1, y = self.bar_span()
@@ -16423,38 +16565,79 @@ class GraphView:
         self.cv.coords(self.bar_done, x0, y, done, y)
 
     def draw_hover(self):
-        cv = self.cv
-        cv.delete("rel")
+        """The ring around the record under the pointer, and the types of the
+        links of the record in focus -- that one, else the middle one --
+        written on their lines, as the web page does: when it has at most a
+        dozen links in view, in a window wide enough or with all the names on."""
+        cv, S = self.cv, self.screen
         n = self.hover
-        if not n or n not in self.screen:
+        if n and n in S:
+            x, y = S[n]
+            r = self.radius(n) * 1.4 + 4
+            cv.coords(self.ring, x - r, y - r, x + r, y + r)
+            cv.itemconfigure(self.ring, state="normal")
+        else:
             cv.itemconfigure(self.ring, state="hidden")
+        focus, want = n or self.center, {}
+        near = self.adjv.get(focus, ()) if focus in S else ()
+        if near and len(near) <= 12 and (cv.winfo_width() >= 600 or self.all_labels):
+            for m in near:
+                key = (min(focus, m), max(focus, m))
+                if key not in self.links or m not in S or self.lgrow.get(key, 1.0) < 1:
+                    continue
+                words = " · ".join(rel_label(rel) + (" →" if f == focus else " ←")
+                                   for rel, f in self.links[key][0])
+                pa, pb = S[key[0]], S[key[1]]
+                mx, my = self.along(pa, self.curve(pa, pb, key), pb, 0.5)
+                want[key] = (words, round(mx), round(my) - 6)
+        R = self.rel_items
+        for key in [k for k in R if k not in want]:
+            cv.delete(R.pop(key)[0])
+        for key, (words, x, y) in want.items():
+            if key not in R:                 # over the lines, under the records
+                item = cv.create_text(x, y, text=words, fill=SOFT, font=self.f_label, tags=("g", "rel"))
+                if cv.find_withtag("node"):
+                    cv.tag_lower(item, "node")
+                R[key] = (item, words)
+            item, said = R[key]
+            cv.coords(item, x, y)
+            if said != words:
+                cv.itemconfigure(item, text=words)
+                R[key] = (item, words)
+
+    def draw_pop(self):
+        """Life: how many are lit, generation by generation (the last sixty),
+        a small line at the top right -- as on the web page."""
+        cv, P = self.cv, self.pop
+        on = self.mode == "life" and len(P) > 1 and not self.rp
+        for item in (self.pop_rule, self.pop_line):
+            cv.itemconfigure(item, state="normal" if on else "hidden")
+        if not on:
             return
-        x, y = self.screen[n]
-        r = self.radius(n) * 1.4 + 4
-        cv.coords(self.ring, x - r, y - r, x + r, y + r)
-        cv.itemconfigure(self.ring, state="normal")
-        for m in self.adjv.get(n, []):
-            key = (min(n, m), max(n, m))
-            if key not in self.links or m not in self.screen:
-                continue
-            rels = self.links[key][0]
-            words = [rel_label(rel) + (" →" if f == n else " ←") for rel, f in rels]
-            pa, pb = self.screen[key[0]], self.screen[key[1]]
-            mx, my = self.along(pa, self.curve(pa, pb, key), pb, 0.5)
-            cv.create_text(round(mx), round(my), text=" · ".join(words), fill=SOFT,
-                           font=self.f_label, tags=("g", "rel"))
+        bw, bh = 104, 26
+        x0, y0 = cv.winfo_width() - bw - 12, self.TOP - bh - 8
+        cv.coords(self.pop_rule, x0, y0 + bh, x0 + bw, y0 + bh)
+        cv.coords(self.pop_line, *[c for i, v in enumerate(P) for c in (x0 + bw * i / 59, y0 + bh - bh * v)])
 
     def resized(self, _e=None):
         cv = self.cv
         w, h = cv.winfo_width(), cv.winfo_height()
-        cv.coords(self.t_left, 12, h - 6)
-        cv.coords(self.t_right, w - 12, h - 6)
+        top = h - self.STATUS_H
+        cv.coords(self.status_bg, 0, top, w, h)
+        cv.coords(self.status_rule, 0, top, w, top)
+        cv.coords(self.t_left, 12, top + 7)
+        cv.coords(self.t_right, 12, top + 25)
+        y = top - 10
+        cv.coords(self.fabs[0], 12, y)
+        cv.coords(self.fabs[2], w - 12, y)
+        cv.coords(self.fabs[1], w - 20 - self.b_draw.winfo_reqwidth(), y)
         cv.coords(self.t_notice, w / 2, h / 2 + 28)
         cv.coords(self.t_link, 12, h - self.bottom() - 4)
         if self.show_key:
             self.show_key = False
             self.toggle_key()
-        cv.itemconfigure(self.t_keys, width=w - 24)
+        cv.itemconfigure(self.t_keys, width=w - 150)
+        self.draw_pop()
         self._dirty = True
 
     def update_status(self, flash=None):
@@ -16496,6 +16679,7 @@ class GraphView:
             right += ", " + tr("depth {d}", d=self.depth)
         self.cv.itemconfigure(self.t_left, text=one_liner(left, 90))
         self.cv.itemconfigure(self.t_right, text=right)
+        self.sync_buttons()
 
     # ---------------------------------------------------------- the hand
     def node_at(self, x, y):
@@ -16526,6 +16710,13 @@ class GraphView:
 
     def press(self, e):
         self.cv.focus_set()
+        if not self.hint_off and not self.rp:
+            self.hint_off = True
+            self.update_status()
+        if self.drawing and not self.rp:
+            self.link_press(e)
+            if self.linking:
+                return
         self.press_at = self.last = (e.x, e.y)
         self.press_node, self.moved = self.node_at(e.x, e.y), False
         self.scrubbing = bool(self.on_bar(e))
@@ -16533,6 +16724,8 @@ class GraphView:
             self.scrub(e)
 
     def drag(self, e):
+        if self.linking:
+            return self.link_drag(e)
         if not self.press_at:
             return
         if self.scrubbing:
@@ -16715,6 +16908,7 @@ class GraphView:
         self.show_key = not self.show_key
         cv = self.cv
         cv.delete("key")
+        self.update_status()
         if not self.show_key:
             return
         x0, y0 = cv.winfo_width() - 330, self.TOP + 8
@@ -16728,8 +16922,11 @@ class GraphView:
                  (blend(RULE, LINK_FAMILY_COLOUR["sources"], 0.9), "", tr("written recently")),
                  (blend(RULE, LINK_FAMILY_COLOUR["sources"], 0.4), "", tr("written long ago")),
                  (STAMP, "", tr("lit, in life"))]
-        cv.create_rectangle(x0 - 10, y0 - 6, x0 + 318, y0 + 18 * len(rows) + 4, fill=PAPER,
-                            outline=RULE, tags=("key",))
+        keys = cv.create_text(x0, y0 + 18 * len(rows) + 8, anchor="nw", width=318, text=tr(GRAPH_KEYS),
+                              fill=SOFT, font=self.f_label, tags=("key",))
+        box = cv.create_rectangle(x0 - 10, y0 - 6, x0 + 318, cv.bbox(keys)[3] + 8, fill=PAPER,
+                                  outline=RULE, tags=("key",))
+        cv.tag_raise(keys, box)
         for i, (colour, dash, text) in enumerate(rows):
             y = y0 + 8 + 18 * i
             if colour is None:
@@ -16741,7 +16938,9 @@ class GraphView:
             cv.create_text(x0 + 56, y, anchor="w", text=text, fill=INK, font=self.f_label,
                            tags=("key",))
 
-    def release(self, _e):
+    def release(self, e):
+        if self.linking:
+            return self.link_release(e)
         n = self.press_node
         if n and not self.moved and not self.scrubbing and not self.rp and n != self.center:
             self.recentre(n)
@@ -16785,6 +16984,7 @@ class GraphView:
         self.mode = GRAPH_MODES[(GRAPH_MODES.index(self.mode) + 1) % len(GRAPH_MODES)]
         if self.mode == "life":
             self.seed_life()
+        self.draw_pop()
         self.update_status()
 
     def set_depth(self, d):
@@ -16795,6 +16995,7 @@ class GraphView:
     def toggle_labels(self):
         self.all_labels = not self.all_labels
         self.label_states()
+        self.sync_buttons()
 
     def shake(self):
         for n, p in self.pos.items():
@@ -16993,10 +17194,14 @@ class LinkDialog:
 
 GRAPH_KEYS = ("click: to the middle (on a line: its links) · double-click / Enter: open on the card · "
               "right-click: spark (in life: flip the cell) · drag: move · Shift+drag: draw a link · "
-              "k: key of the lines · f or Ctrl+click: path to a record · wheel: zoom · "
+              "? or k: key of the lines · f or Ctrl+click: path to a record · wheel: zoom · "
               "m: glow / life / still · 1-3: depth · l: all names · space: pause · "
               "r: shake · c: copy id · p: replay the logs · Home: back to the start · "
               "F5: reread · Esc: close")
+GRAPH_HINT_LIFE = ("click: to the middle · double-click: open · right-click: flip the cell · drag: move · "
+                   "Shift+drag: draw a link · Ctrl+click: path · wheel: zoom · ?: the key and every key")
+GRAPH_HINT = ("click: to the middle · double-click: open · right-click: spark · drag: move · "
+              "Shift+drag: draw a link · Ctrl+click: path · wheel: zoom · ?: the key and every key")
 GRAPH_REPLAY_KEYS = ("REPLAY OF THE LOGS · space: pause / play · + / -: faster / slower · "
                      "← / →: back / ahead · Home / End: start / today · click or drag the "
                      "timeline: go to that moment · w: whole base / around the record · "
@@ -18775,6 +18980,8 @@ PT = {
         "Grafo de ligações",
     "Kustos · link graph (read-only)":
         "Kustos · grafo de ligações (só leitura)",
+    "Kustos · link graph":
+        "Kustos · grafo de ligações",
     "spreading glow":
         "brilho que se espalha",
     "Conway's life":
@@ -18808,11 +19015,15 @@ PT = {
     "Nothing yet at this point of the logs.":
         "Ainda nada neste ponto dos logs.",
     GRAPH_KEYS:
-        "clique: ao centro · duplo clique / Enter: abrir no cartão · botão direito: faísca (na vida: vira a célula) · arrastar: mover · roda: zoom · m: brilho / vida / parado · 1-3: profundidade · l: todos os nomes · espaço: pausa · r: sacudir · c: copiar id · p: reproduzir os logs · Home: voltar ao início · F5: reler · Esc: fechar",
+        "clique: ao centro (numa linha: suas ligações) · duplo clique / Enter: abrir no cartão · botão direito: faísca (na vida: vira a célula) · arrastar: mover · Shift+arrastar: desenhar uma ligação · ? ou k: legenda das linhas · f ou Ctrl+clique: caminho até um registro · roda: zoom · m: brilho / vida / parado · 1-3: profundidade · l: todos os nomes · espaço: pausa · r: sacudir · c: copiar id · p: reproduzir os logs · Home: voltar ao início · F5: reler · Esc: fechar",
+    GRAPH_HINT_LIFE:
+        "clique: ao centro · duplo clique: abrir · botão direito: vira a célula · arrastar: mover · Shift+arrastar: desenhar uma ligação · Ctrl+clique: caminho · roda: zoom · ?: a legenda e todas as teclas",
+    GRAPH_HINT:
+        "clique: ao centro · duplo clique: abrir · botão direito: faísca · arrastar: mover · Shift+arrastar: desenhar uma ligação · Ctrl+clique: caminho · roda: zoom · ?: a legenda e todas as teclas",
     GRAPH_REPLAY_KEYS:
         "REPRODUÇÃO DOS LOGS · espaço: pausa / continua · + / -: mais rápido / mais lento · ← / →: voltar / avançar · Home / End: início / hoje · clicar ou arrastar a linha do tempo: ir àquele momento · w: base inteira / em volta do registro · m: brilho / vida / parado · duplo clique: abrir no cartão · Esc ou p: voltar ao grafo vivo",
     HELP_GRAPH:
-        "\n  Ctrl+Shift+G    grafo de ligações (segunda janela, só leitura): o registro aberto\n                  no centro, suas ligações em volta, brilhando com as edições recentes.\n                  Ele segue o registro que você abre aqui; m troca o brilho\n                  (brilho que se espalha, vida de Conway, parado), Enter abre um registro\n                  no cartão. p reproduz os logs: a base cresce na tela como cresceu,\n                  com uma linha do tempo para percorrer. As teclas estão no alto\n                  da janela.\n",
+        "\n  Ctrl+Shift+G    grafo de ligações (segunda janela): o registro aberto no centro,\n                  suas ligações em volta, brilhando com as edições recentes. Ele\n                  segue o registro que você abre aqui; os botões no alto trocam o\n                  brilho (vida de Conway, brilho que se espalha, parado) e a\n                  profundidade, Abrir (ou Enter) abre um registro no cartão,\n                  Caminho mostra como dois registros se ligam e Ligação desenha\n                  uma ligação. p reproduz os logs: a base cresce na tela como\n                  cresceu, com uma linha do tempo para percorrer. ? mostra a\n                  legenda das linhas e todas as teclas.\n",
     "drafts":
         "rascunhos",
     "Drafts":

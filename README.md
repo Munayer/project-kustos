@@ -74,15 +74,20 @@ selected, and the path finder with its steps written out.
 - **Linked entries** between any registers (`author_of`, `cites`,
   `attested_in`, `defined_in`, `translates`, `measured_in`…). Labels outside of the table are accepted and marked as atypical.
 - **Link graph** (`Ctrl+Shift+G`, **View › Link graph**, or `python _kustos.py graph [id]`):
-  a second, read-only window with the open record in the middle and the records
+  a second window with the open record in the middle and the records
   one to three links away around it, laid out by springs that settle by
-  themselves. It follows the record you open in the main window. The records
+  themselves. It follows the record you open in the main window. It looks and
+  is worked like the web page's graph: buttons at the top switch the rule and
+  the depth (1–3), pause, reseed, show every name (**Aa**) and open the middle
+  record; **?**, **⇢ Path** and **⤳ Link** float at its foot; a hint above the
+  graph goes after the first click, and in life a small line at the top right
+  follows how many are lit. Every button has its key too. The records
   glow and the glow changes as it runs, by one of three rules (`m` switches):
   *Conway's life* (the default: the Game of Life with the links as neighbours —
   a lit record stays lit with 2 or 3 lit neighbours, a dark one lights with
   exactly 3, a generation every 1.2 s; a birth is fed by its lit neighbours,
   whose light flows along the links into it; when the pattern dies out or
-  settles the run rests, the survivors lit, until `r` starts it again),
+  settles the run rests, the survivors lit, until ↻ or `r` starts it again),
   *spreading glow* (light runs along the links and fades, fed by recent edits
   and by sparks) and *still*. Nothing jumps: when the middle changes, the
   records already there keep their place and light, new ones sprout beside the
@@ -105,18 +110,20 @@ selected, and the path finder with its steps written out.
   says what backs it — solid with a reason or a source, dashed with neither
   (a link that still needs a reason), dotted for a type outside the list — and
   a *taper*, thick at the record it comes from, gives its direction (two-way
-  types like *knows* stay even). `k` in the window, **?** on the web, shows the
-  key. Click a line (tap, on the web) to read its links: type, reason, source,
-  span, when written. In the window, double-click the line to open the record
-  it comes from on the card, and Shift+drag from one record to another to draw
-  a new link (type, reason, source, span; only the types that fit the two
-  records are offered, and one that does not fit is refused). On the web the
-  link card edits and deletes links too, **Link** turns dragging into drawing
-  links, and **⋯ › Links** lists every link, with *Needs a reason* and
+  types like *knows* stay even). The types of the middle record's links (or
+  of the one under the pointer) are written on their lines, when it has at
+  most a dozen. **?** (or `k` in the window) shows the key. Click a line (tap,
+  on the web) to read its links: type, reason, source, span, when written. In
+  the window, double-click the line to open the record it comes from on the
+  card. **⤳ Link** turns dragging from one record to another into drawing a
+  new link (in the window, Shift+drag does it too): type, reason, source,
+  span; only the types that fit the two records are offered, and one that
+  does not fit is refused. On the web the link card edits and deletes links
+  too, and **⋯ › Links** lists every link, with *Needs a reason* and
   *Atypical* as filters. A link is always saved as a change of the record it
   comes from, with its log line, as when typed in its LINKS field.
 - **Path finder** — how are two records related? In the graph (window and web
-  alike), `f` in the window or **⇢ Path** on the web asks for a record by a few
+  alike), **⇢ Path** (or `f` in the window) asks for a record by a few
   letters of its name; `Ctrl+click` on a record in the window, or *Tap a record
   in the graph* on the web, takes it straight from the graph. The graph then
   shows only the shortest chains of links between the middle record and that

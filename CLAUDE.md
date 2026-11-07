@@ -95,7 +95,14 @@ Ideas that span several sections:
   along the links into a birth) instead of jumping; every brightness eases;
   the springs take damped steps that keep half of the last one, and dragging
   holds the view still -- full-temperature steps made every record shake
-  around its place, which read as flicker.
+  around its place, which read as flicker. The window's graph also has the
+  page's controls (`GraphView.segment`/`button`, kept in step with the state by
+  `sync_buttons`, called from `update_status`), its labels on the focus's
+  links and its curve of how many are lit. Tk draws no soft edges: its solid
+  lines are smooth polygons with a lighter rim (`RIM`) and a core never under
+  2 px (`MIN_HALF`), or Tk's fill comes and goes along them and they read as
+  dashed. Check a change to them on a big invented base (frame time) and by
+  eye, enlarged.
 - **Long texts are markdown**: `textfield(..., pages=True)` (every NOTES and the
   draft's text) gets `MarkdownKeys`, and `fit(opening=True)` paints it before
   the pages are measured. The text stored stays plain.
