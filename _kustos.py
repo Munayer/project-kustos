@@ -12800,19 +12800,28 @@ class App:
                     return
             glide(units)
 
-        def claim(_e=None):
+        # Tk sends the wheel to the widget under the pointer, on every system;
+        # one handler for the whole window passes it to the card that widget is
+        # in (card_wheel). It used to be switched on and off as the pointer came
+        # and went, and a click in a field could leave it off.
+        canvas.wheel = wheel
+        if not getattr(self, "_card_wheel", False):
+            self._card_wheel = True
             for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-                canvas.bind_all(seq, wheel)
-
-        def release(_e=None):
-            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-                canvas.unbind_all(seq)
-
-        canvas.bind("<Enter>", claim)
-        canvas.bind("<Leave>", release)
+                self.root.bind_all(seq, self.card_wheel, add="+")
         self.canvases = getattr(self, "canvases", []) + [canvas]
         self.pendings += [(canvas, pending), (canvas, scroll)]
         return inner
+
+    def card_wheel(self, e):
+        """The wheel or the touchpad over a card -- a field of it included --
+        scrolls that card (or turns the field's page), whatever was clicked."""
+        path = str(e.widget)
+        for canvas in getattr(self, "canvases", []):
+            mine = str(canvas)
+            if path == mine or path.startswith(mine + "."):
+                return canvas.wheel(e) if canvas.winfo_exists() else None
+        return None
 
     def autogrow(self, t, minrows=2, tail=False, pages=None):
         """As many rows as the text needs, up to one screen of the card: a long

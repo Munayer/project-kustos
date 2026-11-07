@@ -183,6 +183,10 @@ Force pushes are run by the owner, not by Claude.
   never move a fixed step per event. Amounts (a zoom, a scroll) take
   `wheel_units(e)`; steps (a page) count with `WheelNotches` / `wheel_turn`.
   The page's graph does the same in `gWheelZoom`.
+  A card's wheel goes through one window-wide handler, `App.card_wheel`,
+  which finds the card from the widget under the pointer (Tk sends the wheel
+  there on every system); do not switch wheel handlers on Enter/Leave --
+  a click could leave one off.
 - Patching with shell heredocs mangles backslashes; write patch scripts to a
   file and `compile()` the result before writing it.
 
