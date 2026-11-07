@@ -82,7 +82,9 @@ Ideas that span several sections:
   them itself; its life, glow and still rules are the window's `GraphView`
   ones rewritten in JavaScript, so a change to one belongs in the other. Two
   differences are on purpose: the page's generations are slower, and its life
-  stops when the pattern settles instead of reseeding at random.
+  stops when the pattern settles instead of reseeding at random. How changes
+  are drawn (growth, withering, light flowing along links, eased brightness)
+  is the page's own and touches no rule.
 - **Long texts are markdown**: `textfield(..., pages=True)` (every NOTES and the
   draft's text) gets `MarkdownKeys`, and `fit(opening=True)` paints it before
   the pages are measured. The text stored stays plain.

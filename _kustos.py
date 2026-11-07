@@ -7220,14 +7220,22 @@ function menuSheet() {
    window, a generation lasts 1.2 s and the run stops when the pattern dies out
    or settles (a still life, a blinker), leaving the survivors lit, instead of
    reseeding at random: Reseed, or holding a record, starts it again. With
-   reduced motion asked for, the graph opens still. */
+   reduced motion asked for, the graph opens still.
+   Changes are drawn as growth, never as jumps: when the middle changes, the
+   records already there keep their light, new ones sprout from the record that
+   brought them (nearest first) and their links grow out to them, and the ones
+   that leave wither. In life a birth is fed by its three lit neighbours: their
+   light flows along the links and the new cell lights when it arrives. Links
+   are soft curves; every brightness eases (`vis`), so nothing flashes. */
 const G = {on: false, settled: false,
            mode: matchMedia("(prefers-reduced-motion: reduce)").matches ? "still" : "life", depth: 2, paused: false, names: false, nodes: {}, ids: [], links: [],
            adj: {}, center: null, hover: null, cam: [0, 0], goal: [0, 0], zoom: 1, fit: true, temp: 0,
            frame: 0, gen: 0, stale: 0, history: [], born: 0, died: 0, pop: [], acc: 0, last: 0, raf: 0,
+           clock: 0, gone: {}, goneLinks: [], pulses: [],
            C: null, ctx: null, w: 0, h: 0, dpr: 1, ptr: new Map(), press: null, pinch: null, hold: 0,
            dragging: null, said: ""};
 const LINK = 90, TICK = 40, GEN_TICKS = 30, SPARK_TICKS = 30, GTOP = 26;
+const GROW_MS = 700, LEAVE_MS = 600, FLOW_MS = 900, STAGGER_MS = 110;
 const GMODES = [["life", "Conway's life", "Life"], ["glow", "spreading glow", "Glow"], ["still", "still", "Still"]];
 
 function gColors() {
@@ -7292,6 +7300,7 @@ function graphMount() {
   c.addEventListener("contextmenu", e => e.preventDefault());
   G.last = performance.now();
   G.acc = 0;
+  G.gone = {}; G.goneLinks = []; G.pulses = [];
   G.raf = requestAnimationFrame(gLoop);
   gButtons();
 }
@@ -7302,29 +7311,55 @@ async function graphFetch(id) {
   if (G.on) gLoad(d);
 }
 function gLoad(d) {
-  const old = G.nodes, c = d.center;
+  const old = G.nodes, c = d.center, first = !G.ids.length;
   const o = c && old[c] ? [old[c].x, old[c].y] : [0, 0];
+  const lit = r => Math.random() < 0.35 + 0.5 * r.rec;
   const nodes = {};
   for (const n of d.nodes) {          // parents come before the records they bring
     const prev = old[n.id];
+    if (prev) {
+      nodes[n.id] = Object.assign(prev, n, {x: prev.x - o[0], y: prev.y - o[1]});
+      continue;
+    }
     let x = 0, y = 0;
-    if (prev) { x = prev.x - o[0]; y = prev.y - o[1]; }
-    else if (n.parent && nodes[n.parent]) {
-      const p = nodes[n.parent], a = Math.random() * 2 * Math.PI, r = LINK * (0.4 + 0.5 * Math.random());
+    if (n.parent && nodes[n.parent]) {  // a new record sprouts right beside the one that brought it
+      const p = nodes[n.parent], a = Math.random() * 2 * Math.PI, r = LINK * 0.15;
       x = p.x + r * Math.cos(a); y = p.y + r * Math.sin(a);
     }
-    nodes[n.id] = Object.assign({}, n, {x, y, heat: prev ? prev.heat : n.rec * 0.3, lit: prev ? prev.lit : false});
+    const start = G.clock + STAGGER_MS * n.dist + Math.random() * 150;
+    const on = G.mode === "life" && lit(n);
+    nodes[n.id] = Object.assign({}, n, {x, y, grow: 0, start, heat: 0, vis: 0, spark: 0,
+                                        lit: on, arrive: start + GROW_MS + Math.random() * 600});
   }
   if (c && nodes[c]) { nodes[c].x = 0; nodes[c].y = 0; }
+  for (const id of Object.keys(old)) {   // the ones that leave wither where they are
+    if (!nodes[id]) G.gone[id] = Object.assign(old[id], {x: old[id].x - o[0], y: old[id].y - o[1], leave: 1});
+  }
+  for (const g of Object.values(G.gone)) if (nodes[g.id]) delete G.gone[g.id];
+  const before = new Map(G.links.map(l => [l.a + " " + l.b, l]));
+  const now = new Set(d.links.map(l => l.a + " " + l.b));
+  for (const [key, l] of before) if (!now.has(key)) G.goneLinks.push(Object.assign(l, {leave: 1}));
+  G.links = d.links.map(l => {
+    const had = before.get(l.a + " " + l.b);
+    if (had) return Object.assign(had, l);
+    const A = nodes[l.a], B = nodes[l.b];
+    const from = old[l.a] ? l.a : old[l.b] ? l.b : (A.dist <= B.dist ? l.a : l.b);
+    const to = from === l.a ? B : A;
+    return Object.assign(l, {grow: 0, from, start: to.grow < 1 ? to.start : G.clock});
+  });
   G.cam = [G.cam[0] - o[0], G.cam[1] - o[1]];
   G.goal = [0, 0];
-  G.nodes = nodes; G.ids = Object.keys(nodes); G.center = c; G.links = d.links; G.hover = null;
+  G.nodes = nodes; G.ids = Object.keys(nodes); G.center = c; G.hover = null;
   G.adj = {};
   G.ids.forEach(n => { G.adj[n] = []; });
-  for (const l of d.links) { G.adj[l.a].push(l.b); G.adj[l.b].push(l.a); }
-  if (c && G.mode === "glow") nodes[c].heat = 1;
-  if (G.mode === "life") gSeed();
-  G.temp = Math.max(G.temp, 30);
+  for (const l of G.links) { G.adj[l.a].push(l.b); G.adj[l.b].push(l.a); }
+  if (c && G.mode === "glow") nodes[c].spark = 1;
+  if (G.mode === "life") {           // the neighbourhood changed: the run goes on from here
+    G.stale = 0; G.history = [];
+    if (first) { G.gen = G.born = G.died = 0; G.pop = []; }
+    if (G.settled) { G.settled = false; if (G.on) gButtons(); }
+  }
+  G.temp = Math.max(G.temp, first ? 30 : 14);
   G.fit = true;
   S.sel = c; markSel();
   $("#gnote").textContent = !c ? T("The base has no records yet.")
@@ -7368,7 +7403,11 @@ function gStatus(force) {
 
 /* the rules, as in the window */
 function gSeed() {
-  for (const n of G.ids) { const r = G.nodes[n]; r.lit = Math.random() < 0.35 + 0.5 * r.rec; }
+  for (const n of G.ids) {           // the lights come on one by one, not all at once
+    const r = G.nodes[n];
+    r.lit = Math.random() < 0.35 + 0.5 * r.rec;
+    r.arrive = G.clock + Math.random() * 1500;
+  }
   G.gen = G.stale = G.born = G.died = 0;
   G.history = []; G.pop = [];
   G.settled = false;
@@ -7382,10 +7421,14 @@ function gGeneration() {
     next[n] = N[n].lit ? (k === 2 || k === 3) : k === 3;
   }
   for (const n of G.ids) {
-    if (next[n] && !N[n].lit) born++;
+    if (next[n] && !N[n].lit) {      // a birth: the light of its lit neighbours flows to it
+      born++;
+      for (const m of G.adj[n]) if (N[m].lit) G.pulses.push({a: m, b: n, start: G.clock, dur: FLOW_MS});
+      N[n].arrive = G.clock + FLOW_MS;
+    }
     if (!next[n] && N[n].lit) died++;
-    N[n].lit = next[n];
   }
+  for (const n of G.ids) N[n].lit = next[n];
   const state = G.ids.filter(n => next[n]).sort().join(" ");
   G.stale = (!state || G.history.includes(state)) ? G.stale + 1 : 0;
   G.history = G.history.concat([state]).slice(-2);       // still lifes and blinkers
@@ -7399,18 +7442,21 @@ function gHeat() {
     const next = {};
     for (const n of G.ids) {
       const nb = G.adj[n], s = nb.length ? nb.reduce((t, m) => t + N[m].heat, 0) / nb.length : 0;
-      next[n] = Math.min(1, N[n].heat * 0.95 + s * 0.045 + N[n].rec * 0.012);
+      next[n] = Math.min(1, N[n].heat * 0.95 + s * 0.045 + N[n].rec * 0.012 + N[n].spark * 0.08);
     }
-    for (const n of G.ids) N[n].heat = next[n];
-    if (G.frame % SPARK_TICKS === 0 && G.ids.length) {
+    for (const n of G.ids) { N[n].heat = next[n]; N[n].spark *= 0.9; }
+    if (G.frame % SPARK_TICKS === 0 && G.ids.length) {   // a spark swells; it does not flash
       const w = G.ids.map(n => N[n].rec + 0.05), total = w.reduce((a, b) => a + b, 0);
       let r = Math.random() * total, i = 0;
       while (i < w.length - 1 && (r -= w[i]) > 0) i++;
-      N[G.ids[i]].heat = 1;
+      N[G.ids[i]].spark = 1;
     }
   } else if (G.mode === "life") {
     if (!G.settled && G.frame % GEN_TICKS === 0) gGeneration();
-    for (const n of G.ids) N[n].heat += ((N[n].lit ? 1 : 0) - N[n].heat) * 0.12;
+    for (const n of G.ids) {
+      const p = N[n], want = p.lit && G.clock >= (p.arrive || 0) ? 1 : 0;
+      p.heat += (want - p.heat) * (want ? 0.12 : 0.06);  // lighting is quicker than fading
+    }
   } else {
     for (const n of G.ids) N[n].heat += (N[n].rec - N[n].heat) * 0.1;
   }
@@ -7449,11 +7495,30 @@ function gFit() {
 }
 function gTick() {
   G.frame++;
+  G.clock += TICK;
   if (G.temp > 0.2) gLayout();
   G.cam[0] += (G.goal[0] - G.cam[0]) * 0.18;
   G.cam[1] += (G.goal[1] - G.cam[1]) * 0.18;
   if (G.fit && G.ids.length) gFit();
   if (!G.paused) gHeat();
+  for (const n of G.ids) {
+    const p = G.nodes[n];
+    if (p.grow < 1 && G.clock >= p.start) p.grow = Math.min(1, p.grow + TICK / GROW_MS);
+    if (p.grow === undefined) p.grow = 1;
+    p.vis = (p.vis ?? p.heat) + (p.heat * (p.grow ?? 1) - (p.vis ?? p.heat)) * 0.18;
+  }
+  for (const l of G.links) {
+    if (l.grow === undefined) l.grow = 1;
+    if (l.grow < 1 && G.clock >= l.start) l.grow = Math.min(1, l.grow + TICK / GROW_MS);
+  }
+  for (const id of Object.keys(G.gone)) {
+    const g = G.gone[id];
+    g.leave -= TICK / LEAVE_MS;
+    g.vis *= 0.9;
+    if (g.leave <= 0) delete G.gone[id];
+  }
+  G.goneLinks = G.goneLinks.filter(l => (l.leave -= TICK / LEAVE_MS) > 0);
+  G.pulses = G.pulses.filter(q => G.clock < q.start + q.dur && G.nodes[q.a] && G.nodes[q.b]);
 }
 function gLoop(t) {
   if (!G.on) return;
@@ -7471,8 +7536,8 @@ function gScreen(n) {
   const [mx, my] = gMiddle(), p = G.nodes[n];
   return [mx + (p.x - G.cam[0]) * G.zoom, my + (p.y - G.cam[1]) * G.zoom];
 }
-function gRadius(n) {
-  const p = G.nodes[n], r = n === G.center ? 9 : (p.dist === 1 ? 6.5 : 5);
+function gRadius(n, rec) {
+  const p = rec || G.nodes[n], r = n === G.center ? 9 : (p.dist === 1 ? 6.5 : 5);
   return r * Math.min(1.5, Math.max(0.7, G.zoom)) * (G.w < 600 ? 1.3 : 1);
 }
 function gShape(ctx, kind, x, y, r) {
@@ -7491,6 +7556,34 @@ function gLabelShown(n) {
   if (G.w < 600) return G.ids.length <= 12 || (G.nodes[n].dist <= 1 && G.adj[G.center].length <= 8);
   return G.nodes[n].dist <= 1 || G.ids.length <= 40;
 }
+function gHash(key) {
+  let h = 2166136261;
+  for (let i = 0; i < key.length; i++) h = Math.imul(h ^ key.charCodeAt(i), 16777619);
+  return ((h >>> 0) % 1000) / 1000;
+}
+function gCurve(A, B, key) {
+  // a link bows a little to one side, and breathes very slowly
+  const u = gHash(key), dx = B[0] - A[0], dy = B[1] - A[1];
+  const bow = (u < 0.5 ? -1 : 1) * (0.08 + 0.1 * (u * 2 % 1)) * (1 + 0.15 * Math.sin(G.clock / 1700 + u * 6.28));
+  return [(A[0] + B[0]) / 2 - dy * bow, (A[1] + B[1]) / 2 + dx * bow];
+}
+function gAt(A, Cp, B, t) {
+  const v = 1 - t;
+  return [v * v * A[0] + 2 * v * t * Cp[0] + t * t * B[0], v * v * A[1] + 2 * v * t * Cp[1] + t * t * B[1]];
+}
+function gStroke(ctx, A, Cp, B, t0, t1) {
+  ctx.beginPath();
+  if (t0 === 0 && t1 === 1) { ctx.moveTo(...A); ctx.quadraticCurveTo(...Cp, ...B); }
+  else {
+    const steps = 12;
+    for (let i = 0; i <= steps; i++) {
+      const [x, y] = gAt(A, Cp, B, t0 + (t1 - t0) * i / steps);
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    }
+  }
+  ctx.stroke();
+}
+const ease = t => 1 - Math.pow(1 - Math.max(0, Math.min(1, t)), 3);
 function gDraw() {
   const box = $("#gbox"), c = $("#gc");
   if (!box || !c) return;
@@ -7499,35 +7592,77 @@ function gDraw() {
     G.w = w; G.h = h; G.dpr = dpr;
     c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
   }
-  const ctx = G.ctx, C = G.C, N = G.nodes;
+  const ctx = G.ctx, C = G.C, N = G.nodes, GN = G.gone;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.fillStyle = C.paper;
   ctx.fillRect(0, 0, w, h);
+  ctx.lineCap = "round";
+  const [mx, my] = gMiddle();
+  const scr = p => [mx + (p.x - G.cam[0]) * G.zoom, my + (p.y - G.cam[1]) * G.zoom];
   const S = {};
-  for (const n of G.ids) S[n] = gScreen(n);
+  for (const n of G.ids) S[n] = scr(N[n]);
+  for (const id of Object.keys(GN)) S[id] = S[id] || scr(GN[id]);
+  const vis = id => (N[id] || GN[id] || {vis: 0}).vis || 0;
+  for (const l of G.goneLinks) {     // links that leave fade where they were
+    if (!S[l.a] || !S[l.b]) continue;
+    ctx.globalAlpha = Math.max(0, l.leave);
+    ctx.strokeStyle = C.rule; ctx.lineWidth = 1;
+    gStroke(ctx, S[l.a], gCurve(S[l.a], S[l.b], l.a + l.b), S[l.b], 0, 1);
+  }
+  ctx.globalAlpha = 1;
   for (const l of G.links) {
-    const q = (N[l.a].heat + N[l.b].heat) / 2;
+    const q = (vis(l.a) + vis(l.b)) / 2, g = ease(l.grow ?? 1);
+    if (g <= 0) continue;
     ctx.strokeStyle = mix(C.rule, C.accent, 0.85 * q);
     ctx.lineWidth = 1 + 2 * q;
-    ctx.beginPath(); ctx.moveTo(...S[l.a]); ctx.lineTo(...S[l.b]); ctx.stroke();
+    const A = S[l.a], B = S[l.b], Cp = gCurve(A, B, l.a + l.b);
+    if (g >= 1) gStroke(ctx, A, Cp, B, 0, 1);
+    else if (l.from === l.a) gStroke(ctx, A, Cp, B, 0, g);      // it grows out of the record already there
+    else gStroke(ctx, A, Cp, B, 1 - g, 1);
   }
+  for (const q of G.pulses) {        // light flowing along a link into a new cell
+    const l = G.links.find(l => (l.a === q.a && l.b === q.b) || (l.a === q.b && l.b === q.a));
+    if (!l || !S[q.a] || !S[q.b]) continue;
+    const A = S[l.a], B = S[l.b], Cp = gCurve(A, B, l.a + l.b);
+    const t = ease((G.clock - q.start) / q.dur), along = q.a === l.a ? t : 1 - t;
+    for (let k = 0; k < 4; k++) {
+      const tt = q.a === l.a ? along - k * 0.05 : along + k * 0.05;
+      if (tt < 0 || tt > 1) continue;
+      const [x, y] = gAt(A, Cp, B, tt);
+      ctx.globalAlpha = (0.85 - k * 0.2) * Math.sin(Math.PI * Math.min(1, t * 1.1));
+      ctx.fillStyle = C.accent;
+      ctx.beginPath(); ctx.arc(x, y, 3.2 - k * 0.6, 0, 2 * Math.PI); ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
   const focus = G.hover || G.center;
   if (focus && G.adj[focus] && G.adj[focus].length <= 12 && (G.w >= 600 || G.names)) {
     ctx.font = `10px ${C.mono}`; ctx.fillStyle = C.soft; ctx.textAlign = "center"; ctx.textBaseline = "middle";
     for (const l of G.links) {
-      if (l.a !== focus && l.b !== focus) continue;
+      if ((l.a !== focus && l.b !== focus) || (l.grow ?? 1) < 1) continue;
       const words = l.rels.map(([rel, f]) => rel + (f === focus ? " →" : " ←")).join(" · ");
-      ctx.fillText(words, (S[l.a][0] + S[l.b][0]) / 2, (S[l.a][1] + S[l.b][1]) / 2 - 6);
+      const [x, y] = gAt(S[l.a], gCurve(S[l.a], S[l.b], l.a + l.b), S[l.b], 0.5);
+      ctx.fillText(words, x, y - 6);
     }
   }
-  for (const n of G.ids) {
-    const [x, y] = S[n], r = gRadius(n), p = N[n];
+  const node = (p, x, y, r, a) => {
+    ctx.globalAlpha = a;
     gShape(ctx, p.kind, x, y, r);
-    ctx.fillStyle = mix(C.paper, C.accent, p.heat);
+    ctx.fillStyle = mix(C.paper, C.accent, p.vis || 0);
     ctx.fill();
-    if (n === G.center) { ctx.strokeStyle = C.warn; ctx.lineWidth = 2; }
-    else { ctx.strokeStyle = mix(C.faint, C.accent, p.heat); ctx.lineWidth = 1; }
+    if (p.id === G.center) { ctx.strokeStyle = C.warn; ctx.lineWidth = 2; }
+    else { ctx.strokeStyle = mix(C.faint, C.accent, p.vis || 0); ctx.lineWidth = 1; }
     ctx.stroke();
+  };
+  for (const id of Object.keys(GN)) {   // withering
+    const g = GN[id], k = ease(g.leave);
+    if (k > 0) node(g, ...S[id], gRadius(id, g) * k, k);
+  }
+  for (const n of G.ids) {
+    const p = N[n], g = ease(p.grow ?? 1);
+    if (g <= 0) continue;
+    const [x, y] = S[n], r = gRadius(n) * (0.35 + 0.65 * g);
+    node(p, x, y, r, g);
     if (n === G.hover) {
       ctx.strokeStyle = C.ink; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.arc(x, y, r * 1.4 + 4, 0, 2 * Math.PI); ctx.stroke();
@@ -7535,13 +7670,16 @@ function gDraw() {
   }
   ctx.textAlign = "left"; ctx.textBaseline = "middle";
   for (const n of G.ids) {
-    if (!gLabelShown(n)) continue;
-    const [x, y] = S[n], p = N[n], big = n === G.center;
+    const p = N[n], g = ease(p.grow ?? 1);
+    if (g <= 0.2 || !gLabelShown(n)) continue;
+    const [x, y] = S[n], big = n === G.center;
+    ctx.globalAlpha = g;
     ctx.font = `${big ? "600 12px" : "11px"} ${C.mono}`;
     ctx.fillStyle = p.dist <= 1 ? C.ink : C.soft;
     const name = p.name.length > 32 ? p.name.slice(0, 31) + "…" : p.name;
     ctx.fillText(name, x + gRadius(n) * 1.4 + 4, y);
   }
+  ctx.globalAlpha = 1;
   if (G.mode === "life" && G.pop.length > 1) {        // how many are lit, generation by generation
     const bw = 104, bh = 26, x0 = w - bw - 12, y0 = 10;
     ctx.strokeStyle = C.rule; ctx.lineWidth = 1;
@@ -7560,6 +7698,7 @@ function gDraw() {
 function gNodeAt(x, y, slop) {
   let best = null, bd = slop * slop;
   for (const n of G.ids) {
+    if ((G.nodes[n].grow ?? 1) < 0.5) continue;
     const [sx, sy] = gScreen(n), d = (sx - x) ** 2 + (sy - y) ** 2;
     if (d < bd) { best = n; bd = d; }
   }
@@ -7579,9 +7718,10 @@ function gTouch(n) {
   if (!p) return;
   if (G.mode === "life") {
     p.lit = !p.lit;
+    p.arrive = G.clock;
     G.stale = 0;
     if (G.settled) { G.settled = false; gButtons(); }    // a hand on it starts the run again
-  } else p.heat = 1;
+  } else p.spark = 1;
   if (navigator.vibrate) { try { navigator.vibrate(12); } catch (e) { /* not allowed here */ } }
 }
 function gDown(e) {

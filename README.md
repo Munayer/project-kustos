@@ -108,7 +108,11 @@ updating of files and conflicts if used any syncing app or cloud sync.
   records thicken, and a small line in the corner follows how many are lit.
   It runs calmer than the window's: a generation every 1.2 s, and when the
   pattern dies out or settles it stops there, the survivors still lit, until
-  *Reseed* (or holding a record) starts it again. Tap a record
+  *Reseed* (or holding a record) starts it again. Changes grow rather than
+  jump: a new middle keeps the light of the records already there, new ones
+  sprout from the record that brought them and their links grow out to them,
+  the ones that leave wither; a birth is fed by its three lit neighbours,
+  whose light flows along the (softly curved) links into it. Tap a record
   to bring it to the middle, tap the middle to open it, hold one to flip its
   cell, pinch or scroll to zoom; *Life / Glow / Still* and the depth 1–3 sit
   above it. (The replay of the logs is still only in the window.)
