@@ -197,7 +197,55 @@ def wheel_units(e):
     if num in (4, 5):
         return 1.0 if num == 5 else -1.0
     d = getattr(e, "delta", 0) or 0
+    if getattr(e, "touch", False):      # a TouchWheel: pixels, on the wheel's scale
+        return -d / WHEEL_NOTCH
     return float(-d) if sys.platform == "darwin" else -d / WHEEL_NOTCH
+
+
+# ---- Tk 9's touchpad. From Tk 9 (Python 3.13 and later on Windows), a
+# touchpad's two fingers come as <TouchpadScroll>, in pixels, the sideways and
+# the vertical movement packed in one number; only a mouse wheel's notches
+# still come as <MouseWheel>. Every wheel handler hears both (bind_touchpad);
+# Tk 8.6 has no such event, and there nothing changes.
+
+def touchpad_deltas(packed):
+    """(dx, dy) in pixels from a <TouchpadScroll>'s delta: dx in the high 16
+    bits, dy in the low ones, both signed (Tk's tk::PreciseScrollDeltas)."""
+    try:
+        packed = int(packed)
+    except (TypeError, ValueError):
+        return 0, 0
+    dx, dy = (packed >> 16) & 0xffff, packed & 0xffff
+    return (dx - 0x10000 if dx >= 0x8000 else dx), (dy - 0x10000 if dy >= 0x8000 else dy)
+
+
+class TouchWheel:
+    """A <TouchpadScroll> read as the wheel handlers read a <MouseWheel>:
+    `delta` on the wheel's scale (positive up), Shift in `state` when the
+    swipe goes sideways, and `pixels` -- the movement itself, positive down --
+    for what follows the fingers."""
+    touch = True
+
+    def __init__(self, e):
+        dx, dy = touchpad_deltas(getattr(e, "delta", 0))
+        side = abs(dx) > abs(dy)
+        self.widget, self.x, self.y = e.widget, getattr(e, "x", 0), getattr(e, "y", 0)
+        self.x_root, self.y_root = getattr(e, "x_root", 0), getattr(e, "y_root", 0)
+        self.num = 0
+        self.delta = dx if side else dy      # sideways: fingers to the left go forward, as Tk scrolls
+        state = e.state if isinstance(getattr(e, "state", 0), int) else 0
+        self.state = (state | 0x1) if side else (state & ~0x1)
+        self.pixels = 0 if side else -dy
+
+
+def bind_touchpad(bind, handler):
+    """bind("<TouchpadScroll>", ...) with the event read as a TouchWheel --
+    where Tk has the event (9 and later); elsewhere nothing."""
+    try:
+        bind("<TouchpadScroll>", lambda e: handler(TouchWheel(e)))
+        return True
+    except Exception:
+        return False
 
 
 class WheelNotches:
@@ -11536,6 +11584,7 @@ class Reader:
             t.bind(seq, fn)
         notches = WheelNotches()
         t.bind("<MouseWheel>", lambda e: wheel_turn(notches, e, self.turn))
+        bind_touchpad(t.bind, lambda e: wheel_turn(notches, e, self.turn))
         t.bind("<Button-4>", lambda e: self.turn(-1))
         t.bind("<Button-5>", lambda e: self.turn(1))
         t.bind("<KeyRelease>", self.typed, add="+")
@@ -11928,6 +11977,7 @@ class App:
         self.list.bind("<Configure>", self.fit_soon)
         self._list_notches = WheelNotches()
         self.list.bind("<MouseWheel>", lambda e: wheel_turn(self._list_notches, e, self.turn))
+        bind_touchpad(self.list.bind, lambda e: wheel_turn(self._list_notches, e, self.turn))
         self.list.bind("<Button-4>", lambda e: self.turn(-1))
         self.list.bind("<Button-5>", lambda e: self.turn(1))
         pw.add(mid, stretch="always", minsize=200)
@@ -12776,6 +12826,20 @@ class App:
             to = scroll["to"] = max(0.0, min(1.0 - span, base + step * 0.3 * span))
             tween(canvas, scroll, SCROLL_MS, lambda k: canvas.yview_moveto(top + (to - top) * k))
 
+        def follow(px):
+            """A touchpad moves the card by its own pixels, at once: the card
+            follows the fingers, as everywhere else on the system."""
+            halt(canvas, scroll)
+            box = canvas.bbox("all")
+            height = (box[3] - box[1]) if box else 0
+            if height <= 0:
+                return
+            top, bottom = canvas.yview()
+            canvas.yview_moveto(max(0.0, min(1.0 - (bottom - top), top + px / height)))
+
+        def move(e, units):
+            follow(e.pixels) if getattr(e, "touch", False) else glide(units)
+
         gesture = {"at": 0.0, "step": 0, "edge": False}
 
         def wheel(e):
@@ -12808,10 +12872,11 @@ class App:
             if isinstance(w, tk.Text) and not paged and (sideways or gesture["edge"]):
                 first, last_ = w.yview()        # a field that scrolls inside, as a long field pages
                 if (last_ < 0.999) if step > 0 else (first > 0.001):
-                    w.yview_scroll(int(round(units * 40)) or step, "pixels")
+                    px = e.pixels if getattr(e, "touch", False) and e.pixels else units * 40
+                    w.yview_scroll(int(round(px)) or step, "pixels")
                     return
             if not sideways:
-                glide(units)
+                move(e, units)
 
         # Tk sends the wheel to the widget under the pointer, on every system;
         # one handler for the whole window passes it to the card that widget is
@@ -12828,6 +12893,10 @@ class App:
                 # a drop-down box changed its value under the wheel -- a source's
                 # type, a form's status -- while the card scrolled past it
                 self.root.unbind_class("TCombobox", seq)
+            # Tk 9's touchpad, the same way (on Tk 8.6 there is no such event)
+            if bind_touchpad(lambda seq, fn: self.root.bind_all(seq, fn, add="+"), self.card_wheel):
+                bind_touchpad(lambda seq, fn: self.root.bind_class("Text", seq, fn), self.text_touch)
+                self.root.unbind_class("TCombobox", "<TouchpadScroll>")
         self.canvases = getattr(self, "canvases", []) + [canvas]
         self.pendings += [(canvas, pending), (canvas, scroll)]
         return inner
@@ -12846,6 +12915,18 @@ class App:
         scrolls that card (or turns the field's page), whatever was clicked."""
         canvas = self.card_canvas(e.widget)
         return canvas.wheel(e) if canvas is not None else None
+
+    def text_touch(self, e):
+        """A text field's own touchpad (a TouchWheel), as Tk 9 has it -- except
+        in a card, where the card decides."""
+        if self.card_canvas(e.widget) is not None:
+            self.card_wheel(e)
+            return "break"
+        if e.state & 0x1:
+            e.widget.xview_scroll(int(-e.delta) or 0, "pixels")
+        elif e.pixels:
+            e.widget.yview_scroll(int(e.pixels), "pixels")
+        return None
 
     def text_wheel(self, e):
         """A text field's own wheel, as Tk has it -- except in a card, where
@@ -14957,6 +15038,7 @@ class BookView:
         b("<End>", lambda e: self.open_spread(len(self.spreads) - 1, 1))
         notches = WheelNotches()
         b("<MouseWheel>", lambda e: wheel_turn(notches, e, self.turn))
+        bind_touchpad(b, lambda e: wheel_turn(notches, e, self.turn))
         b("<Button-4>", lambda e: self.turn(-1))
         b("<Button-5>", lambda e: self.turn(1))
         for n, (key, _) in enumerate(BOOK_CHAPTERS, 1):
@@ -15942,6 +16024,7 @@ class GraphView:
         cv.bind("<Shift-ButtonRelease-1>", self.link_release)
         cv.bind("<Button-3>", self.touch)
         cv.bind("<MouseWheel>", lambda e: self.zoom_at(e, 1.1 ** -wheel_units(e)))
+        bind_touchpad(cv.bind, lambda t: None if t.state & 0x1 else self.zoom_at(t, 1.1 ** -wheel_units(t)))
         cv.bind("<Button-4>", lambda e: self.zoom_at(e, 1.1))
         cv.bind("<Button-5>", lambda e: self.zoom_at(e, 1 / 1.1))
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -17741,6 +17824,7 @@ class MonadView:
         cv.bind("<ButtonRelease-1>", self.release)
         cv.bind("<Double-Button-1>", lambda e: self.open_in_card(self.hover or self.center))
         cv.bind("<MouseWheel>", lambda e: self.zoom_at(e, 1.1 ** -wheel_units(e)))
+        bind_touchpad(cv.bind, lambda t: None if t.state & 0x1 else self.zoom_at(t, 1.1 ** -wheel_units(t)))
         cv.bind("<Button-4>", lambda e: self.zoom_at(e, 1.1))
         cv.bind("<Button-5>", lambda e: self.zoom_at(e, 1 / 1.1))
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -18309,6 +18393,7 @@ class TimelineView:
         b = root.bind
         cv.bind("<Configure>", lambda e: self.later())
         cv.bind("<MouseWheel>", self.wheel)
+        bind_touchpad(cv.bind, self.wheel)          # sideways: along the time
         cv.bind("<Button-4>", lambda e: self.zoom_at(e.x, 0.8))
         cv.bind("<Button-5>", lambda e: self.zoom_at(e.x, 1.25))
         cv.bind("<ButtonPress-1>", self.press)
