@@ -154,6 +154,17 @@ def kind_of(rec):
             "notes": "note"}[coll]
 
 
+def kind_fits(spec, rec):
+    """Whether a record fits one end of a RELS type: '*' fits any; 'org' only
+    a person marked as an organization; any other kind, the records of that
+    kind -- an organization is also a 'person', so it can be an author, or known."""
+    if spec == "*":
+        return True
+    if spec == "org":
+        return kind_of(rec) == "person" and bool(rec.get("org"))
+    return spec == kind_of(rec)
+
+
 def _host():
     raw = socket.gethostname().split(".")[0] or "machine"
     return re.sub(r"[^A-Za-z0-9_-]+", "_", raw)[:32]
@@ -469,10 +480,10 @@ def haystack_person(p):
     return "  ".join(parts).lower()
 
 
-def blank_person(name=""):
+def blank_person(name="", org=False):
     return {"id": None, "name": name, "tags": [], "met": None, "notes_raw": "",
             "links": [], "place": "", "aliases": [], "interactions": [],
-            "tasks": [], "circles": [], "followup": None, "updated": None}
+            "tasks": [], "circles": [], "followup": None, "updated": None, "org": org}
 
 
 def fix_person(p):
@@ -487,6 +498,7 @@ def fix_person(p):
     p.setdefault("died", "")
     p.setdefault("followup", None)
     p.setdefault("tasks", [])
+    p.setdefault("org", False)          # an organization: a person record, marked so
     p["circles"] = parse_circles(p.get("circles"))
     fu = p.get("followup")
     if fu and (fu.get("text") or "").strip():
@@ -500,6 +512,81 @@ def fix_person(p):
 
 ABBREVS = {"st", "mr", "mrs", "ms", "dr", "prof", "fr", "sr", "jr", "ss", "rev"}
 URL_RE = re.compile(r"^(https?://|www\.)\S+$", re.IGNORECASE)
+
+
+# ---- what a line of URLS is: a site, an email, a phone -- or plain text.
+# The line stays as it was typed; it is read here, for the window, the page and
+# the mirror alike. "work: ana@example.org" names it; a phone written with + and
+# its country code (or 00) also opens a WhatsApp chat. Only web, mail, phone
+# and text-message addresses are ever opened.
+
+CONTACT_SCHEMES = ("mailto", "tel", "sms", "http", "https")
+CONTACT_LABEL_RE = re.compile(r"^([^\s:/@][^:/@]{0,23}?)\s*:\s+(\S.*)$")
+CONTACT_EMAIL_RE = re.compile(r"^[^\s@<>()\[\],;:\"']+@[^\s@<>()\[\],;:\"']+\.[^\s@<>()\[\],;:\"']{2,}$")
+CONTACT_PHONE_RE = re.compile(r"^\+?[\d\s().\-/]+$")
+CONTACT_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}|[12]\d{3}\s*[-/]\s*[12]\d{3})$")   # not phones
+CONTACT_ICON = {"email": "\u2709", "phone": "\u260e", "sms": "\u2709", "web": "\u2197"}
+
+
+def contact_line(line):
+    """One line of URLS read by its kind: {label, kind, text, href, chat}.
+    kind is web | email | phone | sms | text; href opens it (https:, mailto:,
+    tel:, sms:) and is empty for plain text; chat is the WhatsApp address of a
+    phone written in international form, else empty."""
+    body, label = (line or "").strip(), ""
+    m = CONTACT_LABEL_RE.match(body)
+    if m and m.group(1).strip().lower() not in CONTACT_SCHEMES:
+        label, body = m.group(1).strip(), m.group(2).strip()
+    out = {"label": label, "kind": "text", "text": body, "href": "", "chat": ""}
+    scheme, colon, rest = body.partition(":")
+    scheme = scheme.strip().lower() if colon else ""
+    if URL_RE.match(body):
+        out.update(kind="web", href=body if body.lower().startswith("http") else "https://" + body,
+                   text=re.sub(r"^(https?://)?(www\.)?", "", body, flags=re.I).rstrip("/") or body)
+    elif scheme == "mailto" or CONTACT_EMAIL_RE.match(body):
+        addr = rest.strip() if scheme == "mailto" else body
+        bare = addr.split("?")[0]
+        if CONTACT_EMAIL_RE.match(bare) and not re.search(r"\s", addr):
+            out.update(kind="email", text=bare, href="mailto:" + addr)
+    elif scheme in ("tel", "sms") or CONTACT_PHONE_RE.match(body):
+        number = rest.strip() if scheme in ("tel", "sms") else body
+        digits = re.sub(r"\D", "", number)
+        if 7 <= len(digits) <= 15 and CONTACT_PHONE_RE.match(number) and not CONTACT_DATE_RE.match(number):
+            kind = "sms" if scheme == "sms" else "phone"
+            dial = ("+" if number.startswith("+") else "") + digits
+            out.update(kind=kind, text=number, href=("sms:" if kind == "sms" else "tel:") + dial)
+            if number.startswith("+") or digits.startswith("00"):
+                out["chat"] = "https://wa.me/" + (digits[2:] if digits.startswith("00") else digits)
+    return out
+
+
+def contact_lines(lines):
+    """The non-empty lines of URLS, each read by contact_line."""
+    return [contact_line(l) for l in lines or [] if (l or "").strip()]
+
+
+def contact_md(c):
+    """A line of URLS for the markdown mirror: a link when it opens something."""
+    head = c["label"] + ": " if c["label"] else ""
+    if not c["href"]:
+        return f"- {head}{c['text']}"
+    chat = f" · [WhatsApp]({c['chat']})" if c["chat"] else ""
+    return f"- {head}[{c['text']}]({c['href']}){chat}"
+
+
+def open_address(href):
+    """Opens an address made by contact_line with what this computer uses for
+    it: the browser, the mail app, the phone app. False when nothing does."""
+    if not re.match(r"^(https?:|mailto:|tel:|sms:)", href or "", re.I):
+        return False
+    try:
+        if sys.platform == "win32":
+            os.startfile(href)
+            return True
+        import webbrowser
+        return bool(webbrowser.open(href))
+    except OSError:
+        return False
 
 
 def split_name_notes(line):
@@ -702,6 +789,8 @@ RELS = {
     "editor_of":     ("person", "source"),
     "translator_of": ("person", "source"),
     "knows":         ("person", "person"),
+    "works_at":      ("person", "org"),
+    "member_of":     ("person", "org"),
     # sources
     "cites":         ("*", "source"),
     "attested_in":   ("form", "source"),
@@ -725,6 +814,7 @@ REL_LABEL = {
     "coined_by": "coined by", "used_by": "used by", "about": "about",
     "author_of": "author of", "editor_of": "editor of",
     "translator_of": "translator of", "knows": "knows",
+    "works_at": "works at", "member_of": "member of",
     "cites": "cites", "attested_in": "attested in", "defined_in": "defined in",
     "measured_in": "measured in", "part_of": "part of", "edition_of": "edition of",
     "translates": "translates", "comments_on": "comments on", "responds_to": "responds to",
@@ -2698,7 +2788,7 @@ def check(data):
             continue
         sk = kind_of(src)
         dk = kind_of(dst)
-        if (rule[0] not in ("*", sk)) or (rule[1] not in ("*", dk)):
+        if not kind_fits(rule[0], src) or not kind_fits(rule[1], dst):
             errors.append(tr("link {i}: {rel} connects {a}->{b}, but got {c}->{d} "
                              "({src} -> {dst})", i=i, rel=a["rel"], a=rule[0], b=rule[1],
                              c=sk, d=dk, src=label_any(src), dst=label_any(dst)))
@@ -2854,7 +2944,7 @@ def write_mirror(data):
                     date=TODAY()) + "*", "",
            "# " + tr("People"), ""]
     for p in sorted(data["people"], key=lambda x: sort_key(x["name"])):
-        out.append(f"## {p['name']}")
+        out.append(f"## {p['name']}" + (f"  ({tr('organization')})" if p.get("org") else ""))
         out.append(mirror_locus(p))
         meta = []
         if p.get("tags"):
@@ -2874,7 +2964,7 @@ def write_mirror(data):
         if p.get("notes_raw"):
             out += ["", p["notes_raw"]]
         if p.get("links"):
-            out += [""] + [f"- {l}" for l in p["links"]]
+            out += [""] + [contact_md(c) for c in contact_lines(p["links"])]
         if p.get("interactions"):
             out.append("")
             for it in p["interactions"]:
@@ -3021,7 +3111,7 @@ def cmd_mirror():
 
 SEARCH_SCOPES = {"p:": "people", "v:": "entries", "f:": "sources",
                  "c:": "corpus", "d:": "notes"}
-SEARCH_FIELDS = ("tag", "lang", "type", "sys", "dom", "id")
+SEARCH_FIELDS = ("tag", "lang", "type", "sys", "dom", "id", "is")
 
 
 def parse_search(text):
@@ -3056,6 +3146,13 @@ def search_field_ok(r, fields):
             return False
         if k == "id" and not r.get("id", "").lower().startswith(v):
             return False
+        if k == "is":                   # is:org (organizations), is:person (people who are not)
+            person = coll_of(r.get("id", "")) == "people"
+            org = person and bool(r.get("org"))
+            if v.startswith("org") and not org:
+                return False
+            if v.startswith(("pers", "pes")) and (not person or org):
+                return False
     return True
 
 
@@ -3122,6 +3219,8 @@ def list_row_text(r, data, due=None):
     else:
         plain = [t for t in p.get("tags", []) if ":" not in t]
         sub = " · ".join(plain) or one_liner(p.get("notes_raw", ""), 70)
+    if p.get("org"):
+        sub = tr("organization") + (" · " + sub if sub else "")
     return p["name"], sub
 
 
@@ -5818,10 +5917,10 @@ if (location.hash === '#fundamentos') showView('fund');
 
 WEB_IDLE = 120              # seconds without a request before the server stops
 WEB_ROWS = 60               # rows of the list sent at a time
-WEB_KINDS = ("person", "concept", "form", "source",
+WEB_KINDS = ("person", "org", "concept", "form", "source",
              "measure", "medication", "activity", "event", "note")
 # what each kind of record is called on the page
-WEB_KIND_LABEL = {"person": "person", "concept": "concept", "form": "form",
+WEB_KIND_LABEL = {"person": "person", "org": "organization", "concept": "concept", "form": "form",
                   "source": "source", "measure": "measurement", "medication": "medication",
                   "activity": "activity or habit", "event": "event", "note": "draft"}
 # the strings the page's script shows, translated when the page is built
@@ -5875,6 +5974,8 @@ def web_kind(rec):
         return rec.get("kind", "concept") if rec.get("kind") in KINDS else "concept"
     if coll == "corpus":
         return htype(rec)
+    if coll == "people" and rec.get("org"):
+        return "org"
     return {"people": "person", "sources": "source", "notes": "note"}[coll]
 
 
@@ -5901,6 +6002,7 @@ def web_fields():
     return {
         "people": [
             f("name", "NAME"),
+            f("org", "KIND", "choice", opts=[["", tr("person")], ["org", tr("organization")]]),
             f("aliases", "ALSO KNOWN AS", "text", hint="one per line;  lang: name"),
             f("place", "DOMICILIUM"),
             f("born", "BORN  (2024-03-11, 1890, s. XVI)"), f("died", "DIED"),
@@ -5909,7 +6011,8 @@ def web_fields():
             f("tasks", "TASKS", "text", hint="one per line:  [ ] what  ~2026-09-10"),
             f("interactions", "LOG", "text", hint="one per line:  2026-08-01   what happened"),
             f("notes_raw", "NOTES", "md"),
-            links,
+            f("links", "URLS  (sites, emails, phones)", "text",
+              hint="one per line: a site, an email or a phone; work: before it names it"),
         ],
         "entries": [
             f("name", "NAME"),
@@ -5978,7 +6081,8 @@ def web_form(rec, data):
             text = lines(filter(None, [text] + list(rec["edge_drafts"])))
         out["edges"] = text
     if coll == "people":
-        out.update(aliases=format_aliases(rec.get("aliases")), place=rec.get("place", ""),
+        out.update(org="org" if rec.get("org") else "",
+                   aliases=format_aliases(rec.get("aliases")), place=rec.get("place", ""),
                    born=rec.get("born", ""), died=rec.get("died", ""),
                    circles=list(rec.get("circles", [])), source=rec.get("source", ""),
                    tasks=format_tasks(rec.get("tasks")),
@@ -6014,7 +6118,7 @@ def web_form(rec, data):
 def web_blank(coll, kind):
     """A new record of a collection, before it has a name or an id."""
     if coll == "people":
-        rec = fix_person(blank_person())
+        rec = fix_person(blank_person(org=kind == "org"))
     elif coll == "entries":
         rec = fix_entry({"kind": kind if kind in KINDS else "concept"})
     elif coll == "sources":
@@ -6064,6 +6168,8 @@ def web_gather(coll, old, form):
             out["circles"] = parse_circles(form["circles"])
         out["followup"] = None
         out["met"] = old.get("met")
+        if has("org"):
+            out["org"] = text("org") == "org"
     elif coll == "entries":
         for k in ("gloss", "notes", "source"):
             put(k, text(k).strip())
@@ -6295,6 +6401,7 @@ def web_record(data, rid):
                    for a in edges_from(data, rid)],
            "in": [dict(end(a["from"]), rel=rel_label(a.get("rel", "")))
                   for a in edges_to(data, rid)],
+           "contacts": contact_lines(rec.get("links", [])),
            "html": {}}
     for k in ("notes_raw", "notes", "body"):
         if out["form"].get(k):
@@ -6505,7 +6612,7 @@ def web_boot(token):
             "colls": [[c, tr(x)] for c, x in zip(COLLS, ("People", "Verba", "Sources",
                                                          "Corpus", "Drafts"))],
             "kinds": {k: tr(WEB_KIND_LABEL[k]) for k in WEB_KINDS},
-            "new": [["people", "person"], ["entries", "concept"], ["entries", "form"],
+            "new": [["people", "person"], ["people", "org"], ["entries", "concept"], ["entries", "form"],
                     ["sources", "source"], ["corpus", "measure"], ["corpus", "medication"],
                     ["corpus", "activity"], ["corpus", "event"], ["notes", "note"]],
             "linkColours": LINK_FAMILY_COLOUR,
@@ -6897,6 +7004,13 @@ button.chip:hover { border-color: var(--soft); }
   background: var(--paper); font: 14px var(--mono); display: grid; place-items: center; padding: 0; }
 .due { font: 12px var(--mono); color: var(--faint); margin-left: 8px; white-space: nowrap; }
 .links li { border-bottom: 1px dashed var(--rule); }
+.contacts { list-style: none; margin: 0; padding: 0; }
+.contacts li { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; padding: 7px 0;
+               border-bottom: 1px dashed var(--rule); }
+.contacts .clabel { font: 11px var(--mono); color: var(--soft); min-width: 52px; }
+.contacts .cmain { color: var(--accent); text-decoration: none; overflow-wrap: anywhere; }
+.contacts span.cmain { color: var(--ink); }
+.contacts .chat { padding: 5px 10px; font-size: 12px; text-decoration: none; }
 .go { display: block; width: 100%; text-align: left; border: 0; background: transparent; padding: 8px 0; }
 .go .rel { font: 12px var(--mono); color: var(--faint); margin-right: 8px; }
 .go .why { display: block; font-size: 14px; color: var(--soft); }
@@ -7222,14 +7336,15 @@ function renderRecord(changed) {
                   r.reg ? T("registered {stamp}", {stamp: r.reg}) : ""].filter(Boolean).join(" · ");
   out.push(`<div class="kicker">${esc(kicker)}</div><h1 class="title${ch.has("name") ? " changed" : ""}">${esc(r.title)}</h1>`);
   if (r.facts && r.facts.length) out.push(`<div class="sub">${esc(r.facts.join(" · "))}</div>`);
-  const quick = {person: ["interactions", "Add to the log"], measure: ["readings", "Add a reading"],
+  const quick = {person: ["interactions", "Add to the log"], org: ["interactions", "Add to the log"],
+                 measure: ["readings", "Add a reading"],
                  activity: ["sessions", "Add a session"]}[r.kind];
   if (quick) out.push(`<form class="quick" data-quick="${quick[0]}"><input class="f" name="line" autocomplete="off" ` +
     `enterkeyhint="done" placeholder="${esc(T(quick[1]))}"><button class="btn primary">${esc(T("Add"))}</button></form>`);
   const facts = [];
   const flush = () => { if (facts.length) out.push(`<div class="facts">${facts.join("")}</div>`); facts.length = 0; };
   for (const fd of BOOT.fields[r.coll]) {
-    if (fd.k === "name" || fd.k === "edges" || !visible(fd, r.coll, r.kind, f)) continue;
+    if (fd.k === "name" || fd.k === "edges" || fd.k === "org" || !visible(fd, r.coll, r.kind, f)) continue;
     const v = f[fd.k], label = short(fd.label), m = ch.has(fd.k);
     const put = h => out.push(m ? h.replace('class="sec"', 'class="sec changed"') : h);
     if (fd.w === "circles") {
@@ -7255,8 +7370,7 @@ function renderRecord(changed) {
     } else if (fd.k === "source" && r.source && r.source.id) {
       put(sec(label, `<ul class="links">${goItem({id: r.source.id, title: r.source.title, rel: ""}, false)}</ul>`));
     } else if (fd.k === "links") {
-      put(sec(label, `<div class="val">${v.split("\n").map(u => /^https?:\/\//i.test(u)
-        ? `<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(u)}</a>` : esc(u)).join("<br>")}</div>`));
+      put(sec(label, `<ul class="contacts">${(r.contacts || []).map(contactHtml).join("")}</ul>`));
     } else if (fd.w === "choice") put(sec(label, `<div class="val">${esc(optLabel(fd, v))}</div>`));
     else put(sec(label, `<div class="val${fd.w === "text" ? " mono" : ""}">${esc(v)}</div>`));
   }
@@ -7272,6 +7386,18 @@ function renderRecord(changed) {
   $("#rec").innerHTML = head(`<button class="btn quiet" data-act="graph">${esc(T("Graph"))}</button>` +
                             `<button class="btn" data-act="edit">${esc(T("Edit"))}</button>`) +
     `<div class="card">${out.join("")}</div>`;
+}
+
+/* a line of URLS, read on the server (contact_line): a site, an email, a
+   phone -- a tap opens it; a phone in international form also opens WhatsApp */
+function contactHtml(c) {
+  const icon = {email: "\u2709", phone: "\u260e", sms: "\u2709", web: "\u2197"}[c.kind];
+  const away = c.kind === "web" ? ' target="_blank" rel="noopener noreferrer"' : "";
+  const main = c.href ? `<a class="cmain" href="${esc(c.href)}"${away}>${icon ? icon + " " : ""}${esc(c.text)}</a>`
+                      : `<span class="cmain">${esc(c.text)}</span>`;
+  return `<li>${c.label ? `<span class="clabel">${esc(c.label)}</span>` : ""}${main}` +
+    (c.chat ? `<a class="btn chat" href="${esc(c.chat)}" target="_blank" rel="noopener noreferrer">WhatsApp</a>` : "") +
+    `</li>`;
 }
 
 /* ---------------------------------------------------------------- editing */
@@ -7333,6 +7459,7 @@ function startNew(coll, kind) {
   if (coll === "sources") form.type = "outro";
   if (coll === "corpus") form.ctype = kind;
   if (coll === "entries") form.status = "attested";
+  if (coll === "people") form.org = kind === "org" ? "org" : "";
   const q = S.q.trim();
   if (q && !/[:^]/.test(q)) form.name = q;
   S.edit = form; S.dirty = false; S.sel = null;
@@ -7786,7 +7913,8 @@ function gShape(ctx, kind, x, y, r) {
   const P = {concept: [[-r, -r], [r, -r], [r, r], [-r, r]],
              form: [[0, -1.25 * r], [1.25 * r, 0], [0, 1.25 * r], [-1.25 * r, 0]],
              source: [[-1.3 * r, -0.8 * r], [1.3 * r, -0.8 * r], [1.3 * r, 0.8 * r], [-1.3 * r, 0.8 * r]],
-             note: [[-0.8 * r, -1.15 * r], [0.8 * r, -1.15 * r], [0.8 * r, 1.15 * r], [-0.8 * r, 1.15 * r]]}[kind]
+             note: [[-0.8 * r, -1.15 * r], [0.8 * r, -1.15 * r], [0.8 * r, 1.15 * r], [-0.8 * r, 1.15 * r]],
+             org: [0, 1, 2, 3, 4, 5].map(i => [1.15 * r * Math.cos(Math.PI / 3 * i), 1.15 * r * Math.sin(Math.PI / 3 * i)])}[kind]
           || [[0, -1.2 * r], [1.1 * r, 0.8 * r], [-1.1 * r, 0.8 * r]];
   P.forEach(([dx, dy], i) => (i ? ctx.lineTo(x + dx, y + dy) : ctx.moveTo(x + dx, y + dy)));
   ctx.closePath();
@@ -8885,6 +9013,13 @@ class PersonCard:
         self.stamp = tk.Label(head, text="", bg=PAPER, fg=FAINT, font=app.f_meta,
                               justify="right")
         self.stamp.pack(side="right")
+        self.v_org = tk.BooleanVar(value=False)
+        self.c_org = tk.Checkbutton(head, text=tr("organization"), variable=self.v_org,
+                                    bg=PAPER, fg=SOFT, activebackground=PAPER,
+                                    activeforeground=INK, selectcolor=PAPER, font=app.f_meta,
+                                    bd=0, highlightthickness=0, cursor="hand2",
+                                    command=app.mark_dirty)
+        self.c_org.pack(side="right", padx=(0, 12))
         tk.Frame(c, bg=STAMP, height=2).pack(fill="x", pady=(6, 0), **pad)
 
         self.e_tags = app.field(c, tr("TAGS"), app.f_meta, pad)
@@ -8897,7 +9032,13 @@ class PersonCard:
         self.e_source = app.source_field(c, pad)
         self.circles = self.circle_panel(c, pad)
         self.t_alias = app.textfield(c, tr("ALSO KNOWN AS"), 2, app.f_meta, pad)
-        self.t_links = app.textfield(c, tr("URLS"), 2, app.f_meta, pad)
+        self.t_links = app.textfield(c, tr("URLS  (sites, emails, phones)"), 2, app.f_meta, pad)
+        # what the lines of URLS open: an email, a call, a WhatsApp chat, a site
+        self.contacts = tk.Frame(c, bg=PAPER)
+        self.contacts.pack(fill="x", **pad)
+        self._contacts_job, self._contacts_said = None, None
+        for ev in ("<KeyRelease>", "<<Paste>>", "<<Cut>>"):
+            self.t_links.bind(ev, lambda e: self.later_contacts(), add="+")
         self.t_tasks = app.textfield(c, tr("TASKS"), 3, app.f_meta, pad)
         self.t_tasks.bind("<space>", self.space_cycle)
         self.t_tasks.bind("<Control-space>", self.cycle_task_state)
@@ -9099,11 +9240,48 @@ class PersonCard:
         return e
 
     # ---- state
+    def later_contacts(self):
+        """The contact buttons follow the URLS field, a moment after typing."""
+        if self._contacts_job:
+            self.frame.after_cancel(self._contacts_job)
+        self._contacts_job = self.frame.after(350, self.show_contacts)
+
+    def show_contacts(self):
+        """Under URLS, a button for each line that opens something: an email,
+        a call, a site -- and WhatsApp beside a phone in international form."""
+        self._contacts_job = None
+        lines = self.t_links.get("1.0", "end-1c").splitlines()
+        found = [c for c in contact_lines(lines) if c["href"]]
+        said = tuple((c["href"], c["chat"], c["label"], c["text"]) for c in found)
+        if said == self._contacts_said:
+            return
+        self._contacts_said = said
+        for w in self.contacts.winfo_children():
+            w.destroy()
+        app = self.app
+        for c in found:
+            row = tk.Frame(self.contacts, bg=PAPER)
+            row.pack(fill="x", pady=(2, 0))
+            text = CONTACT_ICON.get(c["kind"], "") + "  " + (c["label"] + ": " if c["label"] else "") \
+                + one_liner(c["text"], 48)
+            for words, href in ((text, c["href"]), ("WhatsApp", c["chat"])):
+                if not href:
+                    continue
+                b = tk.Label(row, text=words, bg=PAPER, fg=STAMP, font=app.f_meta, cursor="hand2",
+                             padx=6, pady=1, highlightthickness=1, highlightbackground=RULE)
+                b.pack(side="left", padx=(0, 6))
+                b.bind("<Button-1>", lambda e, h=href: self.open_contact(h))
+
+    def open_contact(self, href):
+        if not open_address(href):
+            self.msg.configure(text=tr("Nothing on this computer opens this kind of address."))
+
     def enable(self, on):
         state = "normal" if on else "disabled"
         for w in (self.e_name, self.e_tags, self.e_place, self.e_log, self.e_source,
                   self.e_born, self.e_died):
             w.configure(state=state)
+        self.c_org.configure(state=state)
         for w in (self.t_notes, self.t_links, self.t_alias, self.t_tasks,
                   self.t_log):
             w.configure(state=state)
@@ -9119,6 +9297,8 @@ class PersonCard:
             t.delete("1.0", "end")
         self.inbox.delete(0, "end")
         self.circles.set_circles([])
+        self.v_org.set(False)
+        self.show_contacts()
         self.stamp.configure(text="")
         self.msg.configure(text="")
 
@@ -9142,6 +9322,8 @@ class PersonCard:
         self.t_alias.insert("1.0", format_aliases(p.get("aliases", [])))
         self.t_links.delete("1.0", "end")
         self.t_links.insert("1.0", "\n".join(p.get("links", [])))
+        self.show_contacts()
+        self.v_org.set(bool(p.get("org")))
         self.t_tasks.delete("1.0", "end")
         self.t_tasks.insert("1.0", format_tasks(p.get("tasks", [])))
         self.circles.set_circles(p.get("circles", []))
@@ -9189,6 +9371,7 @@ class PersonCard:
             "circles": self.circles.get_circles(),
             "followup": None,
             "met": p.get("met"),
+            "org": bool(self.v_org.get()),
         })
         return out
 
@@ -10561,7 +10744,7 @@ HELP_TEXT = (
     "\n  Search operators:"
     "\n  p: v: f: c:   only people / verba / sources / corpus"
     "\n  ^ab           name starting with ab"
-    "\n  tag:csh  lang:de  type:book  sys:renal  dom:law  id:c_"
+    "\n  tag:csh  lang:de  type:book  sys:renal  dom:law  id:c_  is:org"
     "\n  e.g.:  v: lang:de ^ab   ·   f: type:article luhmann"
     "\n"
     "\n  Text fields grow with their text up to the card's height,"
@@ -12979,6 +13162,8 @@ class App:
                     continue
                 if self.viewmode == "untagged" and p.get("tags"):
                     continue
+                if self.viewmode == "orgs" and not p.get("org"):
+                    continue
                 if self.date and not any(t["due"] == self.date for t in dated_tasks(p)):
                     continue
                 if self.view_circle == "none" and p.get("circles"):
@@ -13155,6 +13340,9 @@ class App:
                      self.viewmode == key)
             item("v:untagged", "  " + tr("untagged"),
                  sum(1 for p in people if not p.get("tags")), self.viewmode == "untagged")
+            if any(p.get("org") for p in data["people"]):
+                item("v:orgs", "  " + tr("organizations"),
+                     sum(1 for p in people if p.get("org")), self.viewmode == "orgs")
             all_days = sorted({t["due"] for p in data["people"] for t in dated_tasks(p)})
             if all_days:
                 days = {}
@@ -13258,7 +13446,7 @@ class App:
             return tr("tag: {tag}", tag=value)
         if attr == "viewmode":
             return {"todo": tr("to do"), "doing": tr("in progress"), "waiting": tr("waiting on"),
-                    "untagged": tr("untagged")}.get(value, value)
+                    "untagged": tr("untagged"), "orgs": tr("organizations")}.get(value, value)
         if attr == "view_circle":
             return tr("no circle") if value == "none" else tr(value)
         if attr == "view_kind":
@@ -13535,16 +13723,17 @@ class App:
             self.data[coll] = [r for r in self.data[coll] if not r["id"].startswith("__")]
         self.draft = None
 
-    def new_person(self):
+    def new_person(self, org=False):
         self.clear_drafts()
-        self.draft = blank_person(self.q.get().strip())
+        self.draft = blank_person(self.q.get().strip(), org=org)
         self.draft["id"] = "__draft_p__"
         self.draft["_h"] = ""
         self.data["people"].append(self.draft)
         self.refresh_list()
         self.open_record("__draft_p__")
         self.pc.e_name.focus_set()
-        self.say(tr("New person. It only reaches the disk when saved."))
+        self.say(tr("New organization. It only reaches the disk when saved.") if org
+                 else tr("New person. It only reaches the disk when saved."))
 
     def new_entry(self, kind):
         self.clear_drafts()
@@ -13930,6 +14119,7 @@ class App:
     # kind: its name in the menu, the window's title and the titles of its two fields
     NEW_KINDS = {
         "person": ("+ person", "New person", "NAME", "NOTES"),
+        "org": ("+ organization", "New organization", "NAME", "NOTES"),
         "concept": ("+ concept", "New concept", "NAME", "GLOSS"),
         "form": ("+ form", "New form", "NAME", "GLOSS"),
         "source": ("+ source", "New source", "REFERENCE OR TITLE", "NOTES"),
@@ -13943,7 +14133,8 @@ class App:
         if kind == "source":
             self.new_source(name)               # the card reads the reference
         else:
-            {"person": self.new_person, "health": self.new_metric, "draft": self.new_note,
+            {"person": self.new_person, "org": lambda: self.new_person(org=True),
+             "health": self.new_metric, "draft": self.new_note,
              "concept": lambda: self.new_entry("concept"),
              "form": lambda: self.new_entry("form")}[kind]()
             self.card.e_name.delete(0, "end")
@@ -15262,6 +15453,8 @@ def graph_kind(rec):
     coll = coll_of(rec.get("id", ""))
     if coll == "entries":
         return "form" if rec.get("kind") == "form" else "concept"
+    if coll == "people" and rec.get("org"):
+        return "org"
     return {"people": "person", "sources": "source", "corpus": "metric",
             "notes": "note"}[coll]
 
@@ -15299,7 +15492,7 @@ REL_FAMILY = {
     "requires": "verba",
     "coined_by": "people", "used_by": "people", "about": "people",
     "author_of": "people", "editor_of": "people", "translator_of": "people",
-    "knows": "people",
+    "knows": "people", "works_at": "people", "member_of": "people",
     "cites": "sources", "attested_in": "sources", "defined_in": "sources",
     "measured_in": "sources", "part_of": "sources", "edition_of": "sources",
     "translates": "sources", "comments_on": "sources", "responds_to": "sources",
@@ -15373,8 +15566,7 @@ def link_facts(edges, times=None, now=None):
 
 def typical_rels(a, b):
     """The types of RELS that may go from record a to record b."""
-    ka, kb = kind_of(a), kind_of(b)
-    return [r for r, (fa, fb) in RELS.items() if fa in ("*", ka) and fb in ("*", kb)]
+    return [r for r, (fa, fb) in RELS.items() if kind_fits(fa, a) and kind_fits(fb, b)]
 
 
 # The path finder: how are two records related? The shortest chains of links
@@ -16429,6 +16621,10 @@ class GraphView:
         if kind == "note":                 # a page, upright
             return (x - r * 0.8, y - r * 1.15, x + r * 0.8, y - r * 1.15,
                     x + r * 0.8, y + r * 1.15, x - r * 0.8, y + r * 1.15)
+        if kind == "org":                  # an organization: a hexagon
+            q = r * 1.15
+            return tuple(c for i in range(6) for c in (x + q * math.cos(math.pi / 3 * i),
+                                                        y + q * math.sin(math.pi / 3 * i)))
         return (x, y - r * 1.2, x + r * 1.1, y + r * 0.8, x - r * 1.1, y + r * 0.8)
 
     def curve(self, a_xy, b_xy, key):
@@ -17271,7 +17467,7 @@ def cmd_graph(open_id=None):
 # Read-only: nothing it computes is saved.
 
 MONAD_COLLS = ("people", "entries", "sources")
-MONAD_KINDS = ("all", "person", "concept", "form", "source")
+MONAD_KINDS = ("all", "person", "org", "concept", "form", "source")
 MONAD_SHOWN = (24, 40, 64)   # keys 1-3: how many monads, the view stays fluid
 MONAD_DUST = 260             # at most this many points of dust
 MONAD_TERMS = 60             # the rarest terms of a record: a long note stays cheap
@@ -17646,7 +17842,7 @@ class MonadView:
             left = " › ".join(one_liner(label_any(u.recs[t], self.data), 22)
                               for t in trail if t in u.recs)
         cv.itemconfigure(self.t_left, text=one_liner(left, 110))
-        kind = tr(self.kind) + " · " if self.kind != "all" else ""
+        kind = tr({"org": "organization"}.get(self.kind, self.kind)) + " · " if self.kind != "all" else ""
         cv.itemconfigure(self.t_right, text=kind + tr(
             "{n} near · {far} at the edge", n=len(self.m) - 1, far=self.far))
 
@@ -19255,8 +19451,8 @@ PT = {
         "(padrão)",
     "Yes":
         "Sim",
-    "\n  Ctrl+F     go to the search\n  ↓ / Enter  from the search to the list\n  Ctrl+N     new person\n  Ctrl+Q     bulk entries (any kind, one per line)\n  Ctrl+S     save the open record\n  Ctrl+Enter save and start another of the same kind\n  Ctrl+Z / Ctrl+Y   undo / redo\n  Ctrl+J / Ctrl+K   next / previous, from anywhere\n  Ctrl+G     go to: nº (1852), stamp, id or name\n  Ctrl+L     show in the register: leaves the search, shows the open record's nº\n  Ctrl+B     open as logbook (second window, read-only;\n             Enter in the logbook brings the record to the card)\n  Ctrl+1..4  scope people / verba / sources / corpus; Ctrl+0 everything\n  /  in the list goes back to the search;  Enter in the list goes to the card\n  Home / End within the page;  PageUp / PageDown or the wheel turns the page\n  Ctrl+Home / Ctrl+End  start / end of the list\n  Ctrl+PageUp / Ctrl+PageDown turns the page from anywhere\n  F5         reload from disk\n  Esc        back to the list\n\n  REGISTER: every record gets, on its first save, a stamp\n  (YYYYMMDDhhmmss) and an order number that never changes;\n  what is deleted stays in the sequence as cancelled.\n  Without a search, the list is the register, in number order;\n  with a search or filter, it is the INDEX, in alphabetical order.\n  The list shows what fits the window, without scrolling: the rest\n  is on the following pages.\n\n  Search operators:\n  p: v: f: c:   only people / verba / sources / corpus\n  ^ab           name starting with ab\n  tag:csh  lang:de  type:book  sys:renal  dom:law  id:c_\n  e.g.:  v: lang:de ^ab   ·   f: type:article luhmann\n\n  Text fields grow with their text up to the card's height,\n  then scroll inside (ui.max_rows in the JSON sets a fixed\n  limit). A long LOG or NOTES is read one page per view, each\n  page starting at an entry or paragraph: ‹ › beside the title,\n  PageUp / PageDown in it, or the wheel over it (the LOG opens\n  on the newest). View › Long texts › Continuous scrolls instead.\n  The body map\n  folds with [−] and remembers its state.\n\n  In the rail, COLLECTIONS limits to people or verba;\n  any filter below picks the collection by itself.\n\n  Tasks (people):\n  Enter       new line already with [ ]\n  Space       on the [ ] changes the state\n  Ctrl+Space  changes it from anywhere on the line\n  [ ] to do   [/] in progress  [>] waiting on\n  [x] done    [-] cancelled  (they go to the log on save)\n  A date at the end is the deadline: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. The LAST date on the line wins.\n\n  Links, one per line, on any card:\n  rel target [span] — reason # source\n  e.g.: expresses c_timoneiro -800/400 — literal sense\n  e.g.: author_of s_wiener_1948_cybernetics\n  e.g.: cites s_lochtrop_2006 — entry p. 12\n  The target is the id: c_ concept, f_ form, p_ person,\n  s_ source, h_ measurement. A rel outside the table is not\n  an error: it is an ATYPICAL link, with the label you gave;\n  the doctor lists the atypical ones for you to promote.\n\n  SOURCE (on people, entries and measurements): a source's\n  s_…, or free text. Sources cite in ABNT, author-date,\n  BibTeX or CSL-JSON (picker on the card, copy button).\n  Corpus: readings '2026-09-01 13.5 fasting', one per line;\n  out of range shows with (!).\n\n  Sync: every save rereads the disk; on opening,\n  *.sync-conflict-* files are merged and stored in\n  {conflicts}/. The full history is in\n  {stem}.log.<machine>.jsonl (Base › History).\n":
-        "\n  Ctrl+F     ir para a busca\n  ↓ / Enter  da busca para a lista\n  Ctrl+N     nova pessoa\n  Ctrl+Q     entradas em lote (qualquer tipo, uma por linha)\n  Ctrl+S     salvar o registro aberto\n  Ctrl+Enter salvar e começar outro do mesmo tipo\n  Ctrl+Z / Ctrl+Y   desfazer / refazer\n  Ctrl+J / Ctrl+K   próximo / anterior, de qualquer lugar\n  Ctrl+G     ir para: nº (1852), carimbo, id ou nome\n  Ctrl+L     ver no registro: sai da busca, mostra o nº do aberto\n  Ctrl+B     abrir como livro (segunda janela, só leitura;\n             Enter no livro traz o registro para o cartão)\n  Ctrl+1..4  escopo pessoas / verba / fontes / corpus; Ctrl+0 tudo\n  /  na lista volta à busca;  Enter na lista vai ao cartão\n  Home / End na página;  PageUp / PageDown ou a roda vira a página\n  Ctrl+Home / Ctrl+End  começo / fim da lista\n  Ctrl+PageUp / Ctrl+PageDown vira a página de qualquer lugar\n  F5         recarregar do disco\n  Esc        voltar à lista\n\n  REGISTRO: todo registro recebe, ao ser gravado pela primeira\n  vez, um carimbo (AAAAMMDDhhmmss) e um número de ordem que\n  nunca muda; o que é apagado fica na sequência como cancelado.\n  Sem busca, a lista é o registro, na ordem dos números; com\n  busca ou filtro, é o INDICADOR, em ordem alfabética. A lista\n  mostra o que cabe na janela, sem rolagem: o resto está nas\n  páginas seguintes.\n\n  Operadores da busca:\n  p: v: f: c:   só pessoas / verba / fontes / corpus\n  ^ab           nome que começa com ab\n  tag:csh  lang:de  type:livro  sys:renal  dom:direito  id:c_\n  ex.:  v: lang:de ^ab   ·   f: type:artigo luhmann\n\n  Campos de texto crescem com o texto até a altura do cartão\n  e depois rolam por dentro (ui.max_rows no JSON fixa um teto).\n  LOG e NOTAS longos são lidos uma página por vez, cada página\n  começando numa entrada ou parágrafo: ‹ › ao lado do título,\n  PageUp / PageDown nele, ou a roda sobre ele (o LOG abre na\n  mais nova). Ver › Textos longos › Contínuo rola em vez disso.\n  O mapa do corpo\n  recolhe pelo [−] e lembra o estado.\n\n  No trilho, ACERVO limita a pessoas ou a verba;\n  qualquer filtro abaixo escolhe o acervo sozinho.\n\n  Tarefas (pessoas):\n  Enter       nova linha já com [ ]\n  Espaço      sobre o [ ] muda o estado\n  Ctrl+Espaço muda de qualquer ponto da linha\n  [ ] a fazer  [/] em curso  [>] esperando\n  [x] feito    [-] cancelado  (vão para o log ao salvar)\n  Data no fim é o prazo: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. A ÚLTIMA data da linha vence.\n\n  Ligações, uma por linha, em qualquer cartão:\n  rel alvo [intervalo] — razão # fonte\n  ex.: expresses c_timoneiro -800/400 — sentido próprio\n  ex.: author_of s_wiener_1948_cybernetics\n  ex.: cites s_lochtrop_2006 — verbete p. 12\n  Alvo é o id: c_ conceito, f_ forma, p_ pessoa,\n  s_ fonte, h_ medida. Um rel fora da tabela não é\n  erro: é ligação ATÍPICA, com o rótulo que você deu;\n  o doctor lista as atípicas para você promover.\n\n  FONTE (em pessoas, verbetes e medidas): s_… de uma\n  fonte, ou texto livre. Fontes citam em ABNT, autor-data,\n  BibTeX ou CSL-JSON (seletor no cartão, botão copiar).\n  Corpus: leituras '2026-09-01 13.5 jejum', uma por linha;\n  fora da referência aparece com (!).\n\n  Sincronização: cada gravação relê o disco; ao abrir,\n  *.sync-conflict-* são fundidos e guardados em\n  {conflicts}/. O histórico completo está em\n  {stem}.log.<máquina>.jsonl (menu Base › Histórico).\n",
+    "\n  Ctrl+F     go to the search\n  ↓ / Enter  from the search to the list\n  Ctrl+N     new person\n  Ctrl+Q     bulk entries (any kind, one per line)\n  Ctrl+S     save the open record\n  Ctrl+Enter save and start another of the same kind\n  Ctrl+Z / Ctrl+Y   undo / redo\n  Ctrl+J / Ctrl+K   next / previous, from anywhere\n  Ctrl+G     go to: nº (1852), stamp, id or name\n  Ctrl+L     show in the register: leaves the search, shows the open record's nº\n  Ctrl+B     open as logbook (second window, read-only;\n             Enter in the logbook brings the record to the card)\n  Ctrl+1..4  scope people / verba / sources / corpus; Ctrl+0 everything\n  /  in the list goes back to the search;  Enter in the list goes to the card\n  Home / End within the page;  PageUp / PageDown or the wheel turns the page\n  Ctrl+Home / Ctrl+End  start / end of the list\n  Ctrl+PageUp / Ctrl+PageDown turns the page from anywhere\n  F5         reload from disk\n  Esc        back to the list\n\n  REGISTER: every record gets, on its first save, a stamp\n  (YYYYMMDDhhmmss) and an order number that never changes;\n  what is deleted stays in the sequence as cancelled.\n  Without a search, the list is the register, in number order;\n  with a search or filter, it is the INDEX, in alphabetical order.\n  The list shows what fits the window, without scrolling: the rest\n  is on the following pages.\n\n  Search operators:\n  p: v: f: c:   only people / verba / sources / corpus\n  ^ab           name starting with ab\n  tag:csh  lang:de  type:book  sys:renal  dom:law  id:c_  is:org\n  e.g.:  v: lang:de ^ab   ·   f: type:article luhmann\n\n  Text fields grow with their text up to the card's height,\n  then scroll inside (ui.max_rows in the JSON sets a fixed\n  limit). A long LOG or NOTES is read one page per view, each\n  page starting at an entry or paragraph: ‹ › beside the title,\n  PageUp / PageDown in it, or the wheel over it (the LOG opens\n  on the newest). View › Long texts › Continuous scrolls instead.\n  The body map\n  folds with [−] and remembers its state.\n\n  In the rail, COLLECTIONS limits to people or verba;\n  any filter below picks the collection by itself.\n\n  Tasks (people):\n  Enter       new line already with [ ]\n  Space       on the [ ] changes the state\n  Ctrl+Space  changes it from anywhere on the line\n  [ ] to do   [/] in progress  [>] waiting on\n  [x] done    [-] cancelled  (they go to the log on save)\n  A date at the end is the deadline: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. The LAST date on the line wins.\n\n  Links, one per line, on any card:\n  rel target [span] — reason # source\n  e.g.: expresses c_timoneiro -800/400 — literal sense\n  e.g.: author_of s_wiener_1948_cybernetics\n  e.g.: cites s_lochtrop_2006 — entry p. 12\n  The target is the id: c_ concept, f_ form, p_ person,\n  s_ source, h_ measurement. A rel outside the table is not\n  an error: it is an ATYPICAL link, with the label you gave;\n  the doctor lists the atypical ones for you to promote.\n\n  SOURCE (on people, entries and measurements): a source's\n  s_…, or free text. Sources cite in ABNT, author-date,\n  BibTeX or CSL-JSON (picker on the card, copy button).\n  Corpus: readings '2026-09-01 13.5 fasting', one per line;\n  out of range shows with (!).\n\n  Sync: every save rereads the disk; on opening,\n  *.sync-conflict-* files are merged and stored in\n  {conflicts}/. The full history is in\n  {stem}.log.<machine>.jsonl (Base › History).\n":
+        "\n  Ctrl+F     ir para a busca\n  ↓ / Enter  da busca para a lista\n  Ctrl+N     nova pessoa\n  Ctrl+Q     entradas em lote (qualquer tipo, uma por linha)\n  Ctrl+S     salvar o registro aberto\n  Ctrl+Enter salvar e começar outro do mesmo tipo\n  Ctrl+Z / Ctrl+Y   desfazer / refazer\n  Ctrl+J / Ctrl+K   próximo / anterior, de qualquer lugar\n  Ctrl+G     ir para: nº (1852), carimbo, id ou nome\n  Ctrl+L     ver no registro: sai da busca, mostra o nº do aberto\n  Ctrl+B     abrir como livro (segunda janela, só leitura;\n             Enter no livro traz o registro para o cartão)\n  Ctrl+1..4  escopo pessoas / verba / fontes / corpus; Ctrl+0 tudo\n  /  na lista volta à busca;  Enter na lista vai ao cartão\n  Home / End na página;  PageUp / PageDown ou a roda vira a página\n  Ctrl+Home / Ctrl+End  começo / fim da lista\n  Ctrl+PageUp / Ctrl+PageDown vira a página de qualquer lugar\n  F5         recarregar do disco\n  Esc        voltar à lista\n\n  REGISTRO: todo registro recebe, ao ser gravado pela primeira\n  vez, um carimbo (AAAAMMDDhhmmss) e um número de ordem que\n  nunca muda; o que é apagado fica na sequência como cancelado.\n  Sem busca, a lista é o registro, na ordem dos números; com\n  busca ou filtro, é o INDICADOR, em ordem alfabética. A lista\n  mostra o que cabe na janela, sem rolagem: o resto está nas\n  páginas seguintes.\n\n  Operadores da busca:\n  p: v: f: c:   só pessoas / verba / fontes / corpus\n  ^ab           nome que começa com ab\n  tag:csh  lang:de  type:livro  sys:renal  dom:direito  id:c_  is:org\n  ex.:  v: lang:de ^ab   ·   f: type:artigo luhmann\n\n  Campos de texto crescem com o texto até a altura do cartão\n  e depois rolam por dentro (ui.max_rows no JSON fixa um teto).\n  LOG e NOTAS longos são lidos uma página por vez, cada página\n  começando numa entrada ou parágrafo: ‹ › ao lado do título,\n  PageUp / PageDown nele, ou a roda sobre ele (o LOG abre na\n  mais nova). Ver › Textos longos › Contínuo rola em vez disso.\n  O mapa do corpo\n  recolhe pelo [−] e lembra o estado.\n\n  No trilho, ACERVO limita a pessoas ou a verba;\n  qualquer filtro abaixo escolhe o acervo sozinho.\n\n  Tarefas (pessoas):\n  Enter       nova linha já com [ ]\n  Espaço      sobre o [ ] muda o estado\n  Ctrl+Espaço muda de qualquer ponto da linha\n  [ ] a fazer  [/] em curso  [>] esperando\n  [x] feito    [-] cancelado  (vão para o log ao salvar)\n  Data no fim é o prazo: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. A ÚLTIMA data da linha vence.\n\n  Ligações, uma por linha, em qualquer cartão:\n  rel alvo [intervalo] — razão # fonte\n  ex.: expresses c_timoneiro -800/400 — sentido próprio\n  ex.: author_of s_wiener_1948_cybernetics\n  ex.: cites s_lochtrop_2006 — verbete p. 12\n  Alvo é o id: c_ conceito, f_ forma, p_ pessoa,\n  s_ fonte, h_ medida. Um rel fora da tabela não é\n  erro: é ligação ATÍPICA, com o rótulo que você deu;\n  o doctor lista as atípicas para você promover.\n\n  FONTE (em pessoas, verbetes e medidas): s_… de uma\n  fonte, ou texto livre. Fontes citam em ABNT, autor-data,\n  BibTeX ou CSL-JSON (seletor no cartão, botão copiar).\n  Corpus: leituras '2026-09-01 13.5 jejum', uma por linha;\n  fora da referência aparece com (!).\n\n  Sincronização: cada gravação relê o disco; ao abrir,\n  *.sync-conflict-* são fundidos e guardados em\n  {conflicts}/. O histórico completo está em\n  {stem}.log.<máquina>.jsonl (menu Base › Histórico).\n",
     "OK":
         "OK",
     "Kustos · logbook (read-only)":
@@ -20289,6 +20485,26 @@ PT = {
         "Semear de novo para recomeçar",
     "r: start again":
         "r: recomeçar",
+    "organizations":
+        "organizações",
+    "organization":
+        "organização",
+    "works at":
+        "trabalha em",
+    "member of":
+        "membro de",
+    "URLS  (sites, emails, phones)":
+        "URLS  (sites, e-mails, telefones)",
+    "one per line: a site, an email or a phone; work: before it names it":
+        "uma por linha: um site, um e-mail ou um telefone; trabalho: antes dá um nome",
+    "+ organization":
+        "+ organização",
+    "New organization":
+        "Nova organização",
+    "New organization. It only reaches the disk when saved.":
+        "Organização nova. Só vai ao disco quando salvar.",
+    "Nothing on this computer opens this kind of address.":
+        "Nada neste computador abre este tipo de endereço.",
     "Path to:":
         "Caminho até:",
     "{a} ⇢ {b}":

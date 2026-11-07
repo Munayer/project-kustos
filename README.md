@@ -66,6 +66,22 @@ It refuses any folder it did not make, so it never touches a real base.
 - **Five collections** on the left menu, each with an unique ID:
   `p_` people · `c_` concept · `f_` form · `s_` source · `h_` health track ·
   `n_` draft.
+- **Contacts**, for using Kustos as a personal CRM: a person's URLS hold one
+  address per line, written as you would (`ana@example.org`,
+  `+55 11 91234-5678`, `https://…`; `mailto:` and `tel:` work too), each
+  optionally named (`work: …`, `mobile: …`). Kustos reads every line by its
+  kind and keeps the text as typed: under the field, on the web page and as
+  links in the mirror, each opens with what your computer or phone uses for
+  it — the mail app, a call, the browser — and a phone written with `+` (or
+  `00`) and its country code also gets a **WhatsApp** button. The search finds
+  them, a phone number included.
+- **Organizations** are people with *organization* ticked on the card (or
+  **+ new › organization**; on the web, *Kind* in the form). They live with the
+  people — register, search, graphs, Monads, web — are hexagons in the
+  graphs, and have two link types of their own, *works at* and *member of*,
+  from a person (or another organization) to them; as a person they can still
+  be an author, or be known. The rail's **organizations** lists them, and
+  `is:org` / `is:person` in the search pick them out.
 - **Drafts**: free notes in markdown, one `.md` file each in `notes/` beside the
   program, so other markdown tools (Obsidian, say) read and edit the same
   files. The title is the file name; a small header (`id`, `reg_n`, `reg`,
