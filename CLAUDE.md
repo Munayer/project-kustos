@@ -71,6 +71,14 @@ Ideas that span several sections:
   `PATH_MAX` links at most), also shared: the web asks `web_path`, the window
   calls it in `GraphView.show_path` (`f` opens `PathDialog`, Ctrl+click a
   record).
+- **Contacts** are lines of a record's `links` (URLS), kept as typed and read
+  by `contact_line` (label, kind, `href`, WhatsApp `chat`) for the window's
+  buttons (`PersonCard.show_contacts`), the page (`contacts` in `web_record`)
+  and the mirror (`contact_md`). Only https, mailto, tel and sms are ever
+  opened (`open_address`). **Organizations** are people with `org: true`:
+  `kind_of` still says person, so every older link type fits them, and
+  `kind_fits` checks the `org` end of RELS (`works_at`, `member_of`) for the
+  doctor, `typical_rels` and `write_link`; `graph_kind` makes them hexagons.
 - **Monads** (`# ==== monads`): read-only view; `MonadIndex` weighs shared words
   and links, `MonadView` draws them with no lines. `MONAD_COLLS` keeps health and
   drafts out, also as bridges between records; keep it that way. To measure its

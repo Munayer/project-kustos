@@ -93,7 +93,13 @@ def build(K, folder):
         return {"from": a, "rel": rel, "to": b, "when": "", "why": why, "source": "",
                 "certainty": "established"}
 
-    # ---- people
+    # ---- people (phones in the 555-01xx range, kept for fiction; example.org addresses)
+    put("people", {"id": "p_iss00004", "name": "Institute of Steering Studies", "org": True,
+                   "place": "Lisboa", "tags": ["research"],
+                   "notes_raw": "A small institute on the history of control and regulation.",
+                   "links": ["office: contact@example.org", "+1 202 555 0143",
+                             "https://example.org/institute"],
+                   "interactions": [{"date": "2026-10-15", "text": "Asked about the spring seminar."}]})
     put("people", {"id": "p_ada00001", "name": "Ada Okafor", "place": "Porto",
                    "tags": ["colleague", "research"], "circles": ["influence"],
                    "born": "1984", "met": "2023-04-02",
@@ -104,12 +110,16 @@ def build(K, folder):
                    "interactions": [{"date": "2026-09-14", "text": "Coffee after the seminar; talked about helmsmen."},
                                     {"date": "2026-10-03", "text": "She sent two articles on feedback."},
                                     {"date": "2026-10-28", "text": "Call: agreed to co-write a short note."}],
-                   "links": ["https://example.org/ada"]},
-        edges=[edge("p_ada00001", "author_of", "s_okafor_2021_notes")])
+                   "links": ["work: ada@example.org", "mobile: +1 202 555 0168",
+                             "home: 202 555 0175", "https://example.org/ada"]},
+        edges=[edge("p_ada00001", "author_of", "s_okafor_2021_notes"),
+               edge("p_ada00001", "works_at", "p_iss00004", "research fellow since 2023")])
     put("people", {"id": "p_tom00002", "name": "Tomás Weber", "place": "Basel",
                    "tags": ["teacher"], "born": "1950", "circles": ["concern"],
                    "notes_raw": "Retired engineer. Keeps a workshop full of governors and valves.",
-                   "interactions": [{"date": "2025-12-20", "text": "Letter about the old mill."}]})
+                   "links": ["tom.weber@example.org"],
+                   "interactions": [{"date": "2025-12-20", "text": "Letter about the old mill."}]},
+        edges=[edge("p_tom00002", "member_of", "p_iss00004", "on the advisory board")])
     put("people", {"id": "p_mir00003", "name": "Mira Castellano", "tags": ["friend"],
                    "tasks": [{"text": "Return the atlas", "state": "todo", "due": "", "at": ""}]})
     # ---- sources
