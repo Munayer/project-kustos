@@ -187,6 +187,10 @@ Force pushes are run by the owner, not by Claude.
   which finds the card from the widget under the pointer (Tk sends the wheel
   there on every system); do not switch wheel handlers on Enter/Leave --
   a click could leave one off.
+  Over a card the vertical wheel scrolls the card, whatever field is under
+  the pointer; a long (paged) field turns its pages with a sideways swipe or
+  Shift+wheel, or with the wheel once the card is at its end (a new gesture,
+  so one that only reaches the end does not spill into page turns).
 - Patching with shell heredocs mangles backslashes; write patch scripts to a
   file and `compile()` the result before writing it.
 
