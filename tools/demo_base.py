@@ -44,6 +44,11 @@ def main(argv):
         return 2
     folder = Path(argv[0]).resolve()
     words = {a.lower() for a in argv[1:]}
+    odd = words - {"fresh", "pt", "en", "web"}       # web: for demo.cmd, which opens the page
+    if odd:
+        print("Only these words are understood: fresh, pt, en, web. Not: " + " ".join(sorted(odd)))
+        print("Nothing was done.")
+        return 2
     if folder == REPO or REPO in folder.parents or folder in REPO.parents:
         print(f"Not inside the repository, nor above it: {folder}")
         return 1

@@ -52,7 +52,8 @@ selected, and the path finder with its steps written out.
 
 ### Trying it on invented data
 
-`tools\demo.cmd` (from a copy of this repository) opens Kustos on a base of
+`tools\demo.cmd` (from a copy of this repository: double-click it, or in
+PowerShell type `.\tools\demo.cmd`) opens Kustos on a base of
 invented records, the same as the web demo's, in `%TEMP%\kustos_demo`, apart
 from your own folder: to try a change, to compare the window with the web page
 on the same records (`tools\demo.cmd web`), or to take pictures you can share.

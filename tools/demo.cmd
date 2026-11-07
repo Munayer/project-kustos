@@ -10,6 +10,8 @@ rem   demo.cmd web          the web page, in the browser
 rem   demo.cmd fresh        new invented records first (the old ones go)
 rem   demo.cmd pt           in Portuguese (en: in English)
 rem
+rem Double-click it, or type it in the repository folder (in PowerShell
+rem with .\ before it: .\tools\demo.cmd web).
 rem The words combine: demo.cmd web fresh pt. The program there is this
 rem repository's, copied every time; the records are kept until fresh.
 rem Your own folder is never read or written.
