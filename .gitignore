@@ -31,3 +31,6 @@ __pycache__/
 
 # Claude Code: this machine's own permissions
 .claude/settings.local.json
+
+# What tools/wheel_probe.py records (invented records only)
+wheel_probe.txt
