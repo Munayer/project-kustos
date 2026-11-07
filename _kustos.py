@@ -7329,7 +7329,7 @@ function gLoad(d) {
     const start = G.clock + STAGGER_MS * n.dist + Math.random() * 150;
     const on = G.mode === "life" && lit(n);
     nodes[n.id] = Object.assign({}, n, {x, y, grow: 0, start, heat: 0, vis: 0, spark: 0,
-                                        lit: on, arrive: start + GROW_MS + Math.random() * 600});
+                                        lit: on, arrive: start + GROW_MS + Math.random() * 2000});
   }
   if (c && nodes[c]) { nodes[c].x = 0; nodes[c].y = 0; }
   for (const id of Object.keys(old)) {   // the ones that leave wither where they are
@@ -7457,7 +7457,7 @@ function gHeat() {
     for (const n of G.ids) {
       const p = N[n], want = p.lit ? (G.clock >= (p.arrive || 0) ? 1 : 0)
                                    : (G.clock < (p.dimAt || 0) ? p.heat : 0);
-      p.heat += (want - p.heat) * (want ? 0.09 : 0.05);  // lighting is quicker than fading
+      p.heat += (want - p.heat) * (want ? 0.06 : 0.04);  // lighting is quicker than fading
     }
   } else {
     for (const n of G.ids) N[n].heat += (N[n].rec - N[n].heat) * 0.1;
@@ -7481,9 +7481,13 @@ function gLayout() {
     disp[l.a][0] -= dx * f; disp[l.a][1] -= dy * f; disp[l.b][0] += dx * f; disp[l.b][1] += dy * f;
   }
   for (const n of ids) {
-    if (n === G.center || n === G.dragging) continue;
+    if (n === G.center || n === G.dragging) { N[n].vx = N[n].vy = 0; continue; }
     const p = N[n], dx = disp[n][0] - p.x * 0.05, dy = disp[n][1] - p.y * 0.05, d = Math.hypot(dx, dy);
-    if (d > 0) { const s = Math.min(d * 0.06, G.temp) / d; p.x += dx * s; p.y += dy * s; }
+    if (d > 0) {
+      const s = Math.min(d * 0.06, G.temp) / d;
+      p.vx = 0.5 * ((p.vx || 0) + dx * s); p.vy = 0.5 * ((p.vy || 0) + dy * s);  // keeps half the last step
+      p.x += p.vx; p.y += p.vy;
+    }
   }
   G.temp *= 0.98;
 }
@@ -14576,14 +14580,21 @@ def cmd_book():
 #   glow   light spreads along the links and fades; it is fed by how recently
 #          each record was edited and by a spark now and then (the default);
 #   life   Conway's rule on the graph: a lit record stays lit with 2 or 3 lit
-#          neighbours, a dark one lights with exactly 3; when the pattern dies
-#          or freezes, it is seeded again from the recent edits;
+#          neighbours, a dark one lights with exactly 3; a birth is fed by its
+#          lit neighbours, whose light flows along the links into it; when the
+#          pattern dies or freezes the run rests, until r seeds it again from
+#          the recent edits;
 #   still  only the recency, no motion.
 # p plays the logs back (the replay): the base grows on screen as it grew,
 # records appearing when they were first saved, links when they were written,
 # every edit a flash, with a timeline below to scrub through. Either the whole
 # base (the records touched most recently, up to the cap) or only the records
 # that were on screen when the replay began (w switches).
+# Changes grow rather than jump: records already on screen keep their place and
+# light, new ones sprout beside the record that brought them and their links grow
+# out to them, the ones that leave wither; links are soft curves that breathe;
+# every brightness eases. The springs take damped steps, and dragging a record
+# holds the view still. The web page's graph (# ==== web) moves the same way.
 # Read-only: it reads `edges`, `updated_at` and the logs, and writes nothing.
 
 GRAPH_MAX_NODES = 160        # the view stays fluid: never the whole base at once
@@ -14716,14 +14727,18 @@ class GraphView:
     IDLE_MS = 400        # while the window is minimised or hidden
     LINK = 90.0          # the length a link settles at, before zoom
     STEPS = 24           # colour steps of the glow
-    GEN_TICKS = 15       # ticks per generation in life mode
+    GEN_TICKS = 30       # ticks per generation in life mode (1.2 s)
     SPARK_TICKS = 30     # ticks between sparks in glow mode
     TOP = 44             # the keys above the graph
+    GROW_MS = 700        # a new record sprouting, a new link growing out to it
+    LEAVE_MS = 600       # a record or a link leaving the view, withering
+    FLOW_MS = 900        # light flowing along a link into a newborn cell
+    STAGGER_MS = 110     # each ring of records sprouts this much after the one inside it
 
     def __init__(self, root, get_data, start_id=None, on_open=None):
         self.root, self.get_data, self.on_open = root, get_data, on_open
         self.start = start_id
-        self.mode, self.depth = "glow", 2
+        self.mode, self.depth = "life", 2       # as the web page's graph
         self.all_labels, self.paused = False, False
         self.rng = random.Random()
         self.data = self.idx = self.adj = None
@@ -14743,6 +14758,14 @@ class GraphView:
         self.rp = None       # the replay, while it runs (see start_replay)
         self._job = self._follow = None
         self._dirty = True
+        # how changes are drawn: they grow, wither and flow instead of jumping
+        self.clock = 0.0     # ms of animation time
+        self.settled = False
+        self.grow, self.born_at, self.vis = {}, {}, {}
+        self.arrive, self.dim_at, self.sparkle = {}, {}, {}
+        self.lgrow, self.lfrom, self.lstart = {}, {}, {}
+        self.gone, self.gone_links, self.pulses = {}, [], []
+        self.vel = {}        # each record's last spring step
 
         fams = set(tkfont.families(root))
         mono = next((f for f in ("Cascadia Mono", "Consolas", "Lucida Console",
@@ -14812,8 +14835,10 @@ class GraphView:
     # ---------------------------------------------------------- content
     def recentre(self, rid, fresh=False):
         """Puts `rid` in the middle. The records already on screen keep their
-        place (the camera glides to the new middle); the new ones grow out of
-        the record that brought them."""
+        place and their light (the camera glides to the new middle); new ones
+        sprout beside the record that brought them, nearest first, and their
+        links grow out to them; the ones now out of reach wither where they are."""
+        first = not self.pos
         if fresh or self.data is None:
             self.data = self.get_data()
             self.idx = by_id(self.data)
@@ -14831,35 +14856,60 @@ class GraphView:
             if n in self.pos:
                 x, y = self.pos[n]
                 pos[n] = [x - ox, y - oy]
-            elif parent is None:
+            elif parent is None or parent not in pos:
                 pos[n] = [0.0, 0.0]
             else:
                 px, py = pos[parent]
                 a = self.rng.uniform(0, 2 * math.pi)
-                r = self.LINK * self.rng.uniform(0.4, 0.9)
+                r = self.LINK * 0.15
                 pos[n] = [px + r * math.cos(a), py + r * math.sin(a)]
         if rid:
             pos[rid] = [0.0, 0.0]
         self.cam = [self.cam[0] - ox, self.cam[1] - oy]
         self.goal = [0.0, 0.0]
-        self.clear_items()
+        for g in self.gone.values():        # what is withering moves with the rest
+            g["pos"] = [g["pos"][0] - ox, g["pos"][1] - oy]
+        for n in [n for n in self.pos if n not in ego]:
+            self.drop_node(n)
+        new = [n for n in ego if n not in self.items]
         self.center, self.pos = rid, pos
         self.dist = {n: d for n, (d, _p) in ego.items()}
         self.kinds = {n: graph_kind(self.idx[n]) for n in ego}
         self.names = {n: label_any(self.idx[n], self.data) for n in ego}
         self.adjv = {n: [m for m in self.adj.get(n, {}) if m in ego] for n in ego}
-        self.heat = {n: self.heat.get(n, self.recs.get(n, 0.0) * 0.3) for n in ego}
-        self.lit = {n: self.lit.get(n, False) for n in ego}
+        for n in new:
+            self.born_at[n] = self.clock + self.STAGGER_MS * self.dist[n] + self.rng.uniform(0, 150)
+            self.grow[n] = 0.0
+            self.heat[n] = self.vis[n] = 0.0
+            self.lit[n] = self.mode == "life" and self.rng.random() < 0.35 + 0.5 * self.recs.get(n, 0.0)
+            self.arrive[n] = self.born_at[n] + self.GROW_MS + self.rng.uniform(0, 2000)
         if rid and self.mode == "glow":
-            self.heat[rid] = 1.0
-        if self.mode == "life":
-            self.seed_life()
-        for a in ego:
-            for b, rels in self.adj.get(a, {}).items():
-                if b in ego and a < b:
-                    self.add_link((a, b), rels)
+            self.sparkle[rid] = 1.0
+        if self.mode == "life":             # the neighbourhood changed: the run goes on from here
+            self.stale, self.history, self.settled = 0, [], False
+            if first:
+                self.gen = 0
+        links = {(a, b): rels for a in ego for b, rels in self.adj.get(a, {}).items()
+                 if b in ego and a < b}
+        for key in [key for key in self.links if key not in links]:
+            self.drop_link(key)
+        fresh_ones = set(new)
+        for key, rels in links.items():
+            if key in self.links:
+                self.links[key] = (rels, self.links[key][1])
+                continue
+            was = [e for e in key if e not in fresh_ones]
+            src = was[0] if was else min(key, key=lambda e: self.dist.get(e, 9))
+            start = max([self.born_at.get(e, self.clock) for e in key if e in fresh_ones],
+                        default=self.clock)
+            self.add_link(key, rels, src, start)
         for n in ego:
-            self.add_node(n)
+            if n in self.items:             # it stays: its name and its look follow its new place
+                self.cv.itemconfigure(self.items[n][1], text=one_liner(self.names[n], 32),
+                                      font=self.f_center if n == self.center else self.f_label)
+                self.shown.pop(n, None)
+            else:
+                self.add_node(n)
         if not self.center:
             msg = tr("The base has no records yet.")
         elif len(self.pos) == 1:
@@ -14867,52 +14917,75 @@ class GraphView:
         else:
             msg = ""
         self.cv.itemconfigure(self.t_notice, text=msg)
-        self.temp = max(self.temp, 30.0)
+        self.temp = max(self.temp, 30.0 if first else 14.0)
         self.fit = True
         self.label_states()
         self._dirty = True
         self.update_status()
 
-    # the canvas items are made once per record and per link, and only moved and
-    # recoloured on each tick; the replay adds and drops them as the base grows
     def clear_items(self):
         self.cv.delete("g")
         self.items, self.links, self.shown, self.label_on = {}, {}, {}, {}
+        self.gone, self.gone_links, self.pulses = {}, [], []
+        self.lgrow, self.lfrom, self.lstart = {}, {}, {}
+        self.grow, self.born_at, self.vis = {}, {}, {}
+        self.arrive, self.dim_at, self.sparkle = {}, {}, {}
+        self.vel = {}
         self.hover = None
 
     def add_node(self, n):
+        """A record's shape and name, made once; they start the colour of the
+        paper and grow in (draw)."""
         cv = self.cv
-        centre = n == self.center
-        opts = dict(fill=PAPER, outline=OXIDE if centre else FAINT,
-                    width=2 if centre else 1, tags=("g",))
+        if n in self.gone:                  # back while it was withering
+            for item in self.gone.pop(n)["items"]:
+                cv.delete(item)
+        self.grow.setdefault(n, 0.0)
+        self.born_at.setdefault(n, self.clock)
+        self.vis.setdefault(n, 0.0)
+        opts = dict(fill=PAPER, outline=PAPER, width=1, tags=("g",))
         if self.kinds[n] == "person":
             shape = cv.create_oval(0, 0, 0, 0, **opts)
         else:
             shape = cv.create_polygon(0, 0, 0, 0, 0, 0, **opts)
         text = cv.create_text(0, 0, anchor="w", text=one_liner(self.names[n], 32),
-                              tags=("g",), font=self.f_center if centre else self.f_label,
-                              fill=INK if self.dist.get(n, 2) <= 1 else SOFT)
+                              tags=("g",), font=self.f_center if n == self.center else self.f_label,
+                              fill=PAPER)
         self.items[n] = (shape, text)
         cv.tag_raise(self.ring)
 
     def drop_node(self, n):
-        for item in self.items.pop(n, ()):
-            self.cv.delete(item)
+        """The record leaves the view: it withers where it is, then goes."""
+        items = self.items.pop(n, None)
+        if items:
+            self.cv.itemconfigure(items[1], state="hidden")     # its name goes at once
+            self.gone[n] = dict(items=items, pos=list(self.pos.get(n, (0.0, 0.0))),
+                                kind=self.kinds.get(n, "concept"), dist=self.dist.get(n, 2),
+                                vis=self.vis.get(n, 0.0), leave=1.0)
         for d in (self.pos, self.heat, self.lit, self.dist, self.adjv, self.shown,
-                  self.label_on, self.kinds, self.names):
+                  self.label_on, self.kinds, self.names, self.grow, self.born_at, self.vis,
+                  self.arrive, self.dim_at, self.sparkle, self.vel):
             d.pop(n, None)
         if self.hover == n:
             self.hover = None
 
-    def add_link(self, key, rels):
-        line = self.cv.create_line(0, 0, 0, 0, fill=RULE, width=1, tags=("g",))
+    def add_link(self, key, rels, src=None, start=None):
+        """A link, as a soft curve; it grows out of `src`, the end already there."""
+        line = self.cv.create_line(0, 0, 0, 0, fill=PAPER, width=1, smooth=True,
+                                   splinesteps=10, capstyle="round", tags=("g",))
         self.cv.tag_lower(line)
         self.links[key] = (rels, line)
+        self.lgrow[key] = 0.0
+        self.lfrom[key] = src if src in key else key[0]
+        self.lstart[key] = self.clock if start is None else start
 
     def drop_link(self, key):
+        """The link leaves the view: it fades where it is, then goes."""
         _rels, line = self.links.pop(key)
-        self.cv.delete(line)
+        self.gone_links.append(dict(line=line, key=key, leave=1.0))
         self.shown.pop(line, None)
+        for d in (self.lgrow, self.lfrom, self.lstart):
+            d.pop(key, None)
 
     def label_shown(self, n):
         if n == self.center or n == self.hover or self.all_labels:
@@ -14940,30 +15013,31 @@ class GraphView:
         except tk.TclError:
             return
         self.frame += 1
-        moved = self._dirty
+        self.clock += self.TICK_MS
         if self.rp and not self.paused:
             self.play()
         if self.temp > 0.2:
             self.layout_step()
-            moved = True
         gx, gy = self.goal
         if abs(self.cam[0] - gx) + abs(self.cam[1] - gy) > 0.3:
             self.cam[0] += (gx - self.cam[0]) * 0.18
             self.cam[1] += (gy - self.cam[1]) * 0.18
-            moved = True
         if self.fit and self.pos:
-            moved = self.fit_zoom() or moved
+            self.fit_zoom()
         if not self.paused:
             self.step_heat()
+        self.grow_step()
         if self.rp:
             self.label_states()
-        self.draw(moved)
+        self.draw(True)          # the links breathe, so every frame is drawn
         self._job = self.root.after(self.TICK_MS, self.tick)
 
     def layout_step(self):
         """One step of a spring layout (Fruchterman-Reingold): every pair
-        repels, every link pulls, a little gravity keeps the whole in view; no
-        record moves more than the temperature, which cools on every step."""
+        repels, every link pulls, a little gravity keeps the whole in view. Each
+        record moves a fraction of the way its forces point, never more than the
+        temperature, which cools on every step: the records settle instead of
+        shaking around their place."""
         P, k = self.pos, self.LINK
         k2 = k * k
         ids = list(P)
@@ -14990,35 +15064,50 @@ class GraphView:
             disp[a][1] -= dy * f
             disp[b][0] += dx * f
             disp[b][1] += dy * f
-        t = self.temp
+        t, vel = self.temp, self.vel
         for n in ids:
             if n == self.center or n == self.dragging:
+                vel.pop(n, None)
                 continue
             p = P[n]
             dx, dy = disp[n][0] - p[0] * 0.05, disp[n][1] - p[1] * 0.05
             d = math.hypot(dx, dy)
             if d > 0:
-                s = min(d, t) / d
-                p[0] += dx * s
-                p[1] += dy * s
-        self.temp *= 0.975
+                s = min(d * 0.06, t) / d
+                vx, vy = vel.get(n, (0.0, 0.0))
+                sx, sy = 0.5 * (vx + dx * s), 0.5 * (vy + dy * s)   # keeps half the last step: no back and forth
+                vel[n] = (sx, sy)
+                p[0] += sx
+                p[1] += sy
+        self.temp *= 0.98
 
     def step_heat(self):
         H, A, R = self.heat, self.adjv, self.recs
         if self.mode == "glow":
+            S = self.sparkle
             new = {}
             for n, h in H.items():
-                nb = A[n]
-                s = sum(H[m] for m in nb) / len(nb) if nb else 0.0
-                new[n] = min(1.0, h * 0.95 + s * 0.045 + R.get(n, 0.0) * 0.012)
+                nb = A.get(n, [])
+                s = sum(H.get(m, 0.0) for m in nb) / len(nb) if nb else 0.0
+                new[n] = min(1.0, h * 0.95 + s * 0.045 + R.get(n, 0.0) * 0.012
+                             + S.get(n, 0.0) * 0.08)
             self.heat = new
+            for n in list(S):               # a spark swells and ebbs; it does not flash
+                S[n] *= 0.9
+                if S[n] < 0.01:
+                    del S[n]
             if self.frame % self.SPARK_TICKS == 0 and not self.rp:
                 self.spark()      # in the replay the edits are the sparks
         elif self.mode == "life":
-            if self.frame % self.GEN_TICKS == 0:
+            if not self.settled and self.frame % self.GEN_TICKS == 0:
                 self.generation()
+            clock = self.clock
             for n in H:
-                H[n] += ((1.0 if self.lit[n] else 0.0) - H[n]) * 0.25
+                if self.lit.get(n):
+                    want = 1.0 if clock >= self.arrive.get(n, 0.0) else 0.0
+                else:
+                    want = H[n] if clock < self.dim_at.get(n, 0.0) else 0.0
+                H[n] += (want - H[n]) * (0.06 if want > H[n] else 0.04)
         else:
             for n in H:
                 H[n] += (R.get(n, 0.0) - H[n]) * 0.1
@@ -15028,28 +15117,91 @@ class GraphView:
         ids = list(self.heat)
         if ids:
             n = self.rng.choices(ids, [self.recs.get(i, 0.0) + 0.05 for i in ids])[0]
-            self.heat[n] = 1.0
+            self.sparkle[n] = 1.0
 
     def seed_life(self):
+        """A new start: the recently edited records more likely lit; the lights
+        come on one by one over a second and a half, not all at once."""
         R = self.recs
         self.lit = {n: self.rng.random() < 0.35 + 0.5 * R.get(n, 0.0) for n in self.pos}
+        self.arrive = {n: self.clock + self.rng.uniform(0, 1500) for n in self.pos}
+        self.dim_at = {}
         self.gen, self.stale, self.history = 0, 0, []
+        self.settled = False
 
     def generation(self):
-        """Conway's rule, with the links as the neighbourhood."""
+        """Conway's rule, with the links as the neighbourhood. A birth is fed
+        by its lit neighbours -- their light flows along the links and the new
+        cell lights when it arrives, each at its own pace; a death fades within
+        0.6 s of its own. When the pattern dies out or settles (a still life, a
+        blinker) the run rests, the survivors lit, until r starts it again."""
         L, A = self.lit, self.adjv
         new = {}
         for n, nb in A.items():
-            k = sum(1 for m in nb if L[m])
-            new[n] = k in (2, 3) if L[n] else k == 3
+            k = sum(1 for m in nb if L.get(m))
+            new[n] = k in (2, 3) if L.get(n) else k == 3
+        for n, v in new.items():
+            if v and not L.get(n):
+                dur = self.FLOW_MS * self.rng.uniform(0.7, 1.3)
+                for m in A[n]:
+                    if L.get(m):
+                        self.add_pulse(m, n, dur)
+                self.arrive[n] = self.clock + dur
+            elif not v and L.get(n):
+                self.dim_at[n] = self.clock + self.rng.uniform(0, 600)
         state = frozenset(n for n, v in new.items() if v)
         self.stale = self.stale + 1 if (not state or state in self.history) else 0
         self.history = (self.history + [state])[-2:]      # still lifes and blinkers
         self.lit = new
         self.gen += 1
         if self.stale >= 3:
-            self.seed_life()
+            self.settled = True
         self.update_status()
+
+    def add_pulse(self, a, b, dur):
+        """Light flowing along the link from a to b: a bead and its trail."""
+        items = [self.cv.create_oval(0, 0, 0, 0, fill=PAPER, outline="", tags=("g",))
+                 for _ in range(3)]
+        self.pulses.append(dict(a=a, b=b, start=self.clock, dur=dur, items=items))
+
+    def grow_step(self):
+        """One tick of growth, withering, flows and the eased brightness."""
+        clock, step = self.clock, self.TICK_MS / self.GROW_MS
+        for n in self.pos:
+            g = self.grow.get(n, 1.0)
+            if g < 1.0 and clock >= self.born_at.get(n, 0.0):
+                self.grow[n] = min(1.0, g + step)
+            v = self.vis.get(n, self.heat.get(n, 0.0))
+            self.vis[n] = v + (self.heat.get(n, 0.0) * self.grow.get(n, 1.0) - v) * 0.18
+        for key in self.links:
+            g = self.lgrow.get(key, 1.0)
+            if g < 1.0 and clock >= self.lstart.get(key, 0.0):
+                self.lgrow[key] = min(1.0, g + step)
+        leave = self.TICK_MS / self.LEAVE_MS
+        for n in list(self.gone):
+            g = self.gone[n]
+            g["leave"] -= leave
+            g["vis"] *= 0.9
+            if g["leave"] <= 0:
+                for item in g["items"]:
+                    self.cv.delete(item)
+                del self.gone[n]
+        keep = []
+        for link in self.gone_links:
+            link["leave"] -= leave
+            if link["leave"] <= 0:
+                self.cv.delete(link["line"])
+            else:
+                keep.append(link)
+        self.gone_links = keep
+        alive = []
+        for q in self.pulses:
+            if clock < q["start"] + q["dur"] and q["a"] in self.pos and q["b"] in self.pos:
+                alive.append(q)
+            else:
+                for item in q["items"]:
+                    self.cv.delete(item)
+        self.pulses = alive
 
     # ---------------------------------------------------------- replay
     def toggle_replay(self):
@@ -15092,6 +15244,7 @@ class GraphView:
         for item in (self.bar, self.bar_done):
             self.cv.itemconfigure(item, state="hidden")
         self.cv.itemconfigure(self.t_keys, text=tr(GRAPH_KEYS))
+        self.clear_items()
         self.pos, self.heat, self.lit = {}, {}, {}
         self.recentre(back, fresh=True)
         self.resized()
@@ -15282,8 +15435,8 @@ class GraphView:
         r = 9.0 if n == self.center else (6.5 if self.dist.get(n, 2) == 1 else 5.0)
         return r * min(1.5, max(0.7, self.zoom))
 
-    def shape_at(self, n, x, y):
-        kind, r = self.kinds[n], self.radius(n)
+    def shape_at(self, n, x, y, r=None, kind=None):
+        kind, r = kind or self.kinds[n], self.radius(n) if r is None else r
         if kind == "person":
             return (x - r, y - r, x + r, y + r)
         if kind == "concept":
@@ -15299,32 +15452,105 @@ class GraphView:
                     x + r * 0.8, y + r * 1.15, x - r * 0.8, y + r * 1.15)
         return (x, y - r * 1.2, x + r * 1.1, y + r * 0.8, x - r * 1.1, y + r * 0.8)
 
+    def curve(self, a_xy, b_xy, key):
+        """The bend of a link: a little to one side, breathing very slowly."""
+        u = (hash(key) % 1000) / 1000.0
+        bow = ((-1 if u < 0.5 else 1) * (0.08 + 0.1 * (u * 2 % 1))
+               * (1 + 0.15 * math.sin(self.clock / 1700 + u * 6.28)))
+        dx, dy = b_xy[0] - a_xy[0], b_xy[1] - a_xy[1]
+        return ((a_xy[0] + b_xy[0]) / 2 - dy * bow, (a_xy[1] + b_xy[1]) / 2 + dx * bow)
+
+    @staticmethod
+    def along(a_xy, c_xy, b_xy, t):
+        v = 1 - t
+        return (v * v * a_xy[0] + 2 * v * t * c_xy[0] + t * t * b_xy[0],
+                v * v * a_xy[1] + 2 * v * t * c_xy[1] + t * t * b_xy[1])
+
     def draw(self, coords):
-        cv, H, n_steps = self.cv, self.heat, self.STEPS
+        cv, V, n_steps, shown = self.cv, self.vis, self.STEPS, self.shown
+        S = self.screen = self.to_screen()
+        mx, my = self.middle()
+        z, (cx, cy) = self.zoom, self.cam
+        G = {n: (mx + (g["pos"][0] - cx) * z, my + (g["pos"][1] - cy) * z)
+             for n, g in self.gone.items()}
+
+        def ease(t):
+            return 1 - (1 - max(0.0, min(1.0, t))) ** 3
+
+        for key, (_rels, line) in self.links.items():
+            a, b = key
+            pa, pb = S[a], S[b]
+            pc = self.curve(pa, pb, key)
+            g = ease(self.lgrow.get(key, 1.0))
+            if g >= 1:
+                cv.coords(line, *pa, *pc, *pb)
+            elif g <= 0:
+                cv.coords(line, *pa, *pa)
+            else:                            # it grows out of the record already there
+                t0, t1 = (0.0, g) if self.lfrom.get(key) == a else (1 - g, 1.0)
+                pts = [c for i in range(9) for c in self.along(pa, pc, pb, t0 + (t1 - t0) * i / 8)]
+                cv.coords(line, *pts)
+            q = int((V.get(a, 0.0) + V.get(b, 0.0)) * 0.5 * n_steps + 0.5)
+            look = (q, round(g * 10))
+            if shown.get(line) != look:
+                shown[line] = look
+                fill = self.ramp_line[q] if g >= 1 else blend(PAPER, self.ramp_line[q], g)
+                cv.itemconfigure(line, fill=fill, width=1 + 2 * q // n_steps)
+        for link in self.gone_links:         # links that leave fade where they were
+            a, b = link["key"]
+            pa, pb = S.get(a) or G.get(a), S.get(b) or G.get(b)
+            if not pa or not pb:
+                cv.coords(link["line"], 0, 0, 0, 0)
+                continue
+            cv.coords(link["line"], *pa, *self.curve(pa, pb, link["key"]), *pb)
+            cv.itemconfigure(link["line"], fill=blend(PAPER, RULE, max(0.0, link["leave"])), width=1)
+        for n, (shape, text) in self.items.items():
+            x, y = S[n]
+            g = ease(self.grow.get(n, 1.0))
+            r = self.radius(n) * (0.35 + 0.65 * g)
+            cv.coords(shape, *self.shape_at(n, x, y, r))
+            cv.coords(text, round(x + r * 1.4 + 4), round(y))
+            q = int(V.get(n, 0.0) * n_steps + 0.5)
+            centre, near = n == self.center, self.dist.get(n, 2) <= 1
+            look = (q, round(g * 12), centre, near)
+            if shown.get(n) != look:
+                shown[n] = look
+                fill, edge = self.ramp_fill[q], OXIDE if centre else self.ramp_edge[q]
+                ink = INK if near else SOFT
+                if g < 1:
+                    fill, edge, ink = blend(PAPER, fill, g), blend(PAPER, edge, g), blend(PAPER, ink, g)
+                cv.itemconfigure(shape, fill=fill, outline=edge, width=2 if centre else 1)
+                cv.itemconfigure(text, fill=ink)
+        for n, g in self.gone.items():       # withering
+            k = ease(g["leave"])
+            x, y = G[n]
+            r = (6.5 if g["dist"] == 1 else 5.0) * min(1.5, max(0.7, z)) * max(0.05, k)
+            shape = g["items"][0]
+            cv.coords(shape, *self.shape_at(n, x, y, r, g["kind"]))
+            q = int(g["vis"] * n_steps + 0.5)
+            cv.itemconfigure(shape, fill=blend(PAPER, self.ramp_fill[q], k),
+                             outline=blend(PAPER, FAINT, k), width=1)
+        for p in self.pulses:                # light flowing along a link into a new cell
+            key = (min(p["a"], p["b"]), max(p["a"], p["b"]))
+            if key not in self.links:
+                continue
+            pa, pb = S[key[0]], S[key[1]]
+            pc = self.curve(pa, pb, key)
+            t = ease((self.clock - p["start"]) / p["dur"])
+            fwd = p["a"] == key[0]
+            for k, item in enumerate(p["items"]):
+                tt = (t - k * 0.05) if fwd else (1 - t + k * 0.05)
+                if not 0.0 <= tt <= 1.0:
+                    cv.coords(item, 0, 0, 0, 0)
+                    continue
+                x, y = self.along(pa, pc, pb, tt)
+                rr = 3.2 - k * 0.6
+                cv.coords(item, x - rr, y - rr, x + rr, y + rr)
+                strength = (0.85 - k * 0.2) * math.sin(math.pi * min(1.0, t * 1.1))
+                cv.itemconfigure(item, fill=blend(PAPER, STAMP, max(0.0, strength)))
         if coords:
-            S = self.screen = self.to_screen()
-            for (a, b), (_rels, line) in self.links.items():
-                cv.coords(line, *S[a], *S[b])
-            for n, (shape, text) in self.items.items():
-                x, y = S[n]
-                cv.coords(shape, *self.shape_at(n, x, y))
-                cv.coords(text, x + self.radius(n) * 1.4 + 4, y)
             self.draw_hover()
             self._dirty = False
-        shown = self.shown
-        for n, (shape, _text) in self.items.items():
-            q = int(H[n] * n_steps + 0.5)
-            if shown.get(n) != q:
-                shown[n] = q
-                if n == self.center:
-                    cv.itemconfigure(shape, fill=self.ramp_fill[q])
-                else:
-                    cv.itemconfigure(shape, fill=self.ramp_fill[q], outline=self.ramp_edge[q])
-        for (a, b), (_rels, line) in self.links.items():
-            q = int((H[a] + H[b]) * 0.5 * n_steps + 0.5)
-            if shown.get(line) != q:
-                shown[line] = q
-                cv.itemconfigure(line, fill=self.ramp_line[q], width=1 + 2 * q // n_steps)
         if self.rp:
             self.draw_timeline()
 
@@ -15351,10 +15577,14 @@ class GraphView:
         cv.coords(self.ring, x - r, y - r, x + r, y + r)
         cv.itemconfigure(self.ring, state="normal")
         for m in self.adjv.get(n, []):
-            mx, my = self.screen[m]
-            rels = self.links[(min(n, m), max(n, m))][0]
+            key = (min(n, m), max(n, m))
+            if key not in self.links or m not in self.screen:
+                continue
+            rels = self.links[key][0]
             words = [rel_label(rel) + (" →" if f == n else " ←") for rel, f in rels]
-            cv.create_text((x + mx) / 2, (y + my) / 2, text=" · ".join(words), fill=SOFT,
+            pa, pb = self.screen[key[0]], self.screen[key[1]]
+            mx, my = self.along(pa, self.curve(pa, pb, key), pb, 0.5)
+            cv.create_text(round(mx), round(my), text=" · ".join(words), fill=SOFT,
                            font=self.f_label, tags=("g", "rel"))
 
     def resized(self, _e=None):
@@ -15382,8 +15612,13 @@ class GraphView:
             left = ""
         right = tr(GRAPH_MODE_LABEL[self.mode])
         if self.mode == "life":
-            right += " · " + tr("generation {n}, {k} lit", n=self.gen,
-                                k=sum(1 for v in self.lit.values() if v))
+            k = sum(1 for v in self.lit.values() if v)
+            if self.settled:
+                right += " · " + (tr("settled at generation {n}: {k} stay lit", n=self.gen, k=k) if k
+                                  else tr("died out at generation {n}", n=self.gen))
+                right += " · " + tr("r: start again")
+            else:
+                right += " · " + tr("generation {n}, {k} lit", n=self.gen, k=k)
         if rp:
             speed = rp["speed"]
             right += " · ×" + (f"{speed:g}" if speed >= 1 else f"1/{1 / speed:g}")
@@ -15401,6 +15636,8 @@ class GraphView:
     def node_at(self, x, y):
         best, bd = None, 14 * 14
         for n, (sx, sy) in self.screen.items():
+            if self.grow.get(n, 1.0) < 0.5:
+                continue                     # still sprouting
             d = (sx - x) ** 2 + (sy - y) ** 2
             if d < bd:
                 best, bd = n, d
@@ -15445,7 +15682,8 @@ class GraphView:
             p = self.pos[n]
             p[0] += (e.x - self.last[0]) / z
             p[1] += (e.y - self.last[1]) / z
-            self.temp = max(self.temp, 8.0)
+            self.temp = max(self.temp, 3.0)      # the neighbours follow gently
+            self.fit = False                     # the view holds still while you arrange it
         else:
             for c in (self.cam, self.goal):
                 c[0] -= (e.x - self.last[0]) / z
@@ -15461,16 +15699,18 @@ class GraphView:
         self.scrubbing = False
 
     def touch(self, e):
-        """Right-click: in glow mode a spark; in life mode the cell flips."""
+        """Right-click: in glow mode a spark; in life mode the cell flips (and a
+        run that had settled starts again)."""
         n = self.node_at(e.x, e.y)
         if not n:
             return
         if self.mode == "life":
-            self.lit[n] = not self.lit[n]
-            self.stale = 0
+            self.lit[n] = not self.lit.get(n)
+            self.arrive[n] = self.clock
+            self.stale, self.settled = 0, False
             self.update_status()
         else:
-            self.heat[n] = 1.0
+            self.sparkle[n] = 1.0
 
     def zoom_at(self, e, f):
         z = min(3.0, max(0.12, self.zoom * f))
@@ -18053,6 +18293,8 @@ PT = {
         "apagou-se na geração {n}",
     "Reseed to start again":
         "Semear de novo para recomeçar",
+    "r: start again":
+        "r: recomeçar",
     "Glow":
         "Brilho",
     "Still":

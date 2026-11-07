@@ -79,14 +79,14 @@ Ideas that span several sections:
   Test it on invented data with `web_api(...)`, or run it with `--stay` and
   drive the page in a headless browser. The page's link graph gets its records
   from `web_graph` (`graph_adjacency`, `graph_ego`, as the window) and draws
-  them itself; its life, glow and still rules are the window's `GraphView`
-  ones rewritten in JavaScript, so a change to one belongs in the other. Two
-  differences are on purpose: the page's generations are slower, and its life
-  stops when the pattern settles instead of reseeding at random. How changes
-  are drawn (growth, withering, light flowing along links, eased brightness)
-  is the page's own and touches no rule; so are its springs, which take damped
-  steps instead of the window's full-temperature ones (those shake every
-  record around its place, which on a phone reads as flicker).
+  them itself; its life, glow and still rules, its springs and the way changes
+  are drawn are the window's `GraphView` ones rewritten in JavaScript, so a
+  change to one belongs in the other. Both: life's generations last 1.2 s and
+  the run rests when the pattern settles; changes grow, wither and flow (light
+  along the links into a birth) instead of jumping; every brightness eases;
+  the springs take damped steps that keep half of the last one, and dragging
+  holds the view still -- full-temperature steps made every record shake
+  around its place, which read as flicker.
 - **Long texts are markdown**: `textfield(..., pages=True)` (every NOTES and the
   draft's text) gets `MarkdownKeys`, and `fit(opening=True)` paints it before
   the pages are measured. The text stored stays plain.

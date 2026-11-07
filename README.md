@@ -48,12 +48,20 @@ updating of files and conflicts if used any syncing app or cloud sync.
   one to three links away around it, laid out by springs that settle by
   themselves. It follows the record you open in the main window. The records
   glow and the glow changes as it runs, by one of three rules (`m` switches):
-  *spreading glow* (the default: light runs along the links and fades, fed by
-  recent edits and by sparks), *Conway's life* (the Game of Life with the links
-  as neighbours: a lit record stays lit with 2 or 3 lit neighbours, a dark one
-  lights with exactly 3) and *still*. Click a record to bring it to the middle;
-  double-click or `Enter` opens it on the card; right-click sparks it (in life
-  mode it flips the cell). It shows at most 160 records at a time.
+  *Conway's life* (the default: the Game of Life with the links as neighbours —
+  a lit record stays lit with 2 or 3 lit neighbours, a dark one lights with
+  exactly 3, a generation every 1.2 s; a birth is fed by its lit neighbours,
+  whose light flows along the links into it; when the pattern dies out or
+  settles the run rests, the survivors lit, until `r` starts it again),
+  *spreading glow* (light runs along the links and fades, fed by recent edits
+  and by sparks) and *still*. Nothing jumps: when the middle changes, the
+  records already there keep their place and light, new ones sprout beside the
+  record that brought them and their links grow out to them, the ones that
+  leave wither; links are soft curves; every brightness eases. Click a record
+  to bring it to the middle; double-click or `Enter` opens it on the card;
+  right-click sparks it (in life mode it flips the cell); dragging a record
+  moves it while its neighbours follow gently and the view holds still. It
+  shows at most 160 records at a time. The web version's graph moves the same.
   `p` **replays the logs**: the base grows on screen as it grew, records
   appearing when they were first saved, links when they were written, each
   edit a flash, with a timeline below (click or drag it to go to a moment;
@@ -106,9 +114,9 @@ updating of files and conflicts if used any syncing app or cloud sync.
   menu): the same records, shapes and springs as the window's, with Conway's
   life first — a lit record fills with the accent and its links to other lit
   records thicken, and a small line in the corner follows how many are lit.
-  It runs calmer than the window's: a generation every 1.2 s, and when the
-  pattern dies out or settles it stops there, the survivors still lit, until
-  *Reseed* (or holding a record) starts it again. Changes grow rather than
+  As in the window: a generation every 1.2 s, and when the pattern dies out or
+  settles it stops there, the survivors still lit, until *Reseed* (or holding
+  a record) starts it again. Changes grow rather than
   jump: a new middle keeps the light of the records already there, new ones
   sprout from the record that brought them and their links grow out to them,
   the ones that leave wither; a birth is fed by its three lit neighbours,
