@@ -84,7 +84,9 @@ Ideas that span several sections:
   differences are on purpose: the page's generations are slower, and its life
   stops when the pattern settles instead of reseeding at random. How changes
   are drawn (growth, withering, light flowing along links, eased brightness)
-  is the page's own and touches no rule.
+  is the page's own and touches no rule; so are its springs, which take damped
+  steps instead of the window's full-temperature ones (those shake every
+  record around its place, which on a phone reads as flicker).
 - **Long texts are markdown**: `textfield(..., pages=True)` (every NOTES and the
   draft's text) gets `MarkdownKeys`, and `fit(opening=True)` paints it before
   the pages are measured. The text stored stays plain.

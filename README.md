@@ -114,7 +114,9 @@ updating of files and conflicts if used any syncing app or cloud sync.
   the ones that leave wither; a birth is fed by its three lit neighbours,
   whose light flows along the (softly curved) links into it. Tap a record
   to bring it to the middle, tap the middle to open it, hold one to flip its
-  cell, pinch or scroll to zoom; *Life / Glow / Still* and the depth 1–3 sit
+  cell (a grab that moves is a drag, never a hold), drag one to move it — its
+  neighbours follow gently and the view holds still — pinch or scroll to
+  zoom; *Life / Glow / Still* and the depth 1–3 sit
   above it. (The replay of the logs is still only in the window.)
 - **Source**: free types (book, paper, thesis, law/bill, decisions, webpages, videos), citations in academic formats, BibTeX and CSL-JSON.
   Can import from Zotero via CSL-JSON or BibTeX without duplicating entries.

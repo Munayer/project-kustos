@@ -7483,9 +7483,9 @@ function gLayout() {
   for (const n of ids) {
     if (n === G.center || n === G.dragging) continue;
     const p = N[n], dx = disp[n][0] - p.x * 0.05, dy = disp[n][1] - p.y * 0.05, d = Math.hypot(dx, dy);
-    if (d > 0) { const s = Math.min(d, G.temp) / d; p.x += dx * s; p.y += dy * s; }
+    if (d > 0) { const s = Math.min(d * 0.06, G.temp) / d; p.x += dx * s; p.y += dy * s; }
   }
-  G.temp *= 0.975;
+  G.temp *= 0.98;
 }
 function gMiddle() { return [G.w / 2, (G.h + GTOP) / 2]; }
 function gFit() {
@@ -7679,7 +7679,7 @@ function gDraw() {
     ctx.font = `${big ? "600 12px" : "11px"} ${C.mono}`;
     ctx.fillStyle = p.dist <= 1 ? C.ink : C.soft;
     const name = p.name.length > 32 ? p.name.slice(0, 31) + "…" : p.name;
-    ctx.fillText(name, x + gRadius(n) * 1.4 + 4, y);
+    ctx.fillText(name, Math.round(x + gRadius(n) * 1.4 + 4), Math.round(y));
   }
   ctx.globalAlpha = 1;
   if (G.mode === "life" && G.pop.length > 1) {        // how many are lit, generation by generation
@@ -7739,7 +7739,7 @@ function gDown(e) {
   }
   const n = gNodeAt(e.offsetX, e.offsetY, e.pointerType === "mouse" ? 14 : 24);
   G.press = {x: e.offsetX, y: e.offsetY, lx: e.offsetX, ly: e.offsetY, n, moved: false, held: false};
-  if (n) G.hold = setTimeout(() => { if (G.press && !G.press.moved) { G.press.held = true; gTouch(n); } }, 450);
+  if (n) G.hold = setTimeout(() => { if (G.press && !G.press.crept) { G.press.held = true; gTouch(n); } }, 550);
 }
 function gMove(e) {
   if (G.ptr.has(e.pointerId)) G.ptr.set(e.pointerId, [e.offsetX, e.offsetY]);
@@ -7753,14 +7753,16 @@ function gMove(e) {
     if (e.pointerType === "mouse") G.hover = gNodeAt(e.offsetX, e.offsetY, 14);
     return;
   }
-  if (!p.moved && Math.abs(e.offsetX - p.x) + Math.abs(e.offsetY - p.y) < 6) return;
+  const far = Math.abs(e.offsetX - p.x) + Math.abs(e.offsetY - p.y);
+  if (far >= 3 && !p.crept) { p.crept = true; clearTimeout(G.hold); }
+  if (!p.moved && far < 6) return;
   p.moved = true;
-  clearTimeout(G.hold);
   const dx = (e.offsetX - p.lx) / G.zoom, dy = (e.offsetY - p.ly) / G.zoom;
   if (p.n && p.n !== G.center) {
     G.dragging = p.n;
     G.nodes[p.n].x += dx; G.nodes[p.n].y += dy;
-    G.temp = Math.max(G.temp, 8);
+    G.temp = Math.max(G.temp, 3);   // the neighbours follow gently
+    G.fit = false;                  // the view holds still while you arrange it
   } else {
     for (const c of [G.cam, G.goal]) { c[0] -= dx; c[1] -= dy; }
   }
