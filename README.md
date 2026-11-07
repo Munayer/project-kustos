@@ -7,6 +7,36 @@ mirrored in markdown files capable of giving users readibility out of the
 python ecosystem. Can be runned locally with synchronized folders, with automatic
 updating of files and conflicts if used any syncing app or cloud sync.
 
+## A look
+
+All the pictures below are of an invented base, made up for the demo.
+
+**On a phone** (`python _kustos.py web`): the list, a person's card, the link
+graph in Conway's life, a link's card, the key of the lines, the path between
+two records, and the links that still need a reason.
+
+<p>
+<img src="docs/images/web-list.png" width="180" alt="The list of records on a phone">
+<img src="docs/images/web-record.png" width="180" alt="A person's card on a phone">
+<img src="docs/images/web-graph.png" width="180" alt="The link graph in Conway's life">
+<img src="docs/images/web-link-card.png" width="180" alt="A link's card, opened by tapping its line">
+</p>
+<p>
+<img src="docs/images/web-key.png" width="180" alt="The key of what a line shows">
+<img src="docs/images/web-path.png" width="180" alt="The path finder: the chains of links between two records">
+<img src="docs/images/web-links.png" width="180" alt="Every link, filtered to those that need a reason">
+</p>
+
+**In the window**: the link graph with the key of the lines and a link
+selected, and the path finder with its steps written out.
+
+<p>
+<img src="docs/images/desktop-graph.png" width="720" alt="The window's link graph, with the key and a selected link">
+</p>
+<p>
+<img src="docs/images/desktop-path.png" width="720" alt="The window's path finder: three chains between two records, and their steps">
+</p>
+
 ## Requisites
 
 - Python 3.10 or newer with Tkinter.
@@ -85,6 +115,17 @@ updating of files and conflicts if used any syncing app or cloud sync.
   links, and **⋯ › Links** lists every link, with *Needs a reason* and
   *Atypical* as filters. A link is always saved as a change of the record it
   comes from, with its log line, as when typed in its LINKS field.
+- **Path finder** — how are two records related? In the graph (window and web
+  alike), `f` in the window or **⇢ Path** on the web asks for a record by a few
+  letters of its name; `Ctrl+click` on a record in the window, or *Tap a record
+  in the graph* on the web, takes it straight from the graph. The graph then
+  shows only the shortest chains of links between the middle record and that
+  one — up to three, all of the same length, eight links at most — still, a
+  light running along them from one end to the other, both ends ringed. The
+  steps are written out (in the window above the status line; on the web
+  under *Details*, where a step opens its link card). `Esc` in the window, `×`
+  on the web, goes back to the neighbourhood. When no chain joins the two, it
+  says so.
 - **Timeline** (`Ctrl+Shift+T`, **View › Timeline**, or `python _kustos.py
   timeline [id]`): everything dated on one line of time, in lanes — the
   people's LOG (the facts of a life), births and deaths (`BORN` / `DIED` on the

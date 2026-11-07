@@ -5857,6 +5857,9 @@ WEB_STRINGS = (
     "colour: its family", "with a reason or a source", "without either: needs a reason",
     "a type outside the list (atypical)", "thick where it comes from", "written recently",
     "written long ago", "lit, in life", "Open {name}",
+    "Path", "How are they related?", "From", "To", "Search a record", "Tap a record in the graph",
+    "Tap the record to reach.", "No chain of links joins them.", "{k} link(s) apart · {n} chain(s)",
+    "Details", "Chain {i} of {n}",
 )
 
 
@@ -6465,6 +6468,35 @@ def web_link_list(data, q="", which="", offset=0, limit=WEB_ROWS):
                        "atypical": sum(1 for e in data["edges"] if e.get("rel") not in RELS)}}
 
 
+def web_path(data, a, b):
+    """The path view: the records on the shortest chains from a to b, the
+    links of those chains (with what their lines show) and, step by step, the
+    links each step goes through. None when a record is missing."""
+    idx = by_id(data)
+    if a not in idx or b not in idx:
+        return None
+    adj = graph_adjacency(data)
+    paths = link_paths(adj, a, b)
+    first = {}
+    for path in paths:
+        for i, n in enumerate(path):
+            first.setdefault(n, (i, path[i - 1] if i else None))
+    now = datetime.now()
+    pairs, times = link_index(data), edge_times()
+    nodes = [{"id": n, "kind": graph_kind(idx[n]), "name": one_liner(label_any(idx[n], data), 60),
+              "dist": d, "parent": parent, "rec": round(recency(idx[n], now), 4),
+              "n": idx[n].get("reg_n") or 0} for n, (d, parent) in first.items()]
+    keys = sorted({(min(x, y), max(x, y)) for path in paths for x, y in zip(path, path[1:])})
+    links = [{"a": x, "b": y, "rels": [[rel_label(r), f] for r, f in adj[x][y]],
+              "f": link_facts(pairs.get((x, y), []), times, now.timestamp())} for x, y in keys]
+    steps = [[[{"from": e["from"], "to": e["to"], "label": rel_label(e.get("rel", "")),
+                "why": e.get("why", "")} for e in pairs.get((min(x, y), max(x, y)), [])]
+              for x, y in zip(path, path[1:])] for path in paths]
+    return {"center": a, "a": a, "b": b, "paths": paths, "steps": steps, "nodes": nodes,
+            "links": links, "titles": {n: label_any(idx[n], data) for n in first},
+            "records": len(idx)}
+
+
 def web_boot(token):
     """What the page needs before its first call."""
     return {"token": token, "lang": LANG, "today": TODAY(), "fields": web_fields(),
@@ -6531,6 +6563,9 @@ def web_api(method, path, query, body):
             except ValueError:
                 offset = 0
             return 200, web_link_list(load_json(), arg("q"), arg("which"), offset)
+        if method == "GET" and path == "/api/path":
+            got = web_path(load_json(), arg("a"), arg("b"))
+            return (200, got) if got else (404, {"error": tr("This record no longer exists.")})
         if method == "GET" and path == "/api/graph":
             try:
                 depth = int(arg("depth", "2"))
@@ -6918,6 +6953,12 @@ textarea.prose { font: 17px/1.55 var(--serif); min-height: 10em; }
 .gfab.r { right: 12px; } .gfab.l { left: 12px; }
 .gfab .btn { background: var(--paper); box-shadow: 0 1px 4px rgba(0, 0, 0, .12); }
 .gfab .btn[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--paper); }
+.gpathbar { position: absolute; left: 12px; right: 12px; top: 8px; display: flex; gap: 8px; align-items: center;
+  flex-wrap: wrap; background: var(--paper); border: 1px solid var(--accent); border-radius: 12px; padding: 6px 8px 6px 12px;
+  font-size: 14px; box-shadow: 0 1px 4px rgba(0, 0, 0, .1); }
+.gpathbar .grow { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pick { list-style: none; margin: 8px 0 0; padding: 0; max-height: 45vh; overflow-y: auto; }
+.pick .row { padding: 10px 4px; }
 .lk-edge { border-top: 1px dashed var(--rule); padding: 10px 0; display: grid; gap: 4px; }
 .lk-edge .rel { font: 13px var(--mono); color: var(--soft); }
 .lk-edge .meta { font: 12px var(--mono); color: var(--faint); }
@@ -7453,7 +7494,9 @@ function graphMount() {
     `<div class="gcanvas" id="gbox"><canvas id="gc"></canvas><div class="ghint" id="ghint"></div>` +
     `<div class="gnote" id="gnote"></div>` +
     `<div class="gfab l"><button class="btn" data-act="gkey" ${tip("Key")}>?</button></div>` +
-    `<div class="gfab r"><button class="btn" data-act="gdraw" id="gdraw" aria-pressed="false">&#10547; ${esc(T("Link"))}</button></div></div>` +
+    `<div class="gfab r"><button class="btn" data-act="gpath" id="gpathbtn">&#8674; ${esc(T("Path"))}</button>` +
+    `<button class="btn" data-act="gdraw" id="gdraw" aria-pressed="false">&#10547; ${esc(T("Link"))}</button></div>` +
+    `<div class="gpathbar" id="gpathbar" hidden></div></div>` +
     `<div class="gstatus"><span class="who" id="gwho"></span><span id="gstate"></span></div></div>`;
   G.on = true;
   G.C = gColors();
@@ -7474,6 +7517,7 @@ function graphMount() {
   gButtons();
 }
 async function graphFetch(id) {
+  if (G.path) leavePath(false);
   let d;
   try { d = await api("api/graph?" + new URLSearchParams({id: id || "", depth: G.depth})); }
   catch (e) { toast(e.message, 4000); return; }
@@ -7547,6 +7591,7 @@ function gButtons() {
   $("#gnames").setAttribute("aria-pressed", String(G.names));
   $("#gdraw").setAttribute("aria-pressed", String(!!G.drawing));
   if (G.drawing) { $("#ghint").hidden = false; $("#ghint").textContent = T("Drag from one record to another to link them."); return; }
+  if (G.picking) { $("#ghint").hidden = false; $("#ghint").textContent = T("Tap the record to reach."); return; }
   $("#ghint").textContent = G.mode === "life"
     ? T("tap: to the middle · tap the middle: open · hold: flip the cell · drag: move · pinch or wheel: zoom")
     : T("tap: to the middle · tap the middle: open · hold: spark · drag: move · pinch or wheel: zoom");
@@ -7662,12 +7707,27 @@ function gLayout() {
   }
   G.temp *= 0.98;
 }
-function gMiddle() { return [G.w / 2, (G.h + GTOP) / 2]; }
+const GBOTTOM = 64;          // the floating buttons at the foot of the graph
+function gMiddle() { return [G.w / 2, (G.h + GTOP - GBOTTOM) / 2]; }
 function gFit() {
+  // the whole graph in view: around the middle record, or, in a path view, around the chains
+  if (G.path) {
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+    for (const n of G.ids) {               // names are drawn to the right of their record: they count too
+      const p = G.nodes[n], name = Math.min(32, p.name.length) * (n === G.center ? 7.8 : 6.6) / Math.max(0.3, G.zoom);
+      x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x + name); y0 = Math.min(y0, p.y); y1 = Math.max(y1, p.y);
+    }
+    G.goal = [(x0 + x1) / 2, (y0 + y1) / 2];
+  }
+  const [gx, gy] = G.goal;
   let rx = 1, ry = 1;
-  for (const n of G.ids) { rx = Math.max(rx, Math.abs(G.nodes[n].x)); ry = Math.max(ry, Math.abs(G.nodes[n].y)); }
-  const side = G.w < 600 ? 70 : 110;
-  const z = Math.min(1.5, Math.max(0.12, Math.min((G.w / 2 - side) / rx, (G.h - GTOP) / 2 / ry - 20 / ry)));
+  for (const n of G.ids) { rx = Math.max(rx, Math.abs(G.nodes[n].x - gx)); ry = Math.max(ry, Math.abs(G.nodes[n].y - gy)); }
+  if (G.path) for (const n of G.ids) {
+    const p = G.nodes[n];
+    rx = Math.max(rx, Math.abs(p.x + Math.min(32, p.name.length) * (n === G.center ? 7.8 : 6.6) / Math.max(0.3, G.zoom) - gx));
+  }
+  const side = G.w < 600 ? (G.path ? 24 : 70) : (G.path ? 40 : 110), tall = (G.h - GTOP - GBOTTOM) / 2;
+  const z = Math.min(1.5, Math.max(0.12, Math.min((G.w / 2 - side) / rx, (tall - 20) / ry)));
   if (Math.abs(z - G.zoom) >= 0.002) G.zoom += (z - G.zoom) * 0.15;
 }
 function gTick() {
@@ -7678,6 +7738,7 @@ function gTick() {
   G.cam[1] += (G.goal[1] - G.cam[1]) * 0.18;
   if (G.fit && G.ids.length) gFit();
   if (!G.paused) gHeat();
+  pathFlow();
   for (const n of G.ids) {
     const p = G.nodes[n];
     if (p.grow < 1 && G.clock >= p.start) p.grow = Math.min(1, p.grow + TICK / GROW_MS);
@@ -7848,6 +7909,12 @@ function gDraw() {
     const [t0, t1] = g >= 1 ? [0, 1] : l.from === l.a ? [0, g] : [1 - g, 1];   // it grows out of the record already there
     gLink(ctx, l, A, Cp, B, t0, t1, q);
   }
+  if (G.path) {                            // the chains found: their lines and records stand out
+    ctx.strokeStyle = C.accent; ctx.lineWidth = 3; ctx.globalAlpha = 0.55;
+    for (const l of G.links) if (G.path.keys.has(l.a + " " + l.b) && (l.grow ?? 1) >= 1)
+      gStroke(ctx, S[l.a], gCurve(S[l.a], S[l.b], l.a + l.b), S[l.b], 0, 1);
+    ctx.globalAlpha = 1;
+  }
   if (G.rubber && S[G.rubber.from]) {        // a link being drawn
     ctx.setLineDash([6, 5]); ctx.strokeStyle = C.accent; ctx.lineWidth = 2;
     ctx.beginPath(); ctx.moveTo(...S[G.rubber.from]); ctx.lineTo(G.rubber.x, G.rubber.y); ctx.stroke();
@@ -7900,6 +7967,10 @@ function gDraw() {
     if (n === G.hover) {
       ctx.strokeStyle = C.ink; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.arc(x, y, r * 1.4 + 4, 0, 2 * Math.PI); ctx.stroke();
+    }
+    if (G.path && (n === G.path.a || n === G.path.b)) {    // the two ends
+      ctx.strokeStyle = C.accent; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(x, y, r * 1.5 + 5, 0, 2 * Math.PI); ctx.stroke();
     }
   }
   ctx.textAlign = "left"; ctx.textBaseline = "middle";
@@ -8022,6 +8093,11 @@ function gUp(e) {
   }
   G.rubber = null;
   if (!p || p.moved || p.held) return;
+  if (G.picking && p.n) {                  // the record to reach
+    G.picking = false; gButtons();
+    if (p.n !== G.center) pathTo(p.n);
+    return;
+  }
   if (!p.n) {                              // a tap on a line opens its card
     const l = gLinkAt(p.x, p.y, p.touch ? 16 : 9);
     if (l) linkCard(l.a, l.b);
@@ -8196,6 +8272,79 @@ function showLinks() {
 }
 let linksJob = null;
 
+/* ---------------------------------------------------------------- the path finder
+   How are two records related? The shortest chains of links from the middle
+   to another record (link_paths): the graph shows only those, still, with a
+   light running along them from one end to the other, and their steps can be
+   read one by one. Leaving it brings the neighbourhood back. */
+let pathJob = null;
+function pathSheet() {
+  openSheet(`<span class="lbl">${esc(T("How are they related?"))}</span>` +
+    `<div class="lk-dir">${esc(T("From"))}: <b>${esc((G.nodes[G.center] || {}).name || "")}</b></div>` +
+    `<label class="lbl" for="pq">${esc(T("To"))}</label>` +
+    `<input class="f" id="pq" type="search" autocomplete="off" placeholder="${esc(T("Search a record"))}">` +
+    `<ul class="pick" id="pick"></ul>` +
+    `<div class="lk-form"><button class="btn" data-act="gpath-pick">${esc(T("Tap a record in the graph"))}</button></div>`);
+  $("#pq").focus();
+}
+async function pathSearch(q) {
+  if (!q.trim()) { $("#pick").innerHTML = ""; return; }
+  let j;
+  try { j = await api("api/list?" + new URLSearchParams({q, limit: 12})); } catch (e) { return; }
+  const box = $("#pick");
+  if (!box) return;
+  box.innerHTML = j.rows.filter(r => r.id !== G.center).map(r => `<li><button class="row" data-act="gpath-to" data-id="${esc(r.id)}">` +
+    `<span class="dot c-${r.coll}"></span><span class="t">${esc(r.title)}</span><span class="n"></span>` +
+    `<span class="s">${esc(r.sub)}</span></button></li>`).join("") || `<li class="empty">${esc(T("Nothing found."))}</li>`;
+}
+async function pathTo(b) {
+  closeSheet();
+  let d;
+  try { d = await api("api/path?" + new URLSearchParams({a: G.center, b})); }
+  catch (e) { toast(e.message, 4000); return; }
+  if (!d.paths.length) { toast(T("No chain of links joins them."), 3500); return; }
+  const keep = G.mode;
+  gLoad(d);
+  G.path = {a: d.a, b: d.b, paths: d.paths, steps: d.steps, titles: d.titles, mode: keep, next: 0,
+            keys: new Set(d.paths.flatMap(p => p.slice(1).map((n, i) => [p[i], n].sort().join(" "))))};
+  G.mode = "still";
+  gButtons();
+  const k = d.paths[0].length - 1;
+  $("#gpathbar").innerHTML = `<span class="grow"><b>${esc(d.titles[d.a])}</b> &#8674; <b>${esc(d.titles[d.b])}</b> · ` +
+    `${esc(T("{k} link(s) apart · {n} chain(s)", {k, n: d.paths.length}))}</span>` +
+    `<button class="btn quiet" data-act="gpath-steps">${esc(T("Details"))}</button>` +
+    `<button class="btn quiet" data-act="gpath-x" aria-label="${esc(T("Back"))}">&#215;</button>`;
+  $("#gpathbar").hidden = false;
+  $("#ghint").hidden = true;
+}
+function leavePath(refetch) {
+  if (!G.path) return;
+  G.mode = G.path.mode || G.mode;
+  G.path = null;
+  G.goal = [0, 0];
+  $("#gpathbar").hidden = true;
+  gButtons();
+  if (refetch) graphFetch(G.center);
+}
+function pathSteps() {
+  const P = G.path, title = id => P.titles[id] || id;
+  openSheet(`<span class="lbl">${esc(T("How are they related?"))}</span>` + P.paths.map((path, i) =>
+    `<div class="lk-edge"><span class="meta">${esc(T("Chain {i} of {n}", {i: i + 1, n: P.paths.length}))}</span>` +
+    P.steps[i].map((links, j) => `<button class="go" data-act="lk-row" data-a="${esc(path[j])}" data-b="${esc(path[j + 1])}">` +
+      links.map(l => `<b>${esc(title(l.from))}</b> <span class="rel">${esc(l.label)} &#8594;</span> <b>${esc(title(l.to))}</b>` +
+        (l.why ? `<span class="why">${esc(l.why)}</span>` : "")).join("") + `</button>`).join("") + `</div>`).join(""));
+}
+function pathFlow() {
+  // a light runs along every chain from one end to the other, step by step
+  const P = G.path;
+  if (!P || G.clock < P.next) return;
+  P.next = G.clock + 700;
+  for (const path of P.paths) {
+    const step = Math.floor(G.clock / 700) % (path.length + 1);
+    if (step < path.length - 1) G.pulses.push({a: path[step], b: path[step + 1], start: G.clock, dur: 700});
+  }
+}
+
 /* ---------------------------------------------------------------- events */
 document.addEventListener("click", e => {
   const wl = e.target.closest(".wl");
@@ -8236,6 +8385,11 @@ document.addEventListener("click", e => {
   else if (act === "gopen") { if (G.center) { S.fromList = true; go("r/" + G.center); } }
   else if (act === "gdraw") { G.drawing = !G.drawing; gButtons(); }
   else if (act === "gkey") keySheet();
+  else if (act === "gpath") pathSheet();
+  else if (act === "gpath-to") pathTo(b.dataset.id);
+  else if (act === "gpath-pick") { closeSheet(); G.picking = true; G.drawing = false; gButtons(); }
+  else if (act === "gpath-x") leavePath(true);
+  else if (act === "gpath-steps") pathSteps();
   else if (act === "links") { closeSheet(); S.fromList = true; go("links"); }
   else if (act === "lk-row") linkCard(b.dataset.a, b.dataset.b);
   else if (act === "lk-go") { closeSheet(); S.fromList = true; go("r/" + b.dataset.id); }
@@ -8258,6 +8412,7 @@ document.addEventListener("submit", e => {
 document.addEventListener("input", e => {
   const t = e.target;
   if (t.id === "q") { S.q = t.value; listSoon(); return; }
+  if (t.id === "pq") { clearTimeout(pathJob); pathJob = setTimeout(() => pathSearch(t.value), 150); return; }
   if (t.id === "lq") { L.q = t.value; clearTimeout(linksJob); linksJob = setTimeout(() => loadLinks(false), 150); return; }
   if (!S.edit || !t.closest("#editor")) return;
   if (t.name === "circles") S.edit.circles = $$('#editor input[name="circles"]:checked').map(x => x.value);
@@ -15191,6 +15346,51 @@ def typical_rels(a, b):
     return [r for r, (fa, fb) in RELS.items() if fa in ("*", ka) and fb in ("*", kb)]
 
 
+# The path finder: how are two records related? The shortest chains of links
+# from one to the other, the links taken either way, as both graphs show them.
+
+PATH_LIMIT = 3          # chains shown at once, all of the same (smallest) length
+PATH_MAX = 8            # links in a chain, at most
+
+
+def link_paths(adj, a, b, limit=PATH_LIMIT, max_len=PATH_MAX):
+    """The shortest chains of links from record a to record b over `adj`
+    (graph_adjacency): up to `limit`, all of the smallest length, each a list
+    of ids from a to b; [] when none is within `max_len` links."""
+    if a == b:
+        return [[a]] if a in adj else []
+    if a not in adj or b not in adj:
+        return []
+    dist, parents, frontier = {a: 0}, {a: []}, [a]
+    while frontier and b not in dist:
+        if dist[frontier[0]] >= max_len:
+            return []
+        nxt = []
+        for n in frontier:
+            for m in sorted(adj.get(n, {})):
+                if m not in dist:
+                    dist[m], parents[m] = dist[n] + 1, [n]
+                    nxt.append(m)
+                elif dist[m] == dist[n] + 1:
+                    parents[m].append(n)
+        frontier = nxt
+    if b not in dist:
+        return []
+    out = []
+
+    def walk(n, tail):
+        if len(out) >= limit:
+            return
+        if n == a:
+            out.append([a] + tail)
+            return
+        for q in parents[n]:
+            walk(q, [n] + tail)
+
+    walk(b, [])
+    return out
+
+
 def replay_timeline(data, logs):
     """The logs as a timeline for the replay, oldest first:
     [(stamp, epoch, op, id, info)], where op is "put" (info: (label, kind)),
@@ -15291,6 +15491,7 @@ class GraphView:
         self.lfacts, self.lstyle, self.lcolour = {}, {}, {}   # what each line shows (link_facts)
         self.sel_link = self.linking = None
         self.show_key = False
+        self.path = None     # the path view: {a, b, paths, keys, mode, next}
 
         fams = set(tkfont.families(root))
         mono = next((f for f in ("Cascadia Mono", "Consolas", "Lucida Console",
@@ -15344,7 +15545,9 @@ class GraphView:
         b("<F5>", lambda e: None if self.rp else self.recentre(self.center, fresh=True))
         b("<Return>", lambda e: self.open_in_card())
         b("<k>", lambda e: self.toggle_key())
+        b("<f>", lambda e: None if self.rp else PathDialog(self))
         b("<Escape>", lambda e: self.select_link(None) if self.sel_link else
+          self.leave_path() if self.path else
           (self.stop_replay() if self.rp else self.close()))
         b("<q>", lambda e: self.close())
         cv.bind("<Configure>", self.resized)
@@ -15353,6 +15556,8 @@ class GraphView:
         cv.bind("<B1-Motion>", self.drag)
         cv.bind("<ButtonRelease-1>", self.release)
         cv.bind("<Double-Button-1>", self.double)
+        cv.bind("<Control-ButtonPress-1>", lambda e: "break")
+        cv.bind("<Control-ButtonRelease-1>", self.path_click)
         cv.bind("<Shift-ButtonPress-1>", self.link_press)
         cv.bind("<Shift-B1-Motion>", self.link_drag)
         cv.bind("<Shift-ButtonRelease-1>", self.link_release)
@@ -15365,7 +15570,7 @@ class GraphView:
         self._job = root.after(self.TICK_MS, self.tick)
 
     # ---------------------------------------------------------- content
-    def recentre(self, rid, fresh=False):
+    def recentre(self, rid, fresh=False, view=None):
         """Puts `rid` in the middle. The records already on screen keep their
         place and their light (the camera glides to the new middle); new ones
         sprout beside the record that brought them, nearest first, and their
@@ -15384,7 +15589,11 @@ class GraphView:
             rid = max(self.adj, key=lambda k: (len(self.adj[k]), k), default=None)
         if rid is None and self.idx:
             rid = next(iter(self.idx))
-        ego = graph_ego(self.adj, rid, self.depth) if rid else {}
+        if view is None and self.path:      # anything else than a path: the neighbourhood again
+            self.mode, self.path, self.goal = self.path["mode"], None, [0.0, 0.0]
+            self.cv.itemconfigure(self.t_link, state="hidden")
+            self.cv.delete("pathend")
+        ego = view[0] if view else (graph_ego(self.adj, rid, self.depth) if rid else {})
         ox, oy = self.pos.get(rid, (0.0, 0.0))
         pos = {}
         for n, (_d, parent) in ego.items():
@@ -15424,8 +15633,8 @@ class GraphView:
             self.stale, self.history, self.settled = 0, [], False
             if first:
                 self.gen = 0
-        links = {(a, b): rels for a in ego for b, rels in self.adj.get(a, {}).items()
-                 if b in ego and a < b}
+        links = view[1] if view else {(a, b): rels for a in ego for b, rels in self.adj.get(a, {}).items()
+                                      if b in ego and a < b}
         for key in [key for key in self.links if key not in links]:
             self.drop_link(key)
         fresh_ones = set(new)
@@ -15617,6 +15826,7 @@ class GraphView:
         if not self.paused:
             self.step_heat()
         self.grow_step()
+        self.path_flow()
         if self.rp:
             self.label_states()
         self.draw(True)          # the links breathe, so every frame is drawn
@@ -15997,19 +16207,28 @@ class GraphView:
         self.update_status()
 
     # ---------------------------------------------------------- drawing
-    def bottom(self):
-        return 46 if self.rp else 26     # the status line, and the timeline
+    def bottom(self, room=False):
+        b = 46 if self.rp else 26        # the status line, and the timeline
+        if room and self.path:           # in a path view, also the steps written above it
+            box = self.cv.bbox(self.t_link)
+            b += box[3] - box[1] + 8 if box else 0
+        return b
 
     def middle(self):
         cv = self.cv
-        return cv.winfo_width() / 2, (cv.winfo_height() + self.TOP - self.bottom()) / 2
+        return cv.winfo_width() / 2, (cv.winfo_height() + self.TOP - self.bottom(room=True)) / 2
 
     def fit_zoom(self):
-        """Eases the zoom so the whole graph fits the window; True if it moved."""
+        """Eases the zoom so the whole graph fits the window -- around the
+        middle record or, in a path view, around the chains; True if it moved."""
         cv = self.cv
-        w, h = cv.winfo_width(), cv.winfo_height() - self.TOP - self.bottom()
-        rx = max(abs(x) for x, _y in self.pos.values()) or 1.0
-        ry = max(abs(y) for _x, y in self.pos.values()) or 1.0
+        w, h = cv.winfo_width(), cv.winfo_height() - self.TOP - self.bottom(room=True)
+        if self.path:
+            xs, ys = [x for x, _y in self.pos.values()], [y for _x, y in self.pos.values()]
+            self.goal = [(min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2]
+        gx, gy = self.goal
+        rx = max(abs(x - gx) for x, _y in self.pos.values()) or 1.0
+        ry = max(abs(y - gy) for _x, y in self.pos.values()) or 1.0
         z = min(1.5, max(0.12, min((w / 2 - 110) / rx, (h / 2 - 20) / ry)))
         if abs(z - self.zoom) < 0.002:
             return False
@@ -16089,6 +16308,8 @@ class GraphView:
             g = ease(self.lgrow.get(key, 1.0))
             style, sel = self.lstyle.get(key, "line"), key == self.sel_link
             q = int((V.get(a, 0.0) + V.get(b, 0.0)) * 0.5 * n_steps + 0.5)
+            if self.path and key in self.path["keys"]:
+                q = max(q, int(0.75 * n_steps))
             w = (1 + 2 * q / n_steps) * (1.7 if sel else 1.0)
             t0, t1 = (0.0, 1.0) if g >= 1 else (0.0, g) if self.lfrom.get(key) == a else (1 - g, 1.0)
             if g <= 0:
@@ -16172,6 +16393,15 @@ class GraphView:
                 cv.coords(item, x - rr, y - rr, x + rr, y + rr)
                 strength = (0.85 - k * 0.2) * math.sin(math.pi * min(1.0, t * 1.1))
                 cv.itemconfigure(item, fill=blend(PAPER, STAMP, max(0.0, strength)))
+        if self.path:                        # the two ends of the chains
+            for end, tag in ((self.path["a"], "pa"), (self.path["b"], "pb")):
+                if end in S:
+                    x, y = S[end]
+                    r = self.radius(end) * 1.5 + 5
+                    item = cv.find_withtag(tag)
+                    if not item:
+                        item = (cv.create_oval(0, 0, 0, 0, outline=STAMP, width=2, tags=("g", "pathend", tag)),)
+                    cv.coords(item[0], x - r, y - r, x + r, y + r)
         if self.linking:                     # a link being drawn (Shift+drag)
             x0, y0 = S.get(self.linking[0], (0, 0))
             cv.coords(self.rubber, x0, y0, *self.linking[1])
@@ -16231,6 +16461,10 @@ class GraphView:
         rp = self.rp
         rid = self.hover or self.center
         rec = self.idx.get(rid) if rid else None
+        if flash:            # a message stays three seconds, whatever else updates the line
+            self._flash = (flash, self.clock + 3000)
+        elif getattr(self, "_flash", None) and self.clock < self._flash[1]:
+            flash = self._flash[0]
         if flash:
             left = flash
         elif rid and rid in self.names:
@@ -16417,6 +16651,65 @@ class GraphView:
             return
         LinkDialog(self, start[0], to)
 
+    def path_click(self, e):
+        """Ctrl+click on a record: the path to it from the middle."""
+        n = self.node_at(e.x, e.y)
+        if n and n != self.center and not self.rp:
+            self.show_path(n)
+        return "break"
+
+    def show_path(self, b):
+        """How the middle record and `b` are related: the shortest chains of
+        links between them (link_paths), shown alone and still, a light running
+        along them, their steps written above the status line."""
+        if self.data is None or b not in self.idx:
+            return
+        a = self.center
+        paths = link_paths(self.adj, a, b)
+        if not paths:
+            self.update_status(flash=tr("No chain of links joins them."))
+            return
+        first = {}
+        for path in paths:
+            for i, n in enumerate(path):
+                first.setdefault(n, (i, path[i - 1] if i else None))
+        keys = {(min(x, y), max(x, y)) for path in paths for x, y in zip(path, path[1:])}
+        mode = self.path["mode"] if self.path else self.mode
+        self.recentre(a, view=(first, {k: self.adj[k[0]][k[1]] for k in keys}))
+        self.path = dict(a=a, b=b, paths=paths, keys=keys, mode=mode, next=0.0)
+        self.mode = "still"
+        self.fit = True
+        self.cv.delete("pathend")
+        pairs = link_index(self.data)
+        name = lambda r: one_liner(label_any(self.idx[r], self.data), 40)
+        lines = [tr("{a} ⇢ {b}", a=name(a), b=name(b)) + " · "
+                 + tr("{k} link(s) apart · {n} chain(s)", k=len(paths[0]) - 1, n=len(paths))]
+        for x, y in zip(paths[0], paths[0][1:]):
+            for e in pairs.get((min(x, y), max(x, y)), []):
+                lines.append(f"{name(e['from'])}  —{rel_label(e.get('rel', ''))}→  {name(e['to'])}"
+                             + (f" · {one_liner(e['why'], 60)}" if e.get("why") else ""))
+        lines.append(tr("Esc: back to the graph"))
+        self.sel_link = None
+        self.cv.itemconfigure(self.t_link, text="\n".join(lines), state="normal")
+        self.cv.tag_raise(self.t_link)
+        self.update_status()
+
+    def leave_path(self):
+        """Esc in a path view: the neighbourhood of the middle record again."""
+        if self.path:
+            self.recentre(self.center)
+
+    def path_flow(self):
+        """A light runs along every chain, from one end to the other, step by step."""
+        P = self.path
+        if not P or self.clock < P["next"]:
+            return
+        P["next"] = self.clock + 700
+        for path in P["paths"]:
+            step = int(self.clock // 700) % (len(path) + 1)
+            if step < len(path) - 1:
+                self.add_pulse(path[step], path[step + 1], 700)
+
     def toggle_key(self):
         """k: the key of the lines -- what their colour, stroke and taper say."""
         self.show_key = not self.show_key
@@ -16565,6 +16858,71 @@ class GraphView:
 
 
 
+class PathDialog:
+    """f in the graph: the record to reach from the middle one, found by
+    typing a few letters of its name; Enter or a double-click shows the path."""
+
+    def __init__(self, view):
+        self.view = view
+        self.win = win = tk.Toplevel(view.root)
+        win.title(tr("Path to:"))
+        win.configure(bg=PAPER)
+        win.transient(view.root)
+        name = one_liner(label_any(view.idx.get(view.center), view.data), 50) if view.center else ""
+        tk.Label(win, text=tr("How are they related?") + "  " + tr("From") + ": " + name, bg=PAPER,
+                 fg=INK, font=view.f_center).pack(anchor="w", padx=14, pady=(10, 4))
+        self.v_q = tk.StringVar()
+        entry = ttk.Entry(win, textvariable=self.v_q, width=56)
+        entry.pack(fill="x", padx=14)
+        self.box = tk.Listbox(win, height=10, font=view.f_status, bg=PAPER, fg=INK, relief="flat",
+                              highlightthickness=1, highlightbackground=RULE, selectbackground=SELBG,
+                              selectforeground=SELFG, activestyle="none")
+        self.box.pack(fill="both", expand=True, padx=14, pady=10)
+        self.v_q.trace_add("write", lambda *a: self.fill())
+        win.bind("<Return>", lambda e: self.choose())
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.bind("<Down>", lambda e: self.move(1))
+        win.bind("<Up>", lambda e: self.move(-1))
+        self.box.bind("<Double-Button-1>", lambda e: self.choose())
+        self.ids = []
+        self.fill()
+        entry.focus_set()
+
+    def fill(self):
+        q = sort_key(self.v_q.get().strip())[0]
+        data, center = self.view.data, self.view.center
+        hits = []
+        for rid, rec in self.view.idx.items():
+            if rid == center or rid.startswith("__"):
+                continue
+            label = label_any(rec, data)
+            if q and q not in sort_key(label)[0]:
+                continue
+            hits.append((sort_key(label), rid, label))
+        hits.sort()
+        self.ids = [rid for _k, rid, _l in hits[:40]]
+        self.box.delete(0, "end")
+        for _k, _rid, label in hits[:40]:
+            self.box.insert("end", one_liner(label, 70))
+        if self.ids:
+            self.box.selection_set(0)
+
+    def move(self, d):
+        cur = self.box.curselection()
+        i = max(0, min(len(self.ids) - 1, (cur[0] if cur else 0) + d))
+        self.box.selection_clear(0, "end")
+        self.box.selection_set(i)
+        self.box.see(i)
+
+    def choose(self):
+        cur = self.box.curselection()
+        if not self.ids:
+            return
+        rid = self.ids[cur[0] if cur else 0]
+        self.win.destroy()
+        self.view.show_path(rid)
+
+
 class LinkDialog:
     """Shift+drag in the graph: a new link from one record to another -- its
     type (those that fit the two kinds first), reason, source and span. Saved
@@ -16635,7 +16993,7 @@ class LinkDialog:
 
 GRAPH_KEYS = ("click: to the middle (on a line: its links) · double-click / Enter: open on the card · "
               "right-click: spark (in life: flip the cell) · drag: move · Shift+drag: draw a link · "
-              "k: key of the lines · wheel: zoom · "
+              "k: key of the lines · f or Ctrl+click: path to a record · wheel: zoom · "
               "m: glow / life / still · 1-3: depth · l: all names · space: pause · "
               "r: shake · c: copy id · p: replay the logs · Home: back to the start · "
               "F5: reread · Esc: close")
@@ -19124,6 +19482,34 @@ PT = {
         "Semear de novo para recomeçar",
     "r: start again":
         "r: recomeçar",
+    "Path to:":
+        "Caminho até:",
+    "{a} ⇢ {b}":
+        "{a} ⇢ {b}",
+    "Esc: back to the graph":
+        "Esc: voltar ao grafo",
+    "Path":
+        "Caminho",
+    "How are they related?":
+        "Como se ligam?",
+    "From":
+        "De",
+    "To":
+        "Para",
+    "Search a record":
+        "Buscar um registro",
+    "Tap a record in the graph":
+        "Tocar num registro do grafo",
+    "Tap the record to reach.":
+        "Toque no registro a alcançar.",
+    "No chain of links joins them.":
+        "Nenhuma cadeia de ligações os une.",
+    "{k} link(s) apart · {n} chain(s)":
+        "a {k} ligação(ões) · {n} cadeia(s)",
+    "Details":
+        "Detalhes",
+    "Chain {i} of {n}":
+        "Cadeia {i} de {n}",
     "A “{rel}” link does not fit these two records.":
         "Uma ligação “{rel}” não cabe entre estes dois registros.",
     "double-click: open where it comes from, on the card · Esc: close":
