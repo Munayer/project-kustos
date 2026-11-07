@@ -193,7 +193,9 @@ Force pushes are run by the owner, not by Claude.
   so one that only reaches the end does not spill into page turns). A field
   that scrolls inside (Continuous, `ui.max_rows`) does the same; `text_wheel`
   replaces Tk's own Text wheel so a card's field never scrolls by itself, and
-  a `TCombobox` has no wheel at all -- it changed a record's type in passing.
+  a `TCombobox` has no wheel at all -- it changed a record's type in passing
+  (`python tools/dropdown_check.py <folder>` lists, read-only from the logs,
+  every change of a drop-down value, marking those saved alone).
   From Tk 9 (Python 3.13 and later on Windows; the owner runs 3.14 / Tk 9)
   a touchpad comes as `<TouchpadScroll>`, in pixels with dx and dy packed in
   `delta` (`touchpad_deltas`); only a mouse wheel's notches stay
