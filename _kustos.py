@@ -6784,7 +6784,7 @@ async function loadList(more, keep) {
   const offset = more ? S.rows.length : 0;
   const limit = keep ? Math.min(500, Math.max(60, S.rows.length)) : 60;
   let j;
-  try { j = await api("/api/list?" + new URLSearchParams({q: S.q, coll: S.coll, offset, limit})); }
+  try { j = await api("api/list?" + new URLSearchParams({q: S.q, coll: S.coll, offset, limit})); }
   catch (e) { toast(e.message, 4000); return; }
   if (seq !== listSeq) return;            // a later search is on its way
   S.rows = more ? S.rows.concat(j.rows) : j.rows;
@@ -6875,7 +6875,7 @@ async function showRecord(id) {
   document.body.classList.add("open");
   S.sel = id; S.edit = null; S.dirty = false;
   markSel();
-  try { S.rec = await api("/api/record?id=" + encodeURIComponent(id)); }
+  try { S.rec = await api("api/record?id=" + encodeURIComponent(id)); }
   catch (e) {
     S.rec = null;
     $("#rec").innerHTML = head() + `<div class="empty">${esc(e.status === 404 ? T("no such record") : e.message)}</div>`;
@@ -7073,7 +7073,7 @@ async function save(force) {
   S.busy = true;
   $$('[data-act="save"]').forEach(b => { b.disabled = true; });
   try {
-    const j = await api("/api/save", {coll: r.coll, kind: r.kind, id: r.id || null, base: r.base,
+    const j = await api("api/save", {coll: r.coll, kind: r.kind, id: r.id || null, base: r.base,
                                       opened: r.opened || "", form: S.edit, force: !!force});
     S.dirty = false; S.edit = null; S.rec = j.record; S.sel = j.record.id;
     history.replaceState(null, "", "#r/" + encodeURIComponent(j.record.id));
@@ -7117,7 +7117,7 @@ async function del() {
   if (n) msg += "\n\n" + T("{n} link(s) involving this record go too.", {n});
   msg += "\n\n" + T("The log keeps the previous version (Base › History).");
   if (!confirm(msg)) return;
-  try { await api("/api/delete", {id: r.id}); }
+  try { await api("api/delete", {id: r.id}); }
   catch (e) { toast(e.message, 4000); return; }
   S.dirty = false; S.edit = null;
   toast(T("Deleted. The previous version is in the log."));
@@ -7134,8 +7134,8 @@ function newSheet() {
       `<span class="dot c-${c}"></span>${esc(BOOT.kinds[k])}</button>`).join("") + `</div>`);
 }
 function menuSheet() {
-  openSheet(`<div class="grid"><a class="btn" href="/health" target="_blank" rel="noopener">${esc(T("Health report"))}</a>` +
-    `<a class="btn" href="/corpus" target="_blank" rel="noopener">${esc(T("Body map"))}</a></div>`);
+  openSheet(`<div class="grid"><a class="btn" href="health" target="_blank" rel="noopener">${esc(T("Health report"))}</a>` +
+    `<a class="btn" href="corpus" target="_blank" rel="noopener">${esc(T("Body map"))}</a></div>`);
 }
 
 /* ---------------------------------------------------------------- events */
@@ -7223,7 +7223,7 @@ $("#menuBtn").setAttribute("aria-label", T("More"));
 renderTabs();
 loadList(false);
 route();
-setInterval(() => { api("/api/ping").catch(() => {}); }, 20000);
+setInterval(() => { api("api/ping").catch(() => {}); }, 20000);
 </script>
 </body>
 </html>
