@@ -42,6 +42,9 @@ USAGE
     python _kustos.py graph [id]      the links as a living graph (read-only)
     python _kustos.py timeline [id]   everything dated, on one line of time (read-only)
     python _kustos.py peritia         the skills panel, in the browser (on 127.0.0.1)
+    python _kustos.py web [--stay] [--port N] [--no-open]
+                                      the whole base in the browser, for a phone or a
+                                      desk (on 127.0.0.1; stops when the page closes)
     python _kustos.py doctor          check the structure, change nothing
     python _kustos.py real-dates [apply [order]]
                                       log entries whose text starts with a date:
@@ -3005,6 +3008,121 @@ def cmd_mirror():
 
 
 # ================================================================ search
+#
+# The search operators, shared by the window's list and the web page:
+#      p: v: f: c: d:   limit to a collection (people, verba, sources, corpus,
+#                       drafts)
+#      ^text            only the start of the name
+#      tag:x lang:de type:book sys:renal dom:law id:c_measure
+# The rest are literal terms, all required, looked up in each record's search
+# text (`_h`, made by the haystack_* functions). type: and sys: match the
+# stored key or its label in the current language.
+
+SEARCH_SCOPES = {"p:": "people", "v:": "entries", "f:": "sources",
+                 "c:": "corpus", "d:": "notes"}
+SEARCH_FIELDS = ("tag", "lang", "type", "sys", "dom", "id")
+
+
+def parse_search(text):
+    """Search text -> (scope, prefix, fields, terms)."""
+    scope, prefix, fields, terms = None, None, {}, []
+    for tok in (text or "").strip().lower().split():
+        if tok in SEARCH_SCOPES:
+            scope = SEARCH_SCOPES[tok]
+        elif tok.startswith("^") and len(tok) > 1:
+            prefix = tok[1:]
+        elif ":" in tok and tok.split(":", 1)[0] in SEARCH_FIELDS and tok.split(":", 1)[1]:
+            k, v = tok.split(":", 1)
+            fields[k] = v
+        else:
+            terms.append(tok)
+    return scope, prefix, fields, terms
+
+
+def search_field_ok(r, fields):
+    for k, v in fields.items():
+        if k == "tag" and not any(v in t.lower() for t in r.get("tags", [])):
+            return False
+        if k == "lang" and (r.get("lang") or "").lower() != v:
+            return False
+        if k == "type" and not any(v in x.lower() for x in
+                                   ((r.get("type") or ""), type_label(r.get("type")))):
+            return False
+        if k == "sys" and not any(v in x.lower() for x in
+                                  ((r.get("system") or ""), system_label(r.get("system")))):
+            return False
+        if k == "dom" and not any(v in d.lower() for d in r.get("domains", [])):
+            return False
+        if k == "id" and not r.get("id", "").lower().startswith(v):
+            return False
+    return True
+
+
+def search_base(data, text):
+    """What the search text alone finds, per collection: {coll: [records]}.
+    The records must carry their search text in `_h`."""
+    qscope, prefix, fields, terms = parse_search(text)
+
+    def ok(r):
+        if terms and not all(t in r.get("_h", "") for t in terms):
+            return False
+        if prefix and not sort_key(r.get("name", ""))[0].startswith(sort_key(prefix)[0]):
+            return False
+        return search_field_ok(r, fields) if fields else True
+
+    return {c: ([r for r in data[c] if ok(r)] if qscope in (None, c) else [])
+            for c in COLLS}
+
+
+def list_row_text(r, data, due=None):
+    """(title, subtitle) of a record in a list. `due`, a day, puts the tasks
+    due that day first (the window's calendar filter)."""
+    coll = coll_of(r.get("id", ""))
+    if coll == "notes":
+        body = r.get("_body") or ""
+        first = next((l.strip(" #>-*") for l in body.splitlines() if l.strip(" #>-*")), "")
+        return r["name"], " · ".join(x for x in (", ".join(r.get("tags", [])), first) if x)
+    if coll == "entries":
+        sub = tr(r["kind"]) + " · " + (r.get("gloss") or "")
+        return label_of(r), sub
+    if coll == "sources":
+        au = author_names(r, data)
+        sub = type_label(r.get("type") or "outro") + " · " + ", ".join(
+            a.split(",")[0] for a in au[:2]) + (f" · {year_of_source(r)}"
+                                                if year_of_source(r) else "")
+        return r.get("name") or r.get("raw", ""), sub
+    if coll == "corpus":
+        t = htype(r)
+        if t == "measure":
+            lr = last_reading(r)
+            sub = system_label(r.get("system") or "") + (
+                f" · {lr['date']} = {lr['value']} {r.get('unit', '')}" if lr
+                else " · " + tr("no readings"))
+            if lr and out_of_range(r, lr):
+                sub += "  (!)"
+        else:
+            sub = tr(HEALTH_TYPE_LABEL[t]) + " · " + " · ".join(health_facts(r, data))
+        return r["name"], sub
+    p = r
+    live = open_tasks(p)
+    dated = sorted(dated_tasks(p), key=lambda t: due_label(t))
+    if due:
+        live = [t for t in dated if t["due"] == due] or live
+    elif dated:
+        live = dated + [t for t in live if t not in dated]
+    if live:
+        when = due_label(live[0])
+        sub = "[{}] {}".format(MARK_OF.get(live[0].get("state"), " "),
+                               live[0].get("text", ""))
+        if when:
+            sub = when + "  " + sub
+        if len(live) > 1:
+            sub += f"  (+{len(live) - 1})"
+    else:
+        plain = [t for t in p.get("tags", []) if ":" not in t]
+        sub = " · ".join(plain) or one_liner(p.get("notes_raw", ""), 70)
+    return p["name"], sub
+
 
 def cmd_search(query):
     data = load_json()
@@ -3532,6 +3650,11 @@ def corpus_payload(data):
 
 
 def write_corpus_html(data):
+    CORPUS_HTML_FILE.write_text(corpus_page(data), encoding="utf-8")
+
+
+def corpus_page(data):
+    """The body map page, as HTML text."""
     payload = json.dumps({"systems": corpus_payload(data), "built": TODAY(),
                           "summary": summary(data)}, ensure_ascii=False)
     html = CORPUS_HTML.replace("/*__DATA__*/null", payload)
@@ -3540,8 +3663,7 @@ def write_corpus_html(data):
         ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
         if LANG == "pt" else
         ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]))
-    html = re.sub(r"@@(.+?)@@", lambda m: tr(m.group(1)), html)
-    CORPUS_HTML_FILE.write_text(html, encoding="utf-8")
+    return re.sub(r"@@(.+?)@@", lambda m: tr(m.group(1)), html)
 
 
 def cmd_corpus(open_it=True):
@@ -5671,6 +5793,1437 @@ if (LIVE) {
   adopt(BOOT.data); render(); setStatus();
 }
 if (location.hash === '#fundamentos') showView('fund');
+</script>
+</body>
+</html>
+"""
+
+
+# ================================================================ web
+#
+# The web version: the whole base in a browser page, laid out for a phone as
+# much as for a desk. `python _kustos.py web` serves it as Peritia is served:
+# on 127.0.0.1 only, with a token written into the page that every call to
+# /api/ must carry, and the Host header checked, so that no other page or site
+# can reach the base through it. It stops WEB_IDLE seconds after the page is
+# closed (the page pings while it is open); `--stay` keeps it up.
+#
+# The page edits the same text the window's cards hold -- a LOG line, a task
+# line, a link line ("rel target — reason") -- and the server reads it back
+# with the same parsers (parse_log, parse_tasks, parse_edges...) and saves it
+# with save_record, so a record saved here is saved as the window saves it:
+# the register, the log, the mirror. A record that changed on disk since the
+# page read it is not overwritten without asking: the answer is 409.
+
+WEB_IDLE = 120              # seconds without a request before the server stops
+WEB_ROWS = 60               # rows of the list sent at a time
+WEB_KINDS = ("person", "concept", "form", "source",
+             "measure", "medication", "activity", "event", "note")
+# what each kind of record is called on the page
+WEB_KIND_LABEL = {"person": "person", "concept": "concept", "form": "form",
+                  "source": "source", "measure": "measurement", "medication": "medication",
+                  "activity": "activity or habit", "event": "event", "note": "draft"}
+# the strings the page's script shows, translated when the page is built
+WEB_STRINGS = (
+    "People", "Verba", "Sources", "Corpus", "Drafts", "All",
+    "Search", "New", "Edit", "Save", "Cancel", "Delete", "Back", "More",
+    "Saved.", "Deleted. The previous version is in the log.", "Nothing found.",
+    "Discard the changes made here?", 'Delete "{label}"?',
+    "{n} link(s) involving this record go too.",
+    "The log keeps the previous version (Base › History).",
+    "Save yours over it?", "Kustos is not answering. Start it again: python _kustos.py web",
+    "registered {stamp}", "not registered", "updated {date}",
+    "Links", "Cited by", "Citation (ABNT)", "Copy", "Copied.",
+    "Add to the log", "Add a reading", "Add a session", "Add",
+    "Done: it went to the log.", "Health report", "Body map",
+    "Choose what to create", "show all {n}",
+    "Nothing open. Choose a record from the list.",
+    "{n} of {total}", "register order, newest first", "index, alphabetical",
+    "in range", "near the limit", "out", "no reference",
+    "file", "(the file is made on saving)", "no such record",
+)
+
+
+class WebConflict(Exception):
+    """The record changed (or went) on disk after the page read it."""
+
+
+def web_kind(rec):
+    """Which card the page shows for a record (one of WEB_KINDS)."""
+    coll = coll_of(rec.get("id", ""))
+    if coll == "entries":
+        return rec.get("kind", "concept") if rec.get("kind") in KINDS else "concept"
+    if coll == "corpus":
+        return htype(rec)
+    return {"people": "person", "sources": "source", "notes": "note"}[coll]
+
+
+def web_fields():
+    """The fields of each card on the page, in order: {coll: [field]}. A field
+    is {k, label, w, opts, only, hint}: w is line | text | md | choice | circles;
+    `only` lists the kinds (form, measure...) the field belongs to. Source
+    fields are shown by type, from SOURCE_FIELDS, as in the window."""
+    def f(k, label, w="line", hint="", opts=None, only=None):
+        out = {"k": k, "label": tr(label), "w": w}
+        if hint:
+            out["hint"] = tr(hint)
+        if opts is not None:
+            out["opts"] = opts
+        if only:
+            out["only"] = list(only)
+        return out
+
+    tags = f("tags", "TAGS", hint="separated by commas")
+    source = f("source", "SOURCE", hint="s_… of a source, or free text")
+    links = f("links", "URLS", "text", hint="one per line")
+    edges = f("edges", "LINKS  (rel  target  [span]  — reason  # source)", "text",
+              hint="one per line, e.g.  cites s_…  — why")
+    return {
+        "people": [
+            f("name", "NAME"),
+            f("aliases", "ALSO KNOWN AS", "text", hint="one per line;  lang: name"),
+            f("place", "DOMICILIUM"),
+            f("born", "BORN  (2024-03-11, 1890, s. XVI)"), f("died", "DIED"),
+            f("circles", "CIRCLES", "circles", opts=[[c, tr(c)] for c in CIRCLES]),
+            tags, source,
+            f("tasks", "TASKS", "text", hint="one per line:  [ ] what  ~2026-09-10"),
+            f("interactions", "LOG", "text", hint="one per line:  2026-08-01   what happened"),
+            f("notes_raw", "NOTES", "md"),
+            links,
+        ],
+        "entries": [
+            f("name", "NAME"),
+            f("lang", "LANGUAGE", only=["form"]),
+            f("roman", "ROMANIZATION", only=["form"]),
+            f("attested", "ATTESTED", only=["form"]),
+            f("status", "STATUS", "choice", only=["form"],
+              opts=[["attested", tr("attested")], ["reconstructed", tr("reconstructed")]]),
+            f("gloss", "GLOSS", "text"),
+            f("domains", "DOMAINS", hint="separated by commas"),
+            tags, source, f("notes", "NOTES", "md"), edges, links,
+        ],
+        "sources": [
+            f("type", "TYPE", "choice", opts=[[t, type_label(t)] for t in SOURCE_TYPES]),
+            f("name", "TITLE"),
+        ] + [f(k, SOURCE_FIELD_LABEL[k], "text" if k in ("authors", "extra") else "line")
+             for k in SOURCE_FIELDS["*"]] + [
+            tags, f("notes", "NOTES", "md"), edges, links,
+        ],
+        "corpus": [
+            f("ctype", "TYPE", "choice",
+              opts=[[t, tr(HEALTH_TYPE_LABEL[t])] for t in HEALTH_TYPES]),
+            f("name", "NAME"),
+            f("system", "SYSTEM", "choice",
+              opts=[["", ""]] + [[s, system_label(s)] for s in SYSTEMS]),
+            f("unit", "UNIT", only=["measure"]),
+            f("ref_low", "REF. MIN.", only=["measure"]),
+            f("ref_high", "REF. MAX.", only=["measure"]),
+            f("readings", "READINGS  (one per line:  2026-09-01 [10:30]  value  note)", "text",
+              only=["measure"]),
+            f("dose", "DOSE", only=["medication"]),
+            f("frequency", "FREQUENCY", only=["medication"]),
+            f("start", "SINCE", only=["medication"]),
+            f("end", "UNTIL", only=["medication"]),
+            f("purpose", "FOR", only=["medication"]),
+            f("prescriber", "PRESCRIBED BY  (a person's p_…, or a name)", only=["medication"]),
+            f("target", "AIM  (e.g. 3 times a week)", only=["activity"]),
+            f("sessions", "SESSIONS  (one per line:  2026-10-15  60 min  note)", "text",
+              only=["activity"]),
+            f("etype", "KIND", "choice", only=["event"],
+              opts=[["", ""]] + [[k, tr(k)] for k in EVENT_KINDS]),
+            f("date", "DATE", only=["event"]),
+            f("doctor", "WITH  (a person's p_…, or a name)", only=["event"]),
+            f("place", "PLACE", only=["event"]),
+            source, tags, f("notes", "NOTES", "md"), edges, links,
+        ],
+        "notes": [
+            f("name", "TITLE"),
+            tags,
+            f("when", "DATE OR PERIOD  (2024-03-11, 1609, 1618/1648 — for the timeline)"),
+            f("body", "TEXT  (markdown)", "md"),
+            edges,
+        ],
+    }
+
+
+def web_form(rec, data):
+    """The text of each field of a record, as the window's card shows it."""
+    coll = coll_of(rec["id"])
+    lines = "\n".join
+    out = {"name": rec.get("name", ""), "tags": ", ".join(rec.get("tags", [])),
+           "links": lines(rec.get("links", []))}
+    if coll != "people":            # a person's card has no links of its own
+        text = format_edges(edges_from(data, rec["id"]))
+        if rec.get("edge_drafts"):
+            text = lines(filter(None, [text] + list(rec["edge_drafts"])))
+        out["edges"] = text
+    if coll == "people":
+        out.update(aliases=format_aliases(rec.get("aliases")), place=rec.get("place", ""),
+                   born=rec.get("born", ""), died=rec.get("died", ""),
+                   circles=list(rec.get("circles", [])), source=rec.get("source", ""),
+                   tasks=format_tasks(rec.get("tasks")),
+                   interactions=format_log(rec.get("interactions")),
+                   notes_raw=rec.get("notes_raw", ""))
+    elif coll == "entries":
+        out.update(gloss=rec.get("gloss", ""), domains=", ".join(rec.get("domains", [])),
+                   source=rec.get("source", ""), notes=rec.get("notes", ""),
+                   lang=rec.get("lang", ""), roman=rec.get("roman", ""),
+                   attested=rec.get("attested", ""), status=rec.get("status") or "attested")
+    elif coll == "sources":
+        out["type"] = rec.get("type") or "outro"
+        for k in SOURCE_FIELDS["*"]:
+            v = rec.get(k, "")
+            out[k] = lines(v) if isinstance(v, list) else (v or "")
+        out["notes"] = rec.get("notes", "")
+    elif coll == "corpus":
+        out.update(ctype=htype(rec), system=rec.get("system", ""), source=rec.get("source", ""),
+                   notes=rec.get("notes", ""), readings=format_readings(rec.get("readings")),
+                   sessions=format_log(rec.get("sessions")), etype=rec.get("etype", ""))
+        for k in ("unit", "ref_low", "ref_high", "dose", "frequency", "start", "end",
+                  "purpose", "prescriber", "target", "date", "doctor", "place"):
+            out[k] = str(rec.get(k, "") or "")
+    else:
+        got = read_note_file(note_path(rec)) if rec.get("file") else None
+        meta = got[1] if got else {}
+        when = meta.get("period") or meta.get("date") or ""
+        out["when"] = when if isinstance(when, str) else ""
+        out["body"] = got[2] if got else ""
+    return out
+
+
+def web_blank(coll, kind):
+    """A new record of a collection, before it has a name or an id."""
+    if coll == "people":
+        rec = fix_person(blank_person())
+    elif coll == "entries":
+        rec = fix_entry({"kind": kind if kind in KINDS else "concept"})
+    elif coll == "sources":
+        rec = fix_source({})
+    elif coll == "corpus":
+        rec = fix_metric({"ctype": kind if kind in HEALTH_TYPES else "measure"})
+    else:
+        rec = fix_note({"file": ""})
+    rec["id"] = ""
+    rec.pop("updated", None)
+    return rec
+
+
+def web_gather(coll, old, form):
+    """A record from the page's form, over the record as it is on disk (or a
+    blank one): what each card's gather does in the window. A field the form
+    does not carry keeps its value."""
+    out = {k: v for k, v in old.items() if not k.startswith("_")}
+
+    def has(k):
+        return isinstance(form.get(k), str)
+
+    def text(k):
+        return form[k] if has(k) else ""
+
+    def put(k, value):
+        if has(k):
+            out[k] = value
+
+    def words(k):
+        return [t.strip() for t in text(k).split(",") if t.strip()]
+
+    def rows(k):
+        return [l.strip() for l in text(k).splitlines() if l.strip()]
+
+    put("name", text("name").strip())
+    put("tags", words("tags"))
+    put("links", rows("links"))
+    if coll == "people":
+        put("notes_raw", text("notes_raw"))
+        for k in ("place", "born", "died", "source"):
+            put(k, text(k).strip())
+        put("aliases", parse_aliases(text("aliases")))
+        put("interactions", parse_log(text("interactions")))
+        put("tasks", parse_tasks(text("tasks")))
+        if isinstance(form.get("circles"), list):
+            out["circles"] = parse_circles(form["circles"])
+        out["followup"] = None
+        out["met"] = old.get("met")
+    elif coll == "entries":
+        for k in ("gloss", "notes", "source"):
+            put(k, text(k).strip())
+        put("domains", words("domains"))
+        if out.get("kind") == "form":
+            for k in ("lang", "roman", "attested"):
+                put(k, text(k).strip())
+            if has("status"):
+                out["status"] = text("status") if text("status") in ("attested",
+                                                                      "reconstructed") \
+                    else "attested"
+    elif coll == "sources":
+        if has("type"):
+            out["type"] = type_key(text("type")) or "outro"
+        for k in SOURCE_FIELDS["*"]:
+            put(k, rows(k) if k in ("authors", "extra") else text(k).strip())
+        put("notes", text("notes").strip())
+    elif coll == "corpus":
+        if text("ctype") in HEALTH_TYPES:
+            out["ctype"] = text("ctype")
+        put("system", system_key(text("system")))
+        for k in ("unit", "source", "dose", "frequency", "start", "end", "purpose",
+                  "prescriber", "target", "date", "doctor", "place"):
+            put(k, text(k).strip())
+        for k in ("ref_low", "ref_high"):
+            put(k, text(k).strip().replace(",", "."))
+        put("notes", text("notes").strip())
+        put("readings", parse_readings(text("readings")))
+        put("sessions", parse_log(text("sessions")))
+        if has("etype"):
+            out["etype"] = text("etype") if text("etype") in EVENT_KINDS else ""
+    else:
+        if has("name"):
+            out["name"] = " ".join(text("name").split())
+        if has("tags"):
+            out["tags"] = [t.strip().lstrip("#") for t in text("tags").split(",")
+                           if t.strip().lstrip("#")]
+    return out
+
+
+def web_links(form, rid, rec):
+    """The links typed in the form: (links, lines not understood). The
+    unreadable lines are kept on the record as `edge_drafts`, as the window does."""
+    links = parse_edges(form.get("edges") if isinstance(form.get("edges"), str) else "", rid)
+    unparsed = [a["to"] for a in links if a.get("_bad")]
+    if unparsed:
+        rec["edge_drafts"] = unparsed
+    else:
+        rec.pop("edge_drafts", None)
+    return [a for a in links if not a.get("_bad")], unparsed
+
+
+def web_save(body):
+    """One record from the page: (vault, id, message). `base` is the stamp the
+    page read the record with; another stamp on disk is a WebConflict unless
+    `force`. A draft also checks its file, which Obsidian may have changed."""
+    coll = body.get("coll")
+    if coll not in COLLS:
+        raise ValueError(tr("Not found."))
+    form = body.get("form")
+    if not isinstance(form, dict):
+        raise ValueError(tr("The request could not be read."))
+    rid = str(body.get("id") or "")
+    force = body.get("force") is True
+    data = load_json()
+    old = next((r for r in data[coll] if r.get("id") == rid), None) if rid else None
+    if rid and old is None:
+        raise WebConflict(tr("This record no longer exists."))
+    if old is not None and not force and stamp_of(old) != (body.get("base") or ""):
+        raise WebConflict(tr("This record changed on disk since it was opened "
+                             "(in the window, or on another machine)."))
+    fresh = old is None
+    out = web_gather(coll, old or web_blank(coll, body.get("kind")), form)
+    if not out.get("name"):
+        raise ValueError(tr({"people": "A person needs a name.",
+                             "entries": "An entry needs a name.",
+                             "sources": "A source needs a name.",
+                             "corpus": "A measurement needs a name.",
+                             "notes": "A draft needs a title."}[coll]))
+    taken = set(by_id(data))
+    message = ""
+    if coll == "people":
+        filed = fold_finished_tasks(out)
+        if filed:
+            message = tr("{n} finished task(s) went to the log.", n=filed)
+        if fresh:
+            out["met"] = out.get("met") or TODAY()
+            out["id"] = make_id(out["name"], taken)
+        touch(out)
+        data = save_record("people", out)
+    elif coll == "notes":
+        text = form.get("body") if isinstance(form.get("body"), str) else None
+        when = " ".join(form["when"].split()) if isinstance(form.get("when"), str) else _KEEP
+        if fresh:
+            out["id"] = new_note_id(taken)
+            text = text or ""
+        elif not force and str(note_mtime(out) or "") != str(body.get("opened") or ""):
+            raise WebConflict(tr('"{file}" changed outside Kustos since it was opened '
+                                 '(in Obsidian?).', file=out.get("file", "")))
+        before = "" if fresh else note_body(out)
+        if text is None:
+            text = before
+        place_note(out)
+        links, unparsed = web_links(form, out["id"], out)
+        touch(out)
+        data = save_record("notes", out, edges=links)
+        write_note_file(by_id(data)[out["id"]], text, when)
+        if text != before:
+            log_append("text", "notes", {"id": out["id"], "text": text})
+        save_note_cache()
+        if unparsed:
+            message = tr("{n} link line(s) not understood were kept as drafts.", n=len(unparsed))
+    else:
+        if fresh:
+            if coll == "entries":
+                out["id"] = new_id(out.get("kind", "concept"), out["name"], taken)
+            elif coll == "sources":
+                out["id"] = new_source_id(out, taken)
+            else:
+                out["id"] = new_metric_id(out, taken)
+        links, unparsed = web_links(form, out["id"], out)
+        touch(out)
+        data = save_record(coll, out, edges=links)
+        if unparsed:
+            message = tr("{n} link line(s) not understood were kept as drafts.", n=len(unparsed))
+    return data, out["id"], message
+
+
+def web_delete(body):
+    """Deletes one record, as the window does: tombstone, log, and a draft's
+    file goes to notes/.deleted."""
+    rid = str(body.get("id") or "")
+    data = load_json()
+    rec = by_id(data).get(rid)
+    if rec is None:
+        raise WebConflict(tr("This record no longer exists."))
+    coll = coll_of(rid)
+    data, _ = delete_record(coll, rid, rec.get("name", ""))
+    if coll == "notes":
+        retire_note_file(rec)
+    return data
+
+
+_WEB_HAY = {}       # (id, stamp, file stamp) -> search text, kept between calls
+
+
+def web_prepare(data):
+    """Gives every record its search text (`_h`) and every draft its text
+    (`_body`), working out only what changed since the last call, as the
+    window's reload does."""
+    global _WEB_HAY
+    cache, seen = note_cache(), {}
+    for n in data["notes"]:
+        n["_body"] = note_body(n)
+        key = str(note_path(n)) if n.get("file") else ""
+        seen[n["id"]] = tuple(cache[key][0]) if key in cache else None
+    save_note_cache()
+    makers = (("people", haystack_person),
+              ("entries", lambda r: haystack_entry(r, data)),
+              ("sources", lambda r: haystack_source(r, data)),
+              ("corpus", lambda r: haystack_metric(r, data)),
+              ("notes", haystack_note))
+    fresh = {}
+    for coll, make in makers:
+        for r in data[coll]:
+            key = (r["id"], stamp_of(r), seen.get(r["id"]) if coll == "notes" else None)
+            h = _WEB_HAY.get(key)
+            if h is None:
+                h = make(r)
+            r["_h"] = fresh[key] = h
+    _WEB_HAY = fresh
+
+
+def web_list(data, q, coll, offset=0, limit=WEB_ROWS):
+    """A page of the list. Without a search or a collection it is the register,
+    newest first; otherwise the index, alphabetical, as in the window. The
+    counts are what the search alone finds in each collection."""
+    web_prepare(data)
+    base = search_base(data, q)
+    scope = parse_search(q)[0] or (coll if coll in COLLS else None)
+    filtered = bool((q or "").strip()) or scope is not None
+    if filtered:
+        rows = [r for c in COLLS if scope in (None, c) for r in base[c]]
+        rows.sort(key=lambda r: sort_key(label_any(r, data) if coll_of(r["id"]) == "sources"
+                                         else r.get("name", "")))
+    else:
+        rows = [r for c in COLLS for r in data[c]]
+        rows.sort(key=lambda r: -(r.get("reg_n") or 0))
+    out = []
+    for r in rows[offset:offset + limit]:
+        title, sub = list_row_text(r, data)
+        lr = last_reading(r) if coll_of(r["id"]) == "corpus" else None
+        out.append({"id": r["id"], "coll": coll_of(r["id"]), "kind": web_kind(r),
+                    "title": one_liner(title, 90), "sub": one_liner(sub, 140),
+                    "n": r.get("reg_n") or 0, "warn": bool(lr and out_of_range(r, lr))})
+    return {"counts": {c: len(base[c]) for c in COLLS}, "total": len(rows),
+            "offset": offset, "rows": out, "order": "index" if filtered else "register"}
+
+
+def web_md(text):
+    """Markdown as HTML for the page: md_to_html escapes the text; links keep
+    only web and mail addresses."""
+    def link(m):
+        href = m.group(1) if re.match(r"(https?:|mailto:)", m.group(1), re.I) else "#"
+        return f'<a target="_blank" rel="noopener noreferrer" href="{href}"'
+    return re.sub(r'<a href="([^"]*)"', link, md_to_html(text or ""))
+
+
+def web_record(data, rid):
+    """Everything the page shows of one record, or None."""
+    idx = by_id(data)
+    rec = idx.get(rid)
+    if rec is None:
+        return None
+    coll, kind = coll_of(rid), web_kind(rec)
+
+    def end(other):
+        o = idx.get(other)
+        return {"id": other, "coll": coll_of(other) if o else "",
+                "title": label_any(o, data) if o else other, "missing": o is None}
+
+    out = {"id": rid, "coll": coll, "kind": kind, "kind_label": tr(WEB_KIND_LABEL[kind]),
+           "title": label_any(rec, data), "base": stamp_of(rec),
+           "n": rec.get("reg_n") or 0,
+           "reg": stamp_label(rec.get("reg")) if rec.get("reg") else "",
+           "updated": rec.get("updated") or "", "form": web_form(rec, data),
+           "out": [dict(end(a["to"]), rel=rel_label(a.get("rel", "")),
+                        why=a.get("why", ""), when=a.get("when", ""))
+                   for a in edges_from(data, rid)],
+           "in": [dict(end(a["from"]), rel=rel_label(a.get("rel", "")))
+                  for a in edges_to(data, rid)],
+           "html": {}}
+    for k in ("notes_raw", "notes", "body"):
+        if out["form"].get(k):
+            out["html"][k] = web_md(out["form"][k])
+    src = (rec.get("source") or "").strip()
+    if src:
+        s, label = resolve_source(src, data)
+        out["source"] = {"id": s["id"] if s else "", "title": label}
+    if coll == "people":
+        out["tasks"] = rec.get("tasks", [])
+        out["log"] = rec.get("interactions", [])
+    elif coll == "sources":
+        try:
+            out["cite"] = cite(rec, "abnt", data)
+        except Exception:           # a citation must never keep the record from opening
+            out["cite"] = ""
+    elif coll == "corpus":
+        out["facts"] = health_facts(rec, data)
+        out["readings"] = [dict(r, status=reading_status(rec, r.get("value")))
+                           for r in rec.get("readings", [])]
+        out["sessions"] = rec.get("sessions", [])
+    elif coll == "notes":
+        out["opened"] = str(note_mtime(rec) or "")
+        out["file"] = rec.get("file", "")
+    return out
+
+
+def web_boot(token):
+    """What the page needs before its first call."""
+    return {"token": token, "lang": LANG, "today": TODAY(), "fields": web_fields(),
+            "sfields": SOURCE_FIELDS,
+            "colls": [[c, tr(x)] for c, x in zip(COLLS, ("People", "Verba", "Sources",
+                                                         "Corpus", "Drafts"))],
+            "kinds": {k: tr(WEB_KIND_LABEL[k]) for k in WEB_KINDS},
+            "new": [["people", "person"], ["entries", "concept"], ["entries", "form"],
+                    ["sources", "source"], ["corpus", "measure"], ["corpus", "medication"],
+                    ["corpus", "activity"], ["corpus", "event"], ["notes", "note"]],
+            "T": {s: tr(s) for s in WEB_STRINGS}}
+
+
+def web_page(boot, data, nonce):
+    """The page, in the interface language and the theme of the window."""
+    pal = THEMES.get((data.get("ui") or {}).get("theme"), THEMES["paper"])
+    mono = '"Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, ui-monospace, monospace'
+    sans = mono if pal["mono_only"] else \
+        'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif'
+    serif = mono if pal["mono_only"] else \
+        'Georgia, "Times New Roman", "Liberation Serif", "DejaVu Serif", serif'
+    css = (f"--paper: {pal['card']}; --wash: {pal['shell']}; --rule: {pal['rule']};\n"
+           f"  --ink: {pal['ink']}; --soft: {pal['soft']}; --faint: {pal['faint']};\n"
+           f"  --accent: {pal['stamp']}; --warn: {pal['oxide']};\n"
+           f"  --selbg: {pal['selbg']}; --selfg: {pal['selfg']};\n"
+           f"  --sans: {sans};\n  --serif: {serif};\n  --mono: {mono};\n"
+           f"  color-scheme: {'dark' if pal['dark'] else 'light'};")
+    html = WEB_HTML.replace("/*__THEME__*/", css)
+    html = html.replace("@@LANG@@", "pt-BR" if LANG == "pt" else "en")
+    html = html.replace("@@NONCE@@", nonce)
+    # the data goes in last; <, > and & are escaped so no text can close the script
+    blob = json.dumps(boot, ensure_ascii=False)
+    blob = blob.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    return html.replace("/*__BOOT__*/null", blob)
+
+
+def web_api(method, path, query, body):
+    """One call from the page: (status, answer). Writes reread the disk first,
+    like every save; a stale stamp gets 409 with the record as it is now."""
+    def arg(k, default=""):
+        return (query.get(k) or [default])[0]
+
+    try:
+        if method == "GET" and path == "/api/ping":
+            return 200, {"ok": True}
+        if method == "GET" and path == "/api/list":
+            try:
+                offset = max(0, int(arg("offset", "0")))
+                limit = max(1, min(500, int(arg("limit", str(WEB_ROWS)))))
+            except ValueError:
+                offset, limit = 0, WEB_ROWS
+            return 200, web_list(load_json(), arg("q"), arg("coll"), offset, limit)
+        if method == "GET" and path == "/api/record":
+            got = web_record(load_json(), arg("id"))
+            return (200, got) if got else (404, {"error": tr("This record no longer exists.")})
+        if method != "POST":
+            return 404, {"error": tr("Not found.")}
+        if path == "/api/save":
+            data, rid, message = web_save(body)
+            return 200, {"record": web_record(data, rid), "message": message, "data": data}
+        if path == "/api/delete":
+            return 200, {"ok": True, "data": web_delete(body)}
+        return 404, {"error": tr("Not found.")}
+    except WebConflict as exc:
+        rid = str(body.get("id") or "") if isinstance(body, dict) else ""
+        return 409, {"error": str(exc), "record": web_record(load_json(), rid) if rid else None}
+    except ValueError as exc:
+        return 400, {"error": str(exc)}
+
+
+def cmd_web(rest=()):
+    """Serves the web version on 127.0.0.1 and opens it; stops by itself when
+    idle, unless --stay. --allow-host NAME accepts another Host header (a
+    proxy in front of it); --port N picks the port."""
+    import secrets
+    import threading
+    import time
+    import webbrowser
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlsplit
+
+    rest = list(rest)
+    port, extra_hosts = 0, set()
+    for i, a in enumerate(rest):
+        if a in ("--port", "--allow-host"):
+            if i + 1 >= len(rest):
+                raise SystemExit(tr("{option} needs a value", option=a))
+            if a == "--port":
+                try:
+                    port = int(rest[i + 1])
+                except ValueError:
+                    raise SystemExit(tr("--port needs a number"))
+            else:
+                extra_hosts.add(rest[i + 1].strip().lower())
+    stay = "--stay" in rest
+    # what the window does on opening: bring the base up to date, take in the
+    # other machine's conflicting copies and the new files of notes/
+    if JSON_FILE.exists() and needs_upgrade(load_json()):
+        cmd_upgrade(quiet=True)
+    absorb_conflicts()
+    try:
+        index_notes()
+    except OSError:
+        pass
+    token = secrets.token_urlsafe(24)
+    guard = threading.Lock()        # one call at a time: they all read and write the base
+    last = [time.monotonic()]
+    hosts = set()
+    mirror = {"timer": None, "blob": None}
+    mirroring = threading.Lock()    # one rebuild at a time
+
+    def rebuild_mirror():
+        with mirroring:
+            blob, mirror["blob"] = mirror["blob"], None
+            if blob is None:
+                return
+            try:
+                snapshot = marshal.loads(blob)
+                write_mirror(snapshot)
+                write_corpus_html(snapshot)
+            except (SystemExit, OSError, ValueError):
+                pass                # the mirror is a readable copy; it never blocks a save
+
+    def mirror_soon(data):
+        """The mirror and the body map, 1.5 s after the last save, in a thread,
+        from a snapshot of the data."""
+        try:
+            mirror["blob"] = marshal.dumps(data)
+        except ValueError:
+            return
+        if mirror["timer"] is not None:
+            mirror["timer"].cancel()
+        mirror["timer"] = threading.Timer(1.5, rebuild_mirror)
+        mirror["timer"].daemon = True
+        mirror["timer"].start()
+
+    class Server(ThreadingHTTPServer):
+        daemon_threads = True
+
+        def handle_error(self, request, client_address):
+            pass                    # under pythonw there is no console to print to
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "Kustos"
+
+        def log_message(self, *args):
+            pass
+
+        def answer(self, code, body, ctype="application/json; charset=utf-8", csp=None):
+            raw = (body if isinstance(body, str)
+                   else json.dumps(body, ensure_ascii=False)).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            if csp:
+                self.send_header("Content-Security-Policy", csp)
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            self.route("GET")
+
+        def do_POST(self):
+            self.route("POST")
+
+        def route(self, method):
+            last[0] = time.monotonic()
+            if self.headers.get("Host", "").lower() not in hosts:
+                return self.answer(403, {"error": tr("Not found.")})
+            url = urlsplit(self.path)
+            if method == "GET" and url.path in ("/", "/index.html"):
+                nonce = secrets.token_urlsafe(16)
+                with guard:
+                    page = web_page(web_boot(token), load_json(), nonce)
+                return self.answer(200, page, "text/html; charset=utf-8",
+                                   f"default-src 'none'; script-src 'nonce-{nonce}'; "
+                                   "style-src 'unsafe-inline'; img-src 'self' data:; "
+                                   "connect-src 'self'; base-uri 'none'; form-action 'none'")
+            if method == "GET" and url.path in ("/health", "/corpus"):
+                with guard:
+                    data = load_json()
+                    page = health_report(data) if url.path == "/health" else corpus_page(data)
+                return self.answer(200, page, "text/html; charset=utf-8")
+            if not url.path.startswith("/api/"):
+                return self.answer(404, {"error": tr("Not found.")})
+            sent = (self.headers.get("X-Kustos-Token") or "").encode("latin-1", "replace")
+            if not secrets.compare_digest(sent, token.encode("ascii")):
+                return self.answer(403, {"error": tr("This page is not the one Kustos opened: "
+                                                      "open it again from Kustos.")})
+            body = {}
+            if method == "POST":
+                if not (self.headers.get("Content-Type") or "").startswith("application/json"):
+                    return self.answer(415, {"error": tr("The request could not be read.")})
+                try:
+                    size = int(self.headers.get("Content-Length") or 0)
+                    if size > 16 * 1024 * 1024:
+                        return self.answer(413, {"error": tr("The request could not be read.")})
+                    body = json.loads(self.rfile.read(size) or b"{}")
+                except ValueError:
+                    return self.answer(400, {"error": tr("The request could not be read.")})
+                if not isinstance(body, dict):
+                    return self.answer(400, {"error": tr("The request could not be read.")})
+            try:
+                with guard:
+                    code, out = web_api(method, url.path, parse_qs(url.query), body)
+                    data = out.pop("data", None) if isinstance(out, dict) else None
+                    if data is not None:
+                        mirror_soon(data)
+            except SystemExit as exc:          # the base could not be read
+                code, out = 500, {"error": str(exc)}
+            except Exception as exc:
+                code, out = 500, {"error": f"{type(exc).__name__}: {exc}"}
+            self.answer(code, out)
+
+    server = Server(("127.0.0.1", port), Handler)
+    port = server.server_address[1]
+    hosts.update({f"127.0.0.1:{port}", f"localhost:{port}"} | extra_hosts)
+    url = f"http://127.0.0.1:{port}/"
+
+    def watch():
+        """Stops the server when idle. Once a minute, takes in what Syncthing
+        brought while it runs -- conflicting copies, new files in notes/ --
+        as the window does on opening (this may run for days)."""
+        checked = time.monotonic()
+        while stay or time.monotonic() - last[0] <= WEB_IDLE:
+            time.sleep(5)
+            if time.monotonic() - checked >= 60:
+                checked = time.monotonic()
+                with guard:
+                    try:
+                        merged = absorb_conflicts()
+                        new, moved = index_notes()
+                        if merged or new or moved:
+                            mirror_soon(load_json())
+                    except (OSError, SystemExit):
+                        pass
+        server.shutdown()
+
+    threading.Thread(target=watch, daemon=True).start()
+    if stay:
+        print(tr("Kustos on the web at {url}: it stays up until stopped (Ctrl+C).", url=url),
+              flush=True)
+    else:
+        print(tr("Kustos on the web at {url}: it stops by itself {n} minute(s) after the page "
+                 "is closed.", url=url, n=max(1, WEB_IDLE // 60)), flush=True)
+    if "--no-open" not in rest:
+        webbrowser.open(url)
+    try:
+        server.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        if mirror["timer"] is not None:
+            mirror["timer"].cancel()
+        rebuild_mirror()            # a save still waiting for its mirror gets it now
+    return 0
+
+
+WEB_HTML = r"""<!doctype html>
+<html lang="@@LANG@@">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Kustos</title>
+<style>
+:root {
+  /*__THEME__*/
+  --radius: 10px;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--wash); color: var(--ink); font: 16px/1.45 var(--sans); }
+button, input, textarea, select { font: inherit; color: inherit; }
+button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+[hidden] { display: none !important; }
+#app { min-height: 100vh; min-height: 100dvh; }
+@media (min-width: 900px) {
+  #app { display: grid; grid-template-columns: minmax(340px, 420px) 1fr; height: 100vh; height: 100dvh; }
+  #listpane { overflow-y: auto; border-right: 1px solid var(--rule); }
+  #recpane { overflow-y: auto; }
+  .back { visibility: hidden; }
+}
+@media (max-width: 899.98px) {
+  body.open #listpane { display: none; }
+  body:not(.open) #recpane { display: none; }
+}
+.top { position: sticky; top: 0; z-index: 3; background: var(--wash);
+  padding: 10px 16px 8px; padding-top: max(10px, env(safe-area-inset-top));
+  border-bottom: 1px solid var(--rule); }
+.bar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.brand { font: 600 13px/1 var(--sans); letter-spacing: .24em; text-transform: uppercase; color: var(--soft); }
+.grow { flex: 1; }
+.icon { min-width: 40px; height: 40px; border-radius: 20px; border: 1px solid var(--rule);
+  background: var(--paper); font-size: 20px; line-height: 1; display: inline-grid;
+  place-items: center; padding: 0 10px; }
+.icon.primary { background: var(--accent); color: var(--paper); border-color: var(--accent); }
+#q { width: 100%; padding: 10px 12px; font-size: 16px; border: 1px solid var(--rule);
+  border-radius: var(--radius); background: var(--paper); -webkit-appearance: none; appearance: none; }
+.tabs { display: flex; gap: 6px; overflow-x: auto; padding: 10px 16px 2px; margin: 0 -16px;
+  scrollbar-width: none; }
+.tabs::-webkit-scrollbar { display: none; }
+a { color: var(--accent); }
+@media (min-width: 900px) { .tabs { flex-wrap: wrap; overflow-x: visible; } }
+.tab { flex: none; border: 1px solid var(--rule); border-radius: 999px; background: transparent;
+  color: var(--soft); padding: 6px 12px; font-size: 14px; }
+.tab[aria-pressed="true"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+.tab .n { font: 12px var(--mono); margin-left: 6px; opacity: .75; }
+.tab.zero { opacity: .45; }
+.listinfo { padding: 8px 16px; font-size: 12px; color: var(--faint); }
+.rows { list-style: none; margin: 0; padding: 0; }
+.row { width: 100%; text-align: left; display: grid; grid-template-columns: auto 1fr auto;
+  column-gap: 10px; row-gap: 2px; align-items: baseline; padding: 12px 16px; border: 0;
+  border-bottom: 1px solid var(--rule); background: var(--paper); }
+.row[aria-current="true"] { background: var(--selbg); color: var(--selfg); }
+.row .t { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .n { font: 12px var(--mono); color: var(--faint); white-space: nowrap; }
+.row .s { grid-column: 2 / 4; font-size: 14px; color: var(--soft); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.row[aria-current="true"] .s, .row[aria-current="true"] .n { color: inherit; opacity: .8; }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; align-self: center; }
+.c-people { background: #3f7d99; } .c-entries { background: #a0783a; }
+.c-sources { background: #6f8a3a; } .c-corpus { background: #b5523b; } .c-notes { background: #7a6aa8; }
+.warn { color: var(--warn); font-weight: 700; }
+.more { padding: 16px; text-align: center; }
+.btn { border: 1px solid var(--rule); background: var(--paper); border-radius: var(--radius);
+  padding: 8px 14px; min-height: 40px; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--paper); font-weight: 600; }
+.btn.danger { color: var(--warn); }
+.btn.quiet { background: transparent; border-color: transparent; color: var(--soft); }
+.btn:disabled { opacity: .5; }
+.rechead { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 6px;
+  padding: 8px 12px; padding-top: max(8px, env(safe-area-inset-top)); background: var(--wash);
+  border-bottom: 1px solid var(--rule); }
+.card { max-width: 760px; margin: 0 auto; padding: 18px 16px 120px; }
+.kicker { font: 12px/1.4 var(--mono); color: var(--faint); letter-spacing: .03em; text-transform: uppercase; }
+h1.title { font: 600 28px/1.15 var(--serif); margin: 6px 0 4px; overflow-wrap: anywhere; }
+.sub { color: var(--soft); }
+.sec { margin-top: 22px; }
+.lbl { display: block; font: 600 11px/1.3 var(--sans); letter-spacing: .14em; text-transform: uppercase;
+  color: var(--faint); margin: 0 0 6px; }
+.val { white-space: pre-wrap; overflow-wrap: anywhere; }
+.facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 16px 20px; margin-top: 22px; }
+.mono { font-family: var(--mono); font-size: 14px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { border: 1px solid var(--rule); border-radius: 999px; padding: 2px 10px; font-size: 13px;
+  color: var(--soft); background: transparent; }
+button.chip:hover { border-color: var(--soft); }
+.md { font: 17px/1.55 var(--serif); overflow-wrap: anywhere; }
+.md h1, .md h2, .md h3, .md h4 { line-height: 1.2; margin: 1em 0 .4em; }
+.md p { margin: .5em 0; } .md ul, .md ol { padding-left: 1.4em; }
+.md pre { background: var(--wash); padding: 10px; overflow: auto; border-radius: 6px; }
+.md code { font: 14px var(--mono); }
+.md blockquote { margin: .5em 0; padding-left: 12px; border-left: 3px solid var(--rule); color: var(--soft); }
+.md a, .md .wl { color: var(--accent); } .md .wl { border-bottom: 1px dotted; cursor: pointer; }
+.log, .tasks, .links { list-style: none; margin: 0; padding: 0; }
+.log li { display: grid; grid-template-columns: 6.6em 1fr; gap: 10px; padding: 6px 0;
+  border-bottom: 1px dashed var(--rule); }
+.log .d { font: 13px/1.6 var(--mono); color: var(--faint); }
+.task { display: flex; gap: 10px; align-items: flex-start; padding: 5px 0; }
+.box { flex: none; width: 26px; height: 26px; border: 1.5px solid var(--soft); border-radius: 7px;
+  background: var(--paper); font: 14px var(--mono); display: grid; place-items: center; padding: 0; }
+.due { font: 12px var(--mono); color: var(--faint); margin-left: 8px; white-space: nowrap; }
+.links li { border-bottom: 1px dashed var(--rule); }
+.go { display: block; width: 100%; text-align: left; border: 0; background: transparent; padding: 8px 0; }
+.go .rel { font: 12px var(--mono); color: var(--faint); margin-right: 8px; }
+.go .why { display: block; font-size: 14px; color: var(--soft); }
+.missing { color: var(--warn); }
+.quick { display: flex; gap: 8px; margin-top: 16px; }
+.quick .f { flex: 1; min-width: 0; }
+.f { width: 100%; padding: 9px 11px; font-size: 16px; border: 1px solid var(--rule); border-radius: 8px;
+  background: var(--paper); }
+textarea.f { display: block; min-height: 3.2em; resize: vertical; line-height: 1.45; }
+textarea.code { font: 15px/1.45 var(--mono); }
+textarea.prose { font: 17px/1.55 var(--serif); min-height: 10em; }
+.field { margin-top: 16px; }
+.hint { font-size: 12px; color: var(--faint); margin-top: 4px; }
+.circles { display: flex; flex-wrap: wrap; gap: 6px; }
+.circles label { display: inline-flex; gap: 6px; align-items: center; border: 1px solid var(--rule);
+  border-radius: 999px; padding: 5px 12px; }
+.cite { font: 15px/1.5 var(--serif); background: var(--wash); padding: 10px 12px; border-radius: 8px;
+  white-space: pre-wrap; overflow-wrap: anywhere; }
+.readings { width: 100%; border-collapse: collapse; font-size: 14px; }
+.readings td { padding: 6px 4px; border-bottom: 1px dashed var(--rule); vertical-align: top; }
+.readings td:first-child { font: 13px var(--mono); color: var(--faint); white-space: nowrap; }
+.readings .v { font: 600 15px var(--mono); white-space: nowrap; }
+.spark { width: 100%; height: 64px; display: block; margin-bottom: 6px; }
+.st-out { color: var(--warn); font-weight: 700; } .st-near { color: var(--soft); font-style: italic; }
+.foot { margin-top: 28px; font: 12px var(--mono); color: var(--faint); }
+.empty { padding: 48px 16px; color: var(--faint); text-align: center; }
+.sheet { position: fixed; inset: 0; z-index: 10; background: rgba(0, 0, 0, .35); display: grid; align-items: end; }
+.panel { background: var(--paper); border-radius: 16px 16px 0 0; padding: 16px;
+  padding-bottom: max(16px, env(safe-area-inset-bottom)); max-width: 560px; width: 100%; margin: 0 auto; }
+@media (min-width: 900px) { .sheet { align-items: center; } .panel { border-radius: 16px; } }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin-top: 10px; }
+.grid .btn { text-align: left; display: flex; gap: 8px; align-items: center; text-decoration: none; color: inherit; }
+#toast { position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom)); transform: translateX(-50%);
+  background: var(--ink); color: var(--paper); padding: 10px 16px; border-radius: 999px; font-size: 14px;
+  opacity: 0; pointer-events: none; transition: opacity .2s; max-width: calc(100% - 32px); z-index: 20; }
+#toast.on { opacity: 1; }
+@media (prefers-reduced-motion: reduce) { #toast { transition: none; } }
+</style>
+</head>
+<body>
+<div id="app">
+  <section id="listpane">
+    <header class="top">
+      <div class="bar">
+        <span class="brand">Kustos</span>
+        <span class="grow"></span>
+        <button class="icon" data-act="menu" id="menuBtn">&#8943;</button>
+        <button class="icon primary" data-act="new" id="newBtn">+</button>
+      </div>
+      <input id="q" type="search" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="search">
+      <nav class="tabs" id="tabs"></nav>
+    </header>
+    <div class="listinfo" id="listinfo"></div>
+    <ul class="rows" id="rows"></ul>
+    <div class="more"><button class="btn" data-act="more" id="moreBtn" hidden></button></div>
+  </section>
+  <section id="recpane"><div id="rec"></div></section>
+</div>
+<div class="sheet" id="sheet" data-act="close" hidden><div class="panel" id="sheetPanel"></div></div>
+<div id="toast" role="status" aria-live="polite"></div>
+<script nonce="@@NONCE@@">
+"use strict";
+const BOOT = /*__BOOT__*/null;
+const $ = (sel, el) => (el || document).querySelector(sel);
+const $$ = (sel, el) => Array.from((el || document).querySelectorAll(sel));
+function T(s, v) {
+  let x = (BOOT.T && BOOT.T[s]) || s;
+  if (v) for (const k of Object.keys(v)) x = x.split("{" + k + "}").join(String(v[k]));
+  return x;
+}
+const ESC = {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"};
+const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ESC[c]);
+const short = label => String(label).split("  ")[0];
+const S = {q: "", coll: "", rows: [], total: 0, counts: {}, order: "register", rec: null, sel: null,
+           edit: null, dirty: false, busy: false, listY: 0, fromList: false, all: {}};
+let here = location.hash;
+
+function today() {
+  const d = new Date(), p = n => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+}
+function toast(msg, ms) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.classList.add("on");
+  clearTimeout(toast.h);
+  toast.h = setTimeout(() => t.classList.remove("on"), ms || 2200);
+}
+async function api(path, body) {
+  const opt = {headers: {"X-Kustos-Token": BOOT.token}};
+  if (body !== undefined) {
+    opt.method = "POST";
+    opt.headers["Content-Type"] = "application/json";
+    opt.body = JSON.stringify(body);
+  }
+  let r;
+  try { r = await fetch(path, opt); }
+  catch (e) { const err = new Error(T("Kustos is not answering. Start it again: python _kustos.py web")); err.status = 0; throw err; }
+  let j = {};
+  try { j = await r.json(); } catch (e) { /* not JSON */ }
+  if (!r.ok) { const err = new Error(j.error || r.statusText); err.status = r.status; err.data = j; throw err; }
+  return j;
+}
+
+/* ---------------------------------------------------------------- the list */
+let listJob = null, listSeq = 0;
+function listSoon() { clearTimeout(listJob); listJob = setTimeout(() => loadList(false), 150); }
+async function loadList(more, keep) {
+  const seq = ++listSeq;
+  const offset = more ? S.rows.length : 0;
+  const limit = keep ? Math.min(500, Math.max(60, S.rows.length)) : 60;
+  let j;
+  try { j = await api("/api/list?" + new URLSearchParams({q: S.q, coll: S.coll, offset, limit})); }
+  catch (e) { toast(e.message, 4000); return; }
+  if (seq !== listSeq) return;            // a later search is on its way
+  S.rows = more ? S.rows.concat(j.rows) : j.rows;
+  S.total = j.total; S.counts = j.counts; S.order = j.order;
+  renderTabs();
+  renderRows();
+}
+function renderTabs() {
+  const all = Object.values(S.counts).reduce((a, b) => a + b, 0);
+  const tabs = [["", T("All"), all]].concat(BOOT.colls.map(([c, l]) => [c, l, S.counts[c] || 0]));
+  $("#tabs").innerHTML = tabs.map(([c, l, n]) =>
+    `<button class="tab${n ? "" : " zero"}" data-act="tab" data-coll="${c}" aria-pressed="${S.coll === c}">` +
+    `${esc(l)}<span class="n">${n}</span></button>`).join("");
+}
+function renderRows() {
+  $("#rows").innerHTML = S.rows.length ? S.rows.map(r =>
+    `<li><button class="row" data-act="open" data-id="${esc(r.id)}" aria-current="${S.sel === r.id}">` +
+    `<span class="dot c-${r.coll}"></span><span class="t">${esc(r.title)}</span>` +
+    `<span class="n">${r.n ? "nº " + r.n : ""}</span>` +
+    `<span class="s">${r.warn ? '<span class="warn">!</span> ' : ""}${esc(r.sub)}</span></button></li>`).join("")
+    : `<li class="empty">${esc(T("Nothing found."))}</li>`;
+  $("#listinfo").textContent = T("{n} of {total}", {n: S.rows.length, total: S.total}) + " · " +
+    (S.order === "register" ? T("register order, newest first") : T("index, alphabetical"));
+  const more = $("#moreBtn");
+  more.hidden = S.rows.length >= S.total;
+  more.textContent = T("More");
+}
+function markSel() {
+  $$(".row").forEach(b => b.setAttribute("aria-current", String(b.dataset.id === S.sel)));
+}
+function search(text) {
+  S.q = text;
+  $("#q").value = text;
+  if (document.body.classList.contains("open")) go("");
+  loadList(false);
+}
+
+/* ---------------------------------------------------------------- moving around */
+function go(hash, replace) {
+  const url = "#" + hash;
+  if (replace) { history.replaceState(null, "", hash ? url : location.pathname); here = location.hash; route(); }
+  else if (location.hash === url || (!hash && !location.hash)) route();
+  else location.hash = hash;
+}
+function route() {
+  here = location.hash;
+  const h = decodeURIComponent(location.hash.slice(1));
+  if (h.startsWith("r/")) return showRecord(h.slice(2));
+  if (h.startsWith("new/")) { const p = h.split("/"); return startNew(p[1], p[2]); }
+  closeRecord();
+}
+window.addEventListener("hashchange", () => {
+  if (S.dirty && location.hash !== here && !confirm(T("Discard the changes made here?"))) {
+    history.replaceState(null, "", here || location.pathname);
+    return;
+  }
+  S.dirty = false;
+  route();
+});
+window.addEventListener("beforeunload", e => { if (S.dirty) { e.preventDefault(); e.returnValue = ""; } });
+function back() {
+  if (S.fromList && history.length > 1) history.back();
+  else go("");
+}
+
+/* ---------------------------------------------------------------- a record */
+function visible(f, coll, kind, form) {
+  if (coll === "sources") {
+    if (["type", "name", "tags", "notes", "edges", "links"].includes(f.k)) return true;
+    const t = String(form.type || "outro").toLowerCase();
+    return (BOOT.sfields[t] || BOOT.sfields["*"]).includes(f.k);
+  }
+  if (coll === "corpus" && f.only) return f.only.includes(form.ctype || "measure");
+  return !f.only || f.only.includes(kind);
+}
+function optLabel(f, v) {
+  const o = (f.opts || []).find(o => o[0] === v);
+  return o ? o[1] : v;
+}
+function head(actions) {
+  return `<div class="rechead"><button class="btn quiet back" data-act="back">&#8249; ${esc(T("Back"))}</button>` +
+         `<span class="grow"></span>${actions || ""}</div>`;
+}
+function showEmpty() {
+  $("#rec").innerHTML = `<div class="empty">${esc(T("Nothing open. Choose a record from the list."))}</div>`;
+}
+async function showRecord(id) {
+  document.body.classList.add("open");
+  S.sel = id; S.edit = null; S.dirty = false;
+  markSel();
+  try { S.rec = await api("/api/record?id=" + encodeURIComponent(id)); }
+  catch (e) {
+    S.rec = null;
+    $("#rec").innerHTML = head() + `<div class="empty">${esc(e.status === 404 ? T("no such record") : e.message)}</div>`;
+    return;
+  }
+  renderRecord();
+  window.scrollTo(0, 0);
+  $("#recpane").scrollTop = 0;
+}
+function closeRecord() {
+  const wasOpen = document.body.classList.contains("open");
+  document.body.classList.remove("open");
+  S.rec = null; S.sel = null; S.edit = null; S.dirty = false; S.fromList = false;
+  document.title = "Kustos";
+  markSel();
+  showEmpty();
+  if (wasOpen) window.scrollTo(0, S.listY);
+}
+function sec(label, html) { return `<div class="sec"><span class="lbl">${esc(label)}</span>${html}</div>`; }
+
+function logHtml(items, key) {
+  const list = (items || []).slice().reverse().sort((a, b) => String(b.date).localeCompare(String(a.date)));
+  const shown = S.all[key] ? list : list.slice(0, 12);
+  return `<ul class="log">${shown.map(i => `<li><span class="d">${esc(i.date)}</span><span>${esc(i.text)}</span></li>`).join("")}</ul>` +
+    (list.length > shown.length ? `<button class="btn quiet" data-act="all" data-k="${key}">${esc(T("show all {n}", {n: list.length}))}</button>` : "");
+}
+function tasksHtml(r) {
+  const mark = {doing: "/", waiting: "&gt;", done: "&#10003;", cancelled: "&#8211;"};
+  return `<ul class="tasks">` + (r.tasks || []).map((t, i) =>
+    `<li class="task"><button class="box" data-act="task" data-i="${i}" aria-label="${esc(t.text)}">${mark[t.state] || ""}</button>` +
+    `<span>${esc(t.text)}${t.due ? `<span class="due">${esc(t.due + (t.at ? " " + t.at : ""))}</span>` : ""}</span></li>`).join("") + `</ul>`;
+}
+function readingsHtml(r) {
+  const rs = r.readings || [], f = r.form, unit = f.unit || "";
+  const pts = rs.map((x, i) => ({i, v: parseFloat(String(x.value).split("/")[0]), s: x.status}))
+    .filter(p => isFinite(p.v));
+  let svg = "";
+  if (pts.length > 1) {
+    const lo = parseFloat(f.ref_low), hi = parseFloat(f.ref_high);
+    const vals = pts.map(p => p.v).concat([lo, hi].filter(isFinite));
+    let min = Math.min(...vals), max = Math.max(...vals);
+    if (max === min) { max += 1; min -= 1; }
+    const W = 300, H = 64, pad = 6;
+    const x = i => pad + (W - 2 * pad) * (pts.length === 1 ? .5 : i / (pts.length - 1));
+    const y = v => H - pad - (H - 2 * pad) * (v - min) / (max - min);
+    let band = "";
+    if (isFinite(lo) || isFinite(hi)) {
+      const top = y(isFinite(hi) ? hi : max), bot = y(isFinite(lo) ? lo : min);
+      band = `<rect x="0" y="${top}" width="${W}" height="${Math.max(1, bot - top)}" fill="currentColor" opacity=".08"/>`;
+    }
+    const line = pts.map((p, k) => `${x(k).toFixed(1)},${y(p.v).toFixed(1)}`).join(" ");
+    const lastP = pts[pts.length - 1];
+    svg = `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">${band}` +
+      `<polyline points="${line}" fill="none" stroke="currentColor" stroke-width="1.5" vector-effect="non-scaling-stroke"/>` +
+      `<circle cx="${x(pts.length - 1)}" cy="${y(lastP.v)}" r="3" fill="currentColor" class="st-${lastP.s}"/></svg>`;
+  }
+  const rows = rs.slice().reverse().slice(0, S.all.readings ? rs.length : 12).map(x =>
+    `<tr><td>${esc(x.date)}</td><td class="v st-${esc(x.status)}">${esc(x.value)} ${esc(unit)}</td>` +
+    `<td>${esc(x.note || "")}${x.status !== "ok" && x.status !== "unknown" ? ` <span class="st-${esc(x.status)}">(${esc(T({near: "near the limit", out: "out"}[x.status] || x.status))})</span>` : ""}</td></tr>`).join("");
+  return svg + `<table class="readings">${rows}</table>` +
+    (rs.length > 12 && !S.all.readings ? `<button class="btn quiet" data-act="all" data-k="readings">${esc(T("show all {n}", {n: rs.length}))}</button>` : "");
+}
+function goItem(a, relFirst) {
+  const label = `<span class="${a.missing ? "missing" : ""}">${esc(a.title)}</span>`;
+  const rel = `<span class="rel">${esc(a.rel)}</span>`;
+  const why = [a.when, a.why].filter(Boolean).join(" — ");
+  return `<li><button class="go" data-act="open" data-id="${esc(a.id)}"${a.missing ? " disabled" : ""}>` +
+    (relFirst ? rel + label : label + " " + rel) + (why ? `<span class="why">${esc(why)}</span>` : "") + `</button></li>`;
+}
+function renderRecord() {
+  const r = S.rec;
+  if (!r) return showEmpty();
+  const f = r.form, out = [];
+  document.title = r.title + " · Kustos";
+  const kicker = [r.kind_label, r.n ? "nº " + r.n : T("not registered"),
+                  r.reg ? T("registered {stamp}", {stamp: r.reg}) : ""].filter(Boolean).join(" · ");
+  out.push(`<div class="kicker">${esc(kicker)}</div><h1 class="title">${esc(r.title)}</h1>`);
+  if (r.facts && r.facts.length) out.push(`<div class="sub">${esc(r.facts.join(" · "))}</div>`);
+  const quick = {person: ["interactions", "Add to the log"], measure: ["readings", "Add a reading"],
+                 activity: ["sessions", "Add a session"]}[r.kind];
+  if (quick) out.push(`<form class="quick" data-quick="${quick[0]}"><input class="f" name="line" autocomplete="off" ` +
+    `enterkeyhint="done" placeholder="${esc(T(quick[1]))}"><button class="btn primary">${esc(T("Add"))}</button></form>`);
+  const facts = [];
+  const flush = () => { if (facts.length) out.push(`<div class="facts">${facts.join("")}</div>`); facts.length = 0; };
+  for (const fd of BOOT.fields[r.coll]) {
+    if (fd.k === "name" || fd.k === "edges" || !visible(fd, r.coll, r.kind, f)) continue;
+    const v = f[fd.k], label = short(fd.label);
+    if (fd.w === "circles") {
+      if (v && v.length) { flush(); out.push(sec(label, `<div class="chips">${v.map(c => `<span class="chip">${esc(optLabel(fd, c))}</span>`).join("")}</div>`)); }
+      continue;
+    }
+    if (v == null || v === "") continue;
+    const linked = fd.k === "source" && r.source && r.source.id;
+    if ((fd.w === "line" || fd.w === "choice") && !linked && !["tags", "domains"].includes(fd.k) && String(v).length <= 48) {
+      facts.push(`<div><span class="lbl">${esc(label)}</span><div class="val">${esc(fd.w === "choice" ? optLabel(fd, v) : v)}</div></div>`);
+      continue;
+    }
+    flush();
+    if (fd.k === "tasks") out.push(sec(label, tasksHtml(r)));
+    else if (fd.k === "interactions") out.push(sec(label, logHtml(r.log, "interactions")));
+    else if (fd.k === "sessions") out.push(sec(label, logHtml(r.sessions, "sessions")));
+    else if (fd.k === "readings") out.push(sec(label, readingsHtml(r)));
+    else if (fd.w === "md") out.push(sec(label, `<div class="md">${r.html[fd.k] || ""}</div>`));
+    else if (fd.k === "tags" || fd.k === "domains") {
+      const op = fd.k === "tags" ? "tag:" : "dom:";
+      out.push(sec(label, `<div class="chips">${v.split(",").map(t => t.trim()).filter(Boolean).map(t =>
+        `<button class="chip" data-act="q" data-q="${esc(op + t.replace(/\s+/g, ""))}">${esc(t)}</button>`).join("")}</div>`));
+    } else if (fd.k === "source" && r.source && r.source.id) {
+      out.push(sec(label, `<ul class="links">${goItem({id: r.source.id, title: r.source.title, rel: ""}, false)}</ul>`));
+    } else if (fd.k === "links") {
+      out.push(sec(label, `<div class="val">${v.split("\n").map(u => /^https?:\/\//i.test(u)
+        ? `<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(u)}</a>` : esc(u)).join("<br>")}</div>`));
+    } else if (fd.w === "choice") out.push(sec(label, `<div class="val">${esc(optLabel(fd, v))}</div>`));
+    else out.push(sec(label, `<div class="val${fd.w === "text" ? " mono" : ""}">${esc(v)}</div>`));
+  }
+  flush();
+  if (r.cite) out.push(sec(T("Citation (ABNT)"), `<div class="cite">${esc(r.cite)}</div>` +
+    `<button class="btn quiet" data-act="copy">${esc(T("Copy"))}</button>`));
+  if (r.out.length) out.push(sec(T("Links"), `<ul class="links">${r.out.map(a => goItem(a, true)).join("")}</ul>`));
+  if (r.in.length) out.push(sec(T("Cited by"), `<ul class="links">${r.in.map(a => goItem(a, false)).join("")}</ul>`));
+  const foot = [r.id, r.updated ? T("updated {date}", {date: r.updated}) : "",
+                r.coll === "notes" ? T("file") + ": " + (r.file || T("(the file is made on saving)")) : ""];
+  out.push(`<div class="foot">${foot.filter(Boolean).map(esc).join("<br>")}</div>`);
+  $("#rec").innerHTML = head(`<button class="btn" data-act="edit">${esc(T("Edit"))}</button>`) +
+    `<div class="card">${out.join("")}</div>`;
+}
+
+/* ---------------------------------------------------------------- editing */
+function inputHtml(fd, v) {
+  const id = "f-" + fd.k;
+  if (fd.w === "choice") {
+    const opts = fd.opts.slice();
+    if (v && !opts.some(o => o[0] === v)) opts.push([v, v]);
+    return `<select class="f" id="${id}" name="${fd.k}">` + opts.map(([k, l]) =>
+      `<option value="${esc(k)}"${k === v ? " selected" : ""}>${esc(l)}</option>`).join("") + `</select>`;
+  }
+  if (fd.w === "circles") return `<div class="circles">` + fd.opts.map(([k, l]) =>
+    `<label><input type="checkbox" name="circles" value="${esc(k)}"${(v || []).includes(k) ? " checked" : ""}> ${esc(l)}</label>`).join("") + `</div>`;
+  if (fd.w === "line") return `<input class="f" id="${id}" name="${fd.k}" value="${esc(v)}" autocomplete="off">`;
+  const cls = fd.w === "md" ? "prose" : "code";
+  return `<textarea class="f ${cls}" id="${id}" name="${fd.k}" rows="${fd.w === "md" ? 8 : 2}" ` +
+         `spellcheck="${fd.w === "md"}">${esc(v)}</textarea>`;
+}
+function autosize(t) { t.style.height = "auto"; t.style.height = (t.scrollHeight + 2) + "px"; }
+function renderEdit() {
+  const r = S.rec, f = S.edit;
+  let h = head(`<button class="btn quiet" data-act="cancel">${esc(T("Cancel"))}</button>` +
+               `<button class="btn primary" data-act="save">${esc(T("Save"))}</button>`);
+  h += `<div class="card"><div class="kicker">${esc(r.kind_label)}${r.n ? " · nº " + r.n : ""}</div>` +
+       `<form id="editor" autocomplete="off">`;
+  for (const fd of BOOT.fields[r.coll]) {
+    h += `<div class="field" data-k="${fd.k}"${visible(fd, r.coll, r.kind, f) ? "" : " hidden"}>` +
+         `<label class="lbl" for="f-${fd.k}">${esc(fd.label)}</label>${inputHtml(fd, f[fd.k])}` +
+         (fd.hint ? `<div class="hint">${esc(fd.hint)}</div>` : "") + `</div>`;
+  }
+  h += `</form>`;
+  if (r.id) h += `<div class="sec"><button class="btn danger" data-act="delete">${esc(T("Delete"))}</button></div>`;
+  $("#rec").innerHTML = h + `</div>`;
+  $$("#editor textarea").forEach(autosize);
+  if (!r.id) { const n = $("#f-name"); if (n) n.focus(); }
+}
+function revisible() {
+  const r = S.rec;
+  for (const fd of BOOT.fields[r.coll]) {
+    const box = $(`.field[data-k="${fd.k}"]`);
+    if (box) box.hidden = !visible(fd, r.coll, r.kind, S.edit);
+  }
+}
+function startEdit() {
+  if (!S.rec) return;
+  S.edit = JSON.parse(JSON.stringify(S.rec.form));
+  S.dirty = false;
+  renderEdit();
+}
+function startNew(coll, kind) {
+  if (!BOOT.fields[coll]) return go("");
+  document.body.classList.add("open");
+  S.rec = {id: "", coll, kind, kind_label: BOOT.kinds[kind] || kind, title: "", base: "", n: 0,
+           form: {}, out: [], in: [], html: {}, opened: ""};
+  const form = {};
+  for (const fd of BOOT.fields[coll]) form[fd.k] = fd.w === "circles" ? [] : "";
+  if (coll === "sources") form.type = "outro";
+  if (coll === "corpus") form.ctype = kind;
+  if (coll === "entries") form.status = "attested";
+  const q = S.q.trim();
+  if (q && !/[:^]/.test(q)) form.name = q;
+  S.edit = form; S.dirty = false; S.sel = null;
+  markSel();
+  renderEdit();
+  window.scrollTo(0, 0);
+}
+async function save(force) {
+  if (S.busy || !S.edit) return;
+  const r = S.rec;
+  S.busy = true;
+  $$('[data-act="save"]').forEach(b => { b.disabled = true; });
+  try {
+    const j = await api("/api/save", {coll: r.coll, kind: r.kind, id: r.id || null, base: r.base,
+                                      opened: r.opened || "", form: S.edit, force: !!force});
+    S.dirty = false; S.edit = null; S.rec = j.record; S.sel = j.record.id;
+    history.replaceState(null, "", "#r/" + encodeURIComponent(j.record.id));
+    here = location.hash;
+    renderRecord();
+    toast(j.message || T("Saved."));
+    loadList(false, true);
+  } catch (e) {
+    S.busy = false;
+    if (e.status === 409) {
+      if (confirm(e.message + "\n\n" + T("Save yours over it?"))) return save(true);
+      if (e.data && e.data.record) { S.rec = e.data.record; S.edit = null; S.dirty = false; renderRecord(); }
+    } else toast(e.message, 4000);
+  } finally {
+    S.busy = false;
+    $$('[data-act="save"]').forEach(b => { b.disabled = false; });
+  }
+}
+function saveWith(changes) {
+  S.edit = Object.assign(JSON.parse(JSON.stringify(S.rec.form)), changes);
+  return save(false);
+}
+function quickAdd(key, line) {
+  line = line.trim();
+  if (!line || !S.rec) return;
+  const dated = /^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2})?\s+\S/.test(line);
+  const text = (key === "interactions" || !dated) ? today() + "   " + line : line;
+  const old = String(S.rec.form[key] || "").replace(/\s+$/, "");
+  return saveWith({[key]: old ? old + "\n" + text : text});
+}
+function finishTask(i) {
+  const lines = String(S.rec.form.tasks || "").split("\n");
+  if (i >= lines.length) return;
+  lines[i] = /^\s*(?:[-*]\s*)?\[.\]/.test(lines[i]) ? lines[i].replace(/\[.\]/, "[x]") : "[x] " + lines[i];
+  return saveWith({tasks: lines.join("\n")}).then(() => { if (!S.edit) toast(T("Done: it went to the log.")); });
+}
+async function del() {
+  const r = S.rec;
+  const n = r.out.length + r.in.length;
+  let msg = T('Delete "{label}"?', {label: r.title});
+  if (n) msg += "\n\n" + T("{n} link(s) involving this record go too.", {n});
+  msg += "\n\n" + T("The log keeps the previous version (Base › History).");
+  if (!confirm(msg)) return;
+  try { await api("/api/delete", {id: r.id}); }
+  catch (e) { toast(e.message, 4000); return; }
+  S.dirty = false; S.edit = null;
+  toast(T("Deleted. The previous version is in the log."));
+  go("", true);
+  loadList(false, true);
+}
+
+/* ---------------------------------------------------------------- sheets */
+function openSheet(html) { $("#sheetPanel").innerHTML = html; $("#sheet").hidden = false; }
+function closeSheet() { $("#sheet").hidden = true; }
+function newSheet() {
+  openSheet(`<span class="lbl">${esc(T("Choose what to create"))}</span><div class="grid">` +
+    BOOT.new.map(([c, k]) => `<button class="btn" data-act="mk" data-coll="${c}" data-kind="${k}">` +
+      `<span class="dot c-${c}"></span>${esc(BOOT.kinds[k])}</button>`).join("") + `</div>`);
+}
+function menuSheet() {
+  openSheet(`<div class="grid"><a class="btn" href="/health" target="_blank" rel="noopener">${esc(T("Health report"))}</a>` +
+    `<a class="btn" href="/corpus" target="_blank" rel="noopener">${esc(T("Body map"))}</a></div>`);
+}
+
+/* ---------------------------------------------------------------- events */
+document.addEventListener("click", e => {
+  const wl = e.target.closest(".wl");
+  if (wl) { search(wl.textContent.trim()); return; }
+  const b = e.target.closest("[data-act]");
+  if (!b) return;
+  const act = b.dataset.act;
+  if (act === "close") { if (e.target === b) closeSheet(); return; }
+  if (act === "open") {
+    if (!S.rec || !S.rec.id || b.classList.contains("row")) S.listY = window.scrollY;
+    S.fromList = true;
+    go("r/" + b.dataset.id);
+  }
+  else if (act === "tab") { S.coll = b.dataset.coll; loadList(false); }
+  else if (act === "more") loadList(true);
+  else if (act === "back") back();
+  else if (act === "edit") startEdit();
+  else if (act === "cancel") { if (!S.rec.id) { S.dirty = false; back(); } else { S.edit = null; S.dirty = false; renderRecord(); } }
+  else if (act === "save") save(false);
+  else if (act === "delete") del();
+  else if (act === "task") finishTask(+b.dataset.i);
+  else if (act === "all") { S.all[b.dataset.k] = true; renderRecord(); }
+  else if (act === "q") search(b.dataset.q);
+  else if (act === "copy") {
+    const done = () => toast(T("Copied."));
+    if (navigator.clipboard) navigator.clipboard.writeText(S.rec.cite).then(done, () => toast(S.rec.cite, 5000));
+  }
+  else if (act === "new") newSheet();
+  else if (act === "menu") menuSheet();
+  else if (act === "mk") { closeSheet(); S.fromList = true; go("new/" + b.dataset.coll + "/" + b.dataset.kind); }
+});
+document.addEventListener("submit", e => {
+  e.preventDefault();
+  const form = e.target;
+  if (form.dataset.quick) quickAdd(form.dataset.quick, form.elements.line.value);
+  else if (form.id === "editor") save(false);
+});
+document.addEventListener("input", e => {
+  const t = e.target;
+  if (t.id === "q") { S.q = t.value; listSoon(); return; }
+  if (!S.edit || !t.closest("#editor")) return;
+  if (t.name === "circles") S.edit.circles = $$('#editor input[name="circles"]:checked').map(x => x.value);
+  else S.edit[t.name] = t.value;
+  S.dirty = true;
+  if (t.tagName === "TEXTAREA") autosize(t);
+  if (t.name === "type" || t.name === "ctype") revisible();
+});
+document.addEventListener("change", e => {
+  const t = e.target;
+  if (S.edit && t.closest("#editor") && (t.name === "type" || t.name === "ctype" || t.name === "circles")) {
+    if (t.name === "circles") S.edit.circles = $$('#editor input[name="circles"]:checked').map(x => x.value);
+    else S.edit[t.name] = t.value;
+    S.dirty = true;
+    revisible();
+  }
+});
+document.addEventListener("keydown", e => {
+  const typing = /^(INPUT|TEXTAREA|SELECT)$/.test((document.activeElement || {}).tagName || "");
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+    if (S.edit) { e.preventDefault(); save(false); }
+    return;
+  }
+  if (e.key === "Escape") {
+    if (!$("#sheet").hidden) closeSheet();
+    else if (S.edit && S.rec && S.rec.id && (!S.dirty || confirm(T("Discard the changes made here?")))) {
+      S.edit = null; S.dirty = false; renderRecord();
+    }
+    else if (!S.edit && document.body.classList.contains("open")) back();
+    return;
+  }
+  if (typing || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.key === "/") { e.preventDefault(); if (document.body.classList.contains("open") && innerWidth < 900) go(""); $("#q").focus(); }
+  else if (e.key === "e" && S.rec && S.rec.id && !S.edit) startEdit();
+  else if (e.key === "n") newSheet();
+});
+
+/* ---------------------------------------------------------------- start */
+$("#q").placeholder = T("Search");
+$("#q").setAttribute("aria-label", T("Search"));
+$("#newBtn").setAttribute("aria-label", T("New"));
+$("#newBtn").title = T("New");
+$("#menuBtn").setAttribute("aria-label", T("More"));
+renderTabs();
+loadList(false);
+route();
+setInterval(() => { api("/api/ping").catch(() => {}); }, 20000);
 </script>
 </body>
 </html>
@@ -10110,62 +11663,16 @@ class App:
         self.refresh_rail()
 
     def parse_query(self):
-        """Search operators:
-             p: v: f: c: d:   limit to a collection (people, verba, sources, corpus,
-                              drafts)
-             ^text            only the start of the name
-             tag:x lang:de type:book sys:renal dom:law id:c_measure
-           The rest are literal terms, all required. type: and sys: match the
-           stored key or its label in the current language."""
-        q = self.q.get().strip().lower()
-        scope, prefix, fields, terms = None, None, {}, []
-        for tok in q.split():
-            if tok in ("p:", "v:", "f:", "c:", "d:"):
-                scope = {"p:": "people", "v:": "entries", "f:": "sources",
-                         "c:": "corpus", "d:": "notes"}[tok]
-            elif tok.startswith("^") and len(tok) > 1:
-                prefix = tok[1:]
-            elif ":" in tok and tok.split(":", 1)[0] in ("tag", "lang", "type", "sys",
-                                                          "dom", "id") and tok.split(":", 1)[1]:
-                k, v = tok.split(":", 1)
-                fields[k] = v
-            else:
-                terms.append(tok)
-        return scope, prefix, fields, terms
+        """The search box, read with the operators of parse_search."""
+        return parse_search(self.q.get())
 
     def field_ok(self, r, fields):
-        for k, v in fields.items():
-            if k == "tag" and not any(v in t.lower() for t in r.get("tags", [])):
-                return False
-            if k == "lang" and (r.get("lang") or "").lower() != v:
-                return False
-            if k == "type" and not any(v in x.lower() for x in
-                                       ((r.get("type") or ""), type_label(r.get("type")))):
-                return False
-            if k == "sys" and not any(v in x.lower() for x in
-                                      ((r.get("system") or ""), system_label(r.get("system")))):
-                return False
-            if k == "dom" and not any(v in d.lower() for d in r.get("domains", [])):
-                return False
-            if k == "id" and not r.get("id", "").lower().startswith(v):
-                return False
-        return True
+        return search_field_ok(r, fields)
 
     def query_base(self):
         """What the search text alone finds, per collection: the words, ^prefix,
         field operators and p:/v:/f:/c:, but none of the rail's filters."""
-        qscope, prefix, fields, terms = self.parse_query()
-
-        def ok(r):
-            if terms and not all(t in r.get("_h", "") for t in terms):
-                return False
-            if prefix and not sort_key(r.get("name", ""))[0].startswith(
-                    sort_key(prefix)[0]):
-                return False
-            return self.field_ok(r, fields) if fields else True
-
-        return {c: ([r for r in self.data[c] if ok(r)] if qscope in (None, c) else [])
-                for c in COLLS}
+        return search_base(self.data, self.q.get())
 
     def matches(self):
         qscope = self.parse_query()[0]
@@ -10219,51 +11726,7 @@ class App:
 
     def row_text(self, r):
         """(title, subtitle) of a record in the list."""
-        kind = self.rec_kind(r)
-        if kind == "note":
-            body = r.get("_body") or ""
-            first = next((l.strip(" #>-*") for l in body.splitlines() if l.strip(" #>-*")), "")
-            return r["name"], " · ".join(x for x in (", ".join(r.get("tags", [])), first) if x)
-        if kind == "entry":
-            sub = tr(r["kind"]) + " · " + (r.get("gloss") or "")
-            return label_of(r), sub
-        if kind == "source":
-            au = author_names(r, self.data)
-            sub = type_label(r.get("type") or "outro") + " · " + ", ".join(
-                a.split(",")[0] for a in au[:2]) + (f" · {year_of_source(r)}"
-                                                    if year_of_source(r) else "")
-            return r.get("name") or r.get("raw", ""), sub
-        if kind == "metric":
-            t = htype(r)
-            if t == "measure":
-                lr = last_reading(r)
-                sub = system_label(r.get("system") or "") + (
-                    f" · {lr['date']} = {lr['value']} {r.get('unit', '')}" if lr
-                    else " · " + tr("no readings"))
-                if lr and out_of_range(r, lr):
-                    sub += "  (!)"
-            else:
-                sub = tr(HEALTH_TYPE_LABEL[t]) + " · " + " · ".join(health_facts(r, self.data))
-            return r["name"], sub
-        p = r
-        live = open_tasks(p)
-        dated = sorted(dated_tasks(p), key=lambda t: due_label(t))
-        if self.date:
-            live = [t for t in dated if t["due"] == self.date] or live
-        elif dated:
-            live = dated + [t for t in live if t not in dated]
-        if live:
-            when = due_label(live[0])
-            sub = "[{}] {}".format(MARK_OF.get(live[0].get("state"), " "),
-                                   live[0].get("text", ""))
-            if when:
-                sub = when + "  " + sub
-            if len(live) > 1:
-                sub += f"  (+{len(live) - 1})"
-        else:
-            plain = [t for t in p.get("tags", []) if ":" not in t]
-            sub = " · ".join(plain) or one_liner(p.get("notes_raw", ""), 70)
-        return p["name"], sub
+        return list_row_text(r, self.data, self.date)
 
     def insert_row(self, r, loc):
         text, sub = self.row_text(r)
@@ -14076,6 +15539,8 @@ def main():
         return cmd_timeline(rest[0] if rest else None)
     if cmd == "peritia":
         return cmd_peritia(rest)
+    if cmd == "web":
+        return cmd_web(rest)
     if cmd == "migrate":
         return cmd_migrate()
     if cmd == "merge":
@@ -15817,6 +17282,88 @@ PT = {
         "O Peritia abre no navegador.",
     "Peritia did not start: {why}":
         "O Peritia não abriu: {why}",
+    "Add a reading":
+        "Acrescentar leitura",
+    "Add a session":
+        "Acrescentar sessão",
+    "Add to the log":
+        "Acrescentar ao registro",
+    "All":
+        "Tudo",
+    "Body map":
+        "Mapa do corpo",
+    "Choose what to create":
+        "Escolha o que criar",
+    "Citation (ABNT)":
+        "Citação (ABNT)",
+    "Copied.":
+        "Copiado.",
+    "Copy":
+        "Copiar",
+    "Discard the changes made here?":
+        "Descartar as alterações feitas aqui?",
+    "Done: it went to the log.":
+        "Feito: foi para o registro.",
+    "Kustos is not answering. Start it again: python _kustos.py web":
+        "O Kustos não está respondendo. Abra de novo: python _kustos.py web",
+    "Kustos on the web at {url}: it stays up until stopped (Ctrl+C).":
+        "Kustos na web em {url}: fica no ar até ser parado (Ctrl+C).",
+    "Kustos on the web at {url}: it stops by itself {n} minute(s) after the page is closed.":
+        "Kustos na web em {url}: para sozinho {n} minuto(s) depois que a página é fechada.",
+    "Links":
+        "Ligações",
+    "More":
+        "Mais",
+    "New":
+        "Novo",
+    "Nothing open. Choose a record from the list.":
+        "Nada aberto. Escolha um registro na lista.",
+    "Save yours over it?":
+        "Gravar a sua versão por cima?",
+    "Saved.":
+        "Gravado.",
+    "Search":
+        "Buscar",
+    "This page is not the one Kustos opened: open it again from Kustos.":
+        "Esta página não é a que o Kustos abriu: abra de novo pelo Kustos.",
+    "This record changed on disk since it was opened (in the window, or on another machine).":
+        "Este registro mudou no disco desde que foi aberto (na janela, ou em outra máquina).",
+    "This record no longer exists.":
+        "Este registro não existe mais.",
+    "attested":
+        "atestada",
+    "reconstructed":
+        "reconstruída",
+    "file":
+        "arquivo",
+    "index, alphabetical":
+        "índice, em ordem alfabética",
+    "no such record":
+        "registro inexistente",
+    "one per line":
+        "um por linha",
+    "one per line, e.g.  cites s_…  — why":
+        "uma por linha, p. ex.  cites s_…  — motivo",
+    "one per line:  2026-08-01   what happened":
+        "uma por linha:  2026-08-01   o que aconteceu",
+    "one per line:  [ ] what  ~2026-09-10":
+        "uma por linha:  [ ] o quê  ~2026-09-10",
+    "one per line;  lang: name":
+        "um por linha;  língua: nome",
+    "register order, newest first":
+        "ordem do registro, mais novos primeiro",
+    "registered {stamp}":
+        "registrado em {stamp}",
+    "s_… of a source, or free text":
+        "s_… de uma fonte, ou texto livre",
+    "separated by commas":
+        "separadas por vírgulas",
+    "show all {n}":
+        "mostrar todos os {n}",
+    "updated {date}":
+        "atualizado em {date}",
+    "{option} needs a value":
+        "{option} precisa de um valor",
 }
 
 if __name__ == "__main__":

@@ -39,7 +39,7 @@ empty repository folder gives an empty base (and `doctor` passes on it).
 language (`tr`), common, the collections (**people** `p_`, **verba**
 `c_`/`f_` concepts and forms, **sources** `s_`, **corpus** `h_` health
 records, **notes** `n_` — shown as "drafts"), then file, register, conflicts, lock, doctor, mirror, search,
-history, migration, upgrade, citation, health report, peritia, themes, motion,
+history, migration, upgrade, citation, health report, peritia, web, themes, motion,
 the Tk `*Card` editors, `App` (the main window), `BookView` (the logbook), the
 `cmd_*` functions and `main()`, and finally the `PT` dict.
 
@@ -69,6 +69,15 @@ Ideas that span several sections:
   the panel's parameters are in `peritia`; they save, log, merge and replay
   like records but stay out of `COLLS` and the register. Test it on invented
   data with `peritia_api(...)`, no browser needed.
+- **Web** (`# ==== web`): `cmd_web` serves the whole base the same way, from
+  `WEB_HTML` (its strings come in the boot data as `T`, from `WEB_STRINGS`,
+  translated by `tr`). The page edits the text the window's cards hold and
+  `web_gather` reads it back with the same parsers (`parse_log`,
+  `parse_tasks`, `parse_edges`...), then `save_record`: a change to a card's
+  fields or to how it saves belongs in both places. Search and list rows are
+  shared with the window (`parse_search`, `search_base`, `list_row_text`).
+  Test it on invented data with `web_api(...)`, or run it with `--stay` and
+  drive the page in a headless browser.
 - **Long texts are markdown**: `textfield(..., pages=True)` (every NOTES and the
   draft's text) gets `MarkdownKeys`, and `fit(opening=True)` paints it before
   the pages are measured. The text stored stays plain.

@@ -90,6 +90,18 @@ updating of files and conflicts if used any syncing app or cloud sync.
   over a version that changed on disk is refused and the current one
   reloaded. `_kustos_peritia.html` is a read-only snapshot, rewritten on every
   change; a `_peritia.json` from the panel's standalone days can be imported.
+- **Web version** (`python _kustos.py web`): the whole base in the browser,
+  laid out for a phone as much as for a desk, served by Kustos itself on
+  127.0.0.1 only; it stops two minutes after the page is closed (`--stay`
+  keeps it up). Search with the same operators as the window, the five
+  collections as tabs, every record readable and editable, new records of
+  every kind, and on the card quick entries: a line in a person's LOG, a
+  reading, a session; tick a task and it goes to the log. The fields hold the
+  same text as the window's cards (a LOG line, a task line, a link line), and
+  saving goes the same way — register, log, mirror — so both can be used on
+  the same base. A record changed on disk since the page opened it (in the
+  window, or synced from another machine) is not overwritten without asking.
+  The menu opens the health report and the body map.
 - **Source**: free types (book, paper, thesis, law/bill, decisions, webpages, videos), citations in academic formats, BibTeX and CSL-JSON.
   Can import from Zotero via CSL-JSON or BibTeX without duplicating entries.
 - **Health (corpus)**: four kinds of record, each with its own fields —
@@ -154,6 +166,7 @@ python _kustos.py import zotero <export.json|.bib>
 python _kustos.py mirror | corpus | merge | history <id> | replay
 python _kustos.py logbook                  the base as a logbook (read-only)
 python _kustos.py peritia [--no-open] [--port N]   the skills panel, in the browser
+python _kustos.py web [--stay] [--no-open] [--port N]   the whole base, in the browser (phone or desk)
 ```
 
 ## Suggestion: Using Syncthing to sync
