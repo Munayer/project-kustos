@@ -889,6 +889,7 @@ RELS = {
     "editor_of":     ("person", "source"),
     "translator_of": ("person", "source"),
     "knows":         ("person", "person"),
+    "influenced":    ("person", "person"),     # one's work shaped the other's; no meeting needed
     "works_at":      ("person", "org"),
     "member_of":     ("person", "org"),
     # sources
@@ -913,7 +914,7 @@ REL_LABEL = {
     "instrument_of": "instrument of", "requires": "requires",
     "coined_by": "coined by", "used_by": "used by", "about": "about",
     "author_of": "author of", "editor_of": "editor of",
-    "translator_of": "translator of", "knows": "knows",
+    "translator_of": "translator of", "knows": "knows", "influenced": "influenced",
     "works_at": "works at", "member_of": "member of",
     "cites": "cites", "attested_in": "attested in", "defined_in": "defined in",
     "measured_in": "measured in", "part_of": "part of", "edition_of": "edition of",
@@ -3232,6 +3233,20 @@ def write_mirror(data):
                 out.append("- [{}] {}{}".format(
                     MARK_OF.get(t.get("state", "todo"), " "), t.get("text", ""),
                     "  ~" + due_label(t) if t.get("due") else ""))
+        outgoing = edges_from(data, p["id"])
+        if outgoing:
+            out.append("")
+            for a in sorted(outgoing, key=lambda x: year_of(x.get("when"))):
+                target = idx.get(a["to"])
+                line = f"- {rel_label(a['rel'])} " \
+                       f"[[{label_any(target, data) if target else a['to']}]]"
+                if a.get("when"):
+                    line += f"  ({a['when']})"
+                if a.get("why"):
+                    line += f" — {a['why']}"
+                if a.get("source"):
+                    line += f"  [{a['source']}]"
+                out.append(line)
         citing = edges_to(data, p["id"])
         if citing:
             out.append("")
@@ -6266,6 +6281,7 @@ def web_fields():
             f("tasks", "TASKS", "text", hint="one per line:  [ ] what  ~2026-09-10"),
             f("interactions", "LOG", "text", hint="one per line:  2026-08-01   what happened"),
             f("notes_raw", "NOTES", "md"),
+            edges,
             f("links", "URLS  (sites, emails, phones)", "text",
               hint="one per line: a site, an email or a phone; work: before it names it"),
         ],
@@ -6330,11 +6346,10 @@ def web_form(rec, data):
     lines = "\n".join
     out = {"name": rec.get("name", ""), "tags": ", ".join(rec.get("tags", [])),
            "links": lines(rec.get("links", []))}
-    if coll != "people":            # a person's card has no links of its own
-        text = format_edges(edges_from(data, rec["id"]))
-        if rec.get("edge_drafts"):
-            text = lines(filter(None, [text] + list(rec["edge_drafts"])))
-        out["edges"] = text
+    text = format_edges(edges_from(data, rec["id"]))
+    if rec.get("edge_drafts"):
+        text = lines(filter(None, [text] + list(rec["edge_drafts"])))
+    out["edges"] = text
     if coll == "people":
         out.update(org="org" if rec.get("org") else "",
                    aliases=format_aliases(rec.get("aliases")), place=rec.get("place", ""),
@@ -6513,8 +6528,14 @@ def web_save(body):
         if fresh:
             out["met"] = out.get("met") or TODAY()
             out["id"] = make_id(out["name"], taken)
+        # a page opened before people had links of their own sends none: keep them
+        links, unparsed = (web_links(form, out["id"], out) if isinstance(form.get("edges"), str)
+                           else (None, []))
         touch(out)
-        data = save_record("people", out)
+        data = save_record("people", out, edges=links)
+        if unparsed:
+            message = " ".join(filter(None, [message, tr("{n} link line(s) not understood were "
+                                                         "kept as drafts.", n=len(unparsed))]))
     elif coll == "notes":
         text = form.get("body") if isinstance(form.get("body"), str) else None
         when = " ".join(form["when"].split()) if isinstance(form.get("when"), str) else _KEEP
@@ -9306,15 +9327,37 @@ class PersonCard:
         self.t_tasks.bind("<Control-space>", self.cycle_task_state)
         self.t_tasks.bind("<Return>", self.new_task_line)
 
-        app.label(c, tr("CITED BY  (double-click opens)"), pad)
-        self.inbox = tk.Listbox(c, height=2, width=1, font=app.f_meta,
-                                bg=PAPER, fg=INK, relief="flat",
-                                highlightthickness=0, selectbackground=SELBG,
-                                selectforeground=SELFG, activestyle="none")
-        self.inbox.pack(fill="x", **pad)
-        self.inbox.bind("<Double-Button-1>", self.jump_in)
+        # the links going out of the person, written as on every other card
+        app.label(c, tr("LINKS"), pad)
+        tk.Label(c, text=tr("rel  target  [span]  — reason  # source     "
+                            "(the target can be a person's p_…)"),
+                 bg=PAPER, fg=FAINT, font=app.f_label, anchor="w"
+                 ).pack(fill="x", pady=(0, 3), **pad)
+        self.t_edges = tk.Text(c, height=2, width=1, font=app.f_meta,
+                               bg=PAPER, fg=INK, insertbackground=INK,
+                               relief="flat", wrap="word", highlightthickness=0,
+                               padx=0, spacing1=1, spacing3=3, undo=True,
+                               autoseparators=True, maxundo=-1)
+        app.block_caret(self.t_edges, app.f_meta)
+        app.bind_undo(self.t_edges, text=True)
+        self.t_edges.pack(fill="x", **pad)
+        app.autogrow(self.t_edges, minrows=2)
         tk.Frame(c, bg=RULE, height=1).pack(fill="x", pady=(4, 0), **pad)
-        self.in_ids = []
+
+        def listbox(title):
+            app.label(c, title, pad)
+            lb = tk.Listbox(c, height=2, width=1, font=app.f_meta,
+                            bg=PAPER, fg=INK, relief="flat",
+                            highlightthickness=0, selectbackground=SELBG,
+                            selectforeground=SELFG, activestyle="none")
+            lb.pack(fill="x", **pad)
+            tk.Frame(c, bg=RULE, height=1).pack(fill="x", pady=(4, 0), **pad)
+            return lb
+        self.outbox = listbox(tr("RESOLVED LINKS  (double-click opens)"))
+        self.outbox.bind("<Double-Button-1>", self.jump_out)
+        self.inbox = listbox(tr("CITED BY  (double-click opens)"))
+        self.inbox.bind("<Double-Button-1>", self.jump_in)
+        self.in_ids, self.out_ids = [], []
 
         log_row = tk.Frame(c, bg=PAPER)
         log_row.pack(fill="x", pady=(6, 2), **pad)
@@ -9347,7 +9390,7 @@ class PersonCard:
             app.bind_undo(w)
         for w in (self.e_name, self.e_tags, self.e_place, self.e_source, self.t_notes,
                   self.t_links, self.t_alias, self.t_tasks, self.t_log, self.e_born,
-                  self.e_died):
+                  self.e_died, self.t_edges):
             for ev in ("<KeyRelease>", "<<Paste>>", "<<Cut>>"):
                 w.bind(ev, app.mark_dirty, add="+")
 
@@ -9545,7 +9588,7 @@ class PersonCard:
             w.configure(state=state)
         self.c_org.configure(state=state)
         for w in (self.t_notes, self.t_links, self.t_alias, self.t_tasks,
-                  self.t_log):
+                  self.t_log, self.t_edges):
             w.configure(state=state)
         self.circles.enable_circles(on)
 
@@ -9555,9 +9598,10 @@ class PersonCard:
             w.delete(0, "end")
         self.app.update_source_hint(self.e_source)
         for t in (self.t_notes, self.t_alias, self.t_links, self.t_tasks,
-                  self.t_log):
+                  self.t_log, self.t_edges):
             t.delete("1.0", "end")
         self.inbox.delete(0, "end")
+        self.outbox.delete(0, "end")
         self.circles.set_circles([])
         self.v_org.set(False)
         self.show_contacts()
@@ -9591,6 +9635,11 @@ class PersonCard:
         self.circles.set_circles(p.get("circles", []))
         self.t_log.delete("1.0", "end")
         self.t_log.insert("1.0", format_log(p.get("interactions", [])))
+        self.t_edges.delete("1.0", "end")
+        text = format_edges(edges_from(self.app.data, p["id"]))
+        if p.get("edge_drafts"):
+            text = "\n".join(filter(None, [text] + list(p["edge_drafts"])))
+        self.t_edges.insert("1.0", text)
         self.refresh_citing(p)
         bits = [p["id"] if not p["id"].startswith("__") else tr("draft")]
         if p.get("met"):
@@ -9601,7 +9650,17 @@ class PersonCard:
         self.msg.configure(text="")
 
     def refresh_citing(self, p):
+        """RESOLVED LINKS (the person's own, by name) and CITED BY."""
         data, idx = self.app.data, by_id(self.app.data)
+        self.outbox.delete(0, "end")
+        self.out_ids = []
+        for a in sorted(edges_from(data, p["id"]), key=lambda x: year_of(x.get("when"))):
+            target = idx.get(a["to"])
+            shown = label_any(target, data) if target else tr("{id}  (missing target)", id=a["to"])
+            when = f"  {a['when']}" if a.get("when") else ""
+            self.outbox.insert("end", f"{rel_label(a['rel']):16} {shown}{when}")
+            self.out_ids.append(a["to"])
+        self.outbox.configure(height=max(2, min(8, self.outbox.size())))
         self.inbox.delete(0, "end")
         self.in_ids = []
         for a in edges_to(data, p["id"]):
@@ -9609,6 +9668,14 @@ class PersonCard:
             self.inbox.insert("end", f"{label_any(src, data):28} {rel_label(a['rel'])}")
             self.in_ids.append(a["from"])
         self.inbox.configure(height=max(2, min(8, self.inbox.size())))
+
+    def jump_out(self, _e=None):
+        sel = self.outbox.curselection()
+        if sel and sel[0] < len(self.out_ids):
+            self.app.goto(self.out_ids[sel[0]])
+
+    def edges_text(self):
+        return self.t_edges.get("1.0", "end-1c")
 
     def jump_in(self, _e=None):
         sel = self.inbox.curselection()
@@ -14601,11 +14668,20 @@ class App:
         if rec["id"].startswith("__"):
             rec["met"] = rec.get("met") or TODAY()
             rec["id"] = make_id(rec["name"], set(by_id(load_json())))
+        links = parse_edges(self.pc.edges_text(), rec["id"])
+        unparsed = [a["to"] for a in links if a.get("_bad")]
+        links = [a for a in links if not a.get("_bad")]
+        if unparsed:
+            rec["edge_drafts"] = unparsed
+        else:
+            rec.pop("edge_drafts", None)
         touch(rec)
-        self.data = save_record("people", rec)
+        self.data = save_record("people", rec, edges=links)
         self.safe_mirror(self.data)
         if filed:
             self.say(tr("{n} finished task(s) went to the log.", n=filed))
+        elif unparsed:
+            self.say(tr("{n} link line(s) not understood were kept as drafts.", n=len(unparsed)))
         elif auto:
             self.say(tr('Saved "{name}" automatically.', name=one_liner(rec["name"], 40)))
         return rec["id"]
@@ -16128,7 +16204,7 @@ REL_FAMILY = {
     "requires": "verba",
     "coined_by": "people", "used_by": "people", "about": "people",
     "author_of": "people", "editor_of": "people", "translator_of": "people",
-    "knows": "people", "works_at": "people", "member_of": "people",
+    "knows": "people", "influenced": "people", "works_at": "people", "member_of": "people",
     "cites": "sources", "attested_in": "sources", "defined_in": "sources",
     "measured_in": "sources", "part_of": "sources", "edition_of": "sources",
     "translates": "sources", "comments_on": "sources", "responds_to": "sources",
@@ -21125,6 +21201,8 @@ PT = {
         "Semear de novo para recomeçar",
     "r: start again":
         "r: recomeçar",
+    "influenced":
+        "influenciou",
     "dust off":
         "tirar o pó",
     "Dust off: the longest unvisited":

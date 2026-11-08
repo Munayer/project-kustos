@@ -121,6 +121,18 @@ It refuses any folder it did not make, so it never touches a real base.
   are read again.
 - **Linked entries** between any registers (`author_of`, `cites`,
   `attested_in`, `defined_in`, `translates`, `measured_in`…). Labels outside of the table are accepted and marked as atypical.
+  Every card, a person's included, has a LINKS field, one link per line:
+  `rel target [span] — reason # source`, the target being a record's id
+  (`Ctrl+Shift+C` copies the open record's). Below it, RESOLVED LINKS lists
+  them by name and CITED BY the links coming in. Between two people,
+  `knows` is for people who met, and `influenced` for one whose work shaped
+  the other's, across any distance in time:
+
+  ```
+  influenced p_tom00002 — his notes on governors shaped hers # s_…
+  ```
+
+  The link graph draws them too (Shift+drag from one record to another).
 - **Monads** (`Ctrl+Shift+M`, **View › Monads**, or `python _kustos.py monads [id]`):
   a second, read-only window that shows what records share with no link written,
   after Leibniz. Each person, concept, form or source is a disc and no line is

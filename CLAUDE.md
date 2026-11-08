@@ -79,6 +79,9 @@ Ideas that span several sections:
   `kind_of` still says person, so every older link type fits them, and
   `kind_fits` checks the `org` end of RELS (`works_at`, `member_of`) for the
   doctor, `typical_rels` and `write_link`; `graph_kind` makes them hexagons.
+  A person's card has its own LINKS (`PersonCard.t_edges`, saved by
+  `_save_person` with `edges=`), as every other card; on the page, a form
+  without `edges` (a tab opened before) keeps the person's links.
 - **Monads** (`# ==== monads`): read-only view; `MonadIndex` weighs shared words
   and links, `MonadView` draws them with no lines. `MONAD_COLLS` keeps health and
   drafts out, also as bridges between records; keep it that way. To measure its
