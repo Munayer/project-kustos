@@ -82,6 +82,27 @@ It refuses any folder it did not make, so it never touches a real base.
   from a person (or another organization) to them; as a person they can still
   be an author, or be known. The rail's **organizations** lists them, and
   `is:org` / `is:person` in the search pick them out.
+- **Bulk entries** (`Ctrl+Q`, **File › Bulk entries…**): many records of one
+  kind at once, one per line. Forms can come in several languages in one go:
+  the language in parentheses after the name, or a line of its own (`(ita)`,
+  `[ita]` or `# ita`) for the lines after it; a line with neither takes the
+  LANGUAGE above. Flashcards copied from Obsidian (`questa:;this ^1748…`) are
+  read too, the `^id` dropped:
+
+  ```
+  Domani (ita). tomorrow
+  livre (fra); book
+  (lat)
+  aqua. water
+  ignis. fire
+  ```
+
+  As you type, a line under the box says how many forms will go into each
+  language (one the base does not have yet is marked *new*), which are already
+  there — in the base or earlier in the list, same name and language, ignoring
+  case — and will be skipped, and which have no language yet; Add refuses
+  those until they get one. The `(ita)` is read only in the name, before the
+  `. `, so a gloss such as `beautiful (adj)` keeps its parentheses.
 - **Drafts**: free notes in markdown, one `.md` file each in `notes/` beside the
   program, so other markdown tools (Obsidian, say) read and edit the same
   files. The title is the file name; a small header (`id`, `reg_n`, `reg`,

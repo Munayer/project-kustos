@@ -967,6 +967,96 @@ def year_of(span):
         return float("inf")
 
 
+# ---- bulk forms, in several languages at once. One per line:
+#     Domani (ita). amanhã        the language in parentheses after the name,
+#                                 then ". ", ", ", "; " or ":" before the gloss
+#     (ita)                       a line of its own (also [ita] or # ita, with
+#                                 no dash before it): the lines after it
+#     questa:;esta ^17482127962   Obsidian's flashcards: ":;", the ^id dropped
+# A line with no language takes the one above it, else the dialog's LANGUAGE.
+
+# the "(ita)" only in the name, before any ". " or ":;": "beautiful (adj)" in a
+# gloss is no language
+BULK_LANG_RE = re.compile(r"^(?P<name>(?:(?!\.\s|:;).)*?\S)\s*\((?P<lang>[A-Za-z]{2,3})\)"
+                          r"(?:\s*[.,;:]+\s*|\s+|$)(?P<gloss>.*)$")
+BULK_HEAD_RE = re.compile(r"^(?:[\[(]\s*(?P<a>[A-Za-z]{2,3})\s*[\])]|#+\s*(?P<b>[A-Za-z]{2,3}))\s*:?$")
+BULK_BLOCK_RE = re.compile(r"\s\^[A-Za-z0-9-]+$")
+
+
+def parse_bulk_forms(text, default_lang=""):
+    """The forms of a bulk entry, in order: [{name, lang, gloss, line}]; lang
+    is '' where neither the line, a heading above it nor `default_lang` gives
+    one. A dashed line with only "(lat)" is an empty item, not a heading."""
+    out, heading = [], ""
+    for n, raw in enumerate(text.splitlines(), 1):
+        line, dashed = raw.strip(), False
+        if line[:2] in ("- ", "* ") or line in ("-", "*"):
+            line, dashed = line[1:].strip(), True
+        if not line:
+            continue
+        head = None if dashed else BULK_HEAD_RE.match(line)
+        if head:
+            heading = (head.group("a") or head.group("b")).lower()
+            continue
+        line = BULK_BLOCK_RE.sub("", line).strip()
+        m = BULK_LANG_RE.match(line)
+        if m:
+            name, lang, gloss = m.group("name"), m.group("lang").lower(), m.group("gloss")
+        else:
+            lang = ""
+            if dashed and BULK_HEAD_RE.match(line):
+                continue                        # "- (lat)": an empty item
+            name, gloss = (line.split(":;", 1) if ":;" in line else
+                           line.split(". ", 1) if ". " in line else (line, ""))
+        name = name.strip().rstrip(".,;:").strip()
+        gloss = gloss.strip().removeprefix(":;").strip().rstrip(".").strip()
+        if name:
+            out.append({"name": name, "lang": lang or heading or (default_lang or "").strip().lower(),
+                        "gloss": gloss, "line": n})
+    return out
+
+
+def bulk_form_repeats(items, data):
+    """Which bulk forms are there already, by name and language: {index:
+    "base" | "batch"} -- in the base, or earlier in the same batch."""
+    def key(name, lang):
+        return (lang or "").lower(), unicodedata.normalize("NFC", name or "").casefold().strip()
+    base = {key(e.get("name"), e.get("lang")) for e in data.get("entries", []) if e.get("kind") == "form"}
+    seen, out = set(), {}
+    for i, it in enumerate(items):
+        k = key(it["name"], it["lang"])
+        if k in base:
+            out[i] = "base"
+        elif k in seen:
+            out[i] = "batch"
+        seen.add(k)
+    return out
+
+
+def bulk_forms_summary(items, repeats, known):
+    """What a bulk entry of forms will do, in a line: how many in each
+    language (a language new to the base marked), the repeated ones that will
+    be skipped, and the ones with no language."""
+    if not items:
+        return ""
+    counts = {}
+    for i, it in enumerate(items):
+        if it["lang"] and i not in repeats:
+            counts[it["lang"]] = counts.get(it["lang"], 0) + 1
+    langs = ", ".join(f"{lang} {n}" + (" " + tr("(new)") if lang not in known else "")
+                      for lang, n in sorted(counts.items(), key=lambda kv: -kv[1]))
+    bits = [tr("{n} form(s): {langs}", n=sum(counts.values()), langs=langs or "-")]
+    if repeats:
+        names = ", ".join(f"{items[i]['name']} ({items[i]['lang']})" for i in list(repeats)[:4])
+        bits.append(tr("{n} repeated, skipped: {names}", n=len(repeats), names=names)
+                    + ("…" if len(repeats) > 4 else ""))
+    lost = [it for it in items if not it["lang"]]
+    if lost:
+        bits.append(tr("{n} without a language: {names}", n=len(lost),
+                       names=", ".join(it["name"] for it in lost[:4]) + ("…" if len(lost) > 4 else "")))
+    return " · ".join(bits)
+
+
 def new_id(kind, name, taken):
     base = ("c_" if kind == "concept" else "f_") + slug(name)[:40]
     cand, n = base, 2
@@ -14414,7 +14504,7 @@ class App:
         tk.Label(win, text=tr("BULK ENTRIES"), bg=PAPER, fg=FAINT,
                  font=self.f_label).pack(anchor="w", padx=20, pady=(16, 2))
         hint = tk.Label(win, text="", bg=PAPER, fg=SOFT, font=self.f_meta,
-                        justify="left")
+                        justify="left", wraplength=590)
         hint.pack(anchor="w", padx=20, pady=(0, 10))
         row = tk.Frame(win, bg=PAPER)
         row.pack(fill="x", padx=20)
@@ -14452,10 +14542,14 @@ class App:
                                  "draft": tr("One per line:  title. text"),
                                  "source": tr("One reference per line, as you would write it "
                                               "(SURNAME, Name. Title. Place: Publisher, year)."),
+                                 "form": tr("One per line:  name (language). gloss  -- or a line with "
+                                            "just (ita) for the lines after it; with neither, the "
+                                            "LANGUAGE above. Obsidian's name:;gloss works too."),
                                  }.get(k, tr("One per line:  name. gloss")))
+            later_summary()
 
         v_kind.trace_add("write", toggle)
-        toggle()
+        v_lang.trace_add("write", lambda *_a: later_summary())
         tk.Label(win, text="", bg=PAPER).pack(pady=2)
         box = tk.Text(win, height=10, font=self.f_meta, bg=SHELL, fg=INK,
                       insertbackground=INK, relief="flat", wrap="word",
@@ -14463,6 +14557,31 @@ class App:
                       highlightcolor=STAMP, padx=8, pady=6, undo=True)
         self.bind_undo(box, text=True)
         box.pack(fill="both", expand=True, padx=20)
+        # forms: what the entry will do, as it is typed
+        summary = tk.Label(win, text="", bg=PAPER, fg=SOFT, font=self.f_meta, justify="left",
+                           anchor="w", wraplength=590)
+        summary.pack(fill="x", padx=20, pady=(6, 0))
+        job = {"id": None}
+
+        def show_summary():
+            job["id"] = None
+            if not win.winfo_exists():
+                return
+            if kinds.get(v_kind.get(), "person") != "form":
+                summary.configure(text="")
+                return
+            items = parse_bulk_forms(box.get("1.0", "end-1c"), v_lang.get())
+            summary.configure(text=bulk_forms_summary(items, bulk_form_repeats(items, self.data),
+                                                      set(self.known_langs())))
+
+        def later_summary():
+            if job["id"]:
+                win.after_cancel(job["id"])
+            job["id"] = win.after(250, show_summary)
+
+        for ev in ("<KeyRelease>", "<<Paste>>", "<<Cut>>"):
+            box.bind(ev, lambda e: later_summary(), add="+")
+        toggle()
 
         def add():
             kind = kinds.get(v_kind.get(), "person")
@@ -14513,8 +14632,42 @@ class App:
                 return
             lang = v_lang.get().strip()
             src = e_source.get().strip()
-            if kind == "form" and not lang:
-                hint.configure(text=tr("A form needs a language."))
+            if kind == "form":
+                data = load_json()
+                items = parse_bulk_forms(text, lang)
+                lost = [it for it in items if not it["lang"]]
+                if lost:
+                    hint.configure(text=tr("Give these a language -- (ita) after the name, a line "
+                                           "(ita) above them, or the LANGUAGE above: {names}",
+                                           names=", ".join(it["name"] for it in lost[:6])
+                                           + ("…" if len(lost) > 6 else "")))
+                    return
+                repeats = bulk_form_repeats(items, data)
+                taken = set(by_id(data))
+                counts = {}
+                for i, it in enumerate(items):
+                    if i in repeats:
+                        continue
+                    eid = new_id("form", it["name"], taken)
+                    taken.add(eid)
+                    rec = fix_entry({"id": eid, "kind": "form", "name": it["name"],
+                                     "gloss": it["gloss"], "source": src, "lang": it["lang"],
+                                     "status": "reconstructed" if it["name"].startswith("*")
+                                     else "attested"})
+                    touch(rec)
+                    data["entries"].append(rec)
+                    log_put("entries", rec)
+                    counts[it["lang"]] = counts.get(it["lang"], 0) + 1
+                if counts:
+                    write_json(data)
+                    self.safe_mirror(data)
+                win.destroy()
+                self.reload()
+                said = tr("{n} form(s) added ({langs}).", n=sum(counts.values()),
+                          langs=", ".join(f"{k} {v}" for k, v in counts.items()) or "-")
+                if repeats:
+                    said += " " + tr("{n} repeated, skipped.", n=len(repeats))
+                self.say(said)
                 return
             data = load_json()
             taken = set(by_id(data))
@@ -14533,10 +14686,6 @@ class App:
                 taken.add(eid)
                 rec = fix_entry({"id": eid, "kind": kind, "name": name, "gloss": gloss,
                                  "source": src})
-                if kind == "form":
-                    rec.update({"lang": lang,
-                                "status": "reconstructed" if name.startswith("*")
-                                else "attested"})
                 touch(rec)
                 data["entries"].append(rec)
                 log_put("entries", rec)
@@ -20689,6 +20838,22 @@ PT = {
         "Semear de novo para recomeçar",
     "r: start again":
         "r: recomeçar",
+    "(new)":
+        "(nova)",
+    "{n} form(s): {langs}":
+        "{n} forma(s): {langs}",
+    "{n} repeated, skipped: {names}":
+        "{n} repetida(s), pulada(s): {names}",
+    "{n} without a language: {names}":
+        "{n} sem língua: {names}",
+    "One per line:  name (language). gloss  -- or a line with just (ita) for the lines after it; with neither, the LANGUAGE above. Obsidian's name:;gloss works too.":
+        "Uma por linha:  nome (língua). glosa  -- ou uma linha só com (ita) para as seguintes; sem nenhuma das duas, a LÍNGUA acima. O nome:;glosa do Obsidian também serve.",
+    "Give these a language -- (ita) after the name, a line (ita) above them, or the LANGUAGE above: {names}":
+        "Dê uma língua a estas -- (ita) depois do nome, uma linha (ita) acima delas, ou a LÍNGUA acima: {names}",
+    "{n} form(s) added ({langs}).":
+        "{n} forma(s) adicionada(s) ({langs}).",
+    "{n} repeated, skipped.":
+        "{n} repetida(s), pulada(s).",
     "organizations":
         "organizações",
     "organization":
