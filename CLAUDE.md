@@ -121,6 +121,19 @@ Ideas that span several sections:
 - **Motion** (`# ==== motion`): the timings are constants there, and `tween`
   follows the clock. Animate a tag's colour, not a Text's options: `configure`
   on a Text costs ~20 times as much per frame.
+- **Dust off** (`App.dust_off`, Ctrl+D): opens the record of the list
+  (`self.view`) gone longest without a visit, by `dust_order` (`last_visit`:
+  the later of a visit and `updated_at`). Visits live outside the JSON, in
+  `_kustos.seen.<host>.json` per machine (`seen_read` merges all of them,
+  `seen_write` rereads this machine's before writing; ignored by git as
+  `_kustos.*.json`); a card counts as visited after `DUST_DWELL_MS` open
+  (`dwell_done`), and `flush_seen` writes them a moment later and before the
+  window goes. Never write a visit into a record: it would save, log and
+  sync on every open.
+- **The wide card's search** (F11, then Ctrl+F): `quick_*` methods show the
+  index's results (`self.view` after `refresh_list`) in a frame placed over
+  the card under the search; the search entry's keys go to it while it is
+  shown (`entry_key`, `entry_escape`), and `search_changed` refreshes it.
 - **The logs are the history**: `history <id>` and `replay` (rebuilds the base
   from logs into `_kustos.replay.json`) read them; there are no `.bak` files.
 - **Drafts live in files**: the `notes` collection is an index (id, title,

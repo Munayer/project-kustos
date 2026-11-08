@@ -273,7 +273,9 @@ It refuses any folder it did not make, so it never touches a real base.
   the field across the whole card, read in pages with PageUp/PageDown or the
   wheel, with `Ctrl+F` to find inside it; it stays editable. `F11` hides the
   rail and the list so the card takes the whole window; the text column keeps
-  a readable width. A long LOG or NOTES field is read one page per view
+  a readable width. There, `Ctrl+F` shows what the search finds in a small list
+  under it — the index's own results — chosen with ↑ ↓ (or the mouse) and
+  opened with Enter, Esc to put it away, without leaving the wide card. A long LOG or NOTES field is read one page per view
   inside the card: each page holds what fits on screen and starts at an entry
   or paragraph (`‹ ›` beside the title, PageUp/PageDown, a sideways swipe or
   Shift+wheel over it, or the wheel over it once the card is at its end); the
@@ -293,6 +295,19 @@ It refuses any folder it did not make, so it never touches a real base.
   are dimmed), so a search in one collection shows at once where else it
   matches. The filters in force sit as chips above the list: `×` drops one,
   *clear all* drops them all.
+
+- **Dust off** (`Ctrl+D`, the *dust off* button beside *+ new*, or **View ›
+  Dust off**): opens the record gone longest without a visit, among those in
+  the list — the whole register, or what the search and the filters leave
+  (`Ctrl+5` first, and it goes through the drafts only; `v: lang:ita`, the
+  Italian forms). Not at random: oldest first, so pressing it again and again
+  goes through them all, each one opened going to the back of the line. A
+  visit is a card left open a few seconds (not one passed by on the way), a
+  save, or one opened this way; the status line says when the last one was
+  and how many more in the list have gone a month without one. The visits are
+  kept per machine beside the base (`_kustos.seen.<machine>.json`, only this
+  machine writes its own, so Syncthing never makes a conflict of it), and
+  every machine reads them all.
 
 - **Sync between machines**: each machine that you end up using and syncing will write its own diary of usage
   (`_kustos.log.<machine>.jsonl`); files `*.sync-conflict-*` are mixed register by register on opening. The complete history of each register comes out in the diaries.

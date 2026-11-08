@@ -267,6 +267,9 @@ class WheelNotches:
         return n
 
 
+QUICK_ROWS = 8                  # rows of the wide card's results under the search
+
+
 def wheel_turn(notches, e, turn):
     """A page turned by `turn(+1 | -1)` once a whole notch; "break" either way,
     so the widget's own scrolling does not move it too."""
@@ -2389,6 +2392,71 @@ def by_id(data):
 def touch(rec):
     rec["updated"] = TODAY()
     rec["updated_at"] = NOW()
+
+
+# ---- dust: when each record was last visited, so that the one gone longest
+# without a visit can be opened next (App.dust_off, Ctrl+D). One small file per
+# machine beside the base, as the logs are: only this machine writes its own,
+# so Syncthing never makes a conflict of it, and every machine reads them all,
+# the latest visit winning. A visit is a card left open DUST_DWELL_MS, or one
+# opened by dust off; a save counts too (`updated_at`). Nothing in the JSON.
+
+SEEN_FILE = BASE / f"{STEM}.seen.{HOST}.json"
+DUST_DWELL_MS = 4000            # a card open this long was visited, not passed by
+DUST_OLD_DAYS = 30              # "unvisited for over a month", in the status line
+
+
+def seen_read():
+    """{id: when it was last visited, ISO} from every machine's file."""
+    out = {}
+    for path in BASE.glob(f"{STEM}.seen.*.json"):
+        if ".sync-conflict-" in path.name:
+            continue
+        try:
+            got = json.loads(path.read_text(encoding="utf-8")).get("seen")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(got, dict):
+            for rid, t in got.items():
+                if isinstance(t, str) and t > out.get(rid, ""):
+                    out[rid] = t
+    return out
+
+
+def seen_write(marks, keep=None):
+    """Adds `marks` ({id: ISO}) to this machine's file, read again first so
+    that nothing another Kustos on this machine wrote is lost; `keep` (ids)
+    drops the visits of records that no longer exist."""
+    try:
+        cur = json.loads(SEEN_FILE.read_text(encoding="utf-8")).get("seen")
+    except (OSError, ValueError, AttributeError):
+        cur = None
+    cur = cur if isinstance(cur, dict) else {}
+    for rid, t in marks.items():
+        if t > cur.get(rid, ""):
+            cur[rid] = t
+    if keep is not None:
+        cur = {k: v for k, v in cur.items() if k in keep}
+    try:
+        tmp = SEEN_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"host": HOST, "seen": cur}, ensure_ascii=False,
+                                  separators=(",", ":")), encoding="utf-8")
+        tmp.replace(SEEN_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def last_visit(rec, seen):
+    """When a record was last visited or saved, ISO ('' if never recorded)."""
+    return max(seen.get(rec.get("id"), ""), rec.get("updated_at") or rec.get("updated") or "")
+
+
+def dust_order(records, seen):
+    """The records from the one gone longest without a visit to the latest
+    visited: the order dust off follows (the older register number first on a
+    tie, so records never visited go in the order they came in)."""
+    return sorted(records, key=lambda r: (last_visit(r, seen), r.get("reg_n") or 0))
 
 
 # ---- append-only log, one per machine
@@ -10910,7 +10978,7 @@ HELP_TEXT = (
     "\n  Ctrl+F     go to the search"
     "\n  ↓ / Enter  from the search to the list"
     "\n  Ctrl+N     new person"
-    "\n  Ctrl+Q     bulk entries (any kind, one per line)"
+    "\n  Ctrl+Q     bulk entries (any kind, one per line)\n  Ctrl+D     dust off: opens what has gone longest unvisited in the list"
     "\n  Ctrl+S     save the open record"
     "\n  Ctrl+Enter save and start another of the same kind"
     "\n  Ctrl+Z / Ctrl+Y   undo / redo"
@@ -10990,7 +11058,7 @@ HELP_TEXT = (
 
 # the Help › Shortcuts lines for wide and reading modes
 HELP_READING = (
-    "\n  F11 / Ctrl+\\   wide card: hides the rail and the list (again: brings them back)"
+    "\n  F11 / Ctrl+\\   wide card: hides the rail and the list (again: brings them back);\n                  Ctrl+F there shows the search's results under it"
     "\n  Ctrl+E          reading mode: the long field (notes) across the whole card;"
     "\n                  also a double-click on a field's title. Inside it:"
     "\n                  PageUp / PageDown or the wheel turn the page, Ctrl+F finds,"
@@ -11907,6 +11975,11 @@ class App:
         self.rows = 0              # how many rows fit in the list right now
         self.page_sig = None       # did the filter change? then the view goes back to the start
         self._fit_job = None
+        self.seen = seen_read()    # dust: when each record was last visited (all machines)
+        self.seen_new = {}         # this machine's visits not yet written
+        self._seen_job = self._dwell_job = None
+        self.quick = None          # the wide card's results under the search
+        self.quick_items, self.quick_top, self.quick_cur = [], 0, 0
         ui = self.data.get("ui") or {}
         self.max_rows_fixed = bool(ui.get("max_rows"))      # a fixed limit, if the JSON sets one
         self.max_rows = int(ui.get("max_rows") or 10)
@@ -12011,6 +12084,8 @@ class App:
         add.configure(command=lambda: menu.tk_popup(add.winfo_rootx(),
                                                     add.winfo_rooty() + add.winfo_height()))
         add.pack(side="right", padx=(4, 12))
+        ttk.Button(bar, text=tr("dust off"), style="Quiet.TButton",
+                   command=self.dust_off).pack(side="right", padx=(4, 0))
 
     def build_body(self):
         # opaqueresize off: while the divider is dragged only a thin line moves,
@@ -12258,6 +12333,7 @@ class App:
 
     def toggle_wide(self):
         """F11 / Ctrl+Backslash: the card alone in the window, or back with the rail and list."""
+        self.quick_hide()
         if self.wide:
             self.pw.add(self.mid_pane, before=self.cardbox, stretch="always", minsize=200)
             self.pw.add(self.rail_pane, before=self.mid_pane, stretch="never", minsize=120)
@@ -12431,6 +12507,8 @@ class App:
         v.add_command(label=tr("Skills (Peritia)"), command=self.open_peritia)
         v.add_command(label=tr("Wide card"), accelerator="F11", command=self.toggle_wide)
         v.add_command(label=tr("Read field"), accelerator="Ctrl+E", command=self.open_reader)
+        v.add_command(label=tr("Dust off: the longest unvisited"), accelerator="Ctrl+D",
+                      command=self.dust_off)
         lt = self.menu(v)
         lt.add_radiobutton(label=tr("One page per view"), value="pages",
                            variable=self.long_var, command=self.set_long_text)
@@ -12460,8 +12538,8 @@ class App:
 
     def bind_keys(self):
         r = self.root
-        r.bind("<Control-f>", lambda e: (self.entry.focus_set(),
-                                         self.entry.select_range(0, "end")))
+        r.bind("<Control-f>", lambda e: self.find_index())
+        r.bind("<Control-d>", lambda e: self.dust_off())
         r.bind("<Control-s>", lambda e: self.save())
         r.bind("<Control-n>", lambda e: self.new_person())
         r.bind("<Control-q>", lambda e: self.bulk_add())
@@ -12474,8 +12552,16 @@ class App:
         r.bind("<Control-Key-0>", lambda e: self.set_scope(None))
         for n, key in enumerate(("people", "entries", "sources", "corpus", "notes"), 1):
             r.bind(f"<Control-Key-{n}>", lambda e, k=key: self.set_scope(k))
-        self.entry.bind("<Down>", lambda e: self.focus_list())
-        self.entry.bind("<Return>", lambda e: self.focus_list())
+        self.entry.bind("<Down>", lambda e: self.entry_key(1))
+        self.entry.bind("<Up>", lambda e: self.entry_key(-1))
+        self.entry.bind("<Next>", lambda e: self.entry_key(QUICK_ROWS) if self.quick_on() else None)
+        self.entry.bind("<Prior>", lambda e: self.entry_key(-QUICK_ROWS) if self.quick_on() else None)
+        self.entry.bind("<Return>", lambda e: self.entry_key(0))
+        self.entry.bind("<Escape>", lambda e: self.entry_escape())
+        self.entry.bind("<FocusIn>", lambda e: self.root.after_idle(self.quick_update), add="+")
+        self.entry.bind("<FocusOut>", lambda e: self.quick_hide(), add="+")
+        self.entry.bind("<Configure>", lambda e: self.quick_place() if self.quick_on() else None,
+                        add="+")
         self.list.bind("<slash>", lambda e: (self.entry.focus_set(),
                                              self.entry.select_range(0, "end"), "break")[2])
         self.list.bind("<Return>", lambda e: self.focus_card())
@@ -13422,6 +13508,7 @@ class App:
         self._q_job = None
         self.refresh_list()
         self.refresh_rail()
+        self.quick_update(fresh=True)
 
     def parse_query(self):
         """The search box, read with the operators of parse_search."""
@@ -13985,6 +14072,202 @@ class App:
         for view in (getattr(self, "graph", None), getattr(self, "monads", None)):
             if view and view.is_open():
                 view.follow(rid)
+        if self._dwell_job:
+            self.root.after_cancel(self._dwell_job)
+        self._dwell_job = self.root.after(DUST_DWELL_MS, lambda: self.dwell_done(rid))
+
+    # ---- dust off: the record gone longest without a visit
+    def dwell_done(self, rid):
+        self._dwell_job = None
+        if self.sel == rid:
+            self.mark_seen(rid)
+
+    def mark_seen(self, rid):
+        """A visit to a record, written to this machine's file a moment later."""
+        if not rid or rid.startswith("__"):
+            return
+        self.seen[rid] = self.seen_new[rid] = NOW()
+        if not self._seen_job:
+            self._seen_job = self.root.after(3000, self.flush_seen)
+
+    def flush_seen(self):
+        if self._seen_job:
+            try:
+                self.root.after_cancel(self._seen_job)
+            except tk.TclError:
+                pass
+        self._seen_job = None
+        if self.seen_new and seen_write(self.seen_new, keep=set(by_id(self.data))):
+            self.seen_new = {}
+
+    def dust_off(self):
+        """Ctrl+D: opens the record gone longest without a visit -- opened or
+        saved -- among those in the list: the whole register, or what the search
+        and the filters leave (Ctrl+5 first: only the drafts). Each one opened
+        goes to the back of the line, so pressing again goes through them all."""
+        for rid, t in seen_read().items():          # the other machines' visits too
+            if t > self.seen.get(rid, ""):
+                self.seen[rid] = t
+        pool = [o for k, o in getattr(self, "view", []) if k == "r"
+                and not o["id"].startswith("__") and o["id"] != self.sel]
+        if not pool:
+            self.say(tr("Nothing to dust off in this list."))
+            return "break"
+        order = dust_order(pool, self.seen)
+        rec = order[0]
+        when = last_visit(rec, self.seen)[:10]
+        cutoff = (datetime.now() - timedelta(days=DUST_OLD_DAYS)).isoformat(timespec="seconds")
+        older = sum(1 for r in order[1:] if last_visit(r, self.seen) < cutoff)
+        self.goto(rec["id"])
+        if self.sel != rec["id"]:
+            return "break"
+        self.mark_seen(rec["id"])
+        name = one_liner(label_any(rec, self.data), 50)
+        said = (tr("Dust off · {name} · last visit {when}", name=name, when=when) if when
+                else tr("Dust off · {name} · no visit recorded", name=name))
+        if older:
+            said += " · " + tr("{n} more in this list unvisited for over a month", n=older)
+        self.say(said)
+        return "break"
+
+    # ---- the wide card's search: its results in a small list under it
+    def find_index(self):
+        """Ctrl+F: to the search; on the wide card its results show under it."""
+        self.entry.focus_set()
+        self.entry.select_range(0, "end")
+        self.root.after_idle(self.quick_update)
+        return "break"
+
+    def quick_on(self):
+        return self.quick is not None and bool(self.quick.winfo_manager())
+
+    def quick_update(self, fresh=False):
+        """Shows, or puts away, the small list: only on the wide card, with
+        something searched, while the search has the keys."""
+        try:
+            focused = self.root.focus_get() is self.entry
+        except (KeyError, tk.TclError):
+            focused = False
+        if not (self.wide and focused and self.q.get().strip()):
+            self.quick_hide()
+            return
+        if fresh or not self.quick_on():
+            self.quick_items = [o for k, o in getattr(self, "view", []) if k == "r"
+                                and not o["id"].startswith("__")]
+            self.quick_top = self.quick_cur = 0
+        self.quick_draw()
+
+    def quick_build(self):
+        f = self.quick = tk.Frame(self.root, bg=PAPER, highlightthickness=1,
+                                  highlightbackground=STAMP, highlightcolor=STAMP, bd=0)
+        f.columnconfigure(0, weight=1)
+        self.quick_rows = []
+        notches = WheelNotches()
+
+        def wheel(e):
+            return wheel_turn(notches, e, lambda step: self.quick_move(step * 3))
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.root.bind_class("KustosQuick", seq, wheel)
+        bind_touchpad(lambda seq, fn: self.root.bind_class("KustosQuick", seq, fn), wheel)
+        for i in range(QUICK_ROWS):
+            row = tk.Frame(f, bg=PAPER, cursor="hand2")
+            num = tk.Label(row, bg=PAPER, fg=FAINT, font=self.f_meta, anchor="e")
+            title = tk.Label(row, bg=PAPER, fg=INK, font=self.f_row, anchor="w")
+            subt = tk.Label(row, bg=PAPER, fg=SOFT, font=self.f_meta, anchor="w")
+            num.pack(side="right", padx=(6, 10), pady=3)
+            title.pack(side="left", padx=(10, 8), pady=3)
+            subt.pack(side="left", fill="x", expand=True, pady=3)
+            for w in (row, num, title, subt):
+                w.bindtags(("KustosQuick",) + w.bindtags())
+                w.bind("<Button-1>", lambda e, i=i: self.quick_open(self.quick_top + i))
+                w.bind("<Motion>", lambda e, i=i: self.quick_point(self.quick_top + i))
+            self.quick_rows.append((row, title, subt, num))
+        self.quick_foot = tk.Label(f, bg=PAPER, fg=FAINT, font=self.f_label, anchor="w")
+        self.quick_foot.bindtags(("KustosQuick",) + self.quick_foot.bindtags())
+        self.quick_foot.grid(row=QUICK_ROWS, column=0, sticky="ew", padx=10, pady=(2, 4))
+
+    def quick_draw(self):
+        if self.quick is None:
+            self.quick_build()
+        items, top, cur = self.quick_items, self.quick_top, self.quick_cur
+        for i, (row, title, subt, num) in enumerate(self.quick_rows):
+            j = top + i
+            if j >= len(items):
+                row.grid_remove()
+                continue
+            r = items[j]
+            text, sub = self.row_text(r)
+            on = j == cur
+            bg, fg = (SELBG, SELFG) if on else (PAPER, INK)
+            row.configure(bg=bg)
+            title.configure(text=one_liner(text, 46), bg=bg, fg=fg)
+            subt.configure(text=one_liner(sub, 70), bg=bg, fg=fg if on else SOFT)
+            num.configure(text=f"nº {r['reg_n']}" if r.get("reg_n") else "", bg=bg,
+                          fg=fg if on else FAINT)
+            row.grid(row=i, column=0, sticky="ew")
+        if items:
+            shown = f"{top + 1}–{min(top + QUICK_ROWS, len(items))} / {len(items)}"
+            self.quick_foot.configure(text=shown + "   " + tr("↑ ↓ choose · Enter opens · Esc closes"))
+        else:
+            self.quick_foot.configure(text=tr("Nothing found."))
+        self.quick_place()
+
+    def quick_place(self):
+        x = self.entry.winfo_rootx() - self.root.winfo_rootx()
+        y = self.entry.winfo_rooty() - self.root.winfo_rooty() + self.entry.winfo_height() + 2
+        self.quick.place(x=x, y=y, width=max(320, self.entry.winfo_width()))
+        self.quick.lift()
+
+    def quick_hide(self):
+        if self.quick_on():
+            self.quick.place_forget()
+
+    def quick_move(self, step):
+        """The highlight `step` rows on, the window of rows following it."""
+        if not self.quick_items:
+            return
+        cur = max(0, min(len(self.quick_items) - 1, self.quick_cur + step))
+        self.quick_cur = cur
+        if cur < self.quick_top:
+            self.quick_top = cur
+        elif cur >= self.quick_top + QUICK_ROWS:
+            self.quick_top = cur - QUICK_ROWS + 1
+        self.quick_draw()
+
+    def quick_point(self, j):
+        if j != self.quick_cur and j < len(self.quick_items):
+            self.quick_cur = j
+            self.quick_draw()
+
+    def quick_open(self, j):
+        if not 0 <= j < len(self.quick_items):
+            return "break"
+        rid = self.quick_items[j]["id"]
+        self.quick_hide()
+        self.goto(rid)
+        self.focus_card()
+        return "break"
+
+    def entry_key(self, step):
+        """↓ ↑ PageDown PageUp Enter in the search: in the small list when it is
+        there; otherwise ↓ and Enter go to the list, as always (on the wide
+        card, where the list is hidden, they bring the small list back)."""
+        if self.quick_on():
+            return self.quick_open(self.quick_cur) if step == 0 else (self.quick_move(step), "break")[1]
+        if self.wide:
+            self.quick_update()
+            return "break"
+        if step >= 0:
+            self.focus_list()
+            return "break"
+        return None
+
+    def entry_escape(self):
+        if self.quick_on() or self.wide:
+            self.quick_hide()
+            self.focus_card()
+            return "break"
+        return None
 
     def goto(self, rid):
         if rid not in by_id(self.data):
@@ -15007,6 +15290,7 @@ class App:
             self.commit_if_dirty()
             self.restart_theme = self.theme
             self.flush_mirror()
+            self.flush_seen()
             self.stop_carets()
             self.root.destroy()
 
@@ -15022,6 +15306,7 @@ class App:
         save_ui({"theme": key})
         self.restart_theme = key
         self.flush_mirror()
+        self.flush_seen()
         self.stop_carets()
         self.root.destroy()
 
@@ -15034,6 +15319,7 @@ class App:
         set_lang(code)
         self.restart_theme = self.theme
         self.flush_mirror()
+        self.flush_seen()
         self.stop_carets()
         self.root.destroy()
 
@@ -15111,6 +15397,7 @@ class App:
     def on_close(self):
         self.commit_if_dirty()
         self.flush_mirror()
+        self.flush_seen()
         self.stop_carets()
         self.root.destroy()
 
@@ -19804,8 +20091,8 @@ PT = {
         "(padrão)",
     "Yes":
         "Sim",
-    "\n  Ctrl+F     go to the search\n  ↓ / Enter  from the search to the list\n  Ctrl+N     new person\n  Ctrl+Q     bulk entries (any kind, one per line)\n  Ctrl+S     save the open record\n  Ctrl+Enter save and start another of the same kind\n  Ctrl+Z / Ctrl+Y   undo / redo\n  Ctrl+J / Ctrl+K   next / previous, from anywhere\n  Ctrl+G     go to: nº (1852), stamp, id or name\n  Ctrl+L     show in the register: leaves the search, shows the open record's nº\n  Ctrl+B     open as logbook (second window, read-only;\n             Enter in the logbook brings the record to the card)\n  Ctrl+1..4  scope people / verba / sources / corpus; Ctrl+0 everything\n  /  in the list goes back to the search;  Enter in the list goes to the card\n  Home / End within the page;  PageUp / PageDown or the wheel turns the page\n  Ctrl+Home / Ctrl+End  start / end of the list\n  Ctrl+PageUp / Ctrl+PageDown turns the page from anywhere\n  F5         reload from disk\n  Esc        back to the list\n\n  REGISTER: every record gets, on its first save, a stamp\n  (YYYYMMDDhhmmss) and an order number that never changes;\n  what is deleted stays in the sequence as cancelled.\n  Without a search, the list is the register, in number order;\n  with a search or filter, it is the INDEX, in alphabetical order.\n  The list shows what fits the window, without scrolling: the rest\n  is on the following pages.\n\n  Search operators:\n  p: v: f: c:   only people / verba / sources / corpus\n  ^ab           name starting with ab\n  tag:csh  lang:de  type:book  sys:renal  dom:law  id:c_  is:org\n  e.g.:  v: lang:de ^ab   ·   f: type:article luhmann\n\n  Text fields grow with their text up to the card's height,\n  then scroll inside (ui.max_rows in the JSON sets a fixed\n  limit). A long LOG or NOTES is read one page per view, each\n  page starting at an entry or paragraph: ‹ › beside the title,\n  PageUp / PageDown in it, a sideways swipe or Shift+wheel over\n  it, or the wheel over it once the card is at its end (the LOG\n  opens on the newest). View › Long texts › Continuous scrolls\n  instead.\n  The body map\n  folds with [−] and remembers its state.\n\n  In the rail, COLLECTIONS limits to people or verba;\n  any filter below picks the collection by itself.\n\n  Tasks (people):\n  Enter       new line already with [ ]\n  Space       on the [ ] changes the state\n  Ctrl+Space  changes it from anywhere on the line\n  [ ] to do   [/] in progress  [>] waiting on\n  [x] done    [-] cancelled  (they go to the log on save)\n  A date at the end is the deadline: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. The LAST date on the line wins.\n\n  Links, one per line, on any card:\n  rel target [span] — reason # source\n  e.g.: expresses c_timoneiro -800/400 — literal sense\n  e.g.: author_of s_wiener_1948_cybernetics\n  e.g.: cites s_lochtrop_2006 — entry p. 12\n  The target is the id: c_ concept, f_ form, p_ person,\n  s_ source, h_ measurement. A rel outside the table is not\n  an error: it is an ATYPICAL link, with the label you gave;\n  the doctor lists the atypical ones for you to promote.\n\n  SOURCE (on people, entries and measurements): a source's\n  s_…, or free text. Sources cite in ABNT, author-date,\n  BibTeX or CSL-JSON (picker on the card, copy button).\n  Corpus: readings '2026-09-01 13.5 fasting', one per line;\n  out of range shows with (!).\n\n  Sync: every save rereads the disk; on opening,\n  *.sync-conflict-* files are merged and stored in\n  {conflicts}/. The full history is in\n  {stem}.log.<machine>.jsonl (Base › History).\n":
-        "\n  Ctrl+F     ir para a busca\n  ↓ / Enter  da busca para a lista\n  Ctrl+N     nova pessoa\n  Ctrl+Q     entradas em lote (qualquer tipo, uma por linha)\n  Ctrl+S     salvar o registro aberto\n  Ctrl+Enter salvar e começar outro do mesmo tipo\n  Ctrl+Z / Ctrl+Y   desfazer / refazer\n  Ctrl+J / Ctrl+K   próximo / anterior, de qualquer lugar\n  Ctrl+G     ir para: nº (1852), carimbo, id ou nome\n  Ctrl+L     ver no registro: sai da busca, mostra o nº do aberto\n  Ctrl+B     abrir como livro (segunda janela, só leitura;\n             Enter no livro traz o registro para o cartão)\n  Ctrl+1..4  escopo pessoas / verba / fontes / corpus; Ctrl+0 tudo\n  /  na lista volta à busca;  Enter na lista vai ao cartão\n  Home / End na página;  PageUp / PageDown ou a roda vira a página\n  Ctrl+Home / Ctrl+End  começo / fim da lista\n  Ctrl+PageUp / Ctrl+PageDown vira a página de qualquer lugar\n  F5         recarregar do disco\n  Esc        voltar à lista\n\n  REGISTRO: todo registro recebe, ao ser gravado pela primeira\n  vez, um carimbo (AAAAMMDDhhmmss) e um número de ordem que\n  nunca muda; o que é apagado fica na sequência como cancelado.\n  Sem busca, a lista é o registro, na ordem dos números; com\n  busca ou filtro, é o INDICADOR, em ordem alfabética. A lista\n  mostra o que cabe na janela, sem rolagem: o resto está nas\n  páginas seguintes.\n\n  Operadores da busca:\n  p: v: f: c:   só pessoas / verba / fontes / corpus\n  ^ab           nome que começa com ab\n  tag:csh  lang:de  type:livro  sys:renal  dom:direito  id:c_  is:org\n  ex.:  v: lang:de ^ab   ·   f: type:artigo luhmann\n\n  Campos de texto crescem com o texto até a altura do cartão\n  e depois rolam por dentro (ui.max_rows no JSON fixa um teto).\n  LOG e NOTAS longos são lidos uma página por vez, cada página\n  começando numa entrada ou parágrafo: ‹ › ao lado do título,\n  PageUp / PageDown nele, um deslizar de lado ou Shift+roda sobre\n  ele, ou a roda sobre ele quando o cartão chega ao fim (o LOG\n  abre na mais nova). Ver › Textos longos › Contínuo rola em vez\n  disso.\n  O mapa do corpo\n  recolhe pelo [−] e lembra o estado.\n\n  No trilho, ACERVO limita a pessoas ou a verba;\n  qualquer filtro abaixo escolhe o acervo sozinho.\n\n  Tarefas (pessoas):\n  Enter       nova linha já com [ ]\n  Espaço      sobre o [ ] muda o estado\n  Ctrl+Espaço muda de qualquer ponto da linha\n  [ ] a fazer  [/] em curso  [>] esperando\n  [x] feito    [-] cancelado  (vão para o log ao salvar)\n  Data no fim é o prazo: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. A ÚLTIMA data da linha vence.\n\n  Ligações, uma por linha, em qualquer cartão:\n  rel alvo [intervalo] — razão # fonte\n  ex.: expresses c_timoneiro -800/400 — sentido próprio\n  ex.: author_of s_wiener_1948_cybernetics\n  ex.: cites s_lochtrop_2006 — verbete p. 12\n  Alvo é o id: c_ conceito, f_ forma, p_ pessoa,\n  s_ fonte, h_ medida. Um rel fora da tabela não é\n  erro: é ligação ATÍPICA, com o rótulo que você deu;\n  o doctor lista as atípicas para você promover.\n\n  FONTE (em pessoas, verbetes e medidas): s_… de uma\n  fonte, ou texto livre. Fontes citam em ABNT, autor-data,\n  BibTeX ou CSL-JSON (seletor no cartão, botão copiar).\n  Corpus: leituras '2026-09-01 13.5 jejum', uma por linha;\n  fora da referência aparece com (!).\n\n  Sincronização: cada gravação relê o disco; ao abrir,\n  *.sync-conflict-* são fundidos e guardados em\n  {conflicts}/. O histórico completo está em\n  {stem}.log.<máquina>.jsonl (menu Base › Histórico).\n",
+    "\n  Ctrl+F     go to the search\n  ↓ / Enter  from the search to the list\n  Ctrl+N     new person\n  Ctrl+Q     bulk entries (any kind, one per line)\n  Ctrl+D     dust off: opens what has gone longest unvisited in the list\n  Ctrl+S     save the open record\n  Ctrl+Enter save and start another of the same kind\n  Ctrl+Z / Ctrl+Y   undo / redo\n  Ctrl+J / Ctrl+K   next / previous, from anywhere\n  Ctrl+G     go to: nº (1852), stamp, id or name\n  Ctrl+L     show in the register: leaves the search, shows the open record's nº\n  Ctrl+B     open as logbook (second window, read-only;\n             Enter in the logbook brings the record to the card)\n  Ctrl+1..4  scope people / verba / sources / corpus; Ctrl+0 everything\n  /  in the list goes back to the search;  Enter in the list goes to the card\n  Home / End within the page;  PageUp / PageDown or the wheel turns the page\n  Ctrl+Home / Ctrl+End  start / end of the list\n  Ctrl+PageUp / Ctrl+PageDown turns the page from anywhere\n  F5         reload from disk\n  Esc        back to the list\n\n  REGISTER: every record gets, on its first save, a stamp\n  (YYYYMMDDhhmmss) and an order number that never changes;\n  what is deleted stays in the sequence as cancelled.\n  Without a search, the list is the register, in number order;\n  with a search or filter, it is the INDEX, in alphabetical order.\n  The list shows what fits the window, without scrolling: the rest\n  is on the following pages.\n\n  Search operators:\n  p: v: f: c:   only people / verba / sources / corpus\n  ^ab           name starting with ab\n  tag:csh  lang:de  type:book  sys:renal  dom:law  id:c_  is:org\n  e.g.:  v: lang:de ^ab   ·   f: type:article luhmann\n\n  Text fields grow with their text up to the card's height,\n  then scroll inside (ui.max_rows in the JSON sets a fixed\n  limit). A long LOG or NOTES is read one page per view, each\n  page starting at an entry or paragraph: ‹ › beside the title,\n  PageUp / PageDown in it, a sideways swipe or Shift+wheel over\n  it, or the wheel over it once the card is at its end (the LOG\n  opens on the newest). View › Long texts › Continuous scrolls\n  instead.\n  The body map\n  folds with [−] and remembers its state.\n\n  In the rail, COLLECTIONS limits to people or verba;\n  any filter below picks the collection by itself.\n\n  Tasks (people):\n  Enter       new line already with [ ]\n  Space       on the [ ] changes the state\n  Ctrl+Space  changes it from anywhere on the line\n  [ ] to do   [/] in progress  [>] waiting on\n  [x] done    [-] cancelled  (they go to the log on save)\n  A date at the end is the deadline: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. The LAST date on the line wins.\n\n  Links, one per line, on any card:\n  rel target [span] — reason # source\n  e.g.: expresses c_timoneiro -800/400 — literal sense\n  e.g.: author_of s_wiener_1948_cybernetics\n  e.g.: cites s_lochtrop_2006 — entry p. 12\n  The target is the id: c_ concept, f_ form, p_ person,\n  s_ source, h_ measurement. A rel outside the table is not\n  an error: it is an ATYPICAL link, with the label you gave;\n  the doctor lists the atypical ones for you to promote.\n\n  SOURCE (on people, entries and measurements): a source's\n  s_…, or free text. Sources cite in ABNT, author-date,\n  BibTeX or CSL-JSON (picker on the card, copy button).\n  Corpus: readings '2026-09-01 13.5 fasting', one per line;\n  out of range shows with (!).\n\n  Sync: every save rereads the disk; on opening,\n  *.sync-conflict-* files are merged and stored in\n  {conflicts}/. The full history is in\n  {stem}.log.<machine>.jsonl (Base › History).\n":
+        "\n  Ctrl+F     ir para a busca\n  ↓ / Enter  da busca para a lista\n  Ctrl+N     nova pessoa\n  Ctrl+Q     entradas em lote (qualquer tipo, uma por linha)\n  Ctrl+D     tirar o pó: abre o que está há mais tempo sem visita na lista\n  Ctrl+S     salvar o registro aberto\n  Ctrl+Enter salvar e começar outro do mesmo tipo\n  Ctrl+Z / Ctrl+Y   desfazer / refazer\n  Ctrl+J / Ctrl+K   próximo / anterior, de qualquer lugar\n  Ctrl+G     ir para: nº (1852), carimbo, id ou nome\n  Ctrl+L     ver no registro: sai da busca, mostra o nº do aberto\n  Ctrl+B     abrir como livro (segunda janela, só leitura;\n             Enter no livro traz o registro para o cartão)\n  Ctrl+1..4  escopo pessoas / verba / fontes / corpus; Ctrl+0 tudo\n  /  na lista volta à busca;  Enter na lista vai ao cartão\n  Home / End na página;  PageUp / PageDown ou a roda vira a página\n  Ctrl+Home / Ctrl+End  começo / fim da lista\n  Ctrl+PageUp / Ctrl+PageDown vira a página de qualquer lugar\n  F5         recarregar do disco\n  Esc        voltar à lista\n\n  REGISTRO: todo registro recebe, ao ser gravado pela primeira\n  vez, um carimbo (AAAAMMDDhhmmss) e um número de ordem que\n  nunca muda; o que é apagado fica na sequência como cancelado.\n  Sem busca, a lista é o registro, na ordem dos números; com\n  busca ou filtro, é o INDICADOR, em ordem alfabética. A lista\n  mostra o que cabe na janela, sem rolagem: o resto está nas\n  páginas seguintes.\n\n  Operadores da busca:\n  p: v: f: c:   só pessoas / verba / fontes / corpus\n  ^ab           nome que começa com ab\n  tag:csh  lang:de  type:livro  sys:renal  dom:direito  id:c_  is:org\n  ex.:  v: lang:de ^ab   ·   f: type:artigo luhmann\n\n  Campos de texto crescem com o texto até a altura do cartão\n  e depois rolam por dentro (ui.max_rows no JSON fixa um teto).\n  LOG e NOTAS longos são lidos uma página por vez, cada página\n  começando numa entrada ou parágrafo: ‹ › ao lado do título,\n  PageUp / PageDown nele, um deslizar de lado ou Shift+roda sobre\n  ele, ou a roda sobre ele quando o cartão chega ao fim (o LOG\n  abre na mais nova). Ver › Textos longos › Contínuo rola em vez\n  disso.\n  O mapa do corpo\n  recolhe pelo [−] e lembra o estado.\n\n  No trilho, ACERVO limita a pessoas ou a verba;\n  qualquer filtro abaixo escolhe o acervo sozinho.\n\n  Tarefas (pessoas):\n  Enter       nova linha já com [ ]\n  Espaço      sobre o [ ] muda o estado\n  Ctrl+Espaço muda de qualquer ponto da linha\n  [ ] a fazer  [/] em curso  [>] esperando\n  [x] feito    [-] cancelado  (vão para o log ao salvar)\n  Data no fim é o prazo: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. A ÚLTIMA data da linha vence.\n\n  Ligações, uma por linha, em qualquer cartão:\n  rel alvo [intervalo] — razão # fonte\n  ex.: expresses c_timoneiro -800/400 — sentido próprio\n  ex.: author_of s_wiener_1948_cybernetics\n  ex.: cites s_lochtrop_2006 — verbete p. 12\n  Alvo é o id: c_ conceito, f_ forma, p_ pessoa,\n  s_ fonte, h_ medida. Um rel fora da tabela não é\n  erro: é ligação ATÍPICA, com o rótulo que você deu;\n  o doctor lista as atípicas para você promover.\n\n  FONTE (em pessoas, verbetes e medidas): s_… de uma\n  fonte, ou texto livre. Fontes citam em ABNT, autor-data,\n  BibTeX ou CSL-JSON (seletor no cartão, botão copiar).\n  Corpus: leituras '2026-09-01 13.5 jejum', uma por linha;\n  fora da referência aparece com (!).\n\n  Sincronização: cada gravação relê o disco; ao abrir,\n  *.sync-conflict-* são fundidos e guardados em\n  {conflicts}/. O histórico completo está em\n  {stem}.log.<máquina>.jsonl (menu Base › Histórico).\n",
     "OK":
         "OK",
     "Kustos · logbook (read-only)":
@@ -19908,8 +20195,8 @@ PT = {
         "Trilho e lista de volta.",
     "Wide card. F11 brings the rail and the list back.":
         "Cartão largo. F11 traz o trilho e a lista de volta.",
-    "\n  F11 / Ctrl+\\   wide card: hides the rail and the list (again: brings them back)\n  Ctrl+E          reading mode: the long field (notes) across the whole card;\n                  also a double-click on a field's title. Inside it:\n                  PageUp / PageDown or the wheel turn the page, Ctrl+F finds,\n                  Enter / Shift+Enter next / previous match, Esc closes.\n                  What you type goes back to the field and is saved as usual.\n":
-        "\n  F11 / Ctrl+\\   cartão largo: esconde o trilho e a lista (de novo: traz de volta)\n  Ctrl+E          modo de leitura: o campo longo (notas) no cartão inteiro;\n                  também um duplo clique no título de um campo. Dentro dele:\n                  PageUp / PageDown ou a roda viram a página, Ctrl+F busca,\n                  Enter / Shift+Enter próxima / anterior ocorrência, Esc fecha.\n                  O que você digita volta para o campo e é salvo como sempre.\n",
+    "\n  F11 / Ctrl+\\   wide card: hides the rail and the list (again: brings them back);\n                  Ctrl+F there shows the search's results under it\n  Ctrl+E          reading mode: the long field (notes) across the whole card;\n                  also a double-click on a field's title. Inside it:\n                  PageUp / PageDown or the wheel turn the page, Ctrl+F finds,\n                  Enter / Shift+Enter next / previous match, Esc closes.\n                  What you type goes back to the field and is saved as usual.\n":
+        "\n  F11 / Ctrl+\\   cartão largo: esconde o trilho e a lista (de novo: traz de volta);\n                  ali o Ctrl+F mostra os resultados da busca logo abaixo dela\n  Ctrl+E          modo de leitura: o campo longo (notas) no cartão inteiro;\n                  também um duplo clique no título de um campo. Dentro dele:\n                  PageUp / PageDown ou a roda viram a página, Ctrl+F busca,\n                  Enter / Shift+Enter próxima / anterior ocorrência, Esc fecha.\n                  O que você digita volta para o campo e é salvo como sempre.\n",
     "+ health":
         "+ saúde",
     "+ today's session":
@@ -20838,6 +21125,20 @@ PT = {
         "Semear de novo para recomeçar",
     "r: start again":
         "r: recomeçar",
+    "dust off":
+        "tirar o pó",
+    "Dust off: the longest unvisited":
+        "Tirar o pó: o que está há mais tempo sem visita",
+    "Nothing to dust off in this list.":
+        "Nada para tirar o pó nesta lista.",
+    "Dust off · {name} · last visit {when}":
+        "Tirar o pó · {name} · última visita {when}",
+    "Dust off · {name} · no visit recorded":
+        "Tirar o pó · {name} · nenhuma visita registrada",
+    "{n} more in this list unvisited for over a month":
+        "mais {n} nesta lista sem visita há mais de um mês",
+    "↑ ↓ choose · Enter opens · Esc closes":
+        "↑ ↓ escolhe · Enter abre · Esc fecha",
     "(new)":
         "(nova)",
     "{n} form(s): {langs}":
