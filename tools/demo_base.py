@@ -95,7 +95,7 @@ def build(K, folder):
 
     # ---- people (phones in the 555-01xx range, kept for fiction; example.org addresses)
     put("people", {"id": "p_iss00004", "name": "Institute of Steering Studies", "org": True,
-                   "place": "Lisboa", "tags": ["research"],
+                   "place": "Lisboa", "tags": ["research"], "geo": "38.7075, -9.1364  office",
                    "notes_raw": "A small institute on the history of control and regulation.",
                    "links": ["office: contact@example.org", "+1 202 555 0143",
                              "https://example.org/institute"],
@@ -115,6 +115,7 @@ def build(K, folder):
         edges=[edge("p_ada00001", "author_of", "s_okafor_2021_notes"),
                edge("p_ada00001", "works_at", "p_iss00004", "research fellow since 2023")])
     put("people", {"id": "p_tom00002", "name": "Tomás Weber", "place": "Basel",
+                   "geo": "47.5596, 7.5886  workshop\n47.5480, 7.5890  the old mill",
                    "tags": ["teacher"], "born": "1950", "circles": ["concern"],
                    "notes_raw": "Retired engineer. Keeps a workshop full of governors and valves.",
                    "links": ["tom.weber@example.org"],

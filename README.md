@@ -262,6 +262,25 @@ It refuses any folder it did not make, so it never touches a real base.
   neighbours follow gently and the view holds still — pinch or scroll to
   zoom; *Life / Glow / Still* and the depth 1–3 sit
   above it. (The replay of the logs is still only in the window.)
+- **Geographic location (GEO)**: every card but the draft's has a GEO field.
+  Write a point as a GPS or a map shows it, latitude then longitude in decimal
+  degrees (WGS 84), with a label after it if you like, one point per line:
+
+  ```
+  -19.9167, -43.9345  office
+  geo:-19.92,-43.94
+  ```
+
+  A map link carrying `@lat,lon` is read too, and for a line or an area you
+  paste GeoJSON whole (a geometry, a Feature or a FeatureCollection, as QGIS
+  or geojson.io give it; GeoJSON itself writes longitude first). The line under
+  the field says what it reads as, or what does not read; the doctor lists any
+  GEO that does not. `is:geo` in the search keeps the records that have one.
+  `python _kustos.py geojson` writes them all as `_kustos.geojson`, one feature
+  per point or shape with the record's id, number and name, to open in QGIS or
+  load into PostGIS (`ogr2ogr -f PostgreSQL PG:dbname=… _kustos.geojson`);
+  health records stay out unless you add `--all`. Nothing goes to the network:
+  no geocoding, no map tiles.
 - **Source**: free types (book, paper, thesis, law/bill, decisions, webpages, videos), citations in academic formats, BibTeX and CSL-JSON.
   Can import from Zotero via CSL-JSON or BibTeX without duplicating entries.
 - **Health (corpus)**: four kinds of record, each with its own fields —
@@ -300,6 +319,7 @@ It refuses any folder it did not make, so it never touches a real base.
   p: v: f: c: d:                    only people / verba / sources / body tracks / drafts
   ^ab                               name that starts with "ab"
   tag:x lang:de type:book sys:renal dom:law id:c_
+  is:org is:person is:geo           organizations / people who are not / records with a GEO
   ```
 
   The search always runs over the whole base. The rail keeps every category
@@ -339,6 +359,7 @@ python _kustos.py doctor                data-health check
 python _kustos.py search <texto>
 python _kustos.py cite <id|texto> [abnt|abnt-autor-data|bibtex|csl-json|bruto]  pulls citation from source
 python _kustos.py export [bibtex|csl|abnt] [arquivo]
+python _kustos.py geojson [--all] [file]   every GEO as one GeoJSON file
 python _kustos.py import zotero <export.json|.bib>
 python _kustos.py mirror | corpus | merge | history <id> | replay
 python _kustos.py logbook                  the base as a logbook (read-only)
