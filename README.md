@@ -253,6 +253,30 @@ It refuses any folder it did not make, so it never touches a real base.
   over a version that changed on disk is refused and the current one
   reloaded. `_kustos_peritia.html` is a read-only snapshot, rewritten on every
   change; a `_peritia.json` from the panel's standalone days can be imported.
+- **Behind a login, for your own devices** (`python _kustos.py web --serve`):
+  the same web version, long-running, asking for a password and a 6-digit
+  code from an authenticator app before anything else. Meant to be reached
+  only through [Tailscale](https://tailscale.com) (`tailscale serve` in front
+  of it), so that nothing is open to the internet and the data never leaves
+  your machines; it still listens on 127.0.0.1 only. Set it up once, on the
+  machine that serves it:
+
+  ```
+  python _kustos.py passwd            # a password (12+ characters), then the code
+  python _kustos.py web --serve       # http://127.0.0.1:8484, behind the login
+  ```
+
+  `passwd` shows a key to type into the authenticator app (Aegis, 2FAS,
+  Google Authenticator, 1Password…) and asks for its code to confirm. The
+  password's hash and the key are kept in a file of that machine's own
+  (`%LOCALAPPDATA%\Kustos`), never in the synced folder nor in git. A session
+  lasts 12 hours without use (14 days at most), in a cookie the page's scripts
+  cannot read; a restart, a new password or `passwd --logout-all` ends every
+  session; *Log out* is in the menu. Five wrong tries in 15 minutes close the
+  login for 15 minutes, then 30, and so on; every login, failure and lockout
+  is logged on that machine (`passwd --status` shows the last ones). A code
+  works once. The plain `web` the window opens stays as it was: this machine
+  only, no login.
 - **Web version** (`python _kustos.py web`): the whole base in the browser,
   laid out for a phone as much as for a desk, served by Kustos itself on
   127.0.0.1 only; it stops two minutes after the page is closed (`--stay`
@@ -385,6 +409,8 @@ python _kustos.py mirror | corpus | merge | history <id> | replay
 python _kustos.py logbook                  the base as a logbook (read-only)
 python _kustos.py peritia [--no-open] [--port N]   the web version, opened on its Skills page
 python _kustos.py web [--stay] [--no-open] [--port N]   the whole base, in the browser (phone or desk)
+python _kustos.py web --serve [--port N] [--allow-host NAME]   the same, behind a login
+python _kustos.py passwd [--no-code | --status | --logout-all | --remove]
 ```
 
 ## Suggestion: Using Syncthing to sync
