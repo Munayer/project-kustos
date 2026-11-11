@@ -97,6 +97,22 @@ Ideas that span several sections:
   and links, `MonadView` draws them with no lines. `MONAD_COLLS` keeps health and
   drafts out, also as bridges between records; keep it that way. To measure its
   frames, time the moves themselves: `update()` does not return while two tweens run.
+- **Practice** (`# ==== practice`, the web app's `#practice`): `drill_items`
+  makes an item of a concept in one language (its forms that `express` it) or
+  of a gloss (forms linked to no concept, same language and gloss);
+  `drill_grade`, five boxes (`DRILL_BOXES`), `DRILL_NEW_PER_DAY`. Answers go
+  to `DRILL_LOG` per machine (`_kustos.drill.<host>.jsonl`, ignored by git),
+  never into records. `DRILL_LANGS` maps a base's language codes to names,
+  browser speech tags and Piper locales -- not to be confused with `LANGS`,
+  the interface's languages. Piper (`cmd_voices`) is optional and imported
+  only in `voices_make`; voices and recordings are under `LOCAL_DIR`
+  (`VOICE_DIR`, `AUDIO_DIR`, `VOICE_CONF`), served by `/api/drill/audio`
+  with the page's token; `voices_soon` starts `voices make` in its own
+  process when a practice begins. The page plays a recording, else the
+  device's own voice (`localService` only, never one that sends text out).
+  `parse_bulk_concepts`/`save_bulk_concepts` read the bulk entry's
+  `name | gloss: form (lang); …` lines. Test with Piper stood in for (no
+  voice can be downloaded in the cloud session) and in a headless browser.
 - **Peritia** (`# ==== peritia`): the skills panel is a page of the web app
   (`cmd_web`): `/skills`, from the template `PERITIA_HTML` (strings as
   `@@English@@`, translated by `tr` when the page is built; `@@NONCE@@` gives

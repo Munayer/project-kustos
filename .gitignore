@@ -35,3 +35,6 @@ __pycache__/
 
 # What tools/wheel_probe.py records (invented records only)
 wheel_probe.txt
+
+# Practice: the answers, one log per machine
+_kustos.drill.*.jsonl
