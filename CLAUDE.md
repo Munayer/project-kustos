@@ -133,6 +133,18 @@ Ideas that span several sections:
   2 px (`MIN_HALF`), or Tk's fill comes and goes along them and they read as
   dashed. Check a change to them on a big invented base (frame time) and by
   eye, enlarged.
+- **The login** (`web --serve`, under `# ---- the login` before `cmd_web`):
+  the long-running web app for the owner's devices through Tailscale. Every
+  page and call needs a session (`Handler.session`; `/login` and
+  `/api/login` are the only ways in), and every call still carries the
+  session's own token (`csrf`) in `X-Kustos-Token`. Password hash (scrypt)
+  and TOTP secret live in `AUTH_FILE` under `%LOCALAPPDATA%\Kustos`, never in
+  the synced folder or git; `cmd_passwd` writes it, `auth_set` changes the
+  `version` that ends old sessions. Sessions are in memory; wrong logins sleep
+  and count towards `lock`; `access_log` writes `ACCESS_LOG` beside it. Keep
+  the plain `web` (the window's, Peritia's) working without a login, and keep
+  every server on 127.0.0.1. Test with `LOCALAPPDATA` pointed at a scratch
+  folder, never at a real one.
 - **GEO** (`# ==== geo`): a field of every record but the drafts, kept as
   typed (points `lat, lon` one per line, or GeoJSON pasted whole) and read by
   `parse_geo` into GeoJSON geometries only when needed: the card's hint

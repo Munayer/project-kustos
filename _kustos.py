@@ -47,6 +47,11 @@ USAGE
     python _kustos.py web [--stay] [--port N] [--no-open]
                                       the whole base in the browser, for a phone or a
                                       desk (on 127.0.0.1; stops when the page closes)
+    python _kustos.py web --serve [--port N] [--allow-host NAME]
+                                      the same, long-running and behind a login, for
+                                      your own devices (Tailscale); passwd first
+    python _kustos.py passwd [--no-code | --status | --logout-all | --remove]
+                                      the web app's password and authenticator code
     python _kustos.py doctor          check the structure, change nothing
     python _kustos.py real-dates [apply [order]]
                                       log entries whose text starts with a date:
@@ -70,13 +75,16 @@ USAGE
     python _kustos.py normalize       inline #tags and dates -> tags (people)
 """
 
+import base64
 import hashlib
+import hmac
 import json
 import marshal
 import math
 import os
 import random
 import re
+import secrets
 import shutil
 import socket
 import sys
@@ -5971,6 +5979,7 @@ async function api(path, body) {
   const url = BOOT.api ? path.replace(/^\/api\//, BOOT.api) : path;
   try { res = await fetch(url, opt) } catch { offline = true; setStatus(); throw new Error(`@@Kustos is not answering@@`) }
   offline = false;
+  if (res.status === 401 && BOOT.auth) { location.href = '/login?next=/skills'; throw new Error(`@@Log in again.@@`) }
   const data = await res.json().catch(() => ({}));
   if (res.status === 409) { adopt(data.state); render(); throw new Error(data.error || `@@The record changed on disk; the current version is loaded.@@`) }
   if (!res.ok) throw new Error(data.error || fmt(`@@error {n}@@`, { n: res.status }));
@@ -6443,7 +6452,7 @@ WEB_STRINGS = (
     "tap: to the middle · tap the middle: open · hold: spark · drag: move · pinch or wheel: zoom",
     "settled at generation {n}: {k} stay lit", "died out at generation {n}", "Reseed to start again",
     "Links", "Link", "New link", "Change link", "Type", "Reason", "Source", "Span", "Swap direction",
-    "Circle", "Skills",
+    "Circle", "Skills", "Log out",
     "Another link between them", "no reason or source", "written {date}", "atypical type",
     "Link saved.", "Link deleted.", "Delete this link?", "Draw a link",
     "Drag from one record to another to link them.", "Key", "Search the links",
@@ -7156,9 +7165,11 @@ def web_path(data, a, b):
             "records": len(idx)}
 
 
-def web_boot(token):
-    """What the page needs before its first call."""
-    return {"token": token, "lang": LANG, "today": TODAY(), "fields": web_fields(),
+def web_boot(token, auth=False):
+    """What the page needs before its first call. `auth`: behind the login
+    (web --serve), so the page offers to log out and goes to the login when
+    its session ends."""
+    return {"token": token, "auth": auth, "lang": LANG, "today": TODAY(), "fields": web_fields(),
             "sfields": SOURCE_FIELDS,
             "colls": [[c, tr(x)] for c, x in zip(COLLS, ("People", "Verba", "Sources",
                                                          "Corpus", "Drafts"))],
@@ -7171,8 +7182,8 @@ def web_boot(token):
             "T": {s: tr(s) for s in WEB_STRINGS}}
 
 
-def web_page(boot, data, nonce):
-    """The page, in the interface language and the theme of the window."""
+def web_theme(data):
+    """(palette, CSS variables) of the window's theme, for the pages."""
     pal = THEMES.get((data.get("ui") or {}).get("theme"), THEMES["paper"])
     mono = '"Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, ui-monospace, monospace'
     sans = mono if pal["mono_only"] else \
@@ -7185,6 +7196,12 @@ def web_page(boot, data, nonce):
            f"  --selbg: {pal['selbg']}; --selfg: {pal['selfg']};\n"
            f"  --sans: {sans};\n  --serif: {serif};\n  --mono: {mono};\n"
            f"  color-scheme: {'dark' if pal['dark'] else 'light'};")
+    return pal, css
+
+
+def web_page(boot, data, nonce):
+    """The page, in the interface language and the theme of the window."""
+    pal, css = web_theme(data)
     html = WEB_HTML.replace("/*__THEME__*/", css)
     html = html.replace("@@LANG@@", "pt-BR" if LANG == "pt" else "en")
     html = html.replace("@@NONCE@@", nonce)
@@ -7254,6 +7271,289 @@ def web_api(method, path, query, body):
         return 400, {"error": str(exc)}
 
 
+# ---- the login (web --serve)
+#
+# `python _kustos.py web --serve` is the web app for the owner's own devices,
+# reached through Tailscale (`tailscale serve` in front of it): it stays up,
+# listens on 127.0.0.1 only, as every page here, and asks for a password and
+# a code from an authenticator app (TOTP, RFC 6238) before anything else. The
+# quick `web` the window opens is unchanged: this machine only, a token in
+# the page, no login.
+#
+# The password's hash (scrypt) and the authenticator's secret are kept in a
+# file of this machine's own (AUTH_FILE, in %LOCALAPPDATA%\Kustos), never in
+# the synced folder nor in git; `python _kustos.py passwd` writes it. A
+# session is a random id in a cookie (__Host-, HttpOnly, Secure,
+# SameSite=Strict) that the server keeps in memory: a restart, a new password
+# or `passwd --logout-all` ends every session. Every call still carries the
+# session's token in a header, as the page's token before. LOGIN_TRIES wrong
+# logins within LOGIN_WINDOW lock the login for LOCKOUT, doubling each time;
+# every login, failure and lockout goes to ACCESS_LOG, also of this machine.
+
+LOCAL_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".cache") / "Kustos"
+_BASE_KEY = hashlib.md5(str(BASE).encode("utf-8")).hexdigest()[:10]
+AUTH_FILE = LOCAL_DIR / f"web-auth-{_BASE_KEY}.json"
+ACCESS_LOG = LOCAL_DIR / f"web-access-{_BASE_KEY}.jsonl"
+SERVE_PORT = 8484
+SESSION_COOKIE = "__Host-kustos"
+SESSION_IDLE = 12 * 3600        # seconds without a request before a session ends
+SESSION_MAX = 14 * 86400        # and its whole life
+SESSIONS_KEPT = 20
+PASSWORD_MIN = 12
+LOGIN_TRIES = 5
+LOGIN_WINDOW = 15 * 60
+LOCKOUT = 15 * 60               # the first; each further lockout doubles, up to a day
+TOTP_STEP, TOTP_DIGITS = 30, 6
+
+
+def _b64(raw):
+    return base64.b64encode(raw).decode("ascii")
+
+
+def password_hash(password, salt=None):
+    """{algo, ..., salt, hash} of a password: scrypt (n 2^15, r 8, p 1), or
+    PBKDF2-SHA256 where this Python has no scrypt."""
+    salt = salt or secrets.token_bytes(16)
+    raw = password.encode("utf-8")
+    try:
+        h = hashlib.scrypt(raw, salt=salt, n=2 ** 15, r=8, p=1, maxmem=64 * 1024 * 1024, dklen=32)
+        return {"algo": "scrypt", "n": 2 ** 15, "r": 8, "p": 1, "salt": _b64(salt), "hash": _b64(h)}
+    except (AttributeError, ValueError):
+        h = hashlib.pbkdf2_hmac("sha256", raw, salt, 600_000, 32)
+        return {"algo": "pbkdf2-sha256", "iter": 600_000, "salt": _b64(salt), "hash": _b64(h)}
+
+
+def password_ok(password, rec):
+    """Whether `password` is the one `rec` (password_hash) was made from."""
+    try:
+        salt, want = base64.b64decode(rec["salt"]), base64.b64decode(rec["hash"])
+        raw = str(password).encode("utf-8")
+        if rec.get("algo") == "scrypt":
+            got = hashlib.scrypt(raw, salt=salt, n=int(rec["n"]), r=int(rec["r"]), p=int(rec["p"]),
+                                 maxmem=64 * 1024 * 1024, dklen=len(want))
+        elif rec.get("algo") == "pbkdf2-sha256":
+            got = hashlib.pbkdf2_hmac("sha256", raw, salt, int(rec["iter"]), len(want))
+        else:
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    return hmac.compare_digest(got, want)
+
+
+def totp_code(secret, step):
+    """The code an authenticator app shows for `secret` (base32) at a time
+    step (RFC 6238: HMAC-SHA1, 30 s, 6 digits)."""
+    key = base64.b32decode(secret.upper() + "=" * (-len(secret) % 8))
+    mac = hmac.new(key, int(step).to_bytes(8, "big"), hashlib.sha1).digest()
+    off = mac[-1] & 0x0F
+    n = int.from_bytes(mac[off:off + 4], "big") & 0x7FFFFFFF
+    return str(n % 10 ** TOTP_DIGITS).zfill(TOTP_DIGITS)
+
+
+def totp_check(secret, code, now=None, after=-1):
+    """The time step whose code `code` is -- now, or one step before or after
+    (the clocks may differ by a little) -- or None. A step not after `after`
+    (the last one used) is refused: a code works once."""
+    code = "".join(str(code or "").split())
+    if not secret or not code.isdigit() or len(code) != TOTP_DIGITS:
+        return None
+    step = int((time.time() if now is None else now) // TOTP_STEP)
+    found = None
+    for k in (step - 1, step, step + 1):
+        if hmac.compare_digest(totp_code(secret, k), code) and k > after:
+            found = k
+    return found
+
+
+def auth_load():
+    """The login's settings of this machine (AUTH_FILE), or None if unset."""
+    try:
+        a = json.loads(AUTH_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return a if isinstance(a, dict) and isinstance(a.get("password"), dict) else None
+
+
+def auth_save(a):
+    LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = AUTH_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(a, indent=1), encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    tmp.replace(AUTH_FILE)
+
+
+def auth_set(password, secret=""):
+    """A new password (and authenticator secret, '' for none): every session
+    opened before it ends, as its `version` changes."""
+    a = {"password": password_hash(password), "totp": secret, "version": secrets.token_hex(8),
+         "set": NOW()}
+    auth_save(a)
+    return a
+
+
+def access_log(event, **facts):
+    """One line of ACCESS_LOG: a login, a failure, a lockout, a logout."""
+    try:
+        LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+        if ACCESS_LOG.exists() and ACCESS_LOG.stat().st_size > 1_000_000:
+            keep = ACCESS_LOG.read_text(encoding="utf-8").splitlines()[-2000:]
+            ACCESS_LOG.write_text("\n".join(keep) + "\n", encoding="utf-8")
+        with ACCESS_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(dict({"t": NOW(), "event": event}, **facts), ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def login_page(data, nonce, code, next_path):
+    """The login page: a password and, when set, the authenticator's code."""
+    _pal, css = web_theme(data)
+    html = LOGIN_HTML.replace("/*__THEME__*/", css)
+    html = html.replace("@@LANG@@", "pt-BR" if LANG == "pt" else "en")
+    html = html.replace("@@NONCE@@", nonce)
+    html = re.sub(r"@@(.+?)@@", lambda m: tr(m.group(1)), html)
+    html = html.replace("/*__CODE__*/true", "true" if code else "false")
+    return html.replace("/*__NEXT__*/\"/\"", json.dumps(next_path))
+
+
+LOGIN_HTML = r"""<!doctype html>
+<html lang="@@LANG@@">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Kustos</title>
+<style>
+:root {
+  /*__THEME__*/
+}
+[hidden] { display: none !important }
+body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: var(--wash);
+  color: var(--ink); font: 16px/1.4 var(--sans) }
+form { background: var(--paper); border: 1px solid var(--rule); padding: 28px 24px 20px;
+  width: min(360px, calc(100vw - 32px)); box-sizing: border-box }
+h1 { font: 24px var(--serif); margin: 0 0 6px }
+.sub { font: 12px var(--mono); color: var(--faint); margin: 0 0 14px }
+label { display: block; font: 11px var(--mono); letter-spacing: .06em; color: var(--faint);
+  margin: 14px 0 4px; text-transform: uppercase }
+input { width: 100%; box-sizing: border-box; font: 17px var(--mono); padding: 10px;
+  border: 1px solid var(--rule); background: var(--paper); color: var(--ink); border-radius: 2px }
+input:focus { outline: 2px solid var(--accent); outline-offset: 1px }
+button { margin-top: 20px; width: 100%; padding: 11px; font: 14px var(--mono); background: var(--ink);
+  color: var(--paper); border: 0; border-radius: 2px; cursor: pointer }
+button:disabled { opacity: .5 }
+#msg { min-height: 1.4em; margin: 12px 0 0; color: var(--warn); font-size: 14px }
+</style>
+</head>
+<body>
+<form id="f" novalidate>
+  <h1>Kustos</h1>
+  <p class="sub">@@Log in to your base@@</p>
+  <label for="pw">@@Password@@</label>
+  <input id="pw" name="password" type="password" autocomplete="current-password" required autofocus>
+  <div id="coderow">
+    <label for="code">@@Code from the authenticator app@@</label>
+    <input id="code" name="code" inputmode="numeric" pattern="[0-9]*" maxlength="8"
+           autocomplete="one-time-code">
+  </div>
+  <button id="go" type="submit">@@Log in@@</button>
+  <p id="msg" role="alert"></p>
+</form>
+<script nonce="@@NONCE@@">
+const NEED_CODE = /*__CODE__*/true, NEXT = /*__NEXT__*/"/";
+const f = document.getElementById('f'), msg = document.getElementById('msg'), go = document.getElementById('go');
+if (!NEED_CODE) document.getElementById('coderow').hidden = true;
+f.addEventListener('submit', async ev => {
+  ev.preventDefault();
+  msg.textContent = '';
+  go.disabled = true;
+  try {
+    const r = await fetch('/api/login', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                          body: JSON.stringify({password: f.password.value, code: f.code.value})});
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) { location.replace(NEXT); return; }
+    msg.textContent = j.error || `@@It did not work.@@`;
+    f.password.value = ''; f.code.value = ''; f.password.focus();
+  } catch (e) { msg.textContent = `@@Kustos is not answering.@@`; }
+  go.disabled = false;
+});
+</script>
+</body>
+</html>
+"""
+
+
+def cmd_passwd(rest=()):
+    """Sets the web app's password and its authenticator code, asked in this
+    terminal; --status says what is set and lists the last logins."""
+    import getpass
+    rest = list(rest)
+    a = auth_load()
+    if "--status" in rest:
+        if a is None:
+            print(tr("No password set: `web --serve` will not start."))
+        else:
+            print(tr("Password set on {date}; authenticator code: {code}.", date=a.get("set", "?"),
+                     code=tr("yes") if a.get("totp") else tr("no")))
+            print(tr("Kept in {file} (this machine only).", file=AUTH_FILE))
+        try:
+            lines = ACCESS_LOG.read_text(encoding="utf-8").splitlines()[-12:]
+        except OSError:
+            lines = []
+        for line in lines:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            print("  " + "  ".join(str(e.get(k, "")) for k in ("t", "event", "who", "from") if e.get(k)))
+        return 0
+    if "--remove" in rest:
+        try:
+            AUTH_FILE.unlink()
+        except OSError:
+            pass
+        print(tr("Password removed: `web --serve` will not start until a new one is set."))
+        return 0
+    if "--logout-all" in rest:
+        if a is None:
+            raise SystemExit(tr("No password set."))
+        a["version"] = secrets.token_hex(8)
+        auth_save(a)
+        access_log("logout-all")
+        print(tr("Every session ends at its next request."))
+        return 0
+    password = getpass.getpass(tr("New password ({n} characters or more): ", n=PASSWORD_MIN))
+    if len(password) < PASSWORD_MIN:
+        raise SystemExit(tr("Too short: {n} characters or more. Nothing changed.", n=PASSWORD_MIN))
+    if getpass.getpass(tr("The same again: ")) != password:
+        raise SystemExit(tr("The two did not match. Nothing changed."))
+    secret = ""
+    if "--no-code" not in rest:
+        secret = base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
+        print()
+        print(tr("In your authenticator app (Aegis, 2FAS, Google Authenticator, 1Password...), "
+                 "add an account by typing this key:"))
+        print()
+        print("    " + " ".join(secret[i:i + 4] for i in range(0, len(secret), 4)))
+        print()
+        print(tr("(time-based, 6 digits, 30 seconds; or paste the whole line below)"))
+        print(f"    otpauth://totp/Kustos:{HOST}?secret={secret}&issuer=Kustos&digits=6&period=30")
+        print()
+        for _try in range(3):
+            got = input(tr("The code the app shows now: ")).strip()
+            if totp_check(secret, got) is not None:
+                break
+            print(tr("That is not the code; wait for the next one and try again."))
+        else:
+            raise SystemExit(tr("The code did not match. Nothing changed: run passwd again."))
+    auth_set(password, secret)
+    access_log("password set", code=bool(secret))
+    print(tr("Saved in {file} (this machine only). Sessions opened before end now.", file=AUTH_FILE))
+    return 0
+
+
 def cmd_web(rest=()):
     """Serves the web version on 127.0.0.1 and opens it; stops by itself when
     idle, unless --stay. --allow-host NAME accepts another Host header (a
@@ -7281,6 +7581,12 @@ def cmd_web(rest=()):
             else:
                 extra_hosts.add(rest[i + 1].strip().lower())
     stay = "--stay" in rest
+    serve = "--serve" in rest
+    if serve:
+        if auth_load() is None:
+            raise SystemExit(tr("Set a password first: python _kustos.py passwd"))
+        stay = True
+        port = port or SERVE_PORT
     # what the window does on opening: bring the base up to date, take in the
     # other machine's conflicting copies and the new files of notes/
     if JSON_FILE.exists() and needs_upgrade(load_json()):
@@ -7294,6 +7600,9 @@ def cmd_web(rest=()):
     guard = threading.Lock()        # one call at a time: they all read and write the base
     last = [time.monotonic()]
     hosts = set()
+    sessions = {}                   # --serve: session id -> {csrf, created, seen, version, who}
+    door = threading.Lock()         # one login at a time
+    lock = {"fails": [], "until": 0.0, "count": 0, "step": -1}
     mirror = {"timer": None, "blob": None}
     mirroring = threading.Lock()    # one rebuild at a time
 
@@ -7334,7 +7643,8 @@ def cmd_web(rest=()):
         def log_message(self, *args):
             pass
 
-        def answer(self, code, body, ctype="application/json; charset=utf-8", csp=None):
+        def answer(self, code, body, ctype="application/json; charset=utf-8", csp=None,
+                   cookie=None, location=None):
             raw = (body if isinstance(body, str)
                    else json.dumps(body, ensure_ascii=False)).encode("utf-8")
             self.send_response(code)
@@ -7345,8 +7655,115 @@ def cmd_web(rest=()):
             self.send_header("Referrer-Policy", "no-referrer")
             if csp:
                 self.send_header("Content-Security-Policy", csp)
+            if serve:
+                self.send_header("Strict-Transport-Security", "max-age=31536000")
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+                self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+                self.send_header("Permissions-Policy",
+                                 "camera=(), microphone=(), geolocation=(), payment=()")
+            if cookie:
+                self.send_header("Set-Cookie", cookie)
+            if location:
+                self.send_header("Location", location)
             self.end_headers()
             self.wfile.write(raw)
+
+        def page_csp(self, nonce):
+            return (f"default-src 'none'; script-src 'nonce-{nonce}'; "
+                    "style-src 'unsafe-inline'; img-src 'self' data:; "
+                    "connect-src 'self'; base-uri 'none'; form-action 'none'; "
+                    "frame-ancestors 'none'")
+
+        def who(self):
+            """Who is asking, as Tailscale tells it (tailscale serve adds the
+            tailnet user), and from where."""
+            return {"who": self.headers.get("Tailscale-User-Login") or "",
+                    "from": self.headers.get("X-Forwarded-For") or self.client_address[0],
+                    "agent": (self.headers.get("User-Agent") or "")[:120]}
+
+        def cookie_sid(self):
+            from http.cookies import CookieError, SimpleCookie
+            jar = SimpleCookie()
+            try:
+                jar.load(self.headers.get("Cookie") or "")
+            except CookieError:
+                return ""
+            m = jar.get(SESSION_COOKIE)
+            return m.value if m else ""
+
+        def session(self):
+            """The session this request carries, still alive, or None."""
+            sid = self.cookie_sid()
+            s = sessions.get(sid) if sid else None
+            if s is None:
+                return None
+            now, a = time.time(), auth_load()
+            if (a is None or a.get("version") != s["version"] or now - s["seen"] > SESSION_IDLE
+                    or now - s["created"] > SESSION_MAX):
+                sessions.pop(sid, None)
+                return None
+            s["seen"] = now
+            return s
+
+        def read_json(self, limit=16 * 1024 * 1024):
+            """The request's JSON body (a dict), or an answer already sent (None)."""
+            if not (self.headers.get("Content-Type") or "").startswith("application/json"):
+                self.answer(415, {"error": tr("The request could not be read.")})
+                return None
+            try:
+                size = int(self.headers.get("Content-Length") or 0)
+                if size > limit:
+                    self.answer(413, {"error": tr("The request could not be read.")})
+                    return None
+                body = json.loads(self.rfile.read(size) or b"{}")
+            except ValueError:
+                self.answer(400, {"error": tr("The request could not be read.")})
+                return None
+            if not isinstance(body, dict):
+                self.answer(400, {"error": tr("The request could not be read.")})
+                return None
+            return body
+
+        def login(self):
+            """POST /api/login: the password and the code; a session if both
+            are right, else one more failure towards the lockout."""
+            body = self.read_json(limit=4096)
+            if body is None:
+                return None
+            with door:
+                now = time.time()
+                if now < lock["until"]:
+                    access_log("refused (locked)", **self.who())
+                    return self.answer(429, {"error": tr(
+                        "Too many wrong tries: the login is closed for {n} minute(s).",
+                        n=max(1, round((lock["until"] - now) / 60)))})
+                a = auth_load()
+                if a is None:
+                    return self.answer(503, {"error": tr("No password set on the server.")})
+                good = password_ok(str(body.get("password") or ""), a["password"])
+                step = (totp_check(a["totp"], body.get("code"), after=lock["step"])
+                        if a.get("totp") else 0)
+                if good and step is not None:
+                    lock.update(fails=[], count=0, step=step if a.get("totp") else lock["step"])
+                    sid = secrets.token_urlsafe(32)
+                    for old in sorted(sessions, key=lambda k: sessions[k]["seen"])[:-SESSIONS_KEPT + 1]:
+                        sessions.pop(old, None)
+                    sessions[sid] = {"csrf": secrets.token_urlsafe(24), "created": now, "seen": now,
+                                     "version": a.get("version"), **self.who()}
+                    access_log("login", **self.who())
+                    return self.answer(200, {"ok": True}, cookie=(
+                        f"{SESSION_COOKIE}={sid}; Path=/; HttpOnly; Secure; SameSite=Strict; "
+                        f"Max-Age={SESSION_MAX}"))
+                time.sleep(0.8)             # every wrong try costs time
+                lock["fails"] = [t for t in lock["fails"] if now - t < LOGIN_WINDOW] + [now]
+                if len(lock["fails"]) >= LOGIN_TRIES:
+                    lock["count"] += 1
+                    lock["until"] = now + min(86400, LOCKOUT * 2 ** (lock["count"] - 1))
+                    lock["fails"] = []
+                    access_log("lockout", minutes=round((lock["until"] - now) / 60), **self.who())
+                access_log("failed", password=good, **self.who())
+                return self.answer(401, {"error": tr("Wrong password or code.")})
 
         def do_GET(self):
             self.route("GET")
@@ -7359,18 +7776,38 @@ def cmd_web(rest=()):
             if self.headers.get("Host", "").lower() not in hosts:
                 return self.answer(403, {"error": tr("Not found.")})
             url = urlsplit(self.path)
+            pages = ("/", "/index.html", "/skills", "/health", "/corpus")
+            session = None
+            if serve:                   # behind the login: nothing but it without a session
+                if method == "GET" and url.path == "/login":
+                    nxt = (parse_qs(url.query).get("next") or ["/"])[0]
+                    nxt = nxt if nxt in pages else "/"
+                    if self.session() is not None:
+                        return self.answer(303, "", "text/plain", location=nxt)
+                    nonce = secrets.token_urlsafe(16)
+                    with guard:
+                        page = login_page(load_json(), nonce, bool((auth_load() or {}).get("totp")), nxt)
+                    return self.answer(200, page, "text/html; charset=utf-8", self.page_csp(nonce))
+                if method == "POST" and url.path == "/api/login":
+                    return self.login()
+                session = self.session()
+                if session is None:
+                    if url.path.startswith("/api/"):
+                        return self.answer(401, {"error": tr("Your session ended: log in again."),
+                                                 "login": True})
+                    if method == "GET" and url.path in pages:
+                        return self.answer(303, "", "text/plain", location="/login" + (
+                            f"?next={url.path}" if url.path not in ("/", "/index.html") else ""))
+                    return self.answer(404, {"error": tr("Not found.")})
+            tok = session["csrf"] if session else token
             if method == "GET" and url.path in ("/", "/index.html", "/skills"):
                 nonce = secrets.token_urlsafe(16)
                 with guard:
                     data = load_json()
-                    page = (peritia_page({"mode": "live", "token": token, "api": "/api/skills/",
-                                          "home": "/"}, data, nonce)
-                            if url.path == "/skills" else web_page(web_boot(token), data, nonce))
-                return self.answer(200, page, "text/html; charset=utf-8",
-                                   f"default-src 'none'; script-src 'nonce-{nonce}'; "
-                                   "style-src 'unsafe-inline'; img-src 'self' data:; "
-                                   "connect-src 'self'; base-uri 'none'; form-action 'none'; "
-                                   "frame-ancestors 'none'")
+                    page = (peritia_page({"mode": "live", "token": tok, "api": "/api/skills/",
+                                          "home": "/", "auth": serve}, data, nonce)
+                            if url.path == "/skills" else web_page(web_boot(tok, serve), data, nonce))
+                return self.answer(200, page, "text/html; charset=utf-8", self.page_csp(nonce))
             if method == "GET" and url.path in ("/health", "/corpus"):
                 with guard:
                     data = load_json()
@@ -7379,22 +7816,19 @@ def cmd_web(rest=()):
             if not url.path.startswith("/api/"):
                 return self.answer(404, {"error": tr("Not found.")})
             sent = (self.headers.get("X-Kustos-Token") or "").encode("latin-1", "replace")
-            if not secrets.compare_digest(sent, token.encode("ascii")):
+            if not secrets.compare_digest(sent, tok.encode("ascii")):
                 return self.answer(403, {"error": tr("This page is not the one Kustos opened: "
                                                       "open it again from Kustos.")})
             body = {}
             if method == "POST":
-                if not (self.headers.get("Content-Type") or "").startswith("application/json"):
-                    return self.answer(415, {"error": tr("The request could not be read.")})
-                try:
-                    size = int(self.headers.get("Content-Length") or 0)
-                    if size > 16 * 1024 * 1024:
-                        return self.answer(413, {"error": tr("The request could not be read.")})
-                    body = json.loads(self.rfile.read(size) or b"{}")
-                except ValueError:
-                    return self.answer(400, {"error": tr("The request could not be read.")})
-                if not isinstance(body, dict):
-                    return self.answer(400, {"error": tr("The request could not be read.")})
+                body = self.read_json()
+                if body is None:
+                    return None
+            if serve and method == "POST" and url.path == "/api/logout":
+                sessions.pop(self.cookie_sid(), None)
+                access_log("logout", **self.who())
+                return self.answer(200, {"ok": True}, cookie=(
+                    f"{SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0"))
             try:
                 with guard:
                     if url.path.startswith("/api/skills/"):        # the skills panel's calls
@@ -7436,13 +7870,17 @@ def cmd_web(rest=()):
         server.shutdown()
 
     threading.Thread(target=watch, daemon=True).start()
-    if stay:
+    if serve:
+        print(tr("Kustos on the web at {url}, behind the login: it stays up until stopped "
+                 "(Ctrl+C).", url=url), flush=True)
+        access_log("server started", port=port)
+    elif stay:
         print(tr("Kustos on the web at {url}: it stays up until stopped (Ctrl+C).", url=url),
               flush=True)
     else:
         print(tr("Kustos on the web at {url}: it stops by itself {n} minute(s) after the page "
                  "is closed.", url=url, n=max(1, WEB_IDLE // 60)), flush=True)
-    if "--no-open" not in rest:
+    if "--no-open" not in rest and not serve:
         webbrowser.open(url)
     try:
         server.serve_forever(poll_interval=0.5)
@@ -7714,6 +8152,7 @@ async function api(path, body) {
   catch (e) { const err = new Error(T("Kustos is not answering. Start it again: python _kustos.py web")); err.status = 0; throw err; }
   let j = {};
   try { j = await r.json(); } catch (e) { /* not JSON */ }
+  if (r.status === 401 && BOOT.auth) { location.href = "login"; }   // the session ended
   if (!r.ok) { const err = new Error(j.error || r.statusText); err.status = r.status; err.data = j; throw err; }
   return j;
 }
@@ -8108,7 +8547,8 @@ function menuSheet() {
     `<button class="btn" data-act="links">${esc(T("Links"))}</button>` +
     `<a class="btn" href="health" target="_blank" rel="noopener">${esc(T("Health report"))}</a>` +
     `<a class="btn" href="corpus" target="_blank" rel="noopener">${esc(T("Body map"))}</a>` +
-    `<a class="btn" href="skills">${esc(T("Skills"))}</a></div>`);
+    `<a class="btn" href="skills">${esc(T("Skills"))}</a>` +
+    (BOOT.auth ? `<button class="btn" data-act="logout">${esc(T("Log out"))}</button>` : "") + `</div>`);
 }
 
 /* ---------------------------------------------------------------- the link graph
@@ -9096,6 +9536,7 @@ document.addEventListener("click", e => {
   else if (act === "gpath-x") leavePath(true);
   else if (act === "gpath-steps") pathSteps();
   else if (act === "links") { closeSheet(); S.fromList = true; go("links"); }
+  else if (act === "logout") { api("api/logout", {}).catch(() => {}).finally(() => { location.href = "login"; }); }
   else if (act === "lk-row") linkCard(b.dataset.a, b.dataset.b);
   else if (act === "lk-go") { closeSheet(); S.fromList = true; go("r/" + b.dataset.id); }
   else if (act === "lk-edit") { const e = LK.card.edges[+b.dataset.i]; LK.i = +b.dataset.i; LK.from = e.from; LK.to = e.to; linkForm(); }
@@ -19692,6 +20133,8 @@ def main():
         return cmd_peritia(rest)
     if cmd == "web":
         return cmd_web(rest)
+    if cmd == "passwd":
+        return cmd_passwd(rest)
     if cmd == "migrate":
         return cmd_migrate()
     if cmd == "merge":
@@ -21564,6 +22007,70 @@ PT = {
         "Semear de novo para recomeçar",
     "r: start again":
         "r: recomeçar",
+    "Log in to your base":
+        "Entre na sua base",
+    "Password":
+        "Senha",
+    "Code from the authenticator app":
+        "Código do app autenticador",
+    "Log in":
+        "Entrar",
+    "Log out":
+        "Sair",
+    "Log in again.":
+        "Entre de novo.",
+    "It did not work.":
+        "Não deu certo.",
+    "Kustos is not answering.":
+        "O Kustos não está respondendo.",
+    "Wrong password or code.":
+        "Senha ou código errado.",
+    "Too many wrong tries: the login is closed for {n} minute(s).":
+        "Tentativas erradas demais: a entrada está fechada por {n} minuto(s).",
+    "No password set on the server.":
+        "Nenhuma senha definida no servidor.",
+    "Your session ended: log in again.":
+        "Sua sessão terminou: entre de novo.",
+    "Set a password first: python _kustos.py passwd":
+        "Defina uma senha antes: python _kustos.py passwd",
+    "Kustos on the web at {url}, behind the login: it stays up until stopped (Ctrl+C).":
+        "Kustos na web em {url}, atrás da entrada com senha: fica no ar até ser parado (Ctrl+C).",
+    "No password set: `web --serve` will not start.":
+        "Nenhuma senha definida: o `web --serve` não inicia.",
+    "Password set on {date}; authenticator code: {code}.":
+        "Senha definida em {date}; código do autenticador: {code}.",
+    "yes":
+        "sim",
+    "no":
+        "não",
+    "Kept in {file} (this machine only).":
+        "Guardada em {file} (só nesta máquina).",
+    "Password removed: `web --serve` will not start until a new one is set.":
+        "Senha removida: o `web --serve` não inicia até que outra seja definida.",
+    "No password set.":
+        "Nenhuma senha definida.",
+    "Every session ends at its next request.":
+        "Toda sessão termina no seu próximo pedido.",
+    "New password ({n} characters or more): ":
+        "Nova senha ({n} caracteres ou mais): ",
+    "Too short: {n} characters or more. Nothing changed.":
+        "Curta demais: {n} caracteres ou mais. Nada mudou.",
+    "The same again: ":
+        "A mesma de novo: ",
+    "The two did not match. Nothing changed.":
+        "As duas não conferem. Nada mudou.",
+    "In your authenticator app (Aegis, 2FAS, Google Authenticator, 1Password...), add an account by typing this key:":
+        "No seu app autenticador (Aegis, 2FAS, Google Authenticator, 1Password...), adicione uma conta digitando esta chave:",
+    "(time-based, 6 digits, 30 seconds; or paste the whole line below)":
+        "(baseado em tempo, 6 dígitos, 30 segundos; ou cole a linha inteira abaixo)",
+    "The code the app shows now: ":
+        "O código que o app mostra agora: ",
+    "That is not the code; wait for the next one and try again.":
+        "Esse não é o código; espere o próximo e tente de novo.",
+    "The code did not match. Nothing changed: run passwd again.":
+        "O código não conferiu. Nada mudou: rode o passwd de novo.",
+    "Saved in {file} (this machine only). Sessions opened before end now.":
+        "Gravado em {file} (só nesta máquina). As sessões abertas antes terminam agora.",
     "open in Kustos":
         "abrir no Kustos",
     "Circle":
