@@ -290,6 +290,26 @@ It refuses any folder it did not make, so it never touches a real base.
   last logins; `stop`, `start` and `remove` do what they say. Updating the
   program (`tools\update-instance.cmd`) restarts it on the new version.
   Never `tailscale funnel`: that would open it to the internet.
+- **Encrypted backup, every day** (Windows: **`_kustos_backup.cmd`** in the
+  Kustos folder). It uses [restic](https://restic.net), installed once with
+  `winget install restic.restic`, which encrypts on this computer before
+  anything is written and keeps dated versions. The setup asks where the
+  backup lives — a folder your cloud drive syncs (OneDrive, Google Drive,
+  Dropbox) keeps it off this computer, and the cloud only ever sees encrypted
+  pieces; an external disk works too — and for the backup's password, which
+  Windows then seals for your user on this computer (DPAPI), outside the
+  synced folder and git. **Keep that password outside the computer too**, in a
+  password manager or on paper: without it nobody can open the backup, you
+  included. A scheduled task (*Kustos backup*) backs the folder up every day
+  at 13:17, or as soon as the computer is on after that. Versions kept: 14
+  daily, 8 weekly, 24 monthly, 10 yearly. Once a week part of the stored data
+  is read back to check it, and once a month the latest version is restored
+  into a temporary folder, checked by the doctor and deleted — a backup that
+  was never restored is only a hope. If backups stop or fail, the window says
+  so when it opens. `_kustos_backup.cmd status` shows the last backups,
+  checks and restore tests; `run`, `test` and `remove` do what they say.
+  To bring a backup back by hand: `restic -r <folder> restore latest --target
+  <empty folder>`.
 - **Web version** (`python _kustos.py web`): the whole base in the browser,
   laid out for a phone as much as for a desk, served by Kustos itself on
   127.0.0.1 only; it stops two minutes after the page is closed (`--stay`
@@ -425,6 +445,7 @@ python _kustos.py web [--stay] [--no-open] [--port N]   the whole base, in the b
 python _kustos.py web --serve [--port N] [--allow-host NAME]   the same, behind a login
 python _kustos.py passwd [--no-code | --status | --logout-all | --remove]
 python _kustos.py service [install | status | stop | start | restart | remove]   Windows: web --serve at every login
+python _kustos.py backup [setup | run | status | test | remove]   Windows: an encrypted backup every day (restic)
 ```
 
 ## Suggestion: Using Syncthing to sync

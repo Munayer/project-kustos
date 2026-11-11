@@ -56,7 +56,7 @@ python -m py_compile _kustos.py || (
     exit /b 1
 )
 
-for %%F in (_kustos.py _kustos.cmd _kustos_logbook.cmd _kustos_peritia.cmd _kustos_serve.cmd kustos.ico) do (
+for %%F in (_kustos.py _kustos.cmd _kustos_logbook.cmd _kustos_peritia.cmd _kustos_serve.cmd _kustos_backup.cmd kustos.ico) do (
     copy /y "%%F" "%TARGET%\" >nul || (
         echo Could not copy %%F; the folder may be half updated. Run this again.
         pause

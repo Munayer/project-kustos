@@ -55,6 +55,9 @@ USAGE
     python _kustos.py service [install | status | stop | start | restart | remove]
                                       Windows: web --serve at every login, with
                                       `tailscale serve` in front (_kustos_serve.cmd)
+    python _kustos.py backup [setup | run | status | test | remove]
+                                      Windows: an encrypted backup every day, with
+                                      restic (_kustos_backup.cmd)
     python _kustos.py doctor          check the structure, change nothing
     python _kustos.py real-dates [apply [order]]
                                       log entries whose text starts with a date:
@@ -7601,10 +7604,11 @@ if ($t) { $i = $t | Get-ScheduledTaskInfo; @{installed = $true; state = "$($t.St
 PS_REMOVE = r"""Unregister-ScheduledTask -TaskName $env:KUSTOS_TASK -Confirm:$false -ErrorAction SilentlyContinue"""
 
 
-def run_ps(script, **values):
-    """A PowerShell script, with `values` as $env:KUSTOS_<NAME>: (code, out, err)."""
+def run_ps(script, task=SERVICE_TASK, **values):
+    """A PowerShell script, with `values` as $env:KUSTOS_<NAME> and the task's
+    name as $env:KUSTOS_TASK: (code, out, err)."""
     import subprocess
-    env = dict(os.environ, KUSTOS_TASK=SERVICE_TASK,
+    env = dict(os.environ, KUSTOS_TASK=task,
                **{"KUSTOS_" + k.upper(): str(v) for k, v in values.items()})
     try:
         r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
@@ -7783,6 +7787,384 @@ def cmd_service(rest=()):
     print(tr("Ready. On your phone, with Tailscale on, open:"))
     print(f"    https://{name}")
     return 0
+
+
+# ---- the encrypted backup (Windows): `python _kustos.py backup`
+#
+# Python's standard library has no encryption, and none is written here: the
+# backup is restic's (restic.net), which encrypts on this machine before
+# anything is written, keeps dated versions and checks itself. `setup` asks
+# where the backup lives (a folder a cloud drive syncs keeps it off this
+# machine, and the cloud sees only encrypted pieces) and its password; the
+# password is sealed with Windows' own DPAPI (only this Windows user, on this
+# machine, can open it) in BACKUP_FILE, outside the synced folder and git,
+# and a scheduled task (BACKUP_TASK) runs `backup run` every day. A run backs
+# up this folder, thins old versions once a week (BACKUP_KEEP), checks a part
+# of the stored data once a week, and once a month restores the latest into a
+# temporary folder, runs the doctor on it and deletes it. BACKUP_STATE keeps
+# how the last ones went, and the window says so when backups stopped.
+
+BACKUP_TASK = "Kustos backup"
+BACKUP_FILE = LOCAL_DIR / f"backup-{_BASE_KEY}.json"
+BACKUP_STATE = LOCAL_DIR / f"backup-state-{_BASE_KEY}.json"
+BACKUP_LOG = LOCAL_DIR / f"backup-{_BASE_KEY}.log"
+BACKUP_AT = "13:17"
+BACKUP_KEEP = ("--keep-daily", "14", "--keep-weekly", "8", "--keep-monthly", "24",
+               "--keep-yearly", "10")
+BACKUP_EXCLUDE = ("__pycache__", "*.tmp", ".stversions", ".stfolder", f"{STEM}.replay.json")
+BACKUP_PASSWORD_MIN = 16
+BACKUP_WARN_DAYS = 3            # the window warns when the last good backup is older
+PRUNE_DAYS, CHECK_DAYS, TEST_DAYS = 7, 7, 30
+PS_BACKUP_INSTALL = r"""$ErrorActionPreference = 'Stop'
+$me = "$env:USERDOMAIN\$env:USERNAME"
+$a = New-ScheduledTaskAction -Execute $env:KUSTOS_EXE -Argument $env:KUSTOS_ARGS -WorkingDirectory $env:KUSTOS_DIR
+$t = New-ScheduledTaskTrigger -Daily -At $env:KUSTOS_AT
+$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 4) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew
+$p = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskName $env:KUSTOS_TASK -Action $a -Trigger $t -Settings $s -Principal $p -Description $env:KUSTOS_DESC -Force | Out-Null"""
+
+
+def seal(raw, unseal=False):
+    """Windows DPAPI: `raw` sealed so that only this Windows user on this
+    machine can open it -- or, with unseal, opened."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Blob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    buf = ctypes.create_string_buffer(raw, len(raw))
+    src, dst = Blob(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), Blob()
+    crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
+    fn = crypt32.CryptUnprotectData if unseal else crypt32.CryptProtectData
+    if not fn(ctypes.byref(src), None, None, None, None, 0x01, ctypes.byref(dst)):
+        raise OSError(tr("Windows could not seal or open the backup's password (error {code}).",
+                         code=ctypes.GetLastError()))
+    try:
+        return ctypes.string_at(dst.pbData, dst.cbData)
+    finally:
+        kernel32.LocalFree(ctypes.cast(dst.pbData, ctypes.c_void_p))
+
+
+def _read_json(path):
+    try:
+        got = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return got if isinstance(got, dict) else None
+
+
+def _write_json_local(path, obj):
+    LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(obj, indent=1, ensure_ascii=False), encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    tmp.replace(path)
+
+
+def backup_conf():
+    """Where the backup lives and its sealed password, or None if not set up."""
+    c = _read_json(BACKUP_FILE)
+    return c if c and c.get("repo") and c.get("secret") else None
+
+
+def backup_password(conf):
+    return seal(base64.b64decode(conf["secret"]), unseal=True).decode("utf-8")
+
+
+def backup_state():
+    return _read_json(BACKUP_STATE) or {}
+
+
+def backup_log(line):
+    try:
+        LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+        if BACKUP_LOG.exists() and BACKUP_LOG.stat().st_size > 500_000:
+            keep = BACKUP_LOG.read_text(encoding="utf-8").splitlines()[-1000:]
+            BACKUP_LOG.write_text("\n".join(keep) + "\n", encoding="utf-8")
+        with BACKUP_LOG.open("a", encoding="utf-8") as f:
+            f.write(f"{NOW()}  {line}\n")
+    except OSError:
+        pass
+
+
+def restic_exe():
+    """restic, on the PATH or where winget links it, or None."""
+    exe = shutil.which("restic")
+    if exe:
+        return exe
+    link = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Microsoft" / "WinGet" / "Links" / "restic.exe"
+    return str(link) if link.exists() else None
+
+
+def _quiet_flags():
+    import subprocess
+    return {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+
+
+def run_restic(exe, repo, password, *args, timeout=6 * 3600):
+    """restic with the repository and password in its environment only:
+    (code, stdout, stderr)."""
+    import subprocess
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("RESTIC_PASSWORD_FILE", "RESTIC_PASSWORD_COMMAND")}
+    env.update(RESTIC_REPOSITORY=str(repo), RESTIC_PASSWORD=password)
+    try:
+        r = subprocess.run([exe, *args], capture_output=True, text=True, env=env, timeout=timeout,
+                           **_quiet_flags())
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, "", str(exc)
+    return r.returncode, r.stdout or "", (r.stderr or "").strip()
+
+
+def _days_since(stamp):
+    try:
+        return (datetime.now() - datetime.fromisoformat(stamp)).total_seconds() / 86400
+    except (TypeError, ValueError):
+        return float("inf")
+
+
+def _first_line(text):
+    return next((l.strip() for l in (text or "").splitlines() if l.strip()), "?")
+
+
+def backup_restore_test(exe, conf, password):
+    """The latest backup restored into a temporary folder, read, checked by
+    the doctor of the program restored with it, and deleted: {ok, records,
+    why}. The restored copy's caches go into the same temporary folder."""
+    import subprocess
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix="kustos_restore_"))
+    try:
+        code, out, err = run_restic(exe, conf["repo"], password, "restore", "latest", "--tag", "kustos",
+                                    "--host", HOST, "--target", str(tmp / "r"))
+        if code != 0:
+            return {"ok": False, "why": tr("restore failed: {why}", why=_first_line(err))}
+        found = [x for x in (tmp / "r").rglob(f"{STEM}.json") if (x.parent / "_kustos.py").exists()]
+        if not found:
+            return {"ok": False, "why": tr("no base in the restored copy")}
+        data = json.loads(found[0].read_text(encoding="utf-8"))
+        records = sum(len(data.get(c) or []) for c in COLLS)
+        python = Path(sys.executable)
+        python = python.with_name("python.exe") if python.name.lower() == "pythonw.exe" else python
+        env = dict(os.environ, LOCALAPPDATA=str(tmp / "local"))
+        r = subprocess.run([str(python), str(found[0].parent / "_kustos.py"), "doctor"],
+                           capture_output=True, text=True, env=env, timeout=900, **_quiet_flags())
+        if r.returncode != 0:
+            return {"ok": False, "records": records,
+                    "why": tr("the doctor found errors in the restored copy")}
+        return {"ok": True, "records": records, "why": ""}
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "why": str(exc)}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def backup_run(test=False, say=print):
+    """One backup: the folder, then -- when due -- thinning, a check and a
+    restore test. BACKUP_STATE and BACKUP_LOG say how it went; 0 if well."""
+    conf = backup_conf()
+    if conf is None:
+        say(tr("No backup set up: run _kustos_backup.cmd."))
+        return 1
+    state = backup_state()
+    state["last_try"] = NOW()
+    exe = restic_exe()
+    try:
+        if not exe:
+            raise RuntimeError(tr("restic not found (winget install restic.restic)"))
+        password = backup_password(conf)
+        args = ["backup", str(BASE), "--tag", "kustos", "--host", HOST, "--json"]
+        for pat in BACKUP_EXCLUDE:
+            args += ["--exclude", pat]
+        code, out, err = run_restic(exe, conf["repo"], password, *args)
+        if code not in (0, 3):          # 3: a file could not be read; the snapshot was still made
+            raise RuntimeError(tr("backup failed: {why}", why=_first_line(err)))
+        summary = {}
+        for line in out.splitlines():
+            try:
+                got = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(got, dict) and got.get("message_type") == "summary":
+                summary = got
+        state.update(last_ok=NOW(), last_error="", snapshot=summary.get("snapshot_id", "")[:8],
+                     files=summary.get("total_files_processed", 0),
+                     added=summary.get("data_added", 0))
+        say(tr("Backed up: {files} files, {kb} KB new (version {id}).", files=state["files"],
+               kb=round(state["added"] / 1024), id=state["snapshot"] or "?"))
+        if _days_since(state.get("last_prune")) >= PRUNE_DAYS:
+            code, out, err = run_restic(exe, conf["repo"], password, "forget", "--tag", "kustos",
+                                        "--host", HOST, "--prune", *BACKUP_KEEP)
+            if code != 0:
+                raise RuntimeError(tr("thinning old versions failed: {why}", why=_first_line(err)))
+            state["last_prune"] = NOW()
+            say(tr("Old versions thinned."))
+        if _days_since(state.get("last_check")) >= CHECK_DAYS:
+            code, out, err = run_restic(exe, conf["repo"], password, "check", "--read-data-subset=5%")
+            if code != 0:
+                raise RuntimeError(tr("the backup's check failed: {why}", why=_first_line(err or out)))
+            state["last_check"] = NOW()
+            say(tr("Checked: the stored data reads."))
+        if test or _days_since(state.get("last_test")) >= TEST_DAYS:
+            got = backup_restore_test(exe, conf, password)
+            state["last_test"], state["last_test_ok"] = NOW(), got["ok"]
+            if not got["ok"]:
+                raise RuntimeError(tr("the restore test failed: {why}", why=got["why"]))
+            say(tr("Restore test: the latest version restored, {n} records, the doctor found no "
+                   "errors; the copy was deleted.", n=got.get("records", 0)))
+        backup_log("ok " + (state.get("snapshot") or ""))
+        return 0
+    except (RuntimeError, OSError, ValueError) as exc:
+        state["last_error"] = str(exc)[:400]
+        backup_log("FAILED " + state["last_error"])
+        say(tr("Backup: {why}", why=state["last_error"]))
+        return 1
+    finally:
+        _write_json_local(BACKUP_STATE, state)
+
+
+def backup_notice():
+    """What the window says on opening when backups stopped, or ''."""
+    if backup_conf() is None:
+        return ""
+    st = backup_state()
+    if st.get("last_error") and (st.get("last_try") or "") > (st.get("last_ok") or ""):
+        return tr("The last backup failed: {why} (_kustos_backup.cmd status).", why=st["last_error"])
+    days = _days_since(st.get("last_ok"))
+    if days >= BACKUP_WARN_DAYS:
+        return (tr("No backup has worked yet (_kustos_backup.cmd status).") if days == float("inf")
+                else tr("The last good backup is {n} days old (_kustos_backup.cmd status).", n=int(days)))
+    return ""
+
+
+def cmd_backup(rest=()):
+    """The encrypted backup: setup (the default), run, status, test, remove."""
+    import getpass
+    rest = list(rest)
+    what = rest[0] if rest else "setup"
+    if what not in ("setup", "run", "status", "test", "remove"):
+        raise SystemExit(tr("backup: setup, run, status, test or remove."))
+    if what == "run":
+        return backup_run(say=print if sys.stdout else (lambda *a: None))
+    if what == "test":
+        return backup_run(test=True)
+    if what == "status":
+        conf, st = backup_conf(), backup_state()
+        if conf is None:
+            print(tr("No backup set up: run _kustos_backup.cmd."))
+            return 1
+        print(tr("Backup in: {repo}", repo=conf["repo"]))
+        print(tr("Last good backup: {when}; last try: {last}.", when=st.get("last_ok") or "-",
+                 last=st.get("last_try") or "-"))
+        if st.get("last_error"):
+            print(tr("Last problem: {why}", why=st["last_error"]))
+        print(tr("Last check: {check}; last restore test: {test} ({ok}).", check=st.get("last_check") or "-",
+                 test=st.get("last_test") or "-",
+                 ok=tr("fine") if st.get("last_test_ok") else (tr("failed") if st.get("last_test") else "-")))
+        exe = restic_exe()
+        if exe:
+            try:
+                code, out, err = run_restic(exe, conf["repo"], backup_password(conf), "snapshots",
+                                            "--tag", "kustos", "--json", timeout=300)
+                snaps = json.loads(out or "[]") if code == 0 else None
+            except (OSError, ValueError):
+                snaps = None
+            if snaps is not None:
+                print(tr("{n} version(s) kept; the newest from {when}.", n=len(snaps),
+                         when=(snaps[-1].get("time", "")[:16].replace("T", " ") if snaps else "-")))
+        if sys.platform == "win32":
+            code, out, _err = run_ps(PS_STATUS, task=BACKUP_TASK)
+            try:
+                info = json.loads(out or "{}")
+            except ValueError:
+                info = {}
+            print(tr("Every day at {at}: {yes}.", at=BACKUP_AT,
+                     yes=tr("yes") if info.get("installed") else tr("no")))
+        return 0
+    if sys.platform != "win32":
+        raise SystemExit(tr("The backup's setup is for Windows (its password is sealed by Windows). "
+                            "Elsewhere, use restic directly."))
+    if what == "remove":
+        run_ps(PS_REMOVE, task=BACKUP_TASK)
+        print(tr("The daily backup no longer runs. The backup itself stays in {repo}, and its "
+                 "sealed password in {file}.", repo=(backup_conf() or {}).get("repo", "?"),
+                 file=BACKUP_FILE))
+        return 0
+
+    # ---- setup
+    print(tr("1/6  restic"))
+    exe = restic_exe()
+    if not exe:
+        raise SystemExit(tr("     Not installed. In a terminal: winget install restic.restic\n"
+                            "     then open a new terminal and run this again."))
+    code, out, _err = run_restic(exe, "", "", "version", timeout=60)
+    print("     " + _first_line(out))
+    print(tr("2/6  Where the backup lives"))
+    old = backup_conf() or {}
+    one = os.environ.get("OneDrive")
+    default = old.get("repo") or (str(Path(one) / "Kustos backup") if one else "")
+    print(tr("     A folder a cloud drive syncs (OneDrive, Google Drive, Dropbox) keeps it off this "
+             "machine; the cloud only ever sees encrypted pieces. An external disk works too."))
+    got = input(tr("     Folder [{default}]: ", default=default)).strip().strip('"') or default
+    if not got:
+        raise SystemExit(tr("     No folder given. Nothing changed."))
+    repo = Path(got).expanduser().resolve()
+    base = BASE.resolve()
+    if repo == base or base in repo.parents:
+        raise SystemExit(tr("     Not inside the Kustos folder itself: it would back itself up, and "
+                            "Syncthing would carry it everywhere. Nothing changed."))
+    repo.mkdir(parents=True, exist_ok=True)
+    fresh = not (repo / "config").exists()
+    print(tr("3/6  The backup's password"))
+    if fresh:
+        print(tr("     A new backup. Choose a long password ({n} characters or more) that you do not "
+                 "use anywhere else.", n=BACKUP_PASSWORD_MIN))
+        password = getpass.getpass(tr("     Password: "))
+        if len(password) < BACKUP_PASSWORD_MIN:
+            raise SystemExit(tr("     Too short. Nothing changed."))
+        if getpass.getpass(tr("     The same again: ")) != password:
+            raise SystemExit(tr("     The two did not match. Nothing changed."))
+        print()
+        print(tr("     Without this password the backup cannot be opened, by you or anyone: if this "
+                 "computer is lost, it is the only way back to your data. Keep it OUTSIDE this "
+                 "computer: in a password manager, or written on paper kept safe."))
+        if input(tr("     Kept it outside this computer? Type yes: ")).strip().lower() not in ("yes", "sim", "y", "s"):
+            raise SystemExit(tr("     Then nothing changed: run this again once it is kept."))
+        code, out, err = run_restic(exe, repo, password, "init", timeout=600)
+        if code != 0:
+            raise SystemExit(tr("     restic could not create the backup: {why}", why=_first_line(err)))
+    else:
+        print(tr("     A backup is already there: its password, please."))
+        password = getpass.getpass(tr("     Password: "))
+        code, out, err = run_restic(exe, repo, password, "cat", "config", timeout=300)
+        if code != 0:
+            raise SystemExit(tr("     That is not its password (or the folder cannot be read). Nothing "
+                                "changed."))
+    print(tr("4/6  Sealing the password for this Windows user"))
+    sealed = seal(password.encode("utf-8"))
+    conf = {"repo": str(repo), "secret": base64.b64encode(sealed).decode("ascii"), "set": NOW()}
+    if backup_password(conf) != password:
+        raise SystemExit(tr("     Windows did not give the password back. Nothing changed."))
+    _write_json_local(BACKUP_FILE, conf)
+    print(tr("     sealed in {file}.", file=BACKUP_FILE))
+    print(tr("5/6  Every day at {at} (task “{task}”)", at=BACKUP_AT, task=BACKUP_TASK))
+    py = Path(sys.executable)
+    quiet = py.with_name("pythonw.exe")
+    py = quiet if quiet.exists() else py
+    code, _out, err = run_ps(PS_BACKUP_INSTALL, task=BACKUP_TASK, exe=py,
+                             args=f'"{BASE / "_kustos.py"}" backup run', dir=str(BASE), at=BACKUP_AT,
+                             desc="Kustos: an encrypted backup of the base with restic")
+    if code != 0:
+        raise SystemExit(tr("     Windows refused: {why}\n     Open the terminal as administrator "
+                            "(right-click, Run as administrator) and run this again.",
+                            why=_first_line(err)))
+    print(tr("     done (if the computer is off then, it runs as soon as it can)."))
+    print(tr("6/6  The first backup, and a restore test"))
+    return backup_run(test=True)
 
 
 def cmd_web(rest=()):
@@ -20311,6 +20693,9 @@ def cmd_app(open_id=None):
     for o in other_locks():
         notices.append(tr("Also open on {host} since {since}: editing on both machines "
                           "at once causes conflicts.", host=o.get("host"), since=o.get("since")))
+    stale = backup_notice()
+    if stale:
+        notices.append(stale)
     take_lock()
 
     theme = (load_json().get("ui") or {}).get("theme", "paper")
@@ -20368,6 +20753,8 @@ def main():
         return cmd_passwd(rest)
     if cmd == "service":
         return cmd_service(rest)
+    if cmd == "backup":
+        return cmd_backup(rest)
     if cmd == "migrate":
         return cmd_migrate()
     if cmd == "merge":
@@ -22240,6 +22627,114 @@ PT = {
         "Semear de novo para recomeçar",
     "r: start again":
         "r: recomeçar",
+    "backup: setup, run, status, test or remove.":
+        "backup: setup, run, status, test ou remove.",
+    "Windows could not seal or open the backup's password (error {code}).":
+        "O Windows não conseguiu selar ou abrir a senha do backup (erro {code}).",
+    "restore failed: {why}":
+        "a restauração falhou: {why}",
+    "no base in the restored copy":
+        "nenhuma base na cópia restaurada",
+    "the doctor found errors in the restored copy":
+        "o doctor achou erros na cópia restaurada",
+    "No backup set up: run _kustos_backup.cmd.":
+        "Nenhum backup configurado: rode o _kustos_backup.cmd.",
+    "restic not found (winget install restic.restic)":
+        "restic não encontrado (winget install restic.restic)",
+    "backup failed: {why}":
+        "o backup falhou: {why}",
+    "Backed up: {files} files, {kb} KB new (version {id}).":
+        "Backup feito: {files} arquivos, {kb} KB novos (versão {id}).",
+    "thinning old versions failed: {why}":
+        "o desbaste das versões antigas falhou: {why}",
+    "Old versions thinned.":
+        "Versões antigas desbastadas.",
+    "the backup's check failed: {why}":
+        "a verificação do backup falhou: {why}",
+    "Checked: the stored data reads.":
+        "Verificado: os dados guardados são lidos.",
+    "the restore test failed: {why}":
+        "o teste de restauração falhou: {why}",
+    "Restore test: the latest version restored, {n} records, the doctor found no errors; the copy was deleted.":
+        "Teste de restauração: a última versão restaurada, {n} registros, o doctor não achou erros; a cópia foi apagada.",
+    "Backup: {why}":
+        "Backup: {why}",
+    "The last backup failed: {why} (_kustos_backup.cmd status).":
+        "O último backup falhou: {why} (_kustos_backup.cmd status).",
+    "No backup has worked yet (_kustos_backup.cmd status).":
+        "Nenhum backup funcionou ainda (_kustos_backup.cmd status).",
+    "The last good backup is {n} days old (_kustos_backup.cmd status).":
+        "O último backup bom tem {n} dias (_kustos_backup.cmd status).",
+    "Backup in: {repo}":
+        "Backup em: {repo}",
+    "Last good backup: {when}; last try: {last}.":
+        "Último backup bom: {when}; última tentativa: {last}.",
+    "Last problem: {why}":
+        "Último problema: {why}",
+    "Last check: {check}; last restore test: {test} ({ok}).":
+        "Última verificação: {check}; último teste de restauração: {test} ({ok}).",
+    "fine":
+        "certo",
+    "failed":
+        "falhou",
+    "{n} version(s) kept; the newest from {when}.":
+        "{n} versão(ões) guardada(s); a mais nova de {when}.",
+    "Every day at {at}: {yes}.":
+        "Todo dia às {at}: {yes}.",
+    "The backup's setup is for Windows (its password is sealed by Windows). Elsewhere, use restic directly.":
+        "A configuração do backup é para o Windows (a senha é selada pelo Windows). Em outro sistema, use o restic diretamente.",
+    "The daily backup no longer runs. The backup itself stays in {repo}, and its sealed password in {file}.":
+        "O backup diário não roda mais. O backup em si fica em {repo}, e a senha selada em {file}.",
+    "1/6  restic":
+        "1/6  restic",
+    "     Not installed. In a terminal: winget install restic.restic\n     then open a new terminal and run this again.":
+        "     Não instalado. Num terminal: winget install restic.restic\n     depois abra um terminal novo e rode isto de novo.",
+    "2/6  Where the backup lives":
+        "2/6  Onde fica o backup",
+    "     A folder a cloud drive syncs (OneDrive, Google Drive, Dropbox) keeps it off this machine; the cloud only ever sees encrypted pieces. An external disk works too.":
+        "     Uma pasta que um drive na nuvem sincroniza (OneDrive, Google Drive, Dropbox) o mantém fora desta máquina; a nuvem só vê pedaços cifrados. Um disco externo também serve.",
+    "     Folder [{default}]: ":
+        "     Pasta [{default}]: ",
+    "     No folder given. Nothing changed.":
+        "     Nenhuma pasta dada. Nada mudou.",
+    "     Not inside the Kustos folder itself: it would back itself up, and Syncthing would carry it everywhere. Nothing changed.":
+        "     Não dentro da própria pasta do Kustos: ele faria backup de si mesmo, e o Syncthing o levaria a toda parte. Nada mudou.",
+    "3/6  The backup's password":
+        "3/6  A senha do backup",
+    "     A new backup. Choose a long password ({n} characters or more) that you do not use anywhere else.":
+        "     Um backup novo. Escolha uma senha longa ({n} caracteres ou mais) que você não use em nenhum outro lugar.",
+    "     Password: ":
+        "     Senha: ",
+    "     Too short. Nothing changed.":
+        "     Curta demais. Nada mudou.",
+    "     The same again: ":
+        "     A mesma de novo: ",
+    "     The two did not match. Nothing changed.":
+        "     As duas não conferem. Nada mudou.",
+    "     Without this password the backup cannot be opened, by you or anyone: if this computer is lost, it is the only way back to your data. Keep it OUTSIDE this computer: in a password manager, or written on paper kept safe.":
+        "     Sem esta senha o backup não se abre, nem para você nem para ninguém: se este computador se perder, ela é o único caminho de volta aos seus dados. Guarde-a FORA deste computador: num gerenciador de senhas, ou escrita em papel guardado com segurança.",
+    "     Kept it outside this computer? Type yes: ":
+        "     Guardou fora deste computador? Digite sim: ",
+    "     Then nothing changed: run this again once it is kept.":
+        "     Então nada mudou: rode isto de novo quando ela estiver guardada.",
+    "     restic could not create the backup: {why}":
+        "     o restic não conseguiu criar o backup: {why}",
+    "     A backup is already there: its password, please.":
+        "     Já há um backup ali: a senha dele, por favor.",
+    "     That is not its password (or the folder cannot be read). Nothing changed.":
+        "     Essa não é a senha dele (ou a pasta não pode ser lida). Nada mudou.",
+    "4/6  Sealing the password for this Windows user":
+        "4/6  Selando a senha para este usuário do Windows",
+    "     Windows did not give the password back. Nothing changed.":
+        "     O Windows não devolveu a senha. Nada mudou.",
+    "     sealed in {file}.":
+        "     selada em {file}.",
+    "5/6  Every day at {at} (task “{task}”)":
+        "5/6  Todo dia às {at} (tarefa “{task}”)",
+    "     done (if the computer is off then, it runs as soon as it can).":
+        "     feito (se o computador estiver desligado na hora, roda assim que puder).",
+    "6/6  The first backup, and a restore test":
+        "6/6  O primeiro backup, e um teste de restauração",
     "service: install, status, stop, start, restart or remove.":
         "service: install, status, stop, start, restart ou remove.",
     "This sets up Windows. Elsewhere, start `python _kustos.py web --serve --allow-host <name>` with the system's own service manager, and run `tailscale serve --bg {port}`.":
