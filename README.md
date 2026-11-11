@@ -277,6 +277,19 @@ It refuses any folder it did not make, so it never touches a real base.
   is logged on that machine (`passwd --status` shows the last ones). A code
   works once. The plain `web` the window opens stays as it was: this machine
   only, no login.
+
+  **Always on, from your phone** (Windows): with Tailscale installed and
+  signed in on the machine (MagicDNS and HTTPS certificates on, in its admin
+  console), run **`_kustos_serve.cmd`** in the Kustos folder. It asks for the
+  password if none is set, makes `web --serve` start at every login of that
+  Windows user, in the background (a scheduled task, *Kustos web*), allows
+  the machine's Tailscale address, puts `tailscale serve` in front of it and
+  checks that the login answers; it ends with the address to open on the
+  phone, `https://<machine>.<tailnet>.ts.net` (Tailscale on there too; *https*,
+  not http). `_kustos_serve.cmd status` says whether it runs and lists the
+  last logins; `stop`, `start` and `remove` do what they say. Updating the
+  program (`tools\update-instance.cmd`) restarts it on the new version.
+  Never `tailscale funnel`: that would open it to the internet.
 - **Web version** (`python _kustos.py web`): the whole base in the browser,
   laid out for a phone as much as for a desk, served by Kustos itself on
   127.0.0.1 only; it stops two minutes after the page is closed (`--stay`
@@ -411,6 +424,7 @@ python _kustos.py peritia [--no-open] [--port N]   the web version, opened on it
 python _kustos.py web [--stay] [--no-open] [--port N]   the whole base, in the browser (phone or desk)
 python _kustos.py web --serve [--port N] [--allow-host NAME]   the same, behind a login
 python _kustos.py passwd [--no-code | --status | --logout-all | --remove]
+python _kustos.py service [install | status | stop | start | restart | remove]   Windows: web --serve at every login
 ```
 
 ## Suggestion: Using Syncthing to sync

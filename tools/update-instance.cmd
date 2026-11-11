@@ -36,10 +36,12 @@ for %%I in ("%TARGET%\.") do if /i "%%~fI"=="%CD%" (
     exit /b 1
 )
 
-rem Here: any python running _kustos.py, or whose command line cannot be read.
+rem Here: any python running _kustos.py, or whose command line cannot be read,
+rem except the always-on web app (web --serve, see _kustos_serve.cmd): it holds
+rem nothing unsaved and is restarted on the new program after the copy.
 rem On another computer: a lock file under a day old, the age _kustos.py
 rem itself trusts. If the check itself fails, nothing is copied either.
-set "OPEN_HERE=Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'python*' -and (-not $_.CommandLine -or $_.CommandLine -match '_kustos\.py') } | ForEach-Object { 'Open on this computer: ' + $_.Name + ', process ' + $_.ProcessId }"
+set "OPEN_HERE=Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'python*' -and (-not $_.CommandLine -or ($_.CommandLine -match '_kustos\.py' -and $_.CommandLine -notmatch 'web\s+--serve')) } | ForEach-Object { 'Open on this computer: ' + $_.Name + ', process ' + $_.ProcessId }"
 set "OPEN_THERE=Get-ChildItem -LiteralPath $env:TARGET -Filter '_kustos.lock.*.json' | Where-Object { $_.Name -ne ('_kustos.lock.' + $env:COMPUTERNAME + '.json') -and $_.LastWriteTime -gt (Get-Date).AddDays(-1) } | ForEach-Object { 'Open on another computer: ' + $_.Name }"
 powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; $open = @(%OPEN_HERE%) + @(%OPEN_THERE%); $open; exit [int]($open.Count -gt 0)" || (
     echo Kustos looks open, or the check could not run; nothing was copied.
@@ -54,7 +56,7 @@ python -m py_compile _kustos.py || (
     exit /b 1
 )
 
-for %%F in (_kustos.py _kustos.cmd _kustos_logbook.cmd _kustos_peritia.cmd kustos.ico) do (
+for %%F in (_kustos.py _kustos.cmd _kustos_logbook.cmd _kustos_peritia.cmd _kustos_serve.cmd kustos.ico) do (
     copy /y "%%F" "%TARGET%\" >nul || (
         echo Could not copy %%F; the folder may be half updated. Run this again.
         pause
@@ -63,4 +65,6 @@ for %%F in (_kustos.py _kustos.cmd _kustos_logbook.cmd _kustos_peritia.cmd kusto
 )
 >"%SAVED%" echo %TARGET%
 echo Program copied to %TARGET%
+rem the always-on web app, if set up there, now runs the new program
+python "%TARGET%\_kustos.py" service restart --quiet
 pause

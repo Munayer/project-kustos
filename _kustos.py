@@ -52,6 +52,9 @@ USAGE
                                       your own devices (Tailscale); passwd first
     python _kustos.py passwd [--no-code | --status | --logout-all | --remove]
                                       the web app's password and authenticator code
+    python _kustos.py service [install | status | stop | start | restart | remove]
+                                      Windows: web --serve at every login, with
+                                      `tailscale serve` in front (_kustos_serve.cmd)
     python _kustos.py doctor          check the structure, change nothing
     python _kustos.py real-dates [apply [order]]
                                       log entries whose text starts with a date:
@@ -7485,6 +7488,37 @@ f.addEventListener('submit', async ev => {
 """
 
 
+def passwd_ask(ask_secret, ask, with_code):
+    """The questions of `passwd`: (password, authenticator key or '')."""
+    password = ask_secret(tr("New password ({n} characters or more): ", n=PASSWORD_MIN))
+    if len(password) < PASSWORD_MIN:
+        raise SystemExit(tr("Too short: {n} characters or more. Nothing changed.", n=PASSWORD_MIN))
+    if ask_secret(tr("The same again: ")) != password:
+        raise SystemExit(tr("The two did not match. Nothing changed."))
+    if not with_code:
+        return password, ""
+    secret = base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
+    print()
+    print(tr("In your authenticator app (Aegis, 2FAS, Google Authenticator, 1Password...), "
+             "add an account by typing this key:"))
+    print()
+    print("    " + " ".join(secret[i:i + 4] for i in range(0, len(secret), 4)))
+    print()
+    print(tr("(time-based, 6 digits, 30 seconds; or paste the whole line below)"))
+    print(f"    otpauth://totp/Kustos:{HOST}?secret={secret}&issuer=Kustos&digits=6&period=30")
+    print()
+    print(tr("Type it on your phone: there is nothing to copy. Keep it to yourself -- not in a "
+             "message, a note or a screenshot: whoever has it can make your codes. Here, Ctrl+C "
+             "stops passwd without saving anything."))
+    print()
+    for _try in range(3):
+        got = ask(tr("The code the app shows now: ")).strip()
+        if totp_check(secret, got) is not None:
+            return password, secret
+        print(tr("That is not the code; wait for the next one and try again."))
+    raise SystemExit(tr("The code did not match. Nothing changed: run passwd again."))
+
+
 def cmd_passwd(rest=()):
     """Sets the web app's password and its authenticator code, asked in this
     terminal; --status says what is set and lists the last logins."""
@@ -7508,7 +7542,7 @@ def cmd_passwd(rest=()):
             except ValueError:
                 continue
             print("  " + "  ".join(str(e.get(k, "")) for k in ("t", "event", "who", "from") if e.get(k)))
-        return 0
+        return 0 if a is not None else 1
     if "--remove" in rest:
         try:
             AUTH_FILE.unlink()
@@ -7524,33 +7558,230 @@ def cmd_passwd(rest=()):
         access_log("logout-all")
         print(tr("Every session ends at its next request."))
         return 0
-    password = getpass.getpass(tr("New password ({n} characters or more): ", n=PASSWORD_MIN))
-    if len(password) < PASSWORD_MIN:
-        raise SystemExit(tr("Too short: {n} characters or more. Nothing changed.", n=PASSWORD_MIN))
-    if getpass.getpass(tr("The same again: ")) != password:
-        raise SystemExit(tr("The two did not match. Nothing changed."))
-    secret = ""
-    if "--no-code" not in rest:
-        secret = base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
+    try:
+        password, secret = passwd_ask(getpass.getpass, input, "--no-code" not in rest)
+    except (KeyboardInterrupt, EOFError):
+        # Ctrl+C in a Windows terminal stops the program; it is easy to press
+        # meaning "copy" -- nothing was saved, so nothing is half done
         print()
-        print(tr("In your authenticator app (Aegis, 2FAS, Google Authenticator, 1Password...), "
-                 "add an account by typing this key:"))
-        print()
-        print("    " + " ".join(secret[i:i + 4] for i in range(0, len(secret), 4)))
-        print()
-        print(tr("(time-based, 6 digits, 30 seconds; or paste the whole line below)"))
-        print(f"    otpauth://totp/Kustos:{HOST}?secret={secret}&issuer=Kustos&digits=6&period=30")
-        print()
-        for _try in range(3):
-            got = input(tr("The code the app shows now: ")).strip()
-            if totp_check(secret, got) is not None:
-                break
-            print(tr("That is not the code; wait for the next one and try again."))
-        else:
-            raise SystemExit(tr("The code did not match. Nothing changed: run passwd again."))
+        raise SystemExit(tr("Stopped: nothing was saved. Run passwd again when ready."))
     auth_set(password, secret)
     access_log("password set", code=bool(secret))
     print(tr("Saved in {file} (this machine only). Sessions opened before end now.", file=AUTH_FILE))
+    return 0
+
+
+# ---- the always-on server (Windows): `python _kustos.py service`
+#
+# `install` makes `web --serve` start at every login of this Windows user, in
+# the background (a scheduled task, SERVICE_TASK: pythonw, no time limit,
+# restarted if it fails), allows this machine's Tailscale address, puts
+# `tailscale serve` in front of it and checks that the login answers. Run it
+# again after a change; `status`, `stop`, `start`, `restart` and `remove` do
+# what they say (`remove` also turns `tailscale serve` off). PowerShell does
+# the Windows part; the values reach it as $env:KUSTOS_*, never spliced into
+# its text. update-instance.cmd runs `service restart --quiet` after copying.
+
+SERVICE_TASK = "Kustos web"
+PS_INSTALL = r"""$ErrorActionPreference = 'Stop'
+$me = "$env:USERDOMAIN\$env:USERNAME"
+$a = New-ScheduledTaskAction -Execute $env:KUSTOS_EXE -Argument $env:KUSTOS_ARGS -WorkingDirectory $env:KUSTOS_DIR
+$t = New-ScheduledTaskTrigger -AtLogOn -User $me
+$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew
+$p = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskName $env:KUSTOS_TASK -Action $a -Trigger $t -Settings $s -Principal $p -Description $env:KUSTOS_DESC -Force | Out-Null
+Start-ScheduledTask -TaskName $env:KUSTOS_TASK"""
+PS_STOP = r"""Stop-ScheduledTask -TaskName $env:KUSTOS_TASK -ErrorAction SilentlyContinue
+$dir = $env:KUSTOS_DIR.ToLower()
+Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'python*' -and $_.CommandLine -and $_.CommandLine.ToLower().Contains($dir) -and $_.CommandLine -match 'web\s+--serve' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; $_.ProcessId }"""
+PS_START = r"""$ErrorActionPreference = 'Stop'
+Start-ScheduledTask -TaskName $env:KUSTOS_TASK"""
+PS_STATUS = r"""$t = Get-ScheduledTask -TaskName $env:KUSTOS_TASK -ErrorAction SilentlyContinue
+if ($t) { $i = $t | Get-ScheduledTaskInfo; @{installed = $true; state = "$($t.State)"; last = "$($i.LastRunTime)"; result = [int64]$i.LastTaskResult; args = "$($t.Actions[0].Arguments)"} | ConvertTo-Json -Compress } else { '{"installed": false}' }"""
+PS_REMOVE = r"""Unregister-ScheduledTask -TaskName $env:KUSTOS_TASK -Confirm:$false -ErrorAction SilentlyContinue"""
+
+
+def run_ps(script, **values):
+    """A PowerShell script, with `values` as $env:KUSTOS_<NAME>: (code, out, err)."""
+    import subprocess
+    env = dict(os.environ, KUSTOS_TASK=SERVICE_TASK,
+               **{"KUSTOS_" + k.upper(): str(v) for k, v in values.items()})
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
+                            "Bypass", "-Command", script], capture_output=True, text=True,
+                           env=env, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, "", str(exc)
+    return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+
+
+def tailscale_exe():
+    """The Tailscale command line, or None."""
+    exe = shutil.which("tailscale")
+    if exe:
+        return exe
+    for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
+        cand = Path(base) / "Tailscale" / "tailscale.exe" if base else None
+        if cand and cand.exists():
+            return str(cand)
+    return None
+
+
+def run_tailscale(exe, *args):
+    import subprocess
+    try:
+        r = subprocess.run([exe, *args], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, str(exc)
+    return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
+
+
+def tailscale_name(exe):
+    """This machine's Tailscale address (MagicDNS name), or '' when Tailscale
+    is not running or not signed in."""
+    code, out = run_tailscale(exe, "status", "--json")
+    try:
+        me = json.loads(out[out.find("{"):] if "{" in out else "{}").get("Self") or {}
+    except ValueError:
+        return ""
+    return str(me.get("DNSName") or "").rstrip(".").lower()
+
+
+def serve_answers(port, timeout=1.5):
+    """Whether `web --serve` answers on this machine: its login page, 200."""
+    import http.client
+    try:
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        c.request("GET", "/login", headers={"Host": f"127.0.0.1:{port}"})
+        ok = c.getresponse().status == 200
+        c.close()
+        return ok
+    except OSError:
+        return False
+
+
+def cmd_service(rest=()):
+    """Windows: the web app behind its login, started at every login, with
+    `tailscale serve` in front of it."""
+    rest = list(rest)
+    quiet = "--quiet" in rest
+    rest = [a for a in rest if a != "--quiet"]
+    what = rest[0] if rest else "install"
+    port = SERVE_PORT
+    if what not in ("install", "status", "stop", "start", "restart", "remove"):
+        raise SystemExit(tr("service: install, status, stop, start, restart or remove."))
+    if sys.platform != "win32":
+        raise SystemExit(tr("This sets up Windows. Elsewhere, start `python _kustos.py web --serve "
+                            "--allow-host <name>` with the system's own service manager, and run "
+                            "`tailscale serve --bg {port}`.", port=port))
+    here = str(BASE)
+    say = (lambda *a: None) if quiet else print
+
+    def installed():
+        code, out, _err = run_ps(PS_STATUS)
+        try:
+            return json.loads(out or "{}")
+        except ValueError:
+            return {}
+
+    def stop():
+        code, out, err = run_ps(PS_STOP, dir=here)
+        return [x for x in out.split() if x.isdigit()]
+
+    if what == "status":
+        info = installed()
+        if info.get("installed"):
+            print(tr("Starts with Windows: yes (task “{task}”, {state}; last run {last}, "
+                     "result {result}).", task=SERVICE_TASK, state=info.get("state", "?"),
+                     last=info.get("last", "?"), result=info.get("result", "?")))
+        else:
+            print(tr("Starts with Windows: no (`_kustos_serve.cmd` sets it up)."))
+        print(tr("Answering on 127.0.0.1:{port}: {yes}.", port=port,
+                 yes=tr("yes") if serve_answers(port) else tr("no")))
+        ts = tailscale_exe()
+        if ts:
+            print(tr("tailscale serve:"))
+            print("    " + run_tailscale(ts, "serve", "status")[1].replace("\n", "\n    "))
+        else:
+            print(tr("Tailscale: not found on this machine."))
+        cmd_passwd(["--status"])
+        return 0
+    if what == "stop":
+        gone = stop()
+        print(tr("Stopped ({n} process(es)). It starts again at the next login, or with "
+                 "`_kustos_serve.cmd start`.", n=len(gone)))
+        return 0
+    if what in ("start", "restart"):
+        if not installed().get("installed"):
+            say(tr("Not set up to start with Windows: run `_kustos_serve.cmd` first."))
+            return 0 if quiet else 1
+        if what == "restart":
+            stop()
+        code, _out, err = run_ps(PS_START)
+        if code != 0:
+            raise SystemExit(tr("It did not start: {why}", why=(err or "?").splitlines()[0]))
+        for _i in range(30):
+            if serve_answers(port):
+                break
+            time.sleep(0.5)
+        print(tr("Kustos web is running again (127.0.0.1:{port}).", port=port) if serve_answers(port)
+              else tr("Started, but not answering yet: see `_kustos_serve.cmd status`."))
+        return 0
+    if what == "remove":
+        stop()
+        run_ps(PS_REMOVE)
+        ts = tailscale_exe()
+        if ts:
+            run_tailscale(ts, "serve", "reset")
+        print(tr("Removed: Kustos no longer starts with Windows, and `tailscale serve` is off. "
+                 "The password stays (`passwd --remove` deletes it)."))
+        return 0
+
+    # ---- install
+    print(tr("1/5  Password"))
+    if auth_load() is None:
+        print(tr("     None yet: set one now."))
+        cmd_passwd([])
+    print(tr("     set ({file}).", file=AUTH_FILE))
+    print(tr("2/5  Tailscale"))
+    ts = tailscale_exe()
+    name = tailscale_name(ts) if ts else ""
+    if not name:
+        raise SystemExit(tr("     Tailscale is not installed, not running or not signed in on this "
+                            "machine. Install it from tailscale.com, sign in, then run this again."))
+    print(tr("     this machine is {name}", name=name))
+    print(tr("3/5  Starting with Windows (task “{task}”)", task=SERVICE_TASK))
+    stop()
+    exe = Path(sys.executable)
+    quiet_exe = exe.with_name("pythonw.exe")
+    exe = quiet_exe if quiet_exe.exists() else exe
+    args = f'"{BASE / "_kustos.py"}" web --serve --port {port} --allow-host {name}'
+    code, _out, err = run_ps(PS_INSTALL, exe=exe, args=args, dir=here,
+                             desc="Kustos: the web app behind its login (web --serve), for Tailscale")
+    if code != 0:
+        raise SystemExit(tr("     Windows refused: {why}\n     Open the terminal as administrator "
+                            "(right-click, Run as administrator) and run this again.",
+                            why=(err or "?").splitlines()[0]))
+    print(tr("     done: it starts at every login, in the background."))
+    print(tr("4/5  Kustos answering"))
+    for _i in range(40):
+        if serve_answers(port):
+            break
+        time.sleep(0.5)
+    else:
+        raise SystemExit(tr("     It does not answer on 127.0.0.1:{port}. Is another program using "
+                            "that port? `_kustos_serve.cmd status` says more.", port=port))
+    print(tr("     yes, on 127.0.0.1:{port}, behind the login.", port=port))
+    print(tr("5/5  tailscale serve"))
+    code, out = run_tailscale(ts, "serve", "--bg", str(port))
+    if code != 0:
+        raise SystemExit(tr("     It did not work:\n{out}\n     If it says access denied, open the "
+                            "terminal as administrator and run this again; if it gives a link, "
+                            "open it, approve, and run this again.", out=out))
+    print(tr("     done."))
+    print()
+    print(tr("Ready. On your phone, with Tailscale on, open:"))
+    print(f"    https://{name}")
     return 0
 
 
@@ -20135,6 +20366,8 @@ def main():
         return cmd_web(rest)
     if cmd == "passwd":
         return cmd_passwd(rest)
+    if cmd == "service":
+        return cmd_service(rest)
     if cmd == "migrate":
         return cmd_migrate()
     if cmd == "merge":
@@ -22007,6 +22240,68 @@ PT = {
         "Semear de novo para recomeçar",
     "r: start again":
         "r: recomeçar",
+    "service: install, status, stop, start, restart or remove.":
+        "service: install, status, stop, start, restart ou remove.",
+    "This sets up Windows. Elsewhere, start `python _kustos.py web --serve --allow-host <name>` with the system's own service manager, and run `tailscale serve --bg {port}`.":
+        "Isto configura o Windows. Em outro sistema, inicie `python _kustos.py web --serve --allow-host <nome>` pelo gerenciador de serviços do sistema e rode `tailscale serve --bg {port}`.",
+    "Starts with Windows: yes (task “{task}”, {state}; last run {last}, result {result}).":
+        "Inicia com o Windows: sim (tarefa “{task}”, {state}; última execução {last}, resultado {result}).",
+    "Starts with Windows: no (`_kustos_serve.cmd` sets it up).":
+        "Inicia com o Windows: não (o `_kustos_serve.cmd` configura).",
+    "Answering on 127.0.0.1:{port}: {yes}.":
+        "Respondendo em 127.0.0.1:{port}: {yes}.",
+    "tailscale serve:":
+        "tailscale serve:",
+    "Tailscale: not found on this machine.":
+        "Tailscale: não encontrado nesta máquina.",
+    "Stopped ({n} process(es)). It starts again at the next login, or with `_kustos_serve.cmd start`.":
+        "Parado ({n} processo(s)). Ele volta no próximo login, ou com `_kustos_serve.cmd start`.",
+    "Not set up to start with Windows: run `_kustos_serve.cmd` first.":
+        "Não está configurado para iniciar com o Windows: rode o `_kustos_serve.cmd` antes.",
+    "It did not start: {why}":
+        "Não iniciou: {why}",
+    "Kustos web is running again (127.0.0.1:{port}).":
+        "O Kustos web está rodando de novo (127.0.0.1:{port}).",
+    "Started, but not answering yet: see `_kustos_serve.cmd status`.":
+        "Iniciado, mas ainda sem responder: veja `_kustos_serve.cmd status`.",
+    "Removed: Kustos no longer starts with Windows, and `tailscale serve` is off. The password stays (`passwd --remove` deletes it).":
+        "Removido: o Kustos não inicia mais com o Windows, e o `tailscale serve` está desligado. A senha fica (`passwd --remove` a apaga).",
+    "1/5  Password":
+        "1/5  Senha",
+    "     None yet: set one now.":
+        "     Nenhuma ainda: defina uma agora.",
+    "     set ({file}).":
+        "     definida ({file}).",
+    "2/5  Tailscale":
+        "2/5  Tailscale",
+    "     Tailscale is not installed, not running or not signed in on this machine. Install it from tailscale.com, sign in, then run this again.":
+        "     O Tailscale não está instalado, ligado ou conectado nesta máquina. Instale-o de tailscale.com, entre na conta e rode isto de novo.",
+    "     this machine is {name}":
+        "     esta máquina é {name}",
+    "3/5  Starting with Windows (task “{task}”)":
+        "3/5  Iniciar com o Windows (tarefa “{task}”)",
+    "     Windows refused: {why}\n     Open the terminal as administrator (right-click, Run as administrator) and run this again.":
+        "     O Windows recusou: {why}\n     Abra o terminal como administrador (botão direito, Executar como administrador) e rode isto de novo.",
+    "     done: it starts at every login, in the background.":
+        "     feito: ele inicia a cada login, em segundo plano.",
+    "4/5  Kustos answering":
+        "4/5  Kustos respondendo",
+    "     It does not answer on 127.0.0.1:{port}. Is another program using that port? `_kustos_serve.cmd status` says more.":
+        "     Ele não responde em 127.0.0.1:{port}. Outro programa usa essa porta? O `_kustos_serve.cmd status` diz mais.",
+    "     yes, on 127.0.0.1:{port}, behind the login.":
+        "     sim, em 127.0.0.1:{port}, atrás da entrada com senha.",
+    "5/5  tailscale serve":
+        "5/5  tailscale serve",
+    "     It did not work:\n{out}\n     If it says access denied, open the terminal as administrator and run this again; if it gives a link, open it, approve, and run this again.":
+        "     Não funcionou:\n{out}\n     Se disser acesso negado, abra o terminal como administrador e rode isto de novo; se der um link, abra-o, aprove e rode isto de novo.",
+    "     done.":
+        "     feito.",
+    "Ready. On your phone, with Tailscale on, open:":
+        "Pronto. No celular, com o Tailscale ligado, abra:",
+    "Stopped: nothing was saved. Run passwd again when ready.":
+        "Interrompido: nada foi gravado. Rode o passwd de novo quando quiser.",
+    "Type it on your phone: there is nothing to copy. Keep it to yourself -- not in a message, a note or a screenshot: whoever has it can make your codes. Here, Ctrl+C stops passwd without saving anything.":
+        "Digite-a no celular: não há nada para copiar. Guarde-a só para você -- nada de mensagem, nota ou captura de tela: quem a tem gera os seus códigos. Aqui, Ctrl+C interrompe o passwd sem gravar nada.",
     "Log in to your base":
         "Entre na sua base",
     "Password":
