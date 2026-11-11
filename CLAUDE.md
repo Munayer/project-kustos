@@ -145,6 +145,12 @@ Ideas that span several sections:
   the plain `web` (the window's, Peritia's) working without a login, and keep
   every server on 127.0.0.1. Test with `LOCALAPPDATA` pointed at a scratch
   folder, never at a real one.
+  `cmd_service` (`_kustos_serve.cmd`) makes it start at every Windows login: a
+  scheduled task (`SERVICE_TASK`, PowerShell scripts `PS_*` that get their
+  values as `$env:KUSTOS_*`, never spliced in), `--allow-host` the machine's
+  MagicDNS name (`tailscale_name`), `tailscale serve --bg 8484` in front, and
+  `serve_answers` to check the login answers. Test it with `run_ps`,
+  `run_tailscale` and `sys.platform` stood in for.
 - **GEO** (`# ==== geo`): a field of every record but the drafts, kept as
   typed (points `lat, lon` one per line, or GeoJSON pasted whole) and read by
   `parse_geo` into GeoJSON geometries only when needed: the card's hint
@@ -212,9 +218,12 @@ The rules, in order:
    `Co-Authored-By: Claude <noreply@anthropic.com>`, then push.
 5. Copy to the instance (`tools\update-instance.cmd`, or copy
    `_kustos.py`, `_kustos.cmd`, `_kustos_logbook.cmd`, `_kustos_peritia.cmd`,
-   `kustos.ico`) **only when
+   `_kustos_serve.cmd`, `kustos.ico`) **only when
    Kustos is closed** — check that no `python`/`pythonw` process is running, or
-   ask the owner — then verify the copies match (ignoring CRLF/LF).
+   ask the owner — then verify the copies match (ignoring CRLF/LF). The
+   always-on `web --serve` (task *Kustos web*) does not count: it holds nothing
+   unsaved, and `update-instance.cmd` restarts it after copying
+   (`service restart --quiet`).
 
 Force pushes are run by the owner, not by Claude.
 
