@@ -129,6 +129,13 @@ Ideas that span several sections:
   2 px (`MIN_HALF`), or Tk's fill comes and goes along them and they read as
   dashed. Check a change to them on a big invented base (frame time) and by
   eye, enlarged.
+- **GEO** (`# ==== geo`): a field of every record but the drafts, kept as
+  typed (points `lat, lon` one per line, or GeoJSON pasted whole) and read by
+  `parse_geo` into GeoJSON geometries only when needed: the card's hint
+  (`App.geo_field`, `geo_put`), the doctor (warnings, never errors), the
+  mirror, `is:geo`, and `cmd_geojson`, which leaves health out unless `--all`.
+  Keep it offline: no geocoding and no tiles (the page's CSP is
+  `default-src 'none'`). A new collection with a GEO joins `GEO_COLLS`.
 - **Long texts are markdown**: `textfield(..., pages=True)` (every NOTES and the
   draft's text) gets `MarkdownKeys`, and `fit(opening=True)` paints it before
   the pages are measured. The text stored stays plain.

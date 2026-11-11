@@ -16,6 +16,7 @@ FILES (all side by side, same prefix)
     _kustos.lock.<machine>.json   "Open over there" notice. Removed on close.
     _kustos_mirror.md             Readable mirror (Obsidian, phone).
     _kustos_peritia.html          Skills panel, read-only snapshot (Peritia).
+    _kustos.geojson               Every GEO, made by `geojson` on request only.
     _kustos_conflicts/            *.sync-conflict-* already merged. Nothing is deleted.
     _kustos_old/                  What `migrate` retired.
 
@@ -56,6 +57,9 @@ USAGE
     python _kustos.py search <text>   literal search across the collections
     python _kustos.py cite <id|text> [abnt|abnt-autor-data|bibtex|csl-json|bruto]
     python _kustos.py export [bibtex|csl|abnt] [file]
+    python _kustos.py geojson [--all] [file]
+                                      every GEO as one GeoJSON file (QGIS, PostGIS);
+                                      health records only with --all
     python _kustos.py import zotero <export.json|.bib>
     python _kustos.py import <notes.md>   "- Name. Notes" -> people
     python _kustos.py merge           merge *.sync-conflict-* now
@@ -595,6 +599,7 @@ def fix_person(p):
     p.setdefault("interactions", [])
     p.setdefault("aliases", [])
     p.setdefault("place", "")
+    p.setdefault("geo", "")
     p.setdefault("notes_raw", "")
     p.setdefault("met", None)
     p.setdefault("born", "")
@@ -938,6 +943,7 @@ CARD_FIELDS = [
     ("domains",  "Domains"),
     ("tags",     "Tags"),
     ("source",   "Source"),
+    ("geo",      "Geographic location"),
     ("notes",    "Notes"),
     ("edges",    "Links (text)"),
     ("out",      "Resolved links"),
@@ -1214,6 +1220,7 @@ def fix_entry(e):
     e.setdefault("gloss", "")
     e.setdefault("notes", "")
     e.setdefault("source", "")
+    e.setdefault("geo", "")
     e.setdefault("tags", [])
     e.setdefault("links", [])
     e.setdefault("domains", [])
@@ -1362,7 +1369,7 @@ def fix_source(s):
     s.setdefault("authors", [])
     for k in ("date", "container", "publisher", "place", "edition", "volume",
               "issue", "pages", "doi", "isbn", "url", "accessed", "lang",
-              "raw", "notes"):
+              "raw", "notes", "geo"):
         s.setdefault(k, "")
     s.setdefault("extra", [])
     s.setdefault("tags", [])
@@ -1976,6 +1983,7 @@ def fix_metric(m):
     m.setdefault("ref_low", "")
     m.setdefault("ref_high", "")
     m.setdefault("source", "")
+    m.setdefault("geo", "")
     m.setdefault("notes", "")
     m.setdefault("tags", [])
     m.setdefault("links", [])
@@ -2352,6 +2360,204 @@ def retire_note_file(rec):
 def haystack_note(n):
     return "  ".join([n.get("id", ""), n.get("name", ""), " ".join(n.get("tags", [])),
                       n.get("_body") if "_body" in n else note_body(n)]).lower()
+
+
+# ================================================================ geo
+#
+# GEO, a field of every record but the drafts: where the record is on the
+# Earth. It is kept as the text typed (as LINKS is) and read by parse_geo into
+# GeoJSON geometries (RFC 7946) only when they are needed: the hint under the
+# card's field, the doctor, the mirror and `python _kustos.py geojson`, which
+# writes them all as one FeatureCollection for QGIS or PostGIS. The text is
+#   - points, one per line, as a GPS or a map shows them: latitude, longitude
+#     in decimal degrees (WGS 84), optionally followed by a label --
+#         -19.9167, -43.9345  home
+#     a geo: URI (RFC 5870) or a map link carrying @lat,lon is read too; or
+#   - GeoJSON pasted whole (a geometry, a Feature or a FeatureCollection), for
+#     a line or an area. GeoJSON itself writes LONGITUDE first.
+# Nothing here goes to the network: no geocoding, no map tiles.
+
+GEO_FILE = BASE / f"{STEM}.geojson"
+GEO_COLLS = ("people", "entries", "sources", "corpus")
+GEO_EXPORT = ("people", "entries", "sources")      # health only when asked (--all)
+GEO_BIG = 100_000          # characters: a GEO longer than this gets a warning
+GEO_TYPES = ("Point", "MultiPoint", "LineString", "MultiLineString", "Polygon",
+             "MultiPolygon", "GeometryCollection")
+GEO_SHAPE = {"Point": "point", "MultiPoint": "points", "LineString": "line",
+             "MultiLineString": "lines", "Polygon": "area", "MultiPolygon": "areas",
+             "GeometryCollection": "shapes"}
+_GEO_NUM = r"[-+]?\d{1,3}(?:[.,]\d+)?"
+GEO_LINE_RE = re.compile(rf"^({_GEO_NUM})\s*(?:[,;]\s*|\s+)({_GEO_NUM})(?:\s+[-—–:]?\s*(.*))?$")
+GEO_AT_RE = re.compile(r"@([-+]?\d{1,3}\.\d+),([-+]?\d{1,3}\.\d+)")
+
+
+def _geo_float(text):
+    return float(text.replace(",", "."))
+
+
+def geo_position_error(pos):
+    """None if `pos` is a GeoJSON position [lon, lat, ...] on the Earth."""
+    if not isinstance(pos, (list, tuple)) or len(pos) < 2 or not all(
+            isinstance(v, (int, float)) and not isinstance(v, bool) for v in pos[:3]):
+        return tr("not a position: {pos}", pos=json.dumps(pos)[:40])
+    lon, lat = pos[0], pos[1]
+    if not -180 <= lon <= 180 or not -90 <= lat <= 90:
+        return tr("off the Earth: longitude {lon}, latitude {lat}", lon=lon, lat=lat)
+    return None
+
+
+def geo_geometry_error(g):
+    """None if `g` is a GeoJSON geometry whose positions are all on the Earth."""
+    t = g.get("type")
+    if t == "GeometryCollection":
+        parts = g.get("geometries")
+        if not isinstance(parts, list):
+            return tr("a GeometryCollection without geometries")
+        for part in parts:
+            err = geo_geometry_error(part) if isinstance(part, dict) else tr("not a geometry")
+            if err:
+                return err
+        return None
+    depth = {"Point": 0, "MultiPoint": 1, "LineString": 1, "MultiLineString": 2,
+             "Polygon": 2, "MultiPolygon": 3}[t]
+    level = [g.get("coordinates")]
+    for _ in range(depth):
+        nxt = []
+        for x in level:
+            if not isinstance(x, list) or not x:
+                return tr("{type}: coordinates nested the wrong way", type=t)
+            nxt.extend(x)
+        level = nxt
+    for pos in level:
+        err = geo_position_error(pos)
+        if err:
+            return err
+    coords = g.get("coordinates")
+    if t == "LineString" and len(coords) < 2:
+        return tr("a line needs two positions or more")
+    rings = [coords] if t == "Polygon" else (coords if t == "MultiPolygon" else [])
+    for poly in rings:
+        for ring in poly:
+            if len(ring) < 4 or ring[0][:2] != ring[-1][:2]:
+                return tr("an area's ring must close: four positions or more, the last as the first")
+    return None
+
+
+def _geo_walk(obj, label, parts, errors):
+    t = obj.get("type") if isinstance(obj, dict) else None
+    if t == "FeatureCollection":
+        for f in obj.get("features") or []:
+            _geo_walk(f, "", parts, errors)
+    elif t == "Feature":
+        props = obj.get("properties") or {}
+        name = (props.get("name") or props.get("label") or "") if isinstance(props, dict) else ""
+        if obj.get("geometry") is not None:
+            _geo_walk(obj["geometry"], str(name), parts, errors)
+    elif t in GEO_TYPES:
+        err = geo_geometry_error(obj)
+        if err:
+            errors.append(err)
+        else:
+            parts.append({"geometry": obj, "label": label})
+    else:
+        errors.append(tr("not GeoJSON: {what}", what=t or type(obj).__name__))
+
+
+def parse_geo(text):
+    """GEO text -> (parts, errors). A part is {geometry, label}: one per point
+    line, or one per geometry of the GeoJSON pasted."""
+    text = (text or "").strip()
+    parts, errors = [], []
+    if not text:
+        return parts, errors
+    if text[0] in "{[":
+        try:
+            obj = json.loads(text)
+        except ValueError as err:
+            return [], [tr("GeoJSON that does not read: {err}", err=getattr(err, "msg", err))]
+        for item in (obj if isinstance(obj, list) else [obj]):
+            _geo_walk(item, "", parts, errors)
+        return parts, errors
+    for n, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        m = GEO_AT_RE.search(line) if "@" in line else None
+        if m:
+            lat, lon, label = _geo_float(m.group(1)), _geo_float(m.group(2)), ""
+        else:
+            if line.lower().startswith("geo:"):
+                line = line[4:].split(";")[0]
+            m = GEO_LINE_RE.match(line)
+            if not m:
+                errors.append(tr("line {n}: not latitude, longitude", n=n))
+                continue
+            lat, lon = _geo_float(m.group(1)), _geo_float(m.group(2))
+            label = (m.group(3) or "").strip()
+        if not -90 <= lat <= 90:
+            errors.append(tr("line {n}: latitude {lat} beyond ±90 (written longitude first?)",
+                             n=n, lat=lat) if -180 <= lat <= 180 and -90 <= lon <= 90
+                          else tr("line {n}: latitude {lat} beyond ±90", n=n, lat=lat))
+            continue
+        if not -180 <= lon <= 180:
+            errors.append(tr("line {n}: longitude {lon} beyond ±180", n=n, lon=lon))
+            continue
+        parts.append({"geometry": {"type": "Point", "coordinates": [lon, lat]},
+                      "label": label})
+    return parts, errors
+
+
+def geo_summary(text):
+    """What a GEO reads as, in a few words, or its first error ('' if empty)."""
+    parts, errors = parse_geo(text)
+    if errors:
+        return "(!) " + errors[0]
+    if not parts:
+        return ""
+    if len(parts) == 1 and parts[0]["geometry"]["type"] == "Point":
+        lon, lat = parts[0]["geometry"]["coordinates"][:2]
+        return f"{lat:.5f}, {lon:.5f}" + (f"  {parts[0]['label']}" if parts[0]["label"] else "")
+    kinds = {p["geometry"]["type"] for p in parts}
+    if kinds == {"Point"}:
+        return tr("{n} points", n=len(parts))
+    if len(parts) == 1:
+        return tr(GEO_SHAPE[parts[0]["geometry"]["type"]])
+    return tr("{n} shapes", n=len(parts))
+
+
+def geo_features(data, colls=GEO_EXPORT):
+    """Every GEO of the base as GeoJSON Features, one per part, with the
+    record's id, register number, name, collection and kind as properties."""
+    out = []
+    for coll in colls:
+        for r in data[coll]:
+            parts, _errors = parse_geo(r.get("geo"))
+            for p in parts:
+                out.append({"type": "Feature", "geometry": p["geometry"],
+                            "properties": {"id": r["id"], "reg_n": r.get("reg_n") or 0,
+                                           "name": label_any(r, data), "coll": coll,
+                                           "kind": kind_of(r), "label": p["label"],
+                                           "tags": ", ".join(r.get("tags", []))}})
+    return out
+
+
+def cmd_geojson(rest=()):
+    """Writes every GEO as one FeatureCollection, one Feature per line."""
+    rest = list(rest)
+    every = "--all" in rest
+    rest = [a for a in rest if a != "--all"]
+    data = load_json()
+    feats = geo_features(data, GEO_COLLS if every else GEO_EXPORT)
+    out = Path(rest[0]) if rest else GEO_FILE
+    body = ('{"type": "FeatureCollection", "features": [\n'
+            + ",\n".join(json.dumps(f, ensure_ascii=False) for f in feats) + "\n]}\n")
+    tmp = out.with_name(out.name + ".tmp")
+    tmp.write_text(body, encoding="utf-8")
+    os.replace(tmp, out)
+    print(tr("{n} feature(s) -> {name}", n=len(feats), name=out.name))
+    if not every:
+        print(tr("(health records left out; --all puts them in)"))
+    return 0
 
 
 # ================================================================ file
@@ -3108,6 +3314,16 @@ def check(data):
             if src.startswith("s_") and src not in idx:
                 errors.append(tr("{id}: SOURCE points to {src}, which does not exist",
                                  id=r["id"], src=src))
+    for coll in GEO_COLLS:
+        for r in data[coll]:
+            g = (r.get("geo") or "").strip()
+            if not g:
+                continue
+            for err in parse_geo(g)[1][:3]:
+                warnings.append(tr("{id}: GEO {err}", id=r["id"], err=err))
+            if len(g) > GEO_BIG:
+                warnings.append(tr("{id}: GEO of {n} characters; a simpler shape keeps the "
+                                   "base light", id=r["id"], n=len(g)))
     atypical = []
     for i, a in enumerate(data["edges"]):
         src = idx.get(a["from"])
@@ -3295,6 +3511,8 @@ def write_mirror(data):
             meta.append("met: " + p["met"])
         if p.get("source"):
             meta.append(tr("source: ") + resolve_source(p["source"], data)[1])
+        if p.get("geo"):
+            meta.append("geo: " + geo_summary(p["geo"]))
         if meta:
             out.append("  ·  ".join(meta))
         if p.get("aliases"):
@@ -3357,6 +3575,8 @@ def write_mirror(data):
             meta.append("tags: " + ", ".join(e["tags"]))
         if e.get("source"):
             meta.append(tr("source: ") + resolve_source(e["source"], data)[1])
+        if e.get("geo"):
+            meta.append("geo: " + geo_summary(e["geo"]))
         out.append("  ·  ".join(m for m in meta if m))
         out.append("")
         if e.get("gloss"):
@@ -3385,7 +3605,9 @@ def write_mirror(data):
         out.append(f"## {source_label(s, data)}")
         out.append(mirror_locus(s))
         out.append("  ·  ".join(x for x in (type_label(s.get("type", "")),
-                                            "tags: " + ", ".join(s["tags"]) if s.get("tags") else "") if x))
+                                            "tags: " + ", ".join(s["tags"]) if s.get("tags") else "",
+                                            "geo: " + geo_summary(s["geo"]) if s.get("geo") else "")
+                                if x))
         out += ["", cite(s, "abnt", data), ""]
         if s.get("notes"):
             out += [s["notes"], ""]
@@ -3418,6 +3640,8 @@ def write_mirror(data):
             meta.append(tr("reference: ") + f"{m.get('ref_low', '')}–{m.get('ref_high', '')}")
         if m.get("source"):
             meta.append(tr("source: ") + resolve_source(m["source"], data)[1])
+        if m.get("geo"):
+            meta.append("geo: " + geo_summary(m["geo"]))
         if meta:
             out.append("  ·  ".join(meta))
         out.append("")
@@ -3459,6 +3683,7 @@ def cmd_mirror():
 #                       drafts)
 #      ^text            only the start of the name
 #      tag:x lang:de type:book sys:renal dom:law id:c_measure
+#      is:org is:person is:geo   organizations, people who are not, records with a GEO
 # The rest are literal terms, all required, looked up in each record's search
 # text (`_h`, made by the haystack_* functions). type: and sys: match the
 # stored key or its label in the current language.
@@ -3506,6 +3731,8 @@ def search_field_ok(r, fields):
             if v.startswith("org") and not org:
                 return False
             if v.startswith(("pers", "pes")) and (not person or org):
+                return False
+            if v.startswith("geo") and not (r.get("geo") or "").strip():
                 return False
     return True
 
@@ -6362,6 +6589,8 @@ def web_fields():
     links = f("links", "URLS", "text", hint="one per line")
     edges = f("edges", "LINKS  (rel  target  [span]  [@circle]  — reason  # source)", "text",
               hint="one per line, e.g.  cites s_…  — why")
+    geo = f("geo", "GEO  (latitude, longitude — a point per line — or GeoJSON)", "text",
+            hint="e.g.  -19.9167, -43.9345  home")
     return {
         "people": [
             f("name", "NAME"),
@@ -6370,7 +6599,7 @@ def web_fields():
             f("place", "DOMICILIUM"),
             f("born", "BORN  (2024-03-11, 1890, s. XVI)"), f("died", "DIED"),
             f("circles", "CIRCLES", "circles", opts=[[c, tr(c)] for c in CIRCLES]),
-            tags, source,
+            tags, source, geo,
             f("tasks", "TASKS", "text", hint="one per line:  [ ] what  ~2026-09-10"),
             f("interactions", "LOG", "text", hint="one per line:  2026-08-01   what happened"),
             f("notes_raw", "NOTES", "md"),
@@ -6387,14 +6616,14 @@ def web_fields():
               opts=[["attested", tr("attested")], ["reconstructed", tr("reconstructed")]]),
             f("gloss", "GLOSS", "text"),
             f("domains", "DOMAINS", hint="separated by commas"),
-            tags, source, f("notes", "NOTES", "md"), edges, links,
+            tags, source, geo, f("notes", "NOTES", "md"), edges, links,
         ],
         "sources": [
             f("type", "TYPE", "choice", opts=[[t, type_label(t)] for t in SOURCE_TYPES]),
             f("name", "TITLE"),
         ] + [f(k, SOURCE_FIELD_LABEL[k], "text" if k in ("authors", "extra") else "line")
              for k in SOURCE_FIELDS["*"]] + [
-            tags, f("notes", "NOTES", "md"), edges, links,
+            tags, f("notes", "NOTES", "md"), geo, edges, links,
         ],
         "corpus": [
             f("ctype", "TYPE", "choice",
@@ -6421,7 +6650,7 @@ def web_fields():
             f("date", "DATE", only=["event"]),
             f("doctor", "WITH  (a person's p_…, or a name)", only=["event"]),
             f("place", "PLACE", only=["event"]),
-            source, tags, f("notes", "NOTES", "md"), edges, links,
+            source, geo, tags, f("notes", "NOTES", "md"), edges, links,
         ],
         "notes": [
             f("name", "TITLE"),
@@ -6443,6 +6672,8 @@ def web_form(rec, data):
     if rec.get("edge_drafts"):
         text = lines(filter(None, [text] + list(rec["edge_drafts"])))
     out["edges"] = text
+    if coll in GEO_COLLS:
+        out["geo"] = rec.get("geo", "")
     if coll == "people":
         out.update(org="org" if rec.get("org") else "",
                    aliases=format_aliases(rec.get("aliases")), place=rec.get("place", ""),
@@ -6520,6 +6751,8 @@ def web_gather(coll, old, form):
     put("name", text("name").strip())
     put("tags", words("tags"))
     put("links", rows("links"))
+    if coll in GEO_COLLS:
+        put("geo", text("geo").strip())
     if coll == "people":
         put("notes_raw", text("notes_raw"))
         for k in ("place", "born", "died", "source"):
@@ -9440,6 +9673,7 @@ class PersonCard:
         self.e_born, self.e_died = (self.date_field(life, tr(t)) for t in
                                     ("BORN  (2024-03-11, 1890, s. XVI)", "DIED"))
         self.e_source = app.source_field(c, pad)
+        self.t_geo = app.geo_field(c, pad)
         self.circles = self.circle_panel(c, pad)
         self.t_alias = app.textfield(c, tr("ALSO KNOWN AS"), 2, app.f_meta, pad)
         self.t_links = app.textfield(c, tr("URLS  (sites, emails, phones)"), 2, app.f_meta, pad)
@@ -9715,7 +9949,7 @@ class PersonCard:
             w.configure(state=state)
         self.c_org.configure(state=state)
         for w in (self.t_notes, self.t_links, self.t_alias, self.t_tasks,
-                  self.t_log, self.t_edges):
+                  self.t_log, self.t_edges, self.t_geo):
             w.configure(state=state)
         self.circles.enable_circles(on)
 
@@ -9724,6 +9958,7 @@ class PersonCard:
                   self.e_died):
             w.delete(0, "end")
         self.app.update_source_hint(self.e_source)
+        self.app.geo_put(self.t_geo, "")
         for t in (self.t_notes, self.t_alias, self.t_links, self.t_tasks,
                   self.t_log, self.t_edges):
             t.delete("1.0", "end")
@@ -9751,6 +9986,7 @@ class PersonCard:
         self.e_source.delete(0, "end")
         self.e_source.insert(0, p.get("source", ""))
         self.app.update_source_hint(self.e_source)
+        self.app.geo_put(self.t_geo, p.get("geo", ""))
         self.t_alias.delete("1.0", "end")
         self.t_alias.insert("1.0", format_aliases(p.get("aliases", [])))
         self.t_links.delete("1.0", "end")
@@ -9821,6 +10057,7 @@ class PersonCard:
             "born": self.e_born.get().strip(),
             "died": self.e_died.get().strip(),
             "source": self.e_source.get().strip(),
+            "geo": self.t_geo.get("1.0", "end-1c").strip(),
             "aliases": parse_aliases(self.t_alias.get("1.0", "end-1c")),
             "interactions": parse_log(self.t_log.get("1.0", "end-1c")),
             "tasks": parse_tasks(self.t_tasks.get("1.0", "end-1c")),
@@ -9920,6 +10157,7 @@ class EntryCard:
         self.e_domains = app.field(block("domains"), tr("DOMAINS"), app.f_meta, pad)
         self.e_tags = app.field(block("tags"), tr("TAGS"), app.f_meta, pad)
         self.e_source = app.source_field(block("source"), pad)
+        self.t_geo = app.geo_field(block("geo"), pad)
         self.t_notes = app.textfield(block("notes"), tr("NOTES"), 3, app.f_body, pad,
                                      pages=True)
 
@@ -9989,7 +10227,7 @@ class EntryCard:
         for w in (self.e_name, self.e_lang, self.e_roman, self.e_attested,
                   self.e_domains, self.e_tags, self.e_source):
             w.configure(state=state)
-        for t in (self.t_gloss, self.t_notes, self.t_links, self.t_edges):
+        for t in (self.t_gloss, self.t_notes, self.t_links, self.t_edges, self.t_geo):
             t.configure(state=state)
         self.e_status.configure(state="readonly" if on else "disabled")
 
@@ -10004,6 +10242,7 @@ class EntryCard:
         self.stamp.configure(text="")
         self.msg.configure(text="")
         self.app.update_source_hint(self.e_source)
+        self.app.geo_put(self.t_geo, "")
 
     def open(self, e):
         self.enable(True)
@@ -10026,6 +10265,7 @@ class EntryCard:
         self.e_source.delete(0, "end")
         self.e_source.insert(0, e.get("source", ""))
         self.app.update_source_hint(self.e_source)
+        self.app.geo_put(self.t_geo, e.get("geo", ""))
         self.t_notes.delete("1.0", "end")
         self.t_notes.insert("1.0", e.get("notes", ""))
         self.t_links.delete("1.0", "end")
@@ -10082,6 +10322,7 @@ class EntryCard:
             "tags": [t.strip() for t in self.e_tags.get().split(",") if t.strip()],
             "notes": self.t_notes.get("1.0", "end-1c").strip(),
             "source": self.e_source.get().strip(),
+            "geo": self.t_geo.get("1.0", "end-1c").strip(),
             "links": [l.strip() for l in
                       self.t_links.get("1.0", "end-1c").splitlines() if l.strip()],
             "domains": [d.strip() for d in self.e_domains.get().split(",")
@@ -10525,6 +10766,7 @@ class SourceCard:
         self.e_tags = app.field(block("tags"), tr("TAGS"), app.f_meta, pad)
         self.t_notes = app.textfield(block("notes"), tr("NOTES"), 3, app.f_body, pad,
                                      pages=True)
+        self.t_geo = app.geo_field(block("geo"), pad)
 
         b = block("cite")
         crow = tk.Frame(b, bg=PAPER)
@@ -10574,7 +10816,7 @@ class SourceCard:
         self.entries = [self.e_name, self.e_tags] + [w for k, w in self.widgets.items()
                                                        if k not in ("authors", "extra")]
         self.texts = [self.widgets["authors"], self.widgets["extra"], self.t_notes,
-                      self.t_edges, self.t_links]
+                      self.t_edges, self.t_links, self.t_geo]
         app.bind_undo(self.e_name)
         for w in self.entries + self.texts:
             for ev in ("<KeyRelease>", "<<Paste>>", "<<Cut>>"):
@@ -10583,7 +10825,7 @@ class SourceCard:
         self.apply_layout()
 
     ORDER = ["authors", "date", "container", "publisher", "place", "numbers", "ids",
-             "url", "extra", "tags", "notes", "cite", "edges", "out", "inb", "uses", "links"]
+             "url", "extra", "tags", "notes", "geo", "cite", "edges", "out", "inb", "uses", "links"]
 
     def apply_layout(self):
         show = set(source_fields_for(self.stype))
@@ -10619,6 +10861,7 @@ class SourceCard:
             t.delete("1.0", "end")
         for lb in (self.outbox, self.inbox, self.usebox):
             lb.delete(0, "end")
+        self.app.update_geo_hint(self.t_geo)
         self.t_cite.configure(state="normal")
         self.t_cite.delete("1.0", "end")
         self.t_cite.configure(state="disabled")
@@ -10642,6 +10885,7 @@ class SourceCard:
         self.e_tags.insert(0, ", ".join(s.get("tags", [])))
         self.t_notes.delete("1.0", "end")
         self.t_notes.insert("1.0", s.get("notes", ""))
+        self.app.geo_put(self.t_geo, s.get("geo", ""))
         self.t_links.delete("1.0", "end")
         self.t_links.insert("1.0", "\n".join(s.get("links", [])))
         self.t_edges.delete("1.0", "end")
@@ -10694,6 +10938,7 @@ class SourceCard:
                 out[k] = w.get().strip()
         out["tags"] = [t.strip() for t in self.e_tags.get().split(",") if t.strip()]
         out["notes"] = self.t_notes.get("1.0", "end-1c").strip()
+        out["geo"] = self.t_geo.get("1.0", "end-1c").strip()
         out["links"] = [l.strip() for l in self.t_links.get("1.0", "end-1c").splitlines()
                         if l.strip()]
         return out
@@ -10835,6 +11080,7 @@ class MetricCard:
         self.ctype = "measure"
 
         self.e_source = app.source_field(c, pad)
+        self.t_geo = app.geo_field(c, pad)
         self.e_tags = app.field(c, tr("TAGS"), app.f_meta, pad)
         self.t_notes = app.textfield(c, tr("NOTES"), 2, app.f_body, pad, pages=True)
 
@@ -10863,7 +11109,8 @@ class MetricCard:
                         self.e_tags, self.e_new, self.e_dose, self.e_freq, self.e_start,
                         self.e_end, self.e_purpose, self.e_prescriber, self.e_target,
                         self.e_session, self.e_date, self.e_doctor, self.e_place]
-        self.texts = [self.t_notes, self.t_read, self.t_edges, self.t_links, self.t_sessions]
+        self.texts = [self.t_notes, self.t_read, self.t_edges, self.t_links, self.t_sessions,
+                      self.t_geo]
         app.bind_undo(self.e_name)
         for w in self.entries + self.texts:
             for ev in ("<KeyRelease>", "<<Paste>>", "<<Cut>>"):
@@ -10977,6 +11224,7 @@ class MetricCard:
         self.inbox.delete(0, "end")
         self.summary.configure(text="")
         self.map.set_current(None)
+        self.app.update_geo_hint(self.t_geo)
         self.stamp.configure(text="")
         self.msg.configure(text="")
 
@@ -11004,6 +11252,7 @@ class MetricCard:
         self.t_read.insert("1.0", format_readings(m.get("readings", [])))
         self.t_sessions.delete("1.0", "end")
         self.t_sessions.insert("1.0", format_log(m.get("sessions", [])))
+        self.app.geo_put(self.t_geo, m.get("geo", ""))
         self.apply_type()
         self.refresh_med()
         self.refresh_sessions()
@@ -11129,6 +11378,7 @@ class MetricCard:
             "ref_low": self.e_lo.get().strip().replace(",", "."),
             "ref_high": self.e_hi.get().strip().replace(",", "."),
             "source": self.e_source.get().strip(),
+            "geo": self.t_geo.get("1.0", "end-1c").strip(),
             "tags": [t.strip() for t in self.e_tags.get().split(",") if t.strip()],
             "notes": self.t_notes.get("1.0", "end-1c").strip(),
             "readings": parse_readings(self.t_read.get("1.0", "end-1c")),
@@ -12446,6 +12696,37 @@ class App:
         e.bind("<KeyRelease>", lambda ev: self.update_source_hint(e), add="+")
         self.source_hints.append((e, hint, btn))
         return e
+
+    def geo_field(self, parent, pad):
+        """The GEO field of every card but the draft's: points, latitude,
+        longitude, one per line, or GeoJSON. The line under it says what it
+        reads as, or what does not read."""
+        t = self.textfield(parent, tr("GEO  (latitude, longitude — a point per line — or GeoJSON)"),
+                           1, self.f_meta, pad)
+        t.configure(wrap="char")
+        t.geo_hint = tk.Label(parent, text="", bg=PAPER, fg=SOFT, font=self.f_label, anchor="w")
+        t.geo_hint.pack(fill="x", **pad)
+        for ev in ("<KeyRelease>", "<<Paste>>", "<<Cut>>"):
+            t.bind(ev, self.mark_dirty, add="+")
+            t.bind(ev, lambda e: self.root.after(150, lambda: self.update_geo_hint(t)), add="+")
+        return t
+
+    def update_geo_hint(self, t):
+        try:
+            said = geo_summary(t.get("1.0", "end-1c"))
+            t.geo_hint.configure(text=("→ " + said) if said and not said.startswith("(!)") else said,
+                                 fg=OXIDE if said.startswith("(!)") else SOFT)
+        except tk.TclError:
+            pass
+
+    def geo_put(self, t, value):
+        """Fills a card's GEO (even while the card is disabled) and its hint."""
+        state = t.cget("state")
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        t.insert("1.0", value or "")
+        t.configure(state=state)
+        self.update_geo_hint(t)
 
     def update_source_hint(self, entry):
         for e, hint, btn in self.source_hints:
@@ -19512,6 +19793,8 @@ def main():
         return 0
     if cmd == "cite" and rest:
         return cmd_cite(rest[0], rest[1] if len(rest) > 1 else "abnt")
+    if cmd == "geojson":
+        return cmd_geojson(rest)
     if cmd == "export":
         return cmd_export(rest[0] if rest else "bibtex", rest[1] if len(rest) > 1 else None)
     print(__doc__)
@@ -21539,6 +21822,66 @@ PT = {
         "toque: ao centro · toque no centro: abrir · segure: inverte a célula · arraste: mover · pinça ou roda: zoom",
     "tap: to the middle · tap the middle: open · hold: spark · drag: move · pinch or wheel: zoom":
         "toque: ao centro · toque no centro: abrir · segure: faísca · arraste: mover · pinça ou roda: zoom",
+
+    # ---- geo
+    "GEO  (latitude, longitude — a point per line — or GeoJSON)":
+        "GEO  (latitude, longitude — um ponto por linha — ou GeoJSON)",
+    "e.g.  -19.9167, -43.9345  home":
+        "ex.:  -19.9167, -43.9345  casa",
+    "Geographic location":
+        "Localização geográfica",
+    "point":
+        "ponto",
+    "points":
+        "pontos",
+    "line":
+        "linha",
+    "lines":
+        "linhas",
+    "area":
+        "área",
+    "areas":
+        "áreas",
+    "shapes":
+        "formas",
+    "{n} points":
+        "{n} pontos",
+    "{n} shapes":
+        "{n} formas",
+    "not a position: {pos}":
+        "não é uma posição: {pos}",
+    "off the Earth: longitude {lon}, latitude {lat}":
+        "fora da Terra: longitude {lon}, latitude {lat}",
+    "a GeometryCollection without geometries":
+        "uma GeometryCollection sem geometrias",
+    "not a geometry":
+        "não é uma geometria",
+    "{type}: coordinates nested the wrong way":
+        "{type}: coordenadas aninhadas do jeito errado",
+    "a line needs two positions or more":
+        "uma linha precisa de duas posições ou mais",
+    "an area's ring must close: four positions or more, the last as the first":
+        "o anel de uma área tem de fechar: quatro posições ou mais, a última igual à primeira",
+    "not GeoJSON: {what}":
+        "não é GeoJSON: {what}",
+    "GeoJSON that does not read: {err}":
+        "GeoJSON que não se lê: {err}",
+    "line {n}: not latitude, longitude":
+        "linha {n}: não é latitude, longitude",
+    "line {n}: latitude {lat} beyond ±90 (written longitude first?)":
+        "linha {n}: latitude {lat} além de ±90 (longitude escrita primeiro?)",
+    "line {n}: latitude {lat} beyond ±90":
+        "linha {n}: latitude {lat} além de ±90",
+    "line {n}: longitude {lon} beyond ±180":
+        "linha {n}: longitude {lon} além de ±180",
+    "{n} feature(s) -> {name}":
+        "{n} feição(ões) -> {name}",
+    "(health records left out; --all puts them in)":
+        "(registros de saúde de fora; --all os inclui)",
+    "{id}: GEO {err}":
+        "{id}: GEO {err}",
+    "{id}: GEO of {n} characters; a simpler shape keeps the base light":
+        "{id}: GEO de {n} caracteres; uma forma mais simples deixa a base leve",
 }
 
 if __name__ == "__main__":
