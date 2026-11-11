@@ -82,6 +82,17 @@ Ideas that span several sections:
   A person's card has its own LINKS (`PersonCard.t_edges`, saved by
   `_save_person` with `edges=`), as every other card; on the page, a form
   without `edges` (a tab opened before) keeps the person's links.
+- **A link's circle** (`circle` on an edge, `@influence` in its line, one of
+  `CIRCLES`): where the target sits in the circles of the record the link
+  starts from. `parse_edges`/`format_edges` read and write it, `write_link`
+  checks it, `link_rel_text` shows it in every list, `search_base` answers
+  `circle:` (a person's own circles, or either end of such a link).
+  **Inverse lines** (`INVERSE_RELS`: `cited_by`, `influenced_by`) are read by
+  `take_links`, which every save path uses (the window's `_save_*` and the
+  page's `web_links`), and saved after the record by `write_inverse_links`
+  through `write_link`, as a save of the record they start from, so the log,
+  replay and conflict merges stay right; one that does not fit stays a draft.
+  RELS ends may list alternatives (`"source|person"`, read by `kind_fits`).
 - **Monads** (`# ==== monads`): read-only view; `MonadIndex` weighs shared words
   and links, `MonadView` draws them with no lines. `MONAD_COLLS` keeps health and
   drafts out, also as bridges between records; keep it that way. To measure its
@@ -118,6 +129,13 @@ Ideas that span several sections:
   2 px (`MIN_HALF`), or Tk's fill comes and goes along them and they read as
   dashed. Check a change to them on a big invented base (frame time) and by
   eye, enlarged.
+- **GEO** (`# ==== geo`): a field of every record but the drafts, kept as
+  typed (points `lat, lon` one per line, or GeoJSON pasted whole) and read by
+  `parse_geo` into GeoJSON geometries only when needed: the card's hint
+  (`App.geo_field`, `geo_put`), the doctor (warnings, never errors), the
+  mirror, `is:geo`, and `cmd_geojson`, which leaves health out unless `--all`.
+  Keep it offline: no geocoding and no tiles (the page's CSP is
+  `default-src 'none'`). A new collection with a GEO joins `GEO_COLLS`.
 - **Long texts are markdown**: `textfield(..., pages=True)` (every NOTES and the
   draft's text) gets `MarkdownKeys`, and `fit(opening=True)` paints it before
   the pages are measured. The text stored stays plain.
