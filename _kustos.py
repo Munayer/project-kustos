@@ -5128,15 +5128,14 @@ CORPUS_HTML = r"""<!doctype html>
 # prova) and the freshness windows (viva, morna) keep the Portuguese names
 # they were first stored with.
 #
-# `python _kustos.py peritia` serves the page on a free port, opens it, and
-# stops PERITIA_IDLE seconds after the last request (the page pings every 20
-# seconds while it is open). Every call to /api/ must carry the token written
-# into the page, and the Host header must be 127.0.0.1, so that no other page
-# or site can reach the base through it. The read-only snapshot,
-# _kustos_peritia.html, is rewritten on every change, like the body map.
+# The panel is a page of Kustos's web app (`python _kustos.py web`, cmd_web):
+# /skills, beside the base at /, served by the same server with the same
+# token, Host check and content policy; its calls go to /api/skills/...,
+# answered by peritia_api. `python _kustos.py peritia` opens the web app on
+# that page. The read-only snapshot, _kustos_peritia.html, is rewritten on
+# every change, like the body map.
 
 PERITIA_HTML_FILE = BASE / f"{STEM}_peritia.html"
-PERITIA_IDLE = 120          # seconds without a request before the server stops
 SKILL_KINDS = ("estudo", "pratica", "prova")
 SKILL_KIND_LABEL = {"estudo": "study", "pratica": "practice", "prova": "proof"}
 PERITIA_PARAMS = {"xp": {"estudo": 1, "pratica": 3, "prova": 8},
@@ -5478,9 +5477,11 @@ def peritia_lookup(data, q):
     return [{"id": h[2], "label": h[3], "kind": h[4]} for h in hits[:20]]
 
 
-def peritia_page(boot, data):
+def peritia_page(boot, data, nonce=""):
     """The page, in the interface language and the theme of the window, with
-    `boot` written into it: {mode: live, token} or {mode: snapshot, data}."""
+    `boot` written into it: {mode: live, token, api, home} -- inside the web
+    app -- or {mode: snapshot, data}. `nonce` lets its script run under the
+    web app's content policy."""
     pal = THEMES.get((data.get("ui") or {}).get("theme"), THEMES["paper"])
     mono = '"Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, ui-monospace, monospace'
     serif = mono if pal["mono_only"] else \
@@ -5492,6 +5493,7 @@ def peritia_page(boot, data):
            f"  color-scheme: {'dark' if pal['dark'] else 'light'};")
     html = PERITIA_HTML.replace("/*__THEME__*/", css)
     html = html.replace("@@LANG@@", "pt-BR" if LANG == "pt" else "en")
+    html = html.replace("@@NONCE@@", nonce)
     html = re.sub(r"@@(.+?)@@", lambda m: tr(m.group(1)), html)
     # the data goes in last, so that nothing in it is taken for a mark; <, > and
     # & are escaped so that no text in it can close the script
@@ -5628,121 +5630,8 @@ def peritia_api(method, path, query, body):
 
 
 def cmd_peritia(rest=()):
-    """Serves the panel on 127.0.0.1 and opens it; stops by itself when idle."""
-    import secrets
-    import threading
-    import time
-    import webbrowser
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    from urllib.parse import parse_qs, urlsplit
-
-    rest = list(rest)
-    port = 0
-    if "--port" in rest:
-        try:
-            port = int(rest[rest.index("--port") + 1])
-        except (IndexError, ValueError):
-            raise SystemExit(tr("--port needs a number"))
-    # what the window does on opening: bring the base up to date, take in the
-    # other machine's conflicting copies
-    if JSON_FILE.exists() and needs_upgrade(load_json()):
-        cmd_upgrade(quiet=True)
-    absorb_conflicts()
-    token = secrets.token_urlsafe(24)
-    guard = threading.Lock()        # one call at a time: they all read and write the base
-    last = [time.monotonic()]
-    hosts = set()
-
-    class Server(ThreadingHTTPServer):
-        daemon_threads = True
-
-        def handle_error(self, request, client_address):
-            pass                    # under pythonw there is no console to print to
-
-    class Handler(BaseHTTPRequestHandler):
-        server_version = "Kustos"
-
-        def log_message(self, *args):
-            pass
-
-        def answer(self, code, body, ctype="application/json; charset=utf-8"):
-            raw = (body if isinstance(body, str)
-                   else json.dumps(body, ensure_ascii=False)).encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(raw)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Referrer-Policy", "no-referrer")
-            self.end_headers()
-            self.wfile.write(raw)
-
-        def do_GET(self):
-            self.route("GET")
-
-        def do_POST(self):
-            self.route("POST")
-
-        def route(self, method):
-            last[0] = time.monotonic()
-            if self.headers.get("Host", "") not in hosts:
-                return self.answer(403, {"error": tr("Not found.")})
-            url = urlsplit(self.path)
-            if method == "GET" and url.path in ("/", "/index.html"):
-                with guard:
-                    page = peritia_page({"mode": "live", "token": token}, load_json())
-                return self.answer(200, page, "text/html; charset=utf-8")
-            if not url.path.startswith("/api/"):
-                return self.answer(404, {"error": tr("Not found.")})
-            sent = (self.headers.get("X-Kustos-Token") or "").encode("latin-1", "replace")
-            if not secrets.compare_digest(sent, token.encode("ascii")):
-                return self.answer(403, {"error": tr("This page is not the one Kustos opened: "
-                                                      "open the panel again from Kustos.")})
-            body = {}
-            if method == "POST":
-                if not (self.headers.get("Content-Type") or "").startswith("application/json"):
-                    return self.answer(415, {"error": tr("The request could not be read.")})
-                try:
-                    size = int(self.headers.get("Content-Length") or 0)
-                    if size > 16 * 1024 * 1024:
-                        return self.answer(413, {"error": tr("The request could not be read.")})
-                    body = json.loads(self.rfile.read(size) or b"{}")
-                except ValueError:
-                    return self.answer(400, {"error": tr("The request could not be read.")})
-                if not isinstance(body, dict):
-                    return self.answer(400, {"error": tr("The request could not be read.")})
-            try:
-                with guard:
-                    code, out = peritia_api(method, url.path, parse_qs(url.query), body)
-            except SystemExit as exc:          # the base could not be read
-                code, out = 500, {"error": str(exc)}
-            except Exception as exc:
-                code, out = 500, {"error": f"{type(exc).__name__}: {exc}"}
-            self.answer(code, out)
-
-    server = Server(("127.0.0.1", port), Handler)
-    port = server.server_address[1]
-    hosts.update({f"127.0.0.1:{port}", f"localhost:{port}"})
-    url = f"http://127.0.0.1:{port}/"
-    write_peritia_snapshot(load_json())
-
-    def watch():
-        while time.monotonic() - last[0] <= PERITIA_IDLE:
-            time.sleep(min(5, PERITIA_IDLE / 4))
-        server.shutdown()
-
-    threading.Thread(target=watch, daemon=True).start()
-    print(tr("Peritia at {url}: it stops by itself {n} minute(s) after the page is closed.",
-             url=url, n=max(1, PERITIA_IDLE // 60)), flush=True)
-    if "--no-open" not in rest:
-        webbrowser.open(url)
-    try:
-        server.serve_forever(poll_interval=0.5)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-    return 0
+    """The skills panel: Kustos's web app, opened on its page /skills."""
+    return cmd_web(list(rest) + ["--page", "skills"])
 
 
 PERITIA_HTML = r"""<!doctype html>
@@ -5771,6 +5660,9 @@ h1 small { font-size: 15px; color: var(--soft); font-style: italic; margin-left:
 button, .btn { font: 13px/1 var(--mono); color: var(--ink); background: transparent; border: 1px solid var(--rule);
   padding: 7px 10px; border-radius: 2px; cursor: pointer }
 button:hover { border-color: var(--ink) }
+a.btn { text-decoration: none; display: inline-block }
+a.kchip { text-decoration: none }
+.ref a { color: inherit }
 button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, .star:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }
 button.primary { background: var(--ink); color: var(--paper); border-color: var(--ink) }
 button.armed { border-color: var(--warn); color: var(--warn) }
@@ -5896,6 +5788,7 @@ ul.log .ref span { color: var(--faint) }
   <header>
     <h1>@@Peritia@@ <small>@@skills observatory · Kustos@@</small></h1>
     <div class="tools">
+      <a id="b-home" class="btn homelink" hidden>← Kustos</a>
       <button id="b-new" class="primary live-only" data-act="new-skill">@@New skill@@</button>
       <button id="b-reload" class="live-only" data-act="reload" title="F5">@@Reload@@</button>
       <button id="b-md" class="live-only" data-act="mirror">@@Mirror and snapshot@@</button>
@@ -6009,7 +5902,7 @@ ul.log .ref span { color: var(--faint) }
     </ol>
   </section>
 </div>
-<script>
+<script nonce="@@NONCE@@">
 const BOOT = /*__BOOT__*/null;
 const LIVE = BOOT.mode === 'live';
 const LANG = '@@LANG@@';
@@ -6074,16 +5967,23 @@ async function api(path, body) {
   const opt = { headers: { 'X-Kustos-Token': BOOT.token } };
   if (body !== undefined) { opt.method = 'POST'; opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body) }
   let res;
-  try { res = await fetch(path, opt) } catch { offline = true; setStatus(); throw new Error(`@@Kustos is not answering@@`) }
+  // inside the web app the panel's calls live under BOOT.api (/api/skills/)
+  const url = BOOT.api ? path.replace(/^\/api\//, BOOT.api) : path;
+  try { res = await fetch(url, opt) } catch { offline = true; setStatus(); throw new Error(`@@Kustos is not answering@@`) }
   offline = false;
   const data = await res.json().catch(() => ({}));
   if (res.status === 409) { adopt(data.state); render(); throw new Error(data.error || `@@The record changed on disk; the current version is loaded.@@`) }
   if (!res.ok) throw new Error(data.error || fmt(`@@error {n}@@`, { n: res.status }));
   return data;
 }
+let wanted = /^#k_/.test(location.hash) ? decodeURIComponent(location.hash.slice(1)) : null;
+function takeWanted() {
+  if (wanted && byId(wanted)) { selected = wanted; mode = 'view' }
+  wanted = null;
+}
 async function load(msg) {
   if (!LIVE) return;
-  try { adopt(await api('/api/state')); render(); setStatus(msg) } catch (e) { setStatus(e.message) }
+  try { adopt(await api('/api/state')); takeWanted(); render(); setStatus(msg) } catch (e) { setStatus(e.message) }
 }
 async function putSkill(rec, base, msg) {
   if (busy) return; busy = true;
@@ -6124,8 +6024,10 @@ function nextGate(st) {
   return fmt(`@@For {r} ({name}): {missing} to go.@@`, { r: L.r, name: L.name, missing: miss.join(` @@and@@ `) });
 }
 const usedDomains = () => state.domains.filter(d => state.skills.some(s => s.domain === d));
+const recHref = id => BOOT.home ? `${BOOT.home}#r/${encodeURIComponent(id)}` : '';
 function kref(id) {
   const L = state.labels[id];
+  if (L && BOOT.home) return `<a class="chip kchip" href="${esc(recHref(id))}" title="@@open in Kustos@@">${esc(L.label)} <span>${esc(KIND_LABEL[L.kind] || L.kind)} · ${esc(id)}</span></a>`;
   return L ? `<button class="chip kchip" data-act="copy-id" data-id="${esc(id)}" title="@@copy the id to paste into Kustos@@">${esc(L.label)} <span>${esc(KIND_LABEL[L.kind] || L.kind)} · ${esc(id)}</span></button>`
            : `<span class="chip missing">${esc(id)} · @@not in Kustos@@</span>`;
 }
@@ -6271,7 +6173,9 @@ function skillView(s) {
   const pct = st.lvl === 5 ? 100 : Math.min(100, Math.round(Math.min(st.xp / Math.max(1, N.xp), N.p ? st.p / N.p : 1) * 100));
   const reqs = s.requires.map(r => byId(r)).filter(Boolean), dependents = state.skills.filter(x => x.requires.includes(s.id));
   const chip = q => `<button class="chip ${stats(q).lvl < OPEN_AT ? 'low' : ''}" data-act="pick" data-id="${esc(q.id)}">${esc(q.name)} · ${LEVELS[stats(q).lvl].r}</button>`;
-  const refHtml = r => state.labels[r] ? `<span class="ref">→ ${esc(state.labels[r].label)} <span>(${esc(r)})</span></span>` : `<span class="ref">${esc(r)}</span>`;
+  const refHtml = r => !state.labels[r] ? `<span class="ref">${esc(r)}</span>`
+    : BOOT.home ? `<span class="ref">→ <a href="${esc(recHref(r))}">${esc(state.labels[r].label)}</a> <span>(${esc(r)})</span></span>`
+    : `<span class="ref">→ ${esc(state.labels[r].label)} <span>(${esc(r)})</span></span>`;
   const log = [...s.log].sort((a, b) => b.date.localeCompare(a.date)).map(e => `<li><span class="d">${esc(showDate(e.date))}</span>
       <span><span class="kind ${esc(e.kind)}">${(KINDS[e.kind] || KINDS.estudo).label}</span>${esc(e.note)}${e.ref ? refHtml(e.ref) : ''}</span>
       ${LIVE ? `<button data-act="del-log" data-id="${esc(e.id)}" aria-label="@@Delete entry@@">×</button>` : '<span></span>'}</li>`).join('');
@@ -6474,12 +6378,13 @@ document.addEventListener('keydown', ev => {
 });
 
 /* ---------- start ---------- */
+if (BOOT.home) { const a = $('#b-home'); a.href = BOOT.home; a.hidden = false }
 if (LIVE) {
   load();
   setInterval(() => api('/api/ping').then(() => { if (offline) { offline = false; setStatus() } }).catch(() => {}), 20000);
   window.addEventListener('focus', () => { if (mode === 'view') load() });
 } else {
-  adopt(BOOT.data); render(); setStatus();
+  adopt(BOOT.data); takeWanted(); render(); setStatus();
 }
 if (location.hash === '#fundamentos') showView('fund');
 </script>
@@ -6538,7 +6443,7 @@ WEB_STRINGS = (
     "tap: to the middle · tap the middle: open · hold: spark · drag: move · pinch or wheel: zoom",
     "settled at generation {n}: {k} stay lit", "died out at generation {n}", "Reseed to start again",
     "Links", "Link", "New link", "Change link", "Type", "Reason", "Source", "Span", "Swap direction",
-    "Circle",
+    "Circle", "Skills",
     "Another link between them", "no reason or source", "written {date}", "atypical type",
     "Link saved.", "Link deleted.", "Delete this link?", "Draw a link",
     "Drag from one record to another to link them.", "Key", "Search the links",
@@ -7005,6 +6910,18 @@ def web_md(text):
     return re.sub(r'<a href="([^"]*)"', link, md_to_html(text or ""))
 
 
+def record_skills(data, rid):
+    """The skills that link to a record or whose journal points at it, with
+    their level: [{id, name, level}]."""
+    P, out = None, []
+    for k in data.get("skills", []):
+        if rid in (k.get("links") or []) or any(e.get("ref") == rid for e in k.get("log") or []):
+            P = P or peritia_params(data)
+            out.append({"id": k.get("id", ""), "name": k.get("name", ""),
+                        "level": LEVEL_ROMAN[skill_figures(k, P)[3]]})
+    return sorted(out, key=lambda x: sort_key(x["name"]))
+
+
 def web_record(data, rid):
     """Everything the page shows of one record, or None."""
     idx = by_id(data)
@@ -7029,6 +6946,7 @@ def web_record(data, rid):
            "in": [dict(end(a["from"]), rel=link_rel_text(a))
                   for a in edges_to(data, rid)],
            "contacts": contact_lines(rec.get("links", [])),
+           "skills": record_skills(data, rid),
            "html": {}}
     for k in ("notes_raw", "notes", "body"):
         if out["form"].get(k):
@@ -7348,9 +7266,9 @@ def cmd_web(rest=()):
     from urllib.parse import parse_qs, urlsplit
 
     rest = list(rest)
-    port, extra_hosts = 0, set()
+    port, extra_hosts, first_page = 0, set(), ""
     for i, a in enumerate(rest):
-        if a in ("--port", "--allow-host"):
+        if a in ("--port", "--allow-host", "--page"):
             if i + 1 >= len(rest):
                 raise SystemExit(tr("{option} needs a value", option=a))
             if a == "--port":
@@ -7358,6 +7276,8 @@ def cmd_web(rest=()):
                     port = int(rest[i + 1])
                 except ValueError:
                     raise SystemExit(tr("--port needs a number"))
+            elif a == "--page":
+                first_page = "skills" if rest[i + 1].strip().lower() == "skills" else ""
             else:
                 extra_hosts.add(rest[i + 1].strip().lower())
     stay = "--stay" in rest
@@ -7439,14 +7359,18 @@ def cmd_web(rest=()):
             if self.headers.get("Host", "").lower() not in hosts:
                 return self.answer(403, {"error": tr("Not found.")})
             url = urlsplit(self.path)
-            if method == "GET" and url.path in ("/", "/index.html"):
+            if method == "GET" and url.path in ("/", "/index.html", "/skills"):
                 nonce = secrets.token_urlsafe(16)
                 with guard:
-                    page = web_page(web_boot(token), load_json(), nonce)
+                    data = load_json()
+                    page = (peritia_page({"mode": "live", "token": token, "api": "/api/skills/",
+                                          "home": "/"}, data, nonce)
+                            if url.path == "/skills" else web_page(web_boot(token), data, nonce))
                 return self.answer(200, page, "text/html; charset=utf-8",
                                    f"default-src 'none'; script-src 'nonce-{nonce}'; "
                                    "style-src 'unsafe-inline'; img-src 'self' data:; "
-                                   "connect-src 'self'; base-uri 'none'; form-action 'none'")
+                                   "connect-src 'self'; base-uri 'none'; form-action 'none'; "
+                                   "frame-ancestors 'none'")
             if method == "GET" and url.path in ("/health", "/corpus"):
                 with guard:
                     data = load_json()
@@ -7473,7 +7397,11 @@ def cmd_web(rest=()):
                     return self.answer(400, {"error": tr("The request could not be read.")})
             try:
                 with guard:
-                    code, out = web_api(method, url.path, parse_qs(url.query), body)
+                    if url.path.startswith("/api/skills/"):        # the skills panel's calls
+                        code, out = peritia_api(method, "/api/" + url.path[len("/api/skills/"):],
+                                                parse_qs(url.query), body)
+                    else:
+                        code, out = web_api(method, url.path, parse_qs(url.query), body)
                     data = out.pop("data", None) if isinstance(out, dict) else None
                     if data is not None:
                         mirror_soon(data)
@@ -7486,7 +7414,7 @@ def cmd_web(rest=()):
     server = Server(("127.0.0.1", port), Handler)
     port = server.server_address[1]
     hosts.update({f"127.0.0.1:{port}", f"localhost:{port}"} | extra_hosts)
-    url = f"http://127.0.0.1:{port}/"
+    url = f"http://127.0.0.1:{port}/" + first_page
 
     def watch():
         """Stops the server when idle. Once a minute, takes in what Syncthing
@@ -7646,6 +7574,7 @@ button.chip:hover { border-color: var(--soft); }
 .contacts span.cmain { color: var(--ink); }
 .contacts .chat { padding: 5px 10px; font-size: 12px; text-decoration: none; }
 .go { display: block; width: 100%; text-align: left; border: 0; background: transparent; padding: 8px 0; }
+a.go { color: inherit; text-decoration: none; }
 .go .rel { font: 12px var(--mono); color: var(--faint); margin-right: 8px; }
 .go .why { display: block; font-size: 14px; color: var(--soft); }
 .missing { color: var(--warn); }
@@ -8014,6 +7943,8 @@ function renderRecord(changed) {
   if (r.out.length) out.push(sec(T("Links"), `<ul class="links">${r.out.map(a => goItem(a, true)).join("")}</ul>`)
     .replace('class="sec"', ch.has("edges") ? 'class="sec changed"' : 'class="sec"'));
   if (r.in.length) out.push(sec(T("Cited by"), `<ul class="links">${r.in.map(a => goItem(a, false)).join("")}</ul>`));
+  if (r.skills && r.skills.length) out.push(sec(T("Skills"), `<ul class="links">${r.skills.map(k =>
+    `<li><a class="go" href="skills#${encodeURIComponent(k.id)}"><span class="rel">${esc(k.level)}</span>${esc(k.name)}</a></li>`).join("")}</ul>`));
   const foot = [r.id, r.updated ? T("updated {date}", {date: r.updated}) : "",
                 r.coll === "notes" ? T("file") + ": " + (r.file || T("(the file is made on saving)")) : ""];
   out.push(`<div class="foot">${foot.filter(Boolean).map(esc).join("<br>")}</div>`);
@@ -8176,7 +8107,8 @@ function menuSheet() {
   openSheet(`<div class="grid"><button class="btn" data-act="graph0">${esc(T("Link graph"))}</button>` +
     `<button class="btn" data-act="links">${esc(T("Links"))}</button>` +
     `<a class="btn" href="health" target="_blank" rel="noopener">${esc(T("Health report"))}</a>` +
-    `<a class="btn" href="corpus" target="_blank" rel="noopener">${esc(T("Body map"))}</a></div>`);
+    `<a class="btn" href="corpus" target="_blank" rel="noopener">${esc(T("Body map"))}</a>` +
+    `<a class="btn" href="skills">${esc(T("Skills"))}</a></div>`);
 }
 
 /* ---------------------------------------------------------------- the link graph
@@ -21632,6 +21564,8 @@ PT = {
         "Semear de novo para recomeçar",
     "r: start again":
         "r: recomeçar",
+    "open in Kustos":
+        "abrir no Kustos",
     "Circle":
         "Círculo",
     "A circle is one of: {names}.":

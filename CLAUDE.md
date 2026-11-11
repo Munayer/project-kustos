@@ -97,13 +97,17 @@ Ideas that span several sections:
   and links, `MonadView` draws them with no lines. `MONAD_COLLS` keeps health and
   drafts out, also as bridges between records; keep it that way. To measure its
   frames, time the moves themselves: `update()` does not return while two tweens run.
-- **Peritia** (`# ==== peritia`): the skills panel is a page served by
-  `cmd_peritia` on 127.0.0.1 (a token in the page, the Host header checked),
-  from the template `PERITIA_HTML` (strings as `@@English@@`, translated by
-  `tr` when the page is built). Skills are the top-level list `skills` (`k_`),
-  the panel's parameters are in `peritia`; they save, log, merge and replay
-  like records but stay out of `COLLS` and the register. Test it on invented
-  data with `peritia_api(...)`, no browser needed.
+- **Peritia** (`# ==== peritia`): the skills panel is a page of the web app
+  (`cmd_web`): `/skills`, from the template `PERITIA_HTML` (strings as
+  `@@English@@`, translated by `tr` when the page is built; `@@NONCE@@` gives
+  its one script the page's nonce), with the same token, Host check and
+  content policy as the base's page; its calls go to `/api/skills/…`, which
+  the server hands to `peritia_api`. `cmd_peritia` only opens the web app on
+  that page. Skills are the top-level list `skills` (`k_`), the panel's
+  parameters are in `peritia`; they save, log, merge and replay like records
+  but stay out of `COLLS` and the register. A record's page lists its skills
+  (`record_skills`). Test it on invented data with `peritia_api(...)`, or in a
+  headless browser against `web --stay`.
 - **Web** (`# ==== web`): `cmd_web` serves the whole base the same way, from
   `WEB_HTML` (its strings come in the boot data as `T`, from `WEB_STRINGS`,
   translated by `tr`). The page edits the text the window's cards hold and

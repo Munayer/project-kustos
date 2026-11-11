@@ -236,8 +236,11 @@ It refuses any folder it did not make, so it never touches a real base.
   text starts with a date — as imported notes have it, `20240311…` — and, on
   confirmation, makes it the entry's date.
 - **Peritia, the skills panel** (`_kustos_peritia.cmd`, **View › Skills (Peritia)**,
-  or `python _kustos.py peritia`): a page in the browser, served by Kustos itself
-  on 127.0.0.1 only, that stops two minutes after the page is closed. Skills
+  or `python _kustos.py peritia`): the *Skills* page of the web version below,
+  served by the same server with the same protections — `/skills` beside the
+  base at `/`, reached from the base's menu, with **← Kustos** back. A record
+  a skill links to opens in Kustos, and a record's page lists the skills that
+  point at it, with their level, each leading to the skill. Skills
   (`k_`) sit on a star chart, domains as sectors and prerequisites as rings;
   each has a journal of *study*, *practice* and *proof* entries (a proof asks
   for a reference: a file that runs, a link, or a Kustos id), which add up to
@@ -380,7 +383,7 @@ python _kustos.py geojson [--all] [file]   every GEO as one GeoJSON file
 python _kustos.py import zotero <export.json|.bib>
 python _kustos.py mirror | corpus | merge | history <id> | replay
 python _kustos.py logbook                  the base as a logbook (read-only)
-python _kustos.py peritia [--no-open] [--port N]   the skills panel, in the browser
+python _kustos.py peritia [--no-open] [--port N]   the web version, opened on its Skills page
 python _kustos.py web [--stay] [--no-open] [--port N]   the whole base, in the browser (phone or desk)
 ```
 
