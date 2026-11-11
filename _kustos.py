@@ -157,9 +157,12 @@ def kind_of(rec):
 def kind_fits(spec, rec):
     """Whether a record fits one end of a RELS type: '*' fits any; 'org' only
     a person marked as an organization; any other kind, the records of that
-    kind -- an organization is also a 'person', so it can be an author, or known."""
+    kind -- an organization is also a 'person', so it can be an author, or known.
+    'source|person': either."""
     if spec == "*":
         return True
+    if "|" in spec:
+        return any(kind_fits(one, rec) for one in spec.split("|"))
     if spec == "org":
         return kind_of(rec) == "person" and bool(rec.get("org"))
     return spec == kind_of(rec)
@@ -893,7 +896,7 @@ RELS = {
     "works_at":      ("person", "org"),
     "member_of":     ("person", "org"),
     # sources
-    "cites":         ("*", "source"),
+    "cites":         ("*", "source|person"),  # a work, or a person cited by name (Lycurgus)
     "attested_in":   ("form", "source"),
     "defined_in":    ("concept", "source"),
     "measured_in":   ("metric", "source"),
@@ -1070,12 +1073,26 @@ def new_id(kind, name, taken):
     return cand
 
 
-#   expresses c_timoneiro -800/400 — reason # source
+#   expresses c_timoneiro -800/400 @concern — reason # source
 EDGE_RE = re.compile(
     r"^\s*(?P<rel>[^\s#—]+)\s+(?P<to>[A-Za-z0-9_]+(?::[A-Za-z0-9_]+)?)"
     r"(?:\s+(?P<when>-?\d{1,4}(?:/-?\d{0,4})?))?"
+    r"(?:\s+@(?P<circle>[^\s#—]+))?"
+    r"(?:\s+(?P<when2>-?\d{1,4}(?:/-?\d{0,4})?))?"
     r"(?:\s*[—-]{1,2}\s*(?P<why>[^#]*))?"
     r"(?:\s*#\s*(?P<source>.*))?\s*$")
+
+# A link's circle (`@influence` in its line, `circle` in the link): where the
+# record it points at sits in the circles of the record it starts from -- the
+# same four circles a person card holds for the owner, seen from that record.
+#   Renan:  influenced p_taleb @influence   Taleb is in Renan's circle of influence
+#   Taleb:  cites p_lycurgus @concern       Lycurgus is in Taleb's circle of concern
+
+# A link written from its other end: "cited_by p_x" on a card is p_x's "cites"
+# link to it. It is still one link, kept -- saved, logged, merged -- with the
+# record it starts from, as every link is (write_link); the card it was typed
+# on then shows it under CITED BY.
+INVERSE_RELS = {"cited_by": "cites", "influenced_by": "influenced"}
 
 
 def norm_ref(ref):
@@ -1094,22 +1111,84 @@ def parse_edges(text, source_id):
         if not line:
             continue
         m = EDGE_RE.match(line)
-        if not m:
+        circle = ((m.group("circle") or "") if m else "").lower()
+        if not m or (circle and circle not in CIRCLES) or (m.group("when") and m.group("when2")):
             out.append({"from": source_id, "rel": "?", "to": line,
                         "when": "", "why": "", "source": "",
                         "certainty": "working", "_bad": True})
             continue
         rel = m.group("rel").strip().lower()
-        out.append({
+        edge = {
             "from": source_id,
             "rel": rel,
             "to": norm_ref(m.group("to")),
-            "when": (m.group("when") or "").strip(),
+            "when": (m.group("when") or m.group("when2") or "").strip(),
             "why": (m.group("why") or "").strip(),
             "source": (m.group("source") or "").strip(),
             "certainty": "established" if rel in RELS else "atypical",
-        })
+        }
+        if circle:
+            edge["circle"] = circle
+        if rel in INVERSE_RELS:              # written from the other end
+            rel = INVERSE_RELS[rel]
+            edge.update({"from": edge["to"], "to": source_id, "rel": rel, "_inverse": True,
+                         "certainty": "established" if rel in RELS else "atypical"})
+        out.append(edge)
     return out
+
+
+def take_links(text, rec, data):
+    """A card's LINKS text: (the links going out of `rec`; the links written
+    from their other end, to be saved with the record they start from; the
+    lines kept as drafts -- not understood, or written from the other end of a
+    record that is missing or does not fit)."""
+    rid, idx = rec["id"], by_id(data)
+    out, inverse, drafts = [], [], []
+    for line in (text or "").splitlines():
+        if not line.strip():
+            continue
+        a = parse_edges(line, rid)[0]
+        if a.get("_bad"):
+            drafts.append(a["to"])
+        elif a.pop("_inverse", False):
+            other = idx.get(a["from"])
+            if other is None or a["from"] == rid or (
+                    a["rel"] in RELS and a["rel"] not in typical_rels(other, rec)):
+                drafts.append(line.strip())
+            else:
+                inverse.append(a)
+        else:
+            out.append(a)
+    return out, inverse, drafts
+
+
+def write_inverse_links(inverse):
+    """Saves the links written from their other end, each as a change of the
+    record it starts from (write_link): (the vault, or None if nothing was
+    written; the records they went to; what could not be written)."""
+    data, went, problems = None, [], []
+    for a in inverse:
+        cur = load_json()
+        have = next((e for e in edges_from(cur, a["from"])
+                     if e.get("rel") == a["rel"] and e.get("to") == a["to"]), None)
+        keys = ("when", "why", "source", "circle")
+        if have and all((have.get(k) or "") == (a.get(k) or "") for k in keys):
+            went.append(a["from"])                  # already so: the record is not touched
+            continue
+        try:
+            data = write_link(a["from"], a["to"], a["rel"], a.get("why", ""), a.get("source", ""),
+                              a.get("when", ""), old={"rel": a["rel"], "to": a["to"]} if have else None,
+                              circle=a.get("circle", ""))
+            went.append(a["from"])
+        except (ValueError, WebConflict, SystemExit) as exc:
+            problems.append(f"{a['from']}: {exc}")
+    return data, went, problems
+
+
+def link_rel_text(e):
+    """A link's type as the lists show it, with its circle: 'influenced · influence'."""
+    t = rel_label(e.get("rel", ""))
+    return t + (" · " + tr(e["circle"]) if e.get("circle") else "")
 
 
 def format_edges(edges):
@@ -1118,6 +1197,8 @@ def format_edges(edges):
         line = f"{e.get('rel','')} {e.get('to','')}"
         if e.get("when"):
             line += f" {e['when']}"
+        if e.get("circle"):
+            line += f" @{e['circle']}"
         if e.get("why"):
             line += f" — {e['why']}"
         if e.get("source"):
@@ -3050,6 +3131,9 @@ def check(data):
                              c=sk, d=dk, src=label_any(src), dst=label_any(dst)))
         if a["from"] == a["to"]:
             errors.append(tr("link {i}: links {label} to itself", i=i, label=label_any(src)))
+        if a.get("circle") and a["circle"] not in CIRCLES:
+            warnings.append(tr("link {i}: unknown circle {circle} ({src} -> {dst})", i=i,
+                               circle=a["circle"], src=label_any(src), dst=label_any(dst)))
         if not (a.get("why") or "").strip() and not (a.get("source") or "").strip():
             warnings.append(tr("no reason or source: {src} -{rel}-> {dst}",
                                src=label_any(src), rel=a["rel"], dst=label_any(dst)))
@@ -3238,7 +3322,7 @@ def write_mirror(data):
             out.append("")
             for a in sorted(outgoing, key=lambda x: year_of(x.get("when"))):
                 target = idx.get(a["to"])
-                line = f"- {rel_label(a['rel'])} " \
+                line = f"- {link_rel_text(a)} " \
                        f"[[{label_any(target, data) if target else a['to']}]]"
                 if a.get("when"):
                     line += f"  ({a['when']})"
@@ -3252,7 +3336,7 @@ def write_mirror(data):
             out.append("")
             for a in citing:
                 out.append(f"- [[{label_any(idx.get(a['from']), data)}]] "
-                           f"{rel_label(a['rel'])}")
+                           f"{link_rel_text(a)}")
         out += ["", f"`{p['id']}`", ""]
     out += ["# Verba", ""]
     for e in sorted(data["entries"], key=lambda x: sort_key(x["name"])):
@@ -3283,7 +3367,7 @@ def write_mirror(data):
         if outgoing:
             for a in sorted(outgoing, key=lambda x: year_of(x.get("when"))):
                 target = idx.get(a["to"])
-                line = f"- {rel_label(a['rel'])} " \
+                line = f"- {link_rel_text(a)} " \
                        f"[[{label_any(target, data) if target else a['to']}]]"
                 if a.get("when"):
                     line += f"  ({a['when']})"
@@ -3308,7 +3392,7 @@ def write_mirror(data):
         citing = edges_to(data, s["id"])
         if citing:
             for a in citing:
-                out.append(f"- [[{label_any(idx.get(a['from']), data)}]] {rel_label(a['rel'])}")
+                out.append(f"- [[{label_any(idx.get(a['from']), data)}]] {link_rel_text(a)}")
             out.append("")
         for coll in ("people", "entries", "corpus"):
             users = [r for r in data[coll] if r.get("source") == s["id"]]
@@ -3381,7 +3465,7 @@ def cmd_mirror():
 
 SEARCH_SCOPES = {"p:": "people", "v:": "entries", "f:": "sources",
                  "c:": "corpus", "d:": "notes"}
-SEARCH_FIELDS = ("tag", "lang", "type", "sys", "dom", "id", "is")
+SEARCH_FIELDS = ("tag", "lang", "type", "sys", "dom", "id", "is", "circle")
 
 
 def parse_search(text):
@@ -3430,11 +3514,19 @@ def search_base(data, text):
     """What the search text alone finds, per collection: {coll: [records]}.
     The records must carry their search text in `_h`."""
     qscope, prefix, fields, terms = parse_search(text)
+    # circle:influence -- in the owner's circle of influence (a person's CIRCLES),
+    # or at either end of a link in that circle
+    circ = fields.pop("circle", None)
+    inside = {c for c in CIRCLES if circ and c.startswith(circ)}
+    linked = {x for e in (data.get("edges", []) if circ else []) if e.get("circle") in inside
+              for x in (e.get("from"), e.get("to"))}
 
     def ok(r):
         if terms and not all(t in r.get("_h", "") for t in terms):
             return False
         if prefix and not sort_key(r.get("name", ""))[0].startswith(sort_key(prefix)[0]):
+            return False
+        if circ and r.get("id") not in linked and not inside & set(r.get("circles") or []):
             return False
         return search_field_ok(r, fields) if fields else True
 
@@ -6219,6 +6311,7 @@ WEB_STRINGS = (
     "tap: to the middle · tap the middle: open · hold: spark · drag: move · pinch or wheel: zoom",
     "settled at generation {n}: {k} stay lit", "died out at generation {n}", "Reseed to start again",
     "Links", "Link", "New link", "Change link", "Type", "Reason", "Source", "Span", "Swap direction",
+    "Circle",
     "Another link between them", "no reason or source", "written {date}", "atypical type",
     "Link saved.", "Link deleted.", "Delete this link?", "Draw a link",
     "Drag from one record to another to link them.", "Key", "Search the links",
@@ -6267,7 +6360,7 @@ def web_fields():
     tags = f("tags", "TAGS", hint="separated by commas")
     source = f("source", "SOURCE", hint="s_… of a source, or free text")
     links = f("links", "URLS", "text", hint="one per line")
-    edges = f("edges", "LINKS  (rel  target  [span]  — reason  # source)", "text",
+    edges = f("edges", "LINKS  (rel  target  [span]  [@circle]  — reason  # source)", "text",
               hint="one per line, e.g.  cites s_…  — why")
     return {
         "people": [
@@ -6480,16 +6573,24 @@ def web_gather(coll, old, form):
     return out
 
 
-def web_links(form, rid, rec):
+def web_links(form, rid, rec, inverse=None):
     """The links typed in the form: (links, lines not understood). The
-    unreadable lines are kept on the record as `edge_drafts`, as the window does."""
-    links = parse_edges(form.get("edges") if isinstance(form.get("edges"), str) else "", rid)
-    unparsed = [a["to"] for a in links if a.get("_bad")]
+    unreadable lines are kept on the record as `edge_drafts`, as the window does;
+    the lines written from the other end (cited_by …) go to `inverse`, to be
+    saved with the record they start from once this one is."""
+    rec = dict(rec, id=rid)
+    links, back, unparsed = take_links(form.get("edges") if isinstance(form.get("edges"), str)
+                                       else "", rec, load_json())
+    if inverse is not None:
+        inverse.extend(back)
+    return links, unparsed
+
+
+def web_drafts(rec, unparsed):
     if unparsed:
         rec["edge_drafts"] = unparsed
     else:
         rec.pop("edge_drafts", None)
-    return [a for a in links if not a.get("_bad")], unparsed
 
 
 def web_save(body):
@@ -6521,6 +6622,7 @@ def web_save(body):
                              "notes": "A draft needs a title."}[coll]))
     taken = set(by_id(data))
     message = ""
+    inverse = []
     if coll == "people":
         filed = fold_finished_tasks(out)
         if filed:
@@ -6529,8 +6631,10 @@ def web_save(body):
             out["met"] = out.get("met") or TODAY()
             out["id"] = make_id(out["name"], taken)
         # a page opened before people had links of their own sends none: keep them
-        links, unparsed = (web_links(form, out["id"], out) if isinstance(form.get("edges"), str)
+        links, unparsed = (web_links(form, out["id"], out, inverse) if isinstance(form.get("edges"), str)
                            else (None, []))
+        if links is not None:
+            web_drafts(out, unparsed)
         touch(out)
         data = save_record("people", out, edges=links)
         if unparsed:
@@ -6549,7 +6653,8 @@ def web_save(body):
         if text is None:
             text = before
         place_note(out)
-        links, unparsed = web_links(form, out["id"], out)
+        links, unparsed = web_links(form, out["id"], out, inverse)
+        web_drafts(out, unparsed)
         touch(out)
         data = save_record("notes", out, edges=links)
         write_note_file(by_id(data)[out["id"]], text, when)
@@ -6566,11 +6671,24 @@ def web_save(body):
                 out["id"] = new_source_id(out, taken)
             else:
                 out["id"] = new_metric_id(out, taken)
-        links, unparsed = web_links(form, out["id"], out)
+        links, unparsed = web_links(form, out["id"], out, inverse)
+        web_drafts(out, unparsed)
         touch(out)
         data = save_record(coll, out, edges=links)
         if unparsed:
             message = tr("{n} link line(s) not understood were kept as drafts.", n=len(unparsed))
+    if inverse:
+        done, went, problems = write_inverse_links(inverse)
+        data = done or load_json()
+        idx = by_id(data)
+        bits = [message] if message else []
+        if went:
+            bits.append(tr("{n} link(s) written from the other end, saved with {names}.", n=len(went),
+                           names=", ".join(one_liner(label_any(idx.get(r), data), 30)
+                                           for r in dict.fromkeys(went))))
+        if problems:
+            bits.append(tr("Not saved: {why}", why="; ".join(problems)))
+        message = " ".join(bits)
     return data, out["id"], message
 
 
@@ -6672,10 +6790,10 @@ def web_record(data, rid):
            "n": rec.get("reg_n") or 0,
            "reg": stamp_label(rec.get("reg")) if rec.get("reg") else "",
            "updated": rec.get("updated") or "", "form": web_form(rec, data),
-           "out": [dict(end(a["to"]), rel=rel_label(a.get("rel", "")),
+           "out": [dict(end(a["to"]), rel=link_rel_text(a),
                         why=a.get("why", ""), when=a.get("when", ""))
                    for a in edges_from(data, rid)],
-           "in": [dict(end(a["from"]), rel=rel_label(a.get("rel", "")))
+           "in": [dict(end(a["from"]), rel=link_rel_text(a))
                   for a in edges_to(data, rid)],
            "contacts": contact_lines(rec.get("links", [])),
            "html": {}}
@@ -6753,6 +6871,7 @@ def web_link_details(data, a, b):
         t = times.get((e.get("from"), e.get("to"), e.get("rel", "")))
         edges.append({"from": e["from"], "to": e["to"], "rel": e.get("rel", ""),
                       "label": rel_label(e.get("rel", "")), "why": e.get("why", ""),
+                      "circle": e.get("circle", ""), "circle_label": tr(e["circle"]) if e.get("circle") else "",
                       "source": e.get("source", ""), "source_label": label if e.get("source") else "",
                       "source_id": src["id"] if src else "", "when": e.get("when", ""),
                       "atypical": e.get("rel") not in RELS,
@@ -6766,7 +6885,7 @@ def web_link_details(data, a, b):
 EDGE_WHEN = re.compile(r"-?\d{1,4}(?:/-?\d{0,4})?")
 
 
-def write_link(a, b, rel="", why="", source="", when="", old=None, delete=False):
+def write_link(a, b, rel="", why="", source="", when="", old=None, delete=False, circle=""):
     """Adds, changes or removes ONE link, as a change of the record it comes
     from: its links are reread, the one named by `old` ({rel, to}) is replaced
     or removed, and the record is saved with save_record. The web page and the
@@ -6800,15 +6919,20 @@ def write_link(a, b, rel="", why="", source="", when="", old=None, delete=False)
             raise ValueError(tr("A reason cannot contain #."))
         if when and not EDGE_WHEN.fullmatch(when):
             raise ValueError(tr("A span is a year or two: 1609, 1618/1648, -800/400."))
+        circle = str(circle or "").strip().lower()
+        if circle and circle not in CIRCLES:
+            raise ValueError(tr("A circle is one of: {names}.", names=", ".join(CIRCLES)))
         if any(e.get("rel") == rel and e.get("to") == b for e in edges):
             raise ValueError(tr("This link already exists."))
         kept = old is not None and old.get("rel") == rel and old.get("to") == b
         if rel in RELS and not kept and rel not in typical_rels(idx[a], idx[b]):
             # what the doctor would call an error is not written (an old link keeps its type)
             raise ValueError(tr("A “{rel}” link does not fit these two records.", rel=rel_label(rel)))
-        edges.insert(at, {"from": a, "rel": rel, "to": b, "when": when, "why": why,
-                          "source": source,
-                          "certainty": "established" if rel in RELS else "atypical"})
+        edge = {"from": a, "rel": rel, "to": b, "when": when, "why": why, "source": source,
+                "certainty": "established" if rel in RELS else "atypical"}
+        if circle:
+            edge["circle"] = circle
+        edges.insert(at, edge)
     rec = {k: v for k, v in idx[a].items() if not k.startswith("_")}
     touch(rec)
     return save_record(coll_of(a), rec, edges=edges)
@@ -6819,7 +6943,7 @@ def web_link(body):
     old = body.get("old") if isinstance(body.get("old"), dict) else None
     return write_link(str(body.get("from") or ""), str(body.get("to") or ""), body.get("rel"),
                       body.get("why"), body.get("source"), body.get("when"), old,
-                      body.get("delete") is True)
+                      body.get("delete") is True, circle=body.get("circle"))
 
 
 def web_link_list(data, q="", which="", offset=0, limit=WEB_ROWS):
@@ -6837,7 +6961,7 @@ def web_link_list(data, q="", which="", offset=0, limit=WEB_ROWS):
         if which == "unfounded" and founded or which == "atypical" and not atypical:
             continue
         row = {"a": f, "b": t, "from": label_any(idx[f], data), "to": label_any(idx[t], data),
-               "rel": e.get("rel", ""), "label": rel_label(e.get("rel", "")),
+               "rel": e.get("rel", ""), "label": link_rel_text(e),
                "why": e.get("why", ""), "founded": founded, "atypical": atypical,
                "family": REL_FAMILY.get(e.get("rel"), "other")}
         hay = " ".join((row["from"], row["to"], row["rel"], row["label"], row["why"],
@@ -6873,7 +6997,7 @@ def web_path(data, a, b):
     keys = sorted({(min(x, y), max(x, y)) for path in paths for x, y in zip(path, path[1:])})
     links = [{"a": x, "b": y, "rels": [[rel_label(r), f] for r, f in adj[x][y]],
               "f": link_facts(pairs.get((x, y), []), times, now.timestamp())} for x, y in keys]
-    steps = [[[{"from": e["from"], "to": e["to"], "label": rel_label(e.get("rel", "")),
+    steps = [[[{"from": e["from"], "to": e["to"], "label": link_rel_text(e),
                 "why": e.get("why", "")} for e in pairs.get((min(x, y), max(x, y)), [])]
               for x, y in zip(path, path[1:])] for path in paths]
     return {"center": a, "a": a, "b": b, "paths": paths, "steps": steps, "nodes": nodes,
@@ -6892,6 +7016,7 @@ def web_boot(token):
                     ["sources", "source"], ["corpus", "measure"], ["corpus", "medication"],
                     ["corpus", "activity"], ["corpus", "event"], ["notes", "note"]],
             "linkColours": LINK_FAMILY_COLOUR,
+            "circles": [[c, tr(c)] for c in CIRCLES],
             "T": {s: tr(s) for s in WEB_STRINGS}}
 
 
@@ -8567,7 +8692,7 @@ async function linkCard(a, b, d) {
     `<button class="chip" data-act="lk-go" data-id="${esc(c.a.id)}">${esc(c.a.title)}</button>&#8644;` +
     `<button class="chip" data-act="lk-go" data-id="${esc(c.b.id)}">${esc(c.b.title)}</button></div>` +
     c.edges.map((e, i) => `<div class="lk-edge"><div><b>${esc(linkTitle(e.from))}</b> ` +
-      `<span class="rel">${esc(e.label)} &#8594;</span> <b>${esc(linkTitle(e.to))}</b></div>` +
+      `<span class="rel">${esc(e.label + (e.circle ? " · " + e.circle_label : ""))} &#8594;</span> <b>${esc(linkTitle(e.to))}</b></div>` +
       (e.why ? `<div>${esc(e.why)}</div>` : (e.source ? "" : `<div class="warn">${esc(T("no reason or source"))}</div>`)) +
       (e.source ? `<div class="meta">${esc(e.source_label || e.source)}</div>` : "") +
       `<div class="meta">${[e.when, e.atypical ? T("atypical type") : "",
@@ -8588,6 +8713,8 @@ function linkForm() {
     `<select class="f" id="lk-rel">${opts.map(([k, l]) => `<option value="${esc(k)}"${k === cur ? " selected" : ""}>${esc(l)}</option>`).join("")}` +
     `<option value=""${known ? "" : " selected"}>${esc(T("other type…"))}</option></select>` +
     `<input class="f" id="lk-other" placeholder="${esc(T("one word, e.g. inspired_by"))}" value="${esc(known ? "" : cur)}"${known ? " hidden" : ""}>` +
+    `<label class="lbl" for="lk-circle">${esc(T("Circle"))}</label><select class="f" id="lk-circle">` +
+    [["", "—"]].concat(BOOT.circles).map(([k, l]) => `<option value="${esc(k)}"${k === ((e && e.circle) || "") ? " selected" : ""}>${esc(l)}</option>`).join("") + `</select>` +
     `<label class="lbl" for="lk-why">${esc(T("Reason"))}</label><textarea class="f code" id="lk-why" rows="2">${esc(e ? e.why : "")}</textarea>` +
     `<label class="lbl" for="lk-src">${esc(T("Source"))}</label><input class="f" id="lk-src" placeholder="${esc(T("s_… of a source, or free text"))}" value="${esc(e ? e.source : "")}">` +
     `<label class="lbl" for="lk-when">${esc(T("Span"))}</label><input class="f" id="lk-when" placeholder="${esc(T("1609, 1618/1648, -800/400"))}" value="${esc(e ? e.when : "")}">` +
@@ -8605,7 +8732,7 @@ async function linkSave() {
   const e = LK.i == null ? null : LK.card.edges[LK.i];
   const rel = $("#lk-rel").value || $("#lk-other").value.trim();
   const body = {from: LK.from, to: LK.to, rel, why: $("#lk-why").value, source: $("#lk-src").value,
-                when: $("#lk-when").value, old: null};
+                when: $("#lk-when").value, circle: $("#lk-circle").value, old: null};
   try {
     if (e && e.from !== LK.from) {          // turned round: it moves to the other record
       await api("api/link", {from: e.from, to: e.to, delete: true, old: {rel: e.rel, to: e.to}});
@@ -9329,7 +9456,7 @@ class PersonCard:
 
         # the links going out of the person, written as on every other card
         app.label(c, tr("LINKS"), pad)
-        tk.Label(c, text=tr("rel  target  [span]  — reason  # source     "
+        tk.Label(c, text=tr("rel target [span] [@circle] — reason # source   "
                             "(the target can be a person's p_…)"),
                  bg=PAPER, fg=FAINT, font=app.f_label, anchor="w"
                  ).pack(fill="x", pady=(0, 3), **pad)
@@ -9658,14 +9785,14 @@ class PersonCard:
             target = idx.get(a["to"])
             shown = label_any(target, data) if target else tr("{id}  (missing target)", id=a["to"])
             when = f"  {a['when']}" if a.get("when") else ""
-            self.outbox.insert("end", f"{rel_label(a['rel']):16} {shown}{when}")
+            self.outbox.insert("end", f"{link_rel_text(a):16} {shown}{when}")
             self.out_ids.append(a["to"])
         self.outbox.configure(height=max(2, min(8, self.outbox.size())))
         self.inbox.delete(0, "end")
         self.in_ids = []
         for a in edges_to(data, p["id"]):
             src = idx.get(a["from"])
-            self.inbox.insert("end", f"{label_any(src, data):28} {rel_label(a['rel'])}")
+            self.inbox.insert("end", f"{label_any(src, data):28} {link_rel_text(a)}")
             self.in_ids.append(a["from"])
         self.inbox.configure(height=max(2, min(8, self.inbox.size())))
 
@@ -9798,7 +9925,7 @@ class EntryCard:
 
         b = block("edges")
         app.label(b, tr("LINKS"), pad)
-        tk.Label(b, text=tr("rel  target  [span]  — reason  # source     "
+        tk.Label(b, text=tr("rel target [span] [@circle] — reason # source   "
                             "(the target can be a person's p_…)"),
                  bg=PAPER, fg=FAINT, font=app.f_label, anchor="w"
                  ).pack(fill="x", pady=(0, 3), **pad)
@@ -9922,7 +10049,7 @@ class EntryCard:
             target = idx.get(a["to"])
             shown = label_any(target, data) if target else tr("{id}  (missing target)", id=a["to"])
             when = f"  {a['when']}" if a.get("when") else ""
-            self.outbox.insert("end", f"{rel_label(a['rel']):16} {shown}{when}")
+            self.outbox.insert("end", f"{link_rel_text(a):16} {shown}{when}")
             self.out_ids.append(a["to"])
         self.inbox.delete(0, "end")
         self.in_ids = []
@@ -9930,7 +10057,7 @@ class EntryCard:
             src = idx.get(a["from"])
             when = f"  {a['when']}" if a.get("when") else ""
             self.inbox.insert("end", f"{label_any(src, data):28} "
-                                     f"{rel_label(a['rel'])}{when}")
+                                     f"{link_rel_text(a)}{when}")
             self.in_ids.append(a["from"])
         self.outbox.configure(height=max(3, min(10, self.outbox.size())))
         self.inbox.configure(height=max(3, min(10, self.inbox.size())))
@@ -10418,7 +10545,7 @@ class SourceCard:
         app.autogrow(self.t_cite, minrows=2)
 
         b = block("edges")
-        app.label(b, tr("LINKS  (rel  target  [span]  — reason  # source)"), pad)
+        app.label(b, tr("LINKS  (rel  target  [span]  [@circle]  — reason  # source)"), pad)
         self.t_edges = tk.Text(b, height=2, width=1, font=app.f_meta, bg=PAPER, fg=INK,
                                insertbackground=INK, relief="flat", wrap="word",
                                highlightthickness=0, padx=0, spacing1=1, spacing3=3,
@@ -10538,13 +10665,13 @@ class SourceCard:
         for a in edges_from(data, sid):
             target = idx.get(a["to"])
             shown = label_any(target, data) if target else tr("{id}  (missing target)", id=a["to"])
-            self.outbox.insert("end", f"{rel_label(a['rel']):18} {shown}")
+            self.outbox.insert("end", f"{link_rel_text(a):18} {shown}")
             self.out_ids.append(a["to"])
         self.inbox.delete(0, "end")
         self.in_ids = []
         for a in edges_to(data, sid):
             src = idx.get(a["from"])
-            self.inbox.insert("end", f"{label_any(src, data):30} {rel_label(a['rel'])}")
+            self.inbox.insert("end", f"{label_any(src, data):30} {link_rel_text(a)}")
             self.in_ids.append(a["from"])
         self.usebox.delete(0, "end")
         self.use_ids = []
@@ -10981,14 +11108,14 @@ class MetricCard:
         self.out_ids = []
         for a in edges_from(data, mid):
             target = idx.get(a["to"])
-            self.outbox.insert("end", f"{rel_label(a['rel']):18} "
+            self.outbox.insert("end", f"{link_rel_text(a):18} "
                                       f"{label_any(target, data) if target else a['to']}")
             self.out_ids.append(a["to"])
         self.inbox.delete(0, "end")
         self.in_ids = []
         for a in edges_to(data, mid):
             src = idx.get(a["from"])
-            self.inbox.insert("end", f"{label_any(src, data):30} {rel_label(a['rel'])}")
+            self.inbox.insert("end", f"{label_any(src, data):30} {link_rel_text(a)}")
             self.in_ids.append(a["from"])
         for lb in (self.outbox, self.inbox):
             lb.configure(height=max(2, min(8, lb.size())))
@@ -11073,7 +11200,7 @@ HELP_TEXT = (
     "\n  Search operators:"
     "\n  p: v: f: c:   only people / verba / sources / corpus"
     "\n  ^ab           name starting with ab"
-    "\n  tag:csh  lang:de  type:book  sys:renal  dom:law  id:c_  is:org"
+    "\n  tag:csh  lang:de  type:book  sys:renal  dom:law  id:c_  is:org  circle:influence"
     "\n  e.g.:  v: lang:de ^ab   ·   f: type:article luhmann"
     "\n"
     "\n  Text fields grow with their text up to the card's height,"
@@ -11100,10 +11227,10 @@ HELP_TEXT = (
     "\n  ~2026-09-10 10:00. The LAST date on the line wins."
     "\n"
     "\n  Links, one per line, on any card:"
-    "\n  rel target [span] — reason # source"
+    "\n  rel target [span] [@circle] — reason # source"
     "\n  e.g.: expresses c_timoneiro -800/400 — literal sense"
     "\n  e.g.: author_of s_wiener_1948_cybernetics"
-    "\n  e.g.: cites s_lochtrop_2006 — entry p. 12"
+    "\n  e.g.: cites s_lochtrop_2006 — entry p. 12\n  @circle: concern, adapt, influence or control -- where the\n  target sits in the circles of the record the link starts from.\n  cited_by p_… or influenced_by p_… write a link from its other\n  end: it is saved with p_… and shows here under CITED BY."
     "\n  The target is the id: c_ concept, f_ form, p_ person,"
     "\n  s_ source, h_ measurement. A rel outside the table is not"
     "\n  an error: it is an ATYPICAL link, with the label you gave;"
@@ -11618,7 +11745,7 @@ class NoteCard:
                                 app.f_meta, pad)
         self.t_body = app.textfield(c, tr("TEXT  (markdown)"), 12, app.f_body, pad,
                                     pages=True)
-        app.label(c, tr("LINKS  (rel  target  [span]  — reason  # source)"), pad)
+        app.label(c, tr("LINKS  (rel  target  [span]  [@circle]  — reason  # source)"), pad)
         self.t_edges = tk.Text(c, height=2, width=1, font=app.f_meta, bg=PAPER, fg=INK,
                                insertbackground=INK, relief="flat", wrap="word",
                                highlightthickness=0, padx=0, spacing1=1, spacing3=3,
@@ -11696,14 +11823,14 @@ class NoteCard:
         self.out_ids = []
         for a in edges_from(data, nid):
             target = idx.get(a["to"])
-            self.outbox.insert("end", f"{rel_label(a['rel']):18} "
+            self.outbox.insert("end", f"{link_rel_text(a):18} "
                                       f"{label_any(target, data) if target else a['to']}")
             self.out_ids.append(a["to"])
         self.inbox.delete(0, "end")
         self.in_ids = []
         for a in edges_to(data, nid):
             src = idx.get(a["from"])
-            self.inbox.insert("end", f"{label_any(src, data):30} {rel_label(a['rel'])}")
+            self.inbox.insert("end", f"{label_any(src, data):30} {link_rel_text(a)}")
             self.in_ids.append(a["from"])
         for lb in (self.outbox, self.inbox):
             lb.configure(height=max(2, min(8, lb.size())))
@@ -12761,14 +12888,31 @@ class App:
                                on_open=self.open_from_graph, on_link=self.link_from_graph)
         return "break"
 
-    def link_from_graph(self, a, b, rel, why="", source="", when=""):
+    def write_inverse(self, inverse):
+        """The links typed on this card from their other end (cited_by …),
+        each saved with the record it starts from; the card then shows them
+        under CITED BY. Returns the vault if any was written."""
+        if not inverse:
+            return None
+        data, went, problems = write_inverse_links(inverse)
+        self._reshaped = True
+        idx = by_id(data or load_json())
+        names = ", ".join(one_liner(label_any(idx.get(r), self.data), 30) for r in dict.fromkeys(went))
+        bits = [tr("{n} link(s) written from the other end, saved with {names}.",
+                   n=len(went), names=names)] if went else []
+        if problems:
+            bits.append(tr("Not saved: {why}", why="; ".join(problems)))
+        self.root.after(50, lambda: self.say(" ".join(bits)))
+        return data
+
+    def link_from_graph(self, a, b, rel, why="", source="", when="", circle=""):
         """A link drawn in the graph (Shift+drag), written here: what the card
         holds is saved first, the link is added to the record it comes from
         (write_link, as the web page does), and both windows show it. Returns
         what went wrong, or None."""
         self.commit_if_dirty()
         try:
-            data = write_link(a, b, rel, why, source, when)
+            data = write_link(a, b, rel, why, source, when, circle=circle)
         except (ValueError, WebConflict) as exc:
             return str(exc)
         except SystemExit as exc:
@@ -14453,15 +14597,14 @@ class App:
                 return None if not auto else out["id"]
         before = "" if fresh else note_body(out)
         place_note(out)
-        links = parse_edges(card.edges_text(), out["id"])
-        unparsed = [a["to"] for a in links if a.get("_bad")]
-        links = [a for a in links if not a.get("_bad")]
+        links, inverse, unparsed = take_links(card.edges_text(), out, load_json())
         if unparsed:
             out["edge_drafts"] = unparsed
         else:
             out.pop("edge_drafts", None)
         touch(out)
         self.data = save_record("notes", out, edges=links)
+        self.data = self.write_inverse(inverse) or self.data
         saved = by_id(self.data)[out["id"]]
         write_note_file(saved, body, when)
         card.opened = note_mtime(saved)
@@ -14590,15 +14733,14 @@ class App:
             return None
         if out["id"].startswith("__"):
             out["id"] = make_id_fn(out, set(by_id(load_json())))
-        links = parse_edges(card.edges_text(), out["id"])
-        unparsed = [a["to"] for a in links if a.get("_bad")]
-        links = [a for a in links if not a.get("_bad")]
+        links, inverse, unparsed = take_links(card.edges_text(), out, load_json())
         if unparsed:
             out["edge_drafts"] = unparsed
         else:
             out.pop("edge_drafts", None)
         touch(out)
         self.data = save_record(coll, out, edges=links)
+        self.data = self.write_inverse(inverse) or self.data
         self.safe_mirror(self.data)
         if unparsed:
             self.say(tr("{n} link line(s) not understood were kept as drafts.", n=len(unparsed)))
@@ -14668,15 +14810,14 @@ class App:
         if rec["id"].startswith("__"):
             rec["met"] = rec.get("met") or TODAY()
             rec["id"] = make_id(rec["name"], set(by_id(load_json())))
-        links = parse_edges(self.pc.edges_text(), rec["id"])
-        unparsed = [a["to"] for a in links if a.get("_bad")]
-        links = [a for a in links if not a.get("_bad")]
+        links, inverse, unparsed = take_links(self.pc.edges_text(), rec, load_json())
         if unparsed:
             rec["edge_drafts"] = unparsed
         else:
             rec.pop("edge_drafts", None)
         touch(rec)
         self.data = save_record("people", rec, edges=links)
+        self.data = self.write_inverse(inverse) or self.data
         self.safe_mirror(self.data)
         if filed:
             self.say(tr("{n} finished task(s) went to the log.", n=filed))
@@ -14695,15 +14836,14 @@ class App:
         old = rec["id"]
         if old.startswith("__"):
             rec["id"] = new_id(rec["kind"], rec["name"], set(by_id(load_json())))
-        links = parse_edges(self.vc.edges_text(), rec["id"])
-        unparsed = [a["to"] for a in links if a.get("_bad")]
-        links = [a for a in links if not a.get("_bad")]
+        links, inverse, unparsed = take_links(self.vc.edges_text(), rec, load_json())
         if unparsed:
             rec["edge_drafts"] = unparsed
         else:
             rec.pop("edge_drafts", None)
         touch(rec)
         self.data = save_record("entries", rec, edges=links)
+        self.data = self.write_inverse(inverse) or self.data
         self.safe_mirror(self.data)
         if unparsed:
             self.say(tr("{n} link line(s) not understood were kept as drafts.", n=len(unparsed)))
@@ -15889,9 +16029,9 @@ class BookView:
             if o.get("tags"):
                 out.append(("", ", ".join(o["tags"])))
             out.append(("", o["_body"] if "_body" in o else note_body(o)))
-        outs = [f"{rel_label(a['rel'])} → {label_any(self.idx[a['to']], d)}"
+        outs = [f"{link_rel_text(a)} → {label_any(self.idx[a['to']], d)}"
                 for a in edges_from(d, o["id"]) if a["to"] in self.idx]
-        ins = [f"{label_any(self.idx[a['from']], d)} → {rel_label(a['rel'])}"
+        ins = [f"{label_any(self.idx[a['from']], d)} → {link_rel_text(a)}"
                for a in edges_to(d, o["id"]) if a["from"] in self.idx]
         if outs:
             out.append((tr("links"), "\n".join(outs)))
@@ -17718,7 +17858,7 @@ class GraphView:
             if (min(e.get("from", ""), e.get("to", "")), max(e.get("from", ""), e.get("to", ""))) != key:
                 continue
             a, b = idx.get(e["from"]), idx.get(e["to"])
-            bits = [f"{label_any(a, self.data) if a else e['from']}  —{rel_label(e.get('rel', ''))}→  "
+            bits = [f"{label_any(a, self.data) if a else e['from']}  —{link_rel_text(e)}→  "
                     f"{label_any(b, self.data) if b else e['to']}"]
             bits.append(e.get("why") or ("" if e.get("source") else tr("no reason or source")))
             if e.get("source"):
@@ -17816,7 +17956,7 @@ class GraphView:
                  + tr("{k} link(s) apart · {n} chain(s)", k=len(paths[0]) - 1, n=len(paths))]
         for x, y in zip(paths[0], paths[0][1:]):
             for e in pairs.get((min(x, y), max(x, y)), []):
-                lines.append(f"{name(e['from'])}  —{rel_label(e.get('rel', ''))}→  {name(e['to'])}"
+                lines.append(f"{name(e['from'])}  —{link_rel_text(e)}→  {name(e['to'])}"
                              + (f" · {one_liner(e['why'], 60)}" if e.get("why") else ""))
         lines.append(tr("Esc: back to the graph"))
         self.sel_link = None
@@ -18079,15 +18219,22 @@ class LinkDialog:
         self.l_dir.grid(row=0, column=0, columnspan=2, **pad)
         ttk.Button(win, text="⇄  " + tr("Swap direction"), command=self.swap).grid(
             row=0, column=2, padx=14, pady=(8, 0), sticky="e")
-        self.v_rel, self.v_why, self.v_src, self.v_when = (tk.StringVar() for _ in range(4))
+        self.v_rel, self.v_why, self.v_src, self.v_when, self.v_circle = (tk.StringVar() for _ in range(5))
         rows = ((tr("Type"), self.v_rel), (tr("Reason"), self.v_why), (tr("Source"), self.v_src),
-                (tr("Span"), self.v_when))
+                (tr("Span"), self.v_when), (tr("Circle"), self.v_circle))
         self.boxes = []
         for i, (label, var) in enumerate(rows, start=1):
-            tk.Label(win, text=label, bg=PAPER, fg=SOFT, font=view.f_label).grid(row=i, column=0, **pad)
+            tk.Label(win, text=label, bg=PAPER, fg=SOFT, font=view.f_label).grid(
+                row=i if var is not self.v_circle else 6, column=0, **pad)
             if var is self.v_rel:
                 box = ttk.Combobox(win, textvariable=var, width=44)
                 self.rel_box = box
+            elif var is self.v_circle:      # where the target sits in the start's circles
+                box = ttk.Combobox(win, textvariable=var, width=44, state="readonly",
+                                   values=[""] + [tr(c) for c in CIRCLES])
+                box.grid(row=6, column=1, columnspan=2, padx=14, pady=(8, 0), sticky="we")
+                self.boxes.append(box)
+                continue
             else:
                 box = ttk.Entry(win, textvariable=var, width=46)
             box.grid(row=i, column=1, columnspan=2, padx=14, pady=(8, 0), sticky="we")
@@ -18095,9 +18242,9 @@ class LinkDialog:
         tk.Label(win, text=tr("s_… of a source, or free text") + "   ·   " + tr("1609, 1618/1648, -800/400"),
                  bg=PAPER, fg=FAINT, font=view.f_label).grid(row=5, column=1, columnspan=2, padx=14, sticky="w")
         self.msg = tk.Label(win, text="", bg=PAPER, fg=OXIDE, font=view.f_label, wraplength=420, justify="left")
-        self.msg.grid(row=6, column=0, columnspan=3, padx=14, pady=(6, 0), sticky="w")
+        self.msg.grid(row=7, column=0, columnspan=3, padx=14, pady=(6, 0), sticky="w")
         foot = tk.Frame(win, bg=PAPER)
-        foot.grid(row=7, column=0, columnspan=3, padx=14, pady=12, sticky="e")
+        foot.grid(row=8, column=0, columnspan=3, padx=14, pady=12, sticky="e")
         ttk.Button(foot, text=tr("Cancel"), command=win.destroy).pack(side="right")
         ttk.Button(foot, text=tr("Save"), command=self.save).pack(side="right", padx=(0, 8))
         win.bind("<Return>", lambda e: self.save())
@@ -18122,8 +18269,9 @@ class LinkDialog:
     def save(self):
         typed = self.v_rel.get().strip()
         rel = next((r for r in RELS if rel_label(r) == typed), typed)   # a label back to its type
+        circle = next((c for c in CIRCLES if tr(c) == self.v_circle.get()), "")
         problem = self.view.on_link(self.a, self.b, rel, self.v_why.get(), self.v_src.get(),
-                                    self.v_when.get())
+                                    self.v_when.get(), circle)
         if problem:
             self.msg.configure(text=problem)
             return
@@ -18838,7 +18986,7 @@ def timeline_events(data):
     for a in data["edges"]:
         if a.get("when") and a["from"] in idx and a["to"] in idx:
             add("links", a["from"], a["when"],
-                f"{label_any(idx[a['from']], data)} {rel_label(a['rel'])} "
+                f"{label_any(idx[a['from']], data)} {link_rel_text(a)} "
                 f"{label_any(idx[a['to']], data)}", other=a["to"])
     for m in data["corpus"]:
         name = m.get("name", "")
@@ -19799,8 +19947,8 @@ PT = {
         "STATUS",
     "DOMAINS":
         "DOMÍNIOS",
-    "rel  target  [span]  — reason  # source     (the target can be a person's p_…)":
-        "rel  alvo  [intervalo]  — razão  # fonte     (alvo pode ser p_… de uma pessoa)",
+    "rel target [span] [@circle] — reason # source   (the target can be a person's p_…)":
+        "rel alvo [intervalo] [@círculo] — razão # fonte   (alvo pode ser p_… de uma pessoa)",
     "RESOLVED LINKS  (double-click opens)":
         "LIGAÇÕES RESOLVIDAS  (duplo clique abre)",
     "URLS":
@@ -19825,8 +19973,8 @@ PT = {
         "CITAÇÃO",
     "copy":
         "copiar",
-    "LINKS  (rel  target  [span]  — reason  # source)":
-        "LIGAÇÕES  (rel  alvo  [intervalo]  — razão  # fonte)",
+    "LINKS  (rel  target  [span]  [@circle]  — reason  # source)":
+        "LIGAÇÕES  (rel  alvo  [intervalo]  [@círculo]  — razão  # fonte)",
     "SOURCE OF  (records whose SOURCE field points here; double-click opens)":
         "FONTE DE  (registros cujo campo FONTE aponta para cá; duplo clique abre)",
     "[raw text kept]":
@@ -20167,8 +20315,8 @@ PT = {
         "(padrão)",
     "Yes":
         "Sim",
-    "\n  Ctrl+F     go to the search\n  ↓ / Enter  from the search to the list\n  Ctrl+N     new person\n  Ctrl+Q     bulk entries (any kind, one per line)\n  Ctrl+D     dust off: opens what has gone longest unvisited in the list\n  Ctrl+S     save the open record\n  Ctrl+Enter save and start another of the same kind\n  Ctrl+Z / Ctrl+Y   undo / redo\n  Ctrl+J / Ctrl+K   next / previous, from anywhere\n  Ctrl+G     go to: nº (1852), stamp, id or name\n  Ctrl+L     show in the register: leaves the search, shows the open record's nº\n  Ctrl+B     open as logbook (second window, read-only;\n             Enter in the logbook brings the record to the card)\n  Ctrl+1..4  scope people / verba / sources / corpus; Ctrl+0 everything\n  /  in the list goes back to the search;  Enter in the list goes to the card\n  Home / End within the page;  PageUp / PageDown or the wheel turns the page\n  Ctrl+Home / Ctrl+End  start / end of the list\n  Ctrl+PageUp / Ctrl+PageDown turns the page from anywhere\n  F5         reload from disk\n  Esc        back to the list\n\n  REGISTER: every record gets, on its first save, a stamp\n  (YYYYMMDDhhmmss) and an order number that never changes;\n  what is deleted stays in the sequence as cancelled.\n  Without a search, the list is the register, in number order;\n  with a search or filter, it is the INDEX, in alphabetical order.\n  The list shows what fits the window, without scrolling: the rest\n  is on the following pages.\n\n  Search operators:\n  p: v: f: c:   only people / verba / sources / corpus\n  ^ab           name starting with ab\n  tag:csh  lang:de  type:book  sys:renal  dom:law  id:c_  is:org\n  e.g.:  v: lang:de ^ab   ·   f: type:article luhmann\n\n  Text fields grow with their text up to the card's height,\n  then scroll inside (ui.max_rows in the JSON sets a fixed\n  limit). A long LOG or NOTES is read one page per view, each\n  page starting at an entry or paragraph: ‹ › beside the title,\n  PageUp / PageDown in it, a sideways swipe or Shift+wheel over\n  it, or the wheel over it once the card is at its end (the LOG\n  opens on the newest). View › Long texts › Continuous scrolls\n  instead.\n  The body map\n  folds with [−] and remembers its state.\n\n  In the rail, COLLECTIONS limits to people or verba;\n  any filter below picks the collection by itself.\n\n  Tasks (people):\n  Enter       new line already with [ ]\n  Space       on the [ ] changes the state\n  Ctrl+Space  changes it from anywhere on the line\n  [ ] to do   [/] in progress  [>] waiting on\n  [x] done    [-] cancelled  (they go to the log on save)\n  A date at the end is the deadline: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. The LAST date on the line wins.\n\n  Links, one per line, on any card:\n  rel target [span] — reason # source\n  e.g.: expresses c_timoneiro -800/400 — literal sense\n  e.g.: author_of s_wiener_1948_cybernetics\n  e.g.: cites s_lochtrop_2006 — entry p. 12\n  The target is the id: c_ concept, f_ form, p_ person,\n  s_ source, h_ measurement. A rel outside the table is not\n  an error: it is an ATYPICAL link, with the label you gave;\n  the doctor lists the atypical ones for you to promote.\n\n  SOURCE (on people, entries and measurements): a source's\n  s_…, or free text. Sources cite in ABNT, author-date,\n  BibTeX or CSL-JSON (picker on the card, copy button).\n  Corpus: readings '2026-09-01 13.5 fasting', one per line;\n  out of range shows with (!).\n\n  Sync: every save rereads the disk; on opening,\n  *.sync-conflict-* files are merged and stored in\n  {conflicts}/. The full history is in\n  {stem}.log.<machine>.jsonl (Base › History).\n":
-        "\n  Ctrl+F     ir para a busca\n  ↓ / Enter  da busca para a lista\n  Ctrl+N     nova pessoa\n  Ctrl+Q     entradas em lote (qualquer tipo, uma por linha)\n  Ctrl+D     tirar o pó: abre o que está há mais tempo sem visita na lista\n  Ctrl+S     salvar o registro aberto\n  Ctrl+Enter salvar e começar outro do mesmo tipo\n  Ctrl+Z / Ctrl+Y   desfazer / refazer\n  Ctrl+J / Ctrl+K   próximo / anterior, de qualquer lugar\n  Ctrl+G     ir para: nº (1852), carimbo, id ou nome\n  Ctrl+L     ver no registro: sai da busca, mostra o nº do aberto\n  Ctrl+B     abrir como livro (segunda janela, só leitura;\n             Enter no livro traz o registro para o cartão)\n  Ctrl+1..4  escopo pessoas / verba / fontes / corpus; Ctrl+0 tudo\n  /  na lista volta à busca;  Enter na lista vai ao cartão\n  Home / End na página;  PageUp / PageDown ou a roda vira a página\n  Ctrl+Home / Ctrl+End  começo / fim da lista\n  Ctrl+PageUp / Ctrl+PageDown vira a página de qualquer lugar\n  F5         recarregar do disco\n  Esc        voltar à lista\n\n  REGISTRO: todo registro recebe, ao ser gravado pela primeira\n  vez, um carimbo (AAAAMMDDhhmmss) e um número de ordem que\n  nunca muda; o que é apagado fica na sequência como cancelado.\n  Sem busca, a lista é o registro, na ordem dos números; com\n  busca ou filtro, é o INDICADOR, em ordem alfabética. A lista\n  mostra o que cabe na janela, sem rolagem: o resto está nas\n  páginas seguintes.\n\n  Operadores da busca:\n  p: v: f: c:   só pessoas / verba / fontes / corpus\n  ^ab           nome que começa com ab\n  tag:csh  lang:de  type:livro  sys:renal  dom:direito  id:c_  is:org\n  ex.:  v: lang:de ^ab   ·   f: type:artigo luhmann\n\n  Campos de texto crescem com o texto até a altura do cartão\n  e depois rolam por dentro (ui.max_rows no JSON fixa um teto).\n  LOG e NOTAS longos são lidos uma página por vez, cada página\n  começando numa entrada ou parágrafo: ‹ › ao lado do título,\n  PageUp / PageDown nele, um deslizar de lado ou Shift+roda sobre\n  ele, ou a roda sobre ele quando o cartão chega ao fim (o LOG\n  abre na mais nova). Ver › Textos longos › Contínuo rola em vez\n  disso.\n  O mapa do corpo\n  recolhe pelo [−] e lembra o estado.\n\n  No trilho, ACERVO limita a pessoas ou a verba;\n  qualquer filtro abaixo escolhe o acervo sozinho.\n\n  Tarefas (pessoas):\n  Enter       nova linha já com [ ]\n  Espaço      sobre o [ ] muda o estado\n  Ctrl+Espaço muda de qualquer ponto da linha\n  [ ] a fazer  [/] em curso  [>] esperando\n  [x] feito    [-] cancelado  (vão para o log ao salvar)\n  Data no fim é o prazo: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. A ÚLTIMA data da linha vence.\n\n  Ligações, uma por linha, em qualquer cartão:\n  rel alvo [intervalo] — razão # fonte\n  ex.: expresses c_timoneiro -800/400 — sentido próprio\n  ex.: author_of s_wiener_1948_cybernetics\n  ex.: cites s_lochtrop_2006 — verbete p. 12\n  Alvo é o id: c_ conceito, f_ forma, p_ pessoa,\n  s_ fonte, h_ medida. Um rel fora da tabela não é\n  erro: é ligação ATÍPICA, com o rótulo que você deu;\n  o doctor lista as atípicas para você promover.\n\n  FONTE (em pessoas, verbetes e medidas): s_… de uma\n  fonte, ou texto livre. Fontes citam em ABNT, autor-data,\n  BibTeX ou CSL-JSON (seletor no cartão, botão copiar).\n  Corpus: leituras '2026-09-01 13.5 jejum', uma por linha;\n  fora da referência aparece com (!).\n\n  Sincronização: cada gravação relê o disco; ao abrir,\n  *.sync-conflict-* são fundidos e guardados em\n  {conflicts}/. O histórico completo está em\n  {stem}.log.<máquina>.jsonl (menu Base › Histórico).\n",
+    "\n  Ctrl+F     go to the search\n  ↓ / Enter  from the search to the list\n  Ctrl+N     new person\n  Ctrl+Q     bulk entries (any kind, one per line)\n  Ctrl+D     dust off: opens what has gone longest unvisited in the list\n  Ctrl+S     save the open record\n  Ctrl+Enter save and start another of the same kind\n  Ctrl+Z / Ctrl+Y   undo / redo\n  Ctrl+J / Ctrl+K   next / previous, from anywhere\n  Ctrl+G     go to: nº (1852), stamp, id or name\n  Ctrl+L     show in the register: leaves the search, shows the open record's nº\n  Ctrl+B     open as logbook (second window, read-only;\n             Enter in the logbook brings the record to the card)\n  Ctrl+1..4  scope people / verba / sources / corpus; Ctrl+0 everything\n  /  in the list goes back to the search;  Enter in the list goes to the card\n  Home / End within the page;  PageUp / PageDown or the wheel turns the page\n  Ctrl+Home / Ctrl+End  start / end of the list\n  Ctrl+PageUp / Ctrl+PageDown turns the page from anywhere\n  F5         reload from disk\n  Esc        back to the list\n\n  REGISTER: every record gets, on its first save, a stamp\n  (YYYYMMDDhhmmss) and an order number that never changes;\n  what is deleted stays in the sequence as cancelled.\n  Without a search, the list is the register, in number order;\n  with a search or filter, it is the INDEX, in alphabetical order.\n  The list shows what fits the window, without scrolling: the rest\n  is on the following pages.\n\n  Search operators:\n  p: v: f: c:   only people / verba / sources / corpus\n  ^ab           name starting with ab\n  tag:csh  lang:de  type:book  sys:renal  dom:law  id:c_  is:org  circle:influence\n  e.g.:  v: lang:de ^ab   ·   f: type:article luhmann\n\n  Text fields grow with their text up to the card's height,\n  then scroll inside (ui.max_rows in the JSON sets a fixed\n  limit). A long LOG or NOTES is read one page per view, each\n  page starting at an entry or paragraph: ‹ › beside the title,\n  PageUp / PageDown in it, a sideways swipe or Shift+wheel over\n  it, or the wheel over it once the card is at its end (the LOG\n  opens on the newest). View › Long texts › Continuous scrolls\n  instead.\n  The body map\n  folds with [−] and remembers its state.\n\n  In the rail, COLLECTIONS limits to people or verba;\n  any filter below picks the collection by itself.\n\n  Tasks (people):\n  Enter       new line already with [ ]\n  Space       on the [ ] changes the state\n  Ctrl+Space  changes it from anywhere on the line\n  [ ] to do   [/] in progress  [>] waiting on\n  [x] done    [-] cancelled  (they go to the log on save)\n  A date at the end is the deadline: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. The LAST date on the line wins.\n\n  Links, one per line, on any card:\n  rel target [span] [@circle] — reason # source\n  e.g.: expresses c_timoneiro -800/400 — literal sense\n  e.g.: author_of s_wiener_1948_cybernetics\n  e.g.: cites s_lochtrop_2006 — entry p. 12\n  @circle: concern, adapt, influence or control -- where the\n  target sits in the circles of the record the link starts from.\n  cited_by p_… or influenced_by p_… write a link from its other\n  end: it is saved with p_… and shows here under CITED BY.\n  The target is the id: c_ concept, f_ form, p_ person,\n  s_ source, h_ measurement. A rel outside the table is not\n  an error: it is an ATYPICAL link, with the label you gave;\n  the doctor lists the atypical ones for you to promote.\n\n  SOURCE (on people, entries and measurements): a source's\n  s_…, or free text. Sources cite in ABNT, author-date,\n  BibTeX or CSL-JSON (picker on the card, copy button).\n  Corpus: readings '2026-09-01 13.5 fasting', one per line;\n  out of range shows with (!).\n\n  Sync: every save rereads the disk; on opening,\n  *.sync-conflict-* files are merged and stored in\n  {conflicts}/. The full history is in\n  {stem}.log.<machine>.jsonl (Base › History).\n":
+        "\n  Ctrl+F     ir para a busca\n  ↓ / Enter  da busca para a lista\n  Ctrl+N     nova pessoa\n  Ctrl+Q     entradas em lote (qualquer tipo, uma por linha)\n  Ctrl+D     tirar o pó: abre o que está há mais tempo sem visita na lista\n  Ctrl+S     salvar o registro aberto\n  Ctrl+Enter salvar e começar outro do mesmo tipo\n  Ctrl+Z / Ctrl+Y   desfazer / refazer\n  Ctrl+J / Ctrl+K   próximo / anterior, de qualquer lugar\n  Ctrl+G     ir para: nº (1852), carimbo, id ou nome\n  Ctrl+L     ver no registro: sai da busca, mostra o nº do aberto\n  Ctrl+B     abrir como livro (segunda janela, só leitura;\n             Enter no livro traz o registro para o cartão)\n  Ctrl+1..4  escopo pessoas / verba / fontes / corpus; Ctrl+0 tudo\n  /  na lista volta à busca;  Enter na lista vai ao cartão\n  Home / End na página;  PageUp / PageDown ou a roda vira a página\n  Ctrl+Home / Ctrl+End  começo / fim da lista\n  Ctrl+PageUp / Ctrl+PageDown vira a página de qualquer lugar\n  F5         recarregar do disco\n  Esc        voltar à lista\n\n  REGISTRO: todo registro recebe, ao ser gravado pela primeira\n  vez, um carimbo (AAAAMMDDhhmmss) e um número de ordem que\n  nunca muda; o que é apagado fica na sequência como cancelado.\n  Sem busca, a lista é o registro, na ordem dos números; com\n  busca ou filtro, é o INDICADOR, em ordem alfabética. A lista\n  mostra o que cabe na janela, sem rolagem: o resto está nas\n  páginas seguintes.\n\n  Operadores da busca:\n  p: v: f: c:   só pessoas / verba / fontes / corpus\n  ^ab           nome que começa com ab\n  tag:csh  lang:de  type:livro  sys:renal  dom:direito  id:c_  is:org  circle:influence\n  ex.:  v: lang:de ^ab   ·   f: type:artigo luhmann\n\n  Campos de texto crescem com o texto até a altura do cartão\n  e depois rolam por dentro (ui.max_rows no JSON fixa um teto).\n  LOG e NOTAS longos são lidos uma página por vez, cada página\n  começando numa entrada ou parágrafo: ‹ › ao lado do título,\n  PageUp / PageDown nele, um deslizar de lado ou Shift+roda sobre\n  ele, ou a roda sobre ele quando o cartão chega ao fim (o LOG\n  abre na mais nova). Ver › Textos longos › Contínuo rola em vez\n  disso.\n  O mapa do corpo\n  recolhe pelo [−] e lembra o estado.\n\n  No trilho, ACERVO limita a pessoas ou a verba;\n  qualquer filtro abaixo escolhe o acervo sozinho.\n\n  Tarefas (pessoas):\n  Enter       nova linha já com [ ]\n  Espaço      sobre o [ ] muda o estado\n  Ctrl+Espaço muda de qualquer ponto da linha\n  [ ] a fazer  [/] em curso  [>] esperando\n  [x] feito    [-] cancelado  (vão para o log ao salvar)\n  Data no fim é o prazo: 2026-09-10, 2026-09-10-1000,\n  ~2026-09-10 10:00. A ÚLTIMA data da linha vence.\n\n  Ligações, uma por linha, em qualquer cartão:\n  rel alvo [intervalo] [@círculo] — razão # fonte\n  ex.: expresses c_timoneiro -800/400 — sentido próprio\n  ex.: author_of s_wiener_1948_cybernetics\n  ex.: cites s_lochtrop_2006 — verbete p. 12\n  @círculo: concern, adapt, influence ou control -- onde o alvo\n  fica nos círculos do registro de onde a ligação parte.\n  cited_by p_… ou influenced_by p_… escrevem a ligação pela outra\n  ponta: ela é gravada em p_… e aparece aqui em CITADO POR.\n  Alvo é o id: c_ conceito, f_ forma, p_ pessoa,\n  s_ fonte, h_ medida. Um rel fora da tabela não é\n  erro: é ligação ATÍPICA, com o rótulo que você deu;\n  o doctor lista as atípicas para você promover.\n\n  FONTE (em pessoas, verbetes e medidas): s_… de uma\n  fonte, ou texto livre. Fontes citam em ABNT, autor-data,\n  BibTeX ou CSL-JSON (seletor no cartão, botão copiar).\n  Corpus: leituras '2026-09-01 13.5 jejum', uma por linha;\n  fora da referência aparece com (!).\n\n  Sincronização: cada gravação relê o disco; ao abrir,\n  *.sync-conflict-* são fundidos e guardados em\n  {conflicts}/. O histórico completo está em\n  {stem}.log.<máquina>.jsonl (menu Base › Histórico).\n",
     "OK":
         "OK",
     "Kustos · logbook (read-only)":
@@ -21201,6 +21349,16 @@ PT = {
         "Semear de novo para recomeçar",
     "r: start again":
         "r: recomeçar",
+    "Circle":
+        "Círculo",
+    "A circle is one of: {names}.":
+        "Um círculo é um destes: {names}.",
+    "{n} link(s) written from the other end, saved with {names}.":
+        "{n} ligação(ões) escrita(s) pela outra ponta, gravada(s) em {names}.",
+    "Not saved: {why}":
+        "Não gravado: {why}",
+    "link {i}: unknown circle {circle} ({src} -> {dst})":
+        "ligação {i}: círculo desconhecido {circle} ({src} -> {dst})",
     "influenced":
         "influenciou",
     "dust off":

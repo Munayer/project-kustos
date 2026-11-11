@@ -122,15 +122,31 @@ It refuses any folder it did not make, so it never touches a real base.
 - **Linked entries** between any registers (`author_of`, `cites`,
   `attested_in`, `defined_in`, `translates`, `measured_in`…). Labels outside of the table are accepted and marked as atypical.
   Every card, a person's included, has a LINKS field, one link per line:
-  `rel target [span] — reason # source`, the target being a record's id
-  (`Ctrl+Shift+C` copies the open record's). Below it, RESOLVED LINKS lists
-  them by name and CITED BY the links coming in. Between two people,
-  `knows` is for people who met, and `influenced` for one whose work shaped
-  the other's, across any distance in time:
+  `rel target [span] [@circle] — reason # source`, the target being a
+  record's id (`Ctrl+Shift+C` copies the open record's). Below it, RESOLVED
+  LINKS lists them by name and CITED BY the links coming in. Between two
+  people, `knows` is for people who met, and `influenced` for one whose work
+  shaped the other's, across any distance in time; `cites` points at a
+  source, or at a person cited by name.
 
   ```
-  influenced p_tom00002 — his notes on governors shaped hers # s_…
+  influenced p_tom00002 1950 @influence — his notes on governors shaped hers
+  cites p_ada00001 @concern — quoted by name, never met
   ```
+
+  **A link's circle** (`@concern`, `@adapt`, `@influence`, `@control`) says
+  where the record it points at sits in the circles of the record it starts
+  from — the same four circles a person card holds for you, seen from that
+  record instead. The first line above puts Tomás in this person's circle of
+  influence. It shows in RESOLVED LINKS and CITED BY (*influenced · influence*),
+  on the page, in the mirror and in both graphs' link cards and dialogs, and
+  `circle:influence` in the search finds the records at either end of such a
+  link, with the people in your own circle of influence.
+
+  **From the other end**: `cited_by p_…` or `influenced_by p_…`, written on
+  the card of the one cited or influenced, is the other record's link. It is
+  saved with that record (where it then shows in LINKS), and here it moves to
+  CITED BY: still one link, written from whichever card is open.
 
   The link graph draws them too (Shift+drag from one record to another).
 - **Monads** (`Ctrl+Shift+M`, **View › Monads**, or `python _kustos.py monads [id]`):
@@ -299,7 +315,7 @@ It refuses any folder it did not make, so it never touches a real base.
   ```
   p: v: f: c: d:                    only people / verba / sources / body tracks / drafts
   ^ab                               name that starts with "ab"
-  tag:x lang:de type:book sys:renal dom:law id:c_
+  tag:x lang:de type:book sys:renal dom:law id:c_ circle:influence
   ```
 
   The search always runs over the whole base. The rail keeps every category
