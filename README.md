@@ -235,6 +235,40 @@ It refuses any folder it did not make, so it never touches a real base.
   (or `python _kustos.py real-dates [apply [order]]`) finds log entries whose
   text starts with a date — as imported notes have it, `20240311…` — and, on
   confirmation, makes it the entry's date.
+- **Practice languages** (the web version's menu › *Practice*, on the phone as
+  on the desk, or **View › Practice languages**): the verba drilled in their
+  languages. A meaning is shown — a concept, or for a form linked to no
+  concept its gloss — and you type the word, or say it aloud and grade
+  yourself; then you hear it. Every form that expresses the concept in that
+  language counts as right; a missing accent, ł/ß or article is *almost*.
+  Words come back after 0, 1, 3, 7 and 21 days as you get them right (back to
+  the start when wrong), with at most 15 new ones a day; choose the languages
+  on the page. The answers go to `_kustos.drill.<machine>.jsonl`, never into a
+  record, so practising changes nothing in the base.
+  A concept and its forms in every language go in with one line of the bulk
+  entry (`Ctrl+Q`, kind *concept*):
+
+  ```
+  água | o líquido que se bebe: woda (pol); das Wasser (deu); l'acqua (ita)
+  ```
+
+  It reuses a concept or form already there and only adds the missing links.
+  **Voices**: the page speaks with your device's own offline voices; for
+  better ones, [Piper](https://github.com/OHF-Voice/piper1-gpl) makes a
+  recording of every word on the machine that runs Kustos, and the page —
+  the phone's too — plays those instead:
+
+  ```
+  python -m pip install piper-tts
+  python _kustos.py voices              which languages have a voice, and how many words have sound
+  python _kustos.py voices get ita      a voice for Italian (tens of MB, once), then every word's sound
+  python _kustos.py voices list ita     the other Italian voices (listen at rhasspy.github.io/piper-samples)
+  ```
+
+  New words get their sound by themselves when a practice starts. Voices and
+  recordings live in `%LOCALAPPDATA%\Kustos`, outside the synced folder and
+  the backup: they can always be downloaded and made again. Latin is read
+  with an Italian voice and ancient Greek with a modern Greek one.
 - **Peritia, the skills panel** (`_kustos_peritia.cmd`, **View › Skills (Peritia)**,
   or `python _kustos.py peritia`): the *Skills* page of the web version below,
   served by the same server with the same protections — `/skills` beside the

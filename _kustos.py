@@ -58,6 +58,8 @@ USAGE
     python _kustos.py backup [setup | run | status | test | remove]
                                       Windows: an encrypted backup every day, with
                                       restic (_kustos_backup.cmd)
+    python _kustos.py voices [list LANG | get LANG [VOICE] | make [LANG] | remove LANG]
+                                      Piper's voices for Practice (pip install piper-tts)
     python _kustos.py doctor          check the structure, change nothing
     python _kustos.py real-dates [apply [order]]
                                       log entries whose text starts with a date:
@@ -194,6 +196,10 @@ def _host():
 HOST = _host()
 LOG_FILE = BASE / f"{STEM}.log.{HOST}.jsonl"
 LOCK_FILE = BASE / f"{STEM}.lock.{HOST}.json"
+# this machine's own folder, outside the synced one and git: the drafts' cache,
+# the web app's login, the backup's sealed password, Piper's voices and sounds
+LOCAL_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".cache") / "Kustos"
+_BASE_KEY = hashlib.md5(str(BASE).encode("utf-8")).hexdigest()[:10]
 
 
 def TODAY():
@@ -1041,6 +1047,96 @@ def parse_bulk_forms(text, default_lang=""):
             out.append({"name": name, "lang": lang or heading or (default_lang or "").strip().lower(),
                         "gloss": gloss, "line": n})
     return out
+
+
+# ---- concepts with their forms, in one line each (the bulk entry's concepts):
+#     água | o líquido que se bebe: woda (pol); das Wasser (deu); l'acqua (ita)
+# A line without "|" stays `name. gloss`.
+
+BULK_CONCEPT_RE = re.compile(r"^(?P<name>[^|]*\S)\s*\|\s*(?P<gloss>[^:]*?)\s*(?::\s*(?P<forms>.*))?$")
+BULK_FORM_RE = re.compile(r"^(?P<name>.*\S)\s*\((?P<lang>[A-Za-z]{2,3})\)$")
+
+
+def parse_bulk_concepts(text):
+    """([{name, gloss, forms: [(name, lang)], line}], numbers of the lines not
+    understood) -- a line with "|" may bring forms, one without is `name. gloss`."""
+    out, bad = [], []
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if line[:2] in ("- ", "* "):
+            line = line[2:].strip()
+        if not line or line.startswith("#"):
+            continue
+        if "|" not in line:
+            name, _sep, gloss = line.partition(". ")
+            out.append({"name": name.strip(), "gloss": gloss.strip(), "forms": [], "line": n})
+            continue
+        m = BULK_CONCEPT_RE.match(line)
+        forms = []
+        for part in ((m["forms"] or "") if m else "").split(";"):
+            fm = BULK_FORM_RE.match(part.strip()) if part.strip() else None
+            if part.strip() and not fm:
+                forms = None
+                break
+            if fm:
+                forms.append((fm["name"].strip(), fm["lang"].lower()))
+        if not m or forms is None:
+            bad.append(n)
+            continue
+        out.append({"name": m["name"].strip(), "gloss": m["gloss"].strip(), "forms": forms, "line": n})
+    return out, bad
+
+
+def save_bulk_concepts(plan, source=""):
+    """Saves the concepts and forms of parse_bulk_concepts, each through
+    save_record (a new form with its `expresses` link); one already in the base
+    -- same name, a form also the same language -- is reused unchanged, and a
+    form there without the link gets it (write_link, a save of that form).
+    {concepts, forms, links, reused}."""
+    data = load_json()
+    key = lambda x: unicodedata.normalize("NFC", x or "").casefold().strip()
+    concepts = {key(e.get("name")): e for e in data["entries"] if e.get("kind", "concept") == "concept"}
+    forms = {(key(e.get("name")), (e.get("lang") or "").lower()): e
+             for e in data["entries"] if e.get("kind") == "form"}
+    links = {(a["from"], a["to"]) for a in data["edges"] if a.get("rel") == "expresses"}
+    taken = set(by_id(data)) | {d.get("id") for d in data.get("deleted", [])}
+    done = {"concepts": 0, "forms": 0, "links": 0, "reused": 0}
+    for c in plan:
+        if not c["name"]:
+            continue
+        rec = concepts.get(key(c["name"]))
+        if rec is None:
+            cid = new_id("concept", c["name"], taken)
+            taken.add(cid)
+            rec = fix_entry({"id": cid, "kind": "concept", "name": c["name"], "gloss": c["gloss"],
+                             "source": source})
+            touch(rec)
+            save_record("entries", rec)
+            concepts[key(c["name"])] = rec
+            done["concepts"] += 1
+        else:
+            done["reused"] += 1
+        for fname, lang in c["forms"]:
+            f = forms.get((key(fname), lang))
+            if f is None:
+                fid = new_id("form", fname, taken)
+                taken.add(fid)
+                f = fix_entry({"id": fid, "kind": "form", "name": fname, "gloss": "", "lang": lang,
+                               "source": source,
+                               "status": "reconstructed" if fname.startswith("*") else "attested"})
+                touch(f)
+                save_record("entries", f, edges=[{"from": fid, "rel": "expresses", "to": rec["id"],
+                                                  "when": "", "why": "", "source": source,
+                                                  "certainty": "established"}])
+                forms[(key(fname), lang)] = f
+                links.add((fid, rec["id"]))
+                done["forms"] += 1
+                done["links"] += 1
+            elif (f["id"], rec["id"]) not in links:
+                write_link(f["id"], rec["id"], "expresses", "", source)
+                links.add((f["id"], rec["id"]))
+                done["links"] += 1
+    return done
 
 
 def bulk_form_repeats(items, data):
@@ -6408,6 +6504,484 @@ if (location.hash === '#fundamentos') showView('fund');
 """
 
 
+# ================================================================ practice
+#
+# Practice (the web app's #practice): the verba drilled in their languages,
+# typed or said aloud. An item is a meaning in one language -- a concept, whose
+# forms in that language that `express` it are the answers, or, for forms
+# linked to no concept, a gloss, whose forms (same language, same gloss) are
+# the answers; reconstructed forms (*…) are not asked. Spaced in five boxes
+# (DRILL_BOXES: days until asked again): right moves up a box, almost (accents,
+# ł/ß, punctuation or an article missing) stays, wrong goes back to the first.
+# A day brings at most DRILL_NEW_PER_DAY new items. The answers go to
+# DRILL_LOG, one per machine, append-only, read all together -- never into a
+# record, so practising saves, logs and syncs nothing of the base.
+
+DRILL_BOXES = {1: 0, 2: 1, 3: 3, 4: 7, 5: 21}
+DRILL_NEW_PER_DAY = 15
+DRILL_SESSION = 20
+DRILL_LOG = BASE / f"{STEM}.drill.{HOST}.jsonl"
+DRILL_ARTICLES = frozenset(
+    "der die das den dem des ein eine einen einem einer "         # German
+    "il lo la i gli le l un uno una "                              # Italian
+    "les el los las "                                              # French, Spanish
+    "o a os as um uma "                                            # Portuguese
+    "the an".split())
+# a base's language code -> (name, speech tag for the browser, Piper locale);
+# Latin and ancient Greek are read with Italian and modern Greek voices
+DRILL_LANGS = {
+    "ita": ("Italian", "it-IT", "it_IT"), "deu": ("German", "de-DE", "de_DE"),
+    "fra": ("French", "fr-FR", "fr_FR"), "spa": ("Spanish", "es-ES", "es_ES"),
+    "por": ("Portuguese", "pt-BR", "pt_BR"), "eng": ("English", "en-US", "en_US"),
+    "pol": ("Polish", "pl-PL", "pl_PL"), "tur": ("Turkish", "tr-TR", "tr_TR"),
+    "nld": ("Dutch", "nl-NL", "nl_NL"), "rus": ("Russian", "ru-RU", "ru_RU"),
+    "ell": ("Greek", "el-GR", "el_GR"), "grc": ("Ancient Greek", "el-GR", "el_GR"),
+    "lat": ("Latin", "it-IT", "it_IT"), "cat": ("Catalan", "ca-ES", "ca_ES"),
+    "dan": ("Danish", "da-DK", "da_DK"), "fin": ("Finnish", "fi-FI", "fi_FI"),
+    "hun": ("Hungarian", "hu-HU", "hu_HU"), "ces": ("Czech", "cs-CZ", "cs_CZ"),
+    "ron": ("Romanian", "ro-RO", "ro_RO"), "swe": ("Swedish", "sv-SE", "sv_SE"),
+    "nor": ("Norwegian", "nb-NO", "no_NO"), "ukr": ("Ukrainian", "uk-UA", "uk_UA"),
+    "ara": ("Arabic", "ar-SA", "ar_JO"), "heb": ("Hebrew", "he-IL", "he_IL"),
+    "fas": ("Persian", "fa-IR", "fa_IR"), "hin": ("Hindi", "hi-IN", "hi_IN"),
+    "zho": ("Chinese", "zh-CN", "zh_CN"), "jpn": ("Japanese", "ja-JP", ""),
+    "kor": ("Korean", "ko-KR", ""), "vie": ("Vietnamese", "vi-VN", "vi_VN"),
+    "isl": ("Icelandic", "is-IS", "is_IS"), "slk": ("Slovak", "sk-SK", "sk_SK"),
+    "srp": ("Serbian", "sr-RS", "sr_RS"), "slv": ("Slovenian", "sl-SI", "sl_SI"),
+}
+LANG_ALIASES = {"it": "ita", "de": "deu", "ger": "deu", "fr": "fra", "fre": "fra", "es": "spa",
+                "pt": "por", "en": "eng", "pl": "pol", "tr": "tur", "nl": "nld", "dut": "nld",
+                "ru": "rus", "el": "ell", "gre": "ell", "la": "lat", "ca": "cat", "da": "dan",
+                "fi": "fin", "hu": "hun", "cs": "ces", "cze": "ces", "ro": "ron", "rum": "ron",
+                "sv": "swe", "no": "nor", "nb": "nor", "nob": "nor", "uk": "ukr", "ar": "ara",
+                "he": "heb", "fa": "fas", "per": "fas", "hi": "hin", "zh": "zho", "chi": "zho",
+                "ja": "jpn", "ko": "kor", "vi": "vie", "is": "isl", "ice": "isl", "sk": "slk",
+                "slo": "slk", "sr": "srp", "sl": "slv"}
+
+
+def lang_info(code):
+    """(name, speech tag, Piper locale) of a base's language code; the code
+    itself and nothing else when it is not known."""
+    code = (code or "").strip().lower()
+    got = DRILL_LANGS.get(LANG_ALIASES.get(code, code))
+    return (tr(got[0]), got[1], got[2]) if got else (code, "", "")
+
+
+def _drill_norm(text):
+    text = unicodedata.normalize("NFC", str(text or "")).casefold().replace("’", "'")
+    return " ".join(text.split()).strip(" .!?¿¡,;:")
+
+
+def _drill_bare(text):
+    """Only the letters: no accents, ł or ß, punctuation."""
+    text = _drill_norm(text).replace("ł", "l").replace("ß", "ss")
+    text = "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
+    return " ".join(re.sub(r"[^\w ]", " ", text).split())
+
+
+def _drill_unarticled(text):
+    """Without a leading article: "das Wasser" -> "Wasser", "l'acqua" -> "acqua"."""
+    words = _drill_norm(text).split()
+    if len(words) > 1 and words[0] in DRILL_ARTICLES:
+        words = words[1:]
+    if words and "'" in words[0]:
+        head, _, tail = words[0].partition("'")
+        if head in DRILL_ARTICLES and tail:
+            words[0] = tail
+    return " ".join(words)
+
+
+def drill_grade(answer, names):
+    """right | almost (accents, ł/ß, punctuation or an article missing) | wrong."""
+    a = _drill_norm(answer)
+    if not a:
+        return "wrong"
+    names = [n for n in names if n]
+    if any(a == _drill_norm(n) for n in names):
+        return "right"
+    loose = {_drill_bare(a), _drill_bare(_drill_unarticled(a))}
+    if any(_drill_bare(n) in loose or _drill_bare(_drill_unarticled(n)) in loose for n in names):
+        return "almost"
+    return "wrong"
+
+
+def drill_items(data):
+    """({key: item}, forms that cannot be asked). An item: {key, lang, prompt,
+    gloss, forms: [(id, name, roman)], n} -- `n` the register number it came in
+    with, for the order new items are met."""
+    entries = {e["id"]: e for e in data.get("entries", []) if not e["id"].startswith("__")}
+    expresses = {}
+    for a in data.get("edges", []):
+        f, c = entries.get(a.get("from")), entries.get(a.get("to"))
+        if a.get("rel") == "expresses" and f and c and f.get("kind") == "form" \
+                and c.get("kind", "concept") == "concept":
+            expresses.setdefault(f["id"], []).append(c["id"])
+    items, cannot = {}, []
+    for f in entries.values():
+        if f.get("kind") != "form":
+            continue
+        lang, name = (f.get("lang") or "").strip().lower(), (f.get("name") or "").strip()
+        if not lang or not name or name.startswith("*"):
+            continue
+        n = f.get("reg_n") or 10 ** 9
+        form = (f["id"], name, (f.get("roman") or "").strip())
+        targets = expresses.get(f["id"])
+        if targets:
+            for cid in targets:
+                c = entries[cid]
+                it = items.setdefault(f"c:{cid}:{lang}", {
+                    "key": f"c:{cid}:{lang}", "lang": lang, "prompt": c.get("name", ""),
+                    "gloss": c.get("gloss", ""), "forms": [], "n": n})
+                it["forms"].append(form)
+                it["n"] = min(it["n"], n)
+            continue
+        gloss = " ".join((f.get("gloss") or "").split())
+        if not gloss:
+            cannot.append(f["id"])
+            continue
+        key = f"g:{lang}:" + hashlib.sha1(_drill_norm(gloss).encode("utf-8")).hexdigest()[:12]
+        it = items.setdefault(key, {"key": key, "lang": lang, "prompt": gloss, "gloss": "",
+                                    "forms": [], "n": n})
+        it["forms"].append(form)
+        it["n"] = min(it["n"], n)
+    return items, cannot
+
+
+def drill_rows():
+    """Every machine's answers, oldest first (a torn line, mid-sync, is skipped)."""
+    rows = []
+    for path in BASE.glob(f"{STEM}.drill.*.jsonl"):
+        if ".sync-conflict-" in path.name:
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(r, dict) and isinstance(r.get("key"), str) and r.get("box") in DRILL_BOXES \
+                    and isinstance(r.get("t"), str):
+                rows.append(r)
+    rows.sort(key=lambda r: r["t"])
+    return rows
+
+
+def drill_state(rows):
+    """(the last answer per item, the day each item was first met)."""
+    last, first = {}, {}
+    for r in rows:
+        last[r["key"]] = r
+        first.setdefault(r["key"], r["t"][:10])
+    return last, first
+
+
+def drill_due(rec, today):
+    try:
+        met = date.fromisoformat(rec["t"][:10])
+    except ValueError:
+        return True
+    return met + timedelta(days=DRILL_BOXES[rec["box"]]) <= today
+
+
+# ---- Piper's voices: one per language, chosen with `python _kustos.py voices
+# get LANG` (VOICE_CONF), kept with the words' sound files in this machine's
+# own folder (VOICE_DIR, AUDIO_DIR) -- downloaded again or remade at will, so
+# neither Syncthing nor the backup carries them. A sound file is named by the
+# form's id and a digest of voice and text: a changed word or voice makes a
+# new one, and `voices make` removes the old.
+
+VOICE_DIR = LOCAL_DIR / "voices"
+VOICE_CONF = LOCAL_DIR / f"voices-{_BASE_KEY}.json"
+AUDIO_DIR = LOCAL_DIR / f"audio-{_BASE_KEY}"
+VOICE_RE = re.compile(r"^[a-z]{2,3}_[A-Z]{2}-[A-Za-z0-9_]+-(x_low|low|medium|high)$")
+PIPER_PICK = {   # a voice to start with, per Piper locale (`voices list LANG` shows the others)
+    "it_IT": "it_IT-paola-medium", "de_DE": "de_DE-thorsten-medium", "fr_FR": "fr_FR-siwis-medium",
+    "es_ES": "es_ES-davefx-medium", "pt_BR": "pt_BR-faber-medium", "en_US": "en_US-lessac-medium",
+    "pl_PL": "pl_PL-gosia-medium", "tr_TR": "tr_TR-dfki-medium", "ru_RU": "ru_RU-irina-medium",
+    "el_GR": "el_GR-rapunzelina-low", "ca_ES": "ca_ES-upc_ona-medium",
+    "da_DK": "da_DK-talesyntese-medium", "fi_FI": "fi_FI-harri-medium", "hu_HU": "hu_HU-anna-medium",
+    "cs_CZ": "cs_CZ-jirka-medium", "ro_RO": "ro_RO-mihai-medium", "sv_SE": "sv_SE-nst-medium",
+    "no_NO": "no_NO-talesyntese-medium", "uk_UA": "uk_UA-ukrainian_tts-medium",
+    "ar_JO": "ar_JO-kareem-medium", "zh_CN": "zh_CN-huayan-medium", "vi_VN": "vi_VN-vais1000-medium",
+    "is_IS": "is_IS-bui-medium", "sk_SK": "sk_SK-lili-medium", "sl_SI": "sl_SI-artur-medium",
+    "sr_RS": "sr_RS-serbski_institut-medium"}
+_VOICE_MAKING = {"at": 0.0}     # the server starts `voices make` at most every few minutes
+
+
+def voice_conf():
+    """{language code: Piper voice} chosen on this machine."""
+    got = _read_json(VOICE_CONF) or {}
+    return {k: v for k, v in got.items() if isinstance(v, str) and VOICE_RE.match(v)}
+
+
+def voice_for(lang, conf=None):
+    """The Piper voice of a language, if chosen and on this machine."""
+    v = (voice_conf() if conf is None else conf).get((lang or "").lower())
+    return v if v and (VOICE_DIR / f"{v}.onnx").exists() else None
+
+
+def audio_path(form_id, voice, text):
+    digest = hashlib.sha1(f"{voice}\n{text}".encode("utf-8")).hexdigest()[:10]
+    return AUDIO_DIR / f"{re.sub(r'[^A-Za-z0-9_-]', '_', form_id)}.{digest}.wav"
+
+
+def piper_ready():
+    import importlib.util
+    try:
+        return importlib.util.find_spec("piper") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def drill_public(it, last, conf=None):
+    """An item as the page gets it; an answer has `audio` when Piper made its sound."""
+    name, speech, _piper = lang_info(it["lang"])
+    rec = last.get(it["key"])
+    conf = voice_conf() if conf is None else conf
+    voice = voice_for(it["lang"], conf)
+    return {"key": it["key"], "lang": it["lang"], "lang_name": name, "speech": speech,
+            "prompt": it["prompt"], "gloss": it["gloss"],
+            "answers": [{"id": fid, "name": nm, "roman": ro,
+                         "audio": bool(voice and audio_path(fid, voice, nm).exists())}
+                        for fid, nm, ro in it["forms"]],
+            "box": rec["box"] if rec else 0, "new": rec is None}
+
+
+def drill_audio_file(data, form_id):
+    """The sound file of a form, if Piper made it, or None."""
+    f = next((e for e in data.get("entries", []) if e.get("id") == form_id
+              and e.get("kind") == "form"), None)
+    voice = voice_for(f.get("lang")) if f else None
+    path = audio_path(f["id"], voice, (f.get("name") or "").strip()) if voice else None
+    return path if path and path.exists() else None
+
+
+def voice_jobs(data, langs=None):
+    """{sound file: (voice, text)} every form to practise should have."""
+    conf, out = voice_conf(), {}
+    items, _cannot = drill_items(data)
+    for it in items.values():
+        if langs and it["lang"] not in langs:
+            continue
+        voice = voice_for(it["lang"], conf)
+        if voice:
+            for fid, name, _ro in it["forms"]:
+                out[audio_path(fid, voice, name)] = (voice, name)
+    return out
+
+
+def voices_make(data, langs=None, say=print):
+    """Makes the missing sound files with Piper -- each voice loaded once --
+    and removes the ones no word needs any more. (made, removed)."""
+    import wave
+    want = voice_jobs(data, langs)
+    missing = [p for p in want if not p.exists()]
+    made = 0
+    if missing:
+        from piper import PiperVoice           # only here: Kustos itself needs no Piper
+        AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+        loaded = {}
+        for path in missing:
+            voice, text = want[path]
+            if voice not in loaded:
+                loaded[voice] = PiperVoice.load(str(VOICE_DIR / f"{voice}.onnx"))
+            tmp = path.with_suffix(".tmp")
+            with wave.open(str(tmp), "wb") as w:
+                loaded[voice].synthesize_wav(text, w)
+            tmp.replace(path)
+            made += 1
+            say(f"  {made}/{len(missing)}  {text}")
+    removed = 0
+    if not langs and AUDIO_DIR.exists():
+        for old in AUDIO_DIR.glob("*.wav"):
+            if old not in want:
+                old.unlink(missing_ok=True)
+                removed += 1
+    return made, removed
+
+
+def voices_soon(data, langs):
+    """The server, when a practice starts: if Piper and a voice are here and
+    words lack their sound, `voices make` runs in a process of its own, in the
+    background (at most every five minutes); the page meanwhile uses the
+    device's voice."""
+    if time.time() - _VOICE_MAKING["at"] < 300 or not piper_ready():
+        return
+    if not any(not p.exists() for p in voice_jobs(data, langs)):
+        return
+    _VOICE_MAKING["at"] = time.time()
+    import subprocess
+    exe = Path(sys.executable)
+    quiet = exe.with_name("pythonw.exe")
+    exe = quiet if sys.platform == "win32" and quiet.exists() else exe
+    try:
+        subprocess.Popen([str(exe), str(BASE / "_kustos.py"), "voices", "make", "--quiet"],
+                         cwd=str(BASE), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         **_quiet_flags())
+    except OSError:
+        pass
+
+
+def cmd_voices(rest=()):
+    """Piper's voices for Practice: status, list LANG, get LANG [VOICE], make
+    [LANG], remove LANG."""
+    import subprocess
+    rest = list(rest)
+    quiet = "--quiet" in rest
+    rest = [a for a in rest if a != "--quiet"]
+    what = rest[0] if rest else "status"
+    data = load_json()
+    items, _cannot = drill_items(data)
+    langs = sorted({it["lang"] for it in items.values()})
+
+    def piper_or_exit():
+        if not piper_ready():
+            raise SystemExit(tr("Piper is not installed for this Python: {py} -m pip install piper-tts",
+                                py=Path(sys.executable).name))
+
+    def lang_arg():
+        if len(rest) < 2:
+            raise SystemExit(tr("Which language? One of: {langs}", langs=", ".join(langs) or "-"))
+        return rest[1].strip().lower()
+
+    if what == "status":
+        conf = voice_conf()
+        print(tr("Piper: {yes}.", yes=tr("installed") if piper_ready() else
+                 tr("not installed ({py} -m pip install piper-tts)", py=Path(sys.executable).name)))
+        for lang in langs:
+            name, _speech, loc = lang_info(lang)
+            voice = voice_for(lang, conf)
+            want = [p for p, (v, _t) in voice_jobs(data, [lang]).items()]
+            have = sum(1 for p in want if p.exists())
+            n = sum(1 for it in items.values() if it["lang"] == lang)
+            print(f"  {lang:4} {name:16} " + (
+                tr("{voice}: {have} of {n} words with sound", voice=voice, have=have, n=len(want)) if voice
+                else tr("no voice ({n} word(s)) -- python _kustos.py voices get {lang}", n=n, lang=lang)
+                if loc else tr("Piper has no voice for it")))
+        return 0
+    if what == "list":
+        piper_or_exit()
+        lang = lang_arg()
+        loc = lang_info(lang)[2]
+        if not loc:
+            raise SystemExit(tr("Piper has no voice for {lang}.", lang=lang))
+        r = subprocess.run([sys.executable, "-m", "piper.download_voices"], capture_output=True,
+                           text=True, timeout=120)
+        found = [l.strip() for l in r.stdout.splitlines() if l.strip().startswith(loc + "-")]
+        if not found:
+            raise SystemExit(tr("No list from Piper (is this computer online?): {why}",
+                                why=_first_line(r.stderr)))
+        print("\n".join("  " + v for v in found))
+        print(tr("Listen to them at https://rhasspy.github.io/piper-samples, then: "
+                 "python _kustos.py voices get {lang} <voice>", lang=lang))
+        return 0
+    if what == "get":
+        piper_or_exit()
+        lang = lang_arg()
+        loc = lang_info(lang)[2]
+        voice = rest[2] if len(rest) > 2 else PIPER_PICK.get(loc, "")
+        if not voice:
+            raise SystemExit(tr("No voice to start with for {lang}: python _kustos.py voices list {lang}",
+                                lang=lang))
+        if not VOICE_RE.match(voice):
+            raise SystemExit(tr("Not a Piper voice name: {voice}", voice=voice))
+        VOICE_DIR.mkdir(parents=True, exist_ok=True)
+        print(tr("Downloading {voice} (tens of MB, once)...", voice=voice), flush=True)
+        r = subprocess.run([sys.executable, "-m", "piper.download_voices", voice, "--data-dir",
+                            str(VOICE_DIR)], capture_output=True, text=True, timeout=1800)
+        if r.returncode != 0 or not (VOICE_DIR / f"{voice}.onnx").exists():
+            raise SystemExit(tr("The voice did not download: {why}",
+                                why=_first_line(r.stderr or r.stdout)))
+        conf = voice_conf()
+        conf[lang] = voice
+        _write_json_local(VOICE_CONF, conf)
+        print(tr("{lang} speaks with {voice}. Making its words' sound:", lang=lang, voice=voice))
+        made, _removed = voices_make(data, [lang])
+        print(tr("{n} made.", n=made))
+        return 0
+    if what == "make":
+        piper_or_exit()
+        only = [rest[1].strip().lower()] if len(rest) > 1 else None
+        made, removed = voices_make(data, only, say=(lambda *_a: None) if quiet else print)
+        if not quiet:
+            print(tr("{made} made, {removed} no longer needed removed.", made=made, removed=removed))
+        return 0
+    if what == "remove":
+        lang = lang_arg()
+        conf = voice_conf()
+        conf.pop(lang, None)
+        _write_json_local(VOICE_CONF, conf)
+        print(tr("{lang} no longer uses Piper; the device's voice speaks it.", lang=lang))
+        return 0
+    raise SystemExit(tr("voices: status, list LANG, get LANG [VOICE], make [LANG] or remove LANG."))
+
+
+def drill_overview(data, today=None):
+    """What there is to practise, per language, and how far it has come."""
+    today = today or date.today()
+    items, cannot = drill_items(data)
+    last, first = drill_state(drill_rows())
+    langs = {}
+    for it in items.values():
+        L = langs.setdefault(it["lang"], {"code": it["lang"], "items": 0, "new": 0, "due": 0,
+                                          "boxes": [0] * 5})
+        L["items"] += 1
+        rec = last.get(it["key"])
+        if rec is None:
+            L["new"] += 1
+        else:
+            L["boxes"][rec["box"] - 1] += 1
+            L["due"] += drill_due(rec, today)
+    out = []
+    for code, L in sorted(langs.items(), key=lambda kv: -kv[1]["items"]):
+        name, speech, _piper = lang_info(code)
+        out.append(dict(L, name=name, speech=speech))
+    new_today = sum(1 for d in first.values() if d == today.isoformat())
+    return {"langs": out, "cannot": len(cannot), "new_left": max(0, DRILL_NEW_PER_DAY - new_today),
+            "answered_today": sum(1 for r in drill_rows() if r["t"][:10] == today.isoformat())}
+
+
+def drill_session(data, langs=None, size=DRILL_SESSION, today=None):
+    """The items to practise now, in the chosen languages: those due (the
+    lowest boxes first), then new ones in the order they came in, within the
+    day's allowance; shuffled, so a language or a box does not come in a block."""
+    today = today or date.today()
+    items, _cannot = drill_items(data)
+    last, first = drill_state(drill_rows())
+    pool = [it for it in items.values() if not langs or it["lang"] in langs]
+    due = sorted((it for it in pool if it["key"] in last and drill_due(last[it["key"]], today)),
+                 key=lambda it: (last[it["key"]]["box"], last[it["key"]]["t"]))
+    fresh = sorted((it for it in pool if it["key"] not in last), key=lambda it: (it["n"], it["key"]))
+    room = max(0, DRILL_NEW_PER_DAY - sum(1 for d in first.values() if d == today.isoformat()))
+    take = due[:size]
+    take += fresh[:max(0, min(room, size - len(take)))]
+    random.shuffle(take)
+    conf = voice_conf()
+    return [drill_public(it, last, conf) for it in take]
+
+
+def drill_answer(data, key, answer=None, grade=None):
+    """One answer: graded (typed) or as the person graded it (said aloud),
+    written to this machine's log; the item's new box and when it comes back."""
+    items, _cannot = drill_items(data)
+    it = items.get(str(key or ""))
+    if it is None:
+        raise ValueError(tr("This word is no longer in the base, or changed."))
+    names = [nm for _fid, nm, _ro in it["forms"]] + [ro for _fid, _nm, ro in it["forms"] if ro]
+    result = grade if grade in ("right", "almost", "wrong") else drill_grade(answer, names)
+    last, _first = drill_state(drill_rows())
+    box = last[it["key"]]["box"] if it["key"] in last else 1
+    box = {"right": min(box + 1, 5), "almost": box, "wrong": 1}[result]
+    line = {"t": NOW(), "host": HOST, "key": it["key"], "lang": it["lang"], "result": result,
+            "box": box}
+    with DRILL_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(line, ensure_ascii=False) + "\n")
+    return {"result": result, "box": box, "days": DRILL_BOXES[box],
+            "answers": drill_public(it, {})["answers"]}
+
+
 # ================================================================ web
 #
 # The web version: the whole base in a browser page, laid out for a phone as
@@ -6459,6 +7033,13 @@ WEB_STRINGS = (
     "settled at generation {n}: {k} stay lit", "died out at generation {n}", "Reseed to start again",
     "Links", "Link", "New link", "Change link", "Type", "Reason", "Source", "Span", "Swap direction",
     "Circle", "Skills", "Log out",
+    "Practice", "Nothing to practise yet: forms with a language and a gloss, or linked to a concept, are what is asked.",
+    "{n} word(s)", "{n} due", "{n} new", "boxes 1 to 5", "{n} answered today; up to {m} new words left today.",
+    "How", "Type the word", "Say it aloud", "{n} form(s) cannot be asked: no gloss and no concept.", "Start",
+    "Choose a language.", "Nothing is due now. Come back tomorrow, or add words.", "Listen", "new", "box {n}",
+    "in {lang}", "I do not know", "Check", "Say it aloud in {lang}, then show the answer.", "Show", "Right",
+    "Almost", "Not this time", "Back in {n} day(s).", "Back today.", "Next", "Wrong", "Done",
+    "{right} right, {almost} almost, {wrong} to see again.", "Languages",
     "Another link between them", "no reason or source", "written {date}", "atypical type",
     "Link saved.", "Link deleted.", "Delete this link?", "Draw a link",
     "Drag from one record to another to link them.", "Key", "Search the links",
@@ -7249,6 +7830,15 @@ def web_api(method, path, query, body):
         if method == "GET" and path == "/api/path":
             got = web_path(load_json(), arg("a"), arg("b"))
             return (200, got) if got else (404, {"error": tr("This record no longer exists.")})
+        if method == "GET" and path == "/api/drill":
+            return 200, drill_overview(load_json())
+        if method == "GET" and path == "/api/drill/session":
+            langs = [x for x in arg("langs").split(",") if x] or None
+            data = load_json()
+            voices_soon(data, langs)
+            return 200, {"items": drill_session(data, langs)}
+        if method == "POST" and path == "/api/drill/answer":
+            return 200, drill_answer(load_json(), body.get("key"), body.get("answer"), body.get("grade"))
         if method == "GET" and path == "/api/graph":
             try:
                 depth = int(arg("depth", "2"))
@@ -7296,8 +7886,6 @@ def web_api(method, path, query, body):
 # logins within LOGIN_WINDOW lock the login for LOCKOUT, doubling each time;
 # every login, failure and lockout goes to ACCESS_LOG, also of this machine.
 
-LOCAL_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".cache") / "Kustos"
-_BASE_KEY = hashlib.md5(str(BASE).encode("utf-8")).hexdigest()[:10]
 AUTH_FILE = LOCAL_DIR / f"web-auth-{_BASE_KEY}.json"
 ACCESS_LOG = LOCAL_DIR / f"web-access-{_BASE_KEY}.jsonl"
 SERVE_PORT = 8484
@@ -8190,7 +8778,8 @@ def cmd_web(rest=()):
                 except ValueError:
                     raise SystemExit(tr("--port needs a number"))
             elif a == "--page":
-                first_page = "skills" if rest[i + 1].strip().lower() == "skills" else ""
+                first_page = {"skills": "skills", "practice": "#practice"}.get(
+                    rest[i + 1].strip().lower(), "")
             else:
                 extra_hosts.add(rest[i + 1].strip().lower())
     stay = "--stay" in rest
@@ -8258,8 +8847,8 @@ def cmd_web(rest=()):
 
         def answer(self, code, body, ctype="application/json; charset=utf-8", csp=None,
                    cookie=None, location=None):
-            raw = (body if isinstance(body, str)
-                   else json.dumps(body, ensure_ascii=False)).encode("utf-8")
+            raw = body if isinstance(body, bytes) else (
+                body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(raw)))
@@ -8284,7 +8873,7 @@ def cmd_web(rest=()):
 
         def page_csp(self, nonce):
             return (f"default-src 'none'; script-src 'nonce-{nonce}'; "
-                    "style-src 'unsafe-inline'; img-src 'self' data:; "
+                    "style-src 'unsafe-inline'; img-src 'self' data:; media-src blob: data:; "
                     "connect-src 'self'; base-uri 'none'; form-action 'none'; "
                     "frame-ancestors 'none'")
 
@@ -8437,6 +9026,12 @@ def cmd_web(rest=()):
                 body = self.read_json()
                 if body is None:
                     return None
+            if method == "GET" and url.path == "/api/drill/audio":      # Piper's sound of a word
+                with guard:
+                    path = drill_audio_file(load_json(), (parse_qs(url.query).get("form") or [""])[0])
+                if path is None:
+                    return self.answer(404, {"error": tr("No sound for this word yet.")})
+                return self.answer(200, path.read_bytes(), "audio/wav")
             if serve and method == "POST" and url.path == "/api/logout":
                 sessions.pop(self.cookie_sid(), None)
                 access_log("logout", **self.who())
@@ -8652,6 +9247,20 @@ textarea.prose { font: 17px/1.55 var(--serif); min-height: 10em; }
 .changed { box-shadow: inset 3px 0 0 var(--accent); padding-left: 12px; }
 .foot { margin-top: 28px; font: 12px var(--mono); color: var(--faint); }
 .empty { padding: 48px 16px; color: var(--faint); text-align: center; }
+.seg { display: flex; flex-wrap: wrap; gap: 8px; }
+.small { font-size: 13px; }
+.dlist { list-style: none; padding: 0; margin: 18px 0 0; }
+.drow { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; padding: 10px 0; border-bottom: 1px solid var(--rule); }
+.drow span:not(.boxes) { grid-column: 1; font-size: 14px; color: var(--soft); }
+.boxes { grid-column: 2; grid-row: 1 / 3; display: flex; align-items: flex-end; gap: 3px; height: 30px; }
+.boxes i { width: 8px; height: max(2px, var(--h)); background: var(--accent); opacity: .35; border-radius: 2px; }
+.boxes i[data-b="4"], .boxes i[data-b="5"] { opacity: .8; }
+#drin { font-size: 22px; width: 100%; margin: 6px 0 12px; }
+.dans { list-style: none; padding: 0; margin: 8px 0; }
+.dans li { font: 24px/1.5 var(--serif); }
+.dans .r { font: 15px var(--mono); color: var(--soft); }
+.dverdict { font-weight: 700; font-size: 18px; margin: 0 0 4px; }
+.dverdict.right { color: var(--accent); } .dverdict.almost { color: var(--soft); } .dverdict.wrong { color: var(--warn); }
 .sheet { position: fixed; inset: 0; z-index: 10; background: rgba(0, 0, 0, .35); display: grid; align-items: end; }
 .panel { background: var(--paper); border-radius: 16px 16px 0 0; padding: 16px;
   padding-bottom: max(16px, env(safe-area-inset-bottom)); max-width: 560px; width: 100%; margin: 0 auto; }
@@ -8829,6 +9438,7 @@ function route() {
   if (h.startsWith("g/")) return showGraph(h.slice(2));
   stopGraph();
   if (h === "links") return showLinks();
+  if (h === "practice") return showPractice();
   if (h.startsWith("r/")) return showRecord(h.slice(2));
   if (h.startsWith("new/")) { const p = h.split("/"); return startNew(p[1], p[2]); }
   closeRecord();
@@ -9156,7 +9766,8 @@ function newSheet() {
       `<span class="dot c-${c}"></span>${esc(BOOT.kinds[k])}</button>`).join("") + `</div>`);
 }
 function menuSheet() {
-  openSheet(`<div class="grid"><button class="btn" data-act="graph0">${esc(T("Link graph"))}</button>` +
+  openSheet(`<div class="grid"><button class="btn" data-act="practice">${esc(T("Practice"))}</button>` +
+    `<button class="btn" data-act="graph0">${esc(T("Link graph"))}</button>` +
     `<button class="btn" data-act="links">${esc(T("Links"))}</button>` +
     `<a class="btn" href="health" target="_blank" rel="noopener">${esc(T("Health report"))}</a>` +
     `<a class="btn" href="corpus" target="_blank" rel="noopener">${esc(T("Body map"))}</a>` +
@@ -10030,6 +10641,183 @@ function showLinks() {
 }
 let linksJob = null;
 
+/* ---------------------------------------------------------------- practice
+   The verba drilled in their languages (# ==== practice on the server): a
+   meaning is shown, the word is typed -- or said aloud, then shown and graded
+   by whoever said it. The server keeps the boxes and the answers; this page
+   only asks and says. Pronunciation: the device's own voices that work
+   offline (never one that sends the text out). */
+const D = {langs: null, mode: "write", items: [], i: 0, done: [], shown: false, over: null};
+function drillLangsSaved() {
+  try { return JSON.parse(localStorage.getItem("kustos.drill.langs") || "null"); } catch (e) { return null; }
+}
+function drillVoice(tag) {
+  if (!tag || !window.speechSynthesis) return null;
+  const all = speechSynthesis.getVoices().filter(v => v.localService);
+  const t = tag.toLowerCase(), base = t.split("-")[0];
+  return all.find(v => v.lang.replace("_", "-").toLowerCase() === t)
+      || all.find(v => v.lang.replace("_", "-").toLowerCase().split("-")[0] === base) || null;
+}
+if (window.speechSynthesis) speechSynthesis.onvoiceschanged = () => { if (here === "#practice" && D.shown) drillRender(); };
+const SILENT = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
+function drillUnlock() {
+  // phones play sound only from a tap: one silent sound and one empty phrase,
+  // at Start, let the later ones play when an answer is shown
+  if (!D.player) D.player = new Audio();
+  D.player.src = SILENT;
+  D.player.play().catch(() => {});
+  if (window.speechSynthesis) { try { speechSynthesis.speak(new SpeechSynthesisUtterance("")); } catch (e) { /* none */ } }
+}
+async function drillAudio(id) {
+  // Piper's recording of a form, fetched once (the page's token goes with it)
+  D.audio = D.audio || {};
+  if (D.audio[id] !== undefined) return D.audio[id];
+  D.audio[id] = null;
+  try {
+    const r = await fetch("api/drill/audio?" + new URLSearchParams({form: id}), {headers: {"X-Kustos-Token": BOOT.token}});
+    if (r.ok) D.audio[id] = URL.createObjectURL(await r.blob());
+  } catch (e) { /* the device's voice then */ }
+  return D.audio[id];
+}
+function drillSay(text, tag, id, hasAudio) {
+  if (hasAudio && id) {
+    drillAudio(id).then(url => {
+      if (url) { if (!D.player) D.player = new Audio(); D.player.src = url; D.player.play().catch(() => drillSpeak(text, tag)); }
+      else drillSpeak(text, tag);
+    });
+    return true;
+  }
+  return drillSpeak(text, tag);
+}
+function drillSpeak(text, tag) {
+  const v = drillVoice(tag);
+  if (!v || !text) return false;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.voice = v; u.lang = v.lang; u.rate = 0.9;
+  speechSynthesis.speak(u);
+  return true;
+}
+async function showPractice() {
+  document.body.classList.add("open");
+  S.rec = null; S.edit = null; S.sel = null;
+  markSel();
+  document.title = T("Practice") + " · Kustos";
+  $("#rec").innerHTML = head() + `<div class="card" id="drill"><div class="empty">…</div></div>`;
+  window.scrollTo(0, 0);
+  try { D.over = await api("api/drill"); } catch (e) { $("#drill").innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
+  const codes = D.over.langs.map(l => l.code), saved = drillLangsSaved();
+  D.langs = (saved || codes).filter(c => codes.includes(c));
+  if (!D.langs.length) D.langs = codes.slice();
+  D.items = []; D.i = 0; D.done = []; D.shown = false;
+  drillHome();
+}
+function drillHome() {
+  const o = D.over;
+  if (!o.langs.length) {
+    $("#drill").innerHTML = `<h1 class="title">${esc(T("Practice"))}</h1><p class="sub">${esc(T("Nothing to practise yet: forms with a language and a gloss, or linked to a concept, are what is asked."))}</p>`;
+    return;
+  }
+  const chips = o.langs.map(l => `<button class="tab" data-act="dr-lang" data-code="${esc(l.code)}" aria-pressed="${D.langs.includes(l.code)}">` +
+    `${esc(l.name)}<span class="n">${l.due ? l.due + " · " : ""}${l.items}</span></button>`).join("");
+  const rows = o.langs.filter(l => D.langs.includes(l.code)).map(l => `<li class="drow"><b>${esc(l.name)}</b>` +
+    `<span>${esc(T("{n} word(s)", {n: l.items}))} · ${esc(T("{n} due", {n: l.due}))} · ${esc(T("{n} new", {n: l.new}))}</span>` +
+    `<span class="boxes" title="${esc(T("boxes 1 to 5"))}">${l.boxes.map((b, k) => `<i style="--h:${Math.min(100, b * 8)}%" data-b="${k + 1}"></i>`).join("")}</span></li>`).join("");
+  $("#drill").innerHTML = `<h1 class="title">${esc(T("Practice"))}</h1>` +
+    `<p class="sub">${esc(T("{n} answered today; up to {m} new words left today.", {n: o.answered_today, m: o.new_left}))}</p>` +
+    `<nav class="tabs">${chips}</nav>` +
+    `<div class="sec"><span class="lbl">${esc(T("How"))}</span><div class="seg">` +
+    `<button class="tab" data-act="dr-mode" data-m="write" aria-pressed="${D.mode === "write"}">${esc(T("Type the word"))}</button>` +
+    `<button class="tab" data-act="dr-mode" data-m="say" aria-pressed="${D.mode === "say"}">${esc(T("Say it aloud"))}</button></div></div>` +
+    `<ul class="dlist">${rows}</ul>` +
+    (o.cannot ? `<p class="sub small">${esc(T("{n} form(s) cannot be asked: no gloss and no concept.", {n: o.cannot}))}</p>` : "") +
+    `<div class="sec"><button class="btn primary" data-act="dr-start">${esc(T("Start"))}</button></div>`;
+}
+async function drillStart() {
+  if (!D.langs.length) { toast(T("Choose a language.")); return; }
+  try { D.items = (await api("api/drill/session?" + new URLSearchParams({langs: D.langs.join(",")}))).items; }
+  catch (e) { toast(e.message, 4000); return; }
+  D.i = 0; D.done = []; D.shown = false;
+  if (!D.items.length) {
+    $("#drill").innerHTML = `<h1 class="title">${esc(T("Practice"))}</h1><p class="sub">${esc(T("Nothing is due now. Come back tomorrow, or add words."))}</p>` +
+      `<div class="sec"><button class="btn" data-act="dr-home">${esc(T("Back"))}</button></div>`;
+    return;
+  }
+  drillRender();
+}
+function drillAnswersHtml(it) {
+  return `<ul class="dans">${it.answers.map(a => `<li><span class="w" lang="${esc(it.speech || it.lang)}">${esc(a.name)}</span>` +
+    (a.roman ? ` <span class="r">[${esc(a.roman)}]</span>` : "") +
+    (a.audio || drillVoice(it.speech) ? ` <button class="btn quiet" data-act="dr-say" data-id="${esc(a.id)}" data-text="${esc(a.name)}" data-audio="${a.audio ? 1 : ""}" aria-label="${esc(T("Listen"))}">&#128266;</button>` : "") +
+    `</li>`).join("")}</ul>`;
+}
+function drillRender() {
+  const it = D.items[D.i];
+  if (!it) return drillEnd();
+  const head = `<div class="kicker">${esc(it.lang_name)} · ${it.new ? esc(T("new")) : esc(T("box {n}", {n: it.box}))} · ${D.i + 1} / ${D.items.length}</div>` +
+    `<h1 class="title">${esc(it.prompt)}</h1>` + (it.gloss ? `<p class="sub">${esc(it.gloss)}</p>` : "");
+  let body;
+  if (!D.shown) {
+    body = D.mode === "write"
+      ? `<form id="drform" class="sec" autocomplete="off"><input id="drin" class="f" lang="${esc(it.speech || it.lang)}" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="go" placeholder="${esc(T("in {lang}", {lang: it.lang_name}))}">` +
+        `<div class="row2"><button class="btn quiet" type="button" data-act="dr-skip">${esc(T("I do not know"))}</button><button class="btn primary">${esc(T("Check"))}</button></div></form>`
+      : `<div class="sec"><p class="sub">${esc(T("Say it aloud in {lang}, then show the answer.", {lang: it.lang_name}))}</p>` +
+        `<button class="btn primary" data-act="dr-show">${esc(T("Show"))}</button></div>`;
+  } else {
+    const r = D.result;
+    const verdict = r ? `<p class="dverdict ${r.result}">${esc(T({right: "Right", almost: "Almost", wrong: "Not this time"}[r.result]))}` +
+      (r.answer && r.result !== "right" ? ` <span class="sub">— ${esc(r.answer)}</span>` : "") + `</p>` : "";
+    body = `<div class="sec">${verdict}${drillAnswersHtml(it)}</div>` +
+      (r ? `<p class="sub small">${esc(r.days ? T("Back in {n} day(s).", {n: r.days}) : T("Back today."))}</p>` +
+           `<div class="sec"><button class="btn primary" data-act="dr-next" id="drnext">${esc(T("Next"))}</button></div>`
+         : `<div class="sec seg"><button class="btn" data-act="dr-grade" data-g="wrong">${esc(T("Wrong"))}</button>` +
+           `<button class="btn" data-act="dr-grade" data-g="almost">${esc(T("Almost"))}</button>` +
+           `<button class="btn primary" data-act="dr-grade" data-g="right">${esc(T("Right"))}</button></div>`);
+  }
+  $("#drill").innerHTML = head + body;
+  const inp = $("#drin");
+  if (inp) inp.focus();
+  const nx = $("#drnext");
+  if (nx) nx.focus();
+}
+async function drillSend(payload) {
+  const it = D.items[D.i];
+  try { D.result = await api("api/drill/answer", Object.assign({key: it.key}, payload)); }
+  catch (e) { toast(e.message, 4000); return; }
+  D.result.answer = payload.answer || "";
+  D.done.push(D.result.result);
+  D.shown = true;
+  drillRender();
+  drillSay(it.answers[0].name, it.speech, it.answers[0].id, it.answers[0].audio);
+}
+function drillCheck() {
+  const inp = $("#drin");
+  drillSend({answer: inp ? inp.value : ""});
+}
+function drillEnd() {
+  const n = k => D.done.filter(x => x === k).length;
+  $("#drill").innerHTML = `<h1 class="title">${esc(T("Done"))}</h1>` +
+    `<p class="sub">${esc(T("{right} right, {almost} almost, {wrong} to see again.", {right: n("right"), almost: n("almost"), wrong: n("wrong")}))}</p>` +
+    `<div class="sec seg"><button class="btn" data-act="dr-home">${esc(T("Languages"))}</button>` +
+    `<button class="btn primary" data-act="dr-start">${esc(T("More"))}</button></div>`;
+}
+async function drillAct(act, b) {
+  if (act === "dr-lang") {
+    const c = b.dataset.code;
+    D.langs = D.langs.includes(c) ? D.langs.filter(x => x !== c) : D.langs.concat([c]);
+    try { localStorage.setItem("kustos.drill.langs", JSON.stringify(D.langs)); } catch (e) { /* private mode */ }
+    drillHome();
+  }
+  else if (act === "dr-mode") { D.mode = b.dataset.m; drillHome(); }
+  else if (act === "dr-start") { drillUnlock(); drillStart(); }
+  else if (act === "dr-home") { try { D.over = await api("api/drill"); } catch (e) { /* keep the last */ } drillHome(); }
+  else if (act === "dr-skip") drillSend({answer: ""});
+  else if (act === "dr-show") { const it = D.items[D.i]; D.shown = true; D.result = null; drillRender(); drillSay(it.answers[0].name, it.speech, it.answers[0].id, it.answers[0].audio); }
+  else if (act === "dr-grade") drillSend({grade: b.dataset.g});
+  else if (act === "dr-next") { D.i += 1; D.shown = false; D.result = null; drillRender(); }
+  else if (act === "dr-say") drillSay(b.dataset.text, D.items[D.i].speech, b.dataset.id, !!b.dataset.audio);
+}
+
 /* ---------------------------------------------------------------- the path finder
    How are two records related? The shortest chains of links from the middle
    to another record (link_paths): the graph shows only those, still, with a
@@ -10149,6 +10937,8 @@ document.addEventListener("click", e => {
   else if (act === "gpath-x") leavePath(true);
   else if (act === "gpath-steps") pathSteps();
   else if (act === "links") { closeSheet(); S.fromList = true; go("links"); }
+  else if (act === "practice") { closeSheet(); S.fromList = true; go("practice"); }
+  else if (act.startsWith("dr-")) drillAct(act, b);
   else if (act === "logout") { api("api/logout", {}).catch(() => {}).finally(() => { location.href = "login"; }); }
   else if (act === "lk-row") linkCard(b.dataset.a, b.dataset.b);
   else if (act === "lk-go") { closeSheet(); S.fromList = true; go("r/" + b.dataset.id); }
@@ -10166,6 +10956,7 @@ document.addEventListener("submit", e => {
   e.preventDefault();
   const form = e.target;
   if (form.dataset.quick) quickAdd(form.dataset.quick, form.elements.line.value);
+  else if (form.id === "drform") drillCheck();
   else if (form.id === "editor") save(false);
 });
 document.addEventListener("input", e => {
@@ -13966,6 +14757,7 @@ class App:
         v.add_command(label=tr("Monads"), accelerator="Ctrl+Shift+M",
                       command=self.open_monads)
         v.add_command(label=tr("Skills (Peritia)"), command=self.open_peritia)
+        v.add_command(label=tr("Practice languages (browser)"), command=self.open_practice)
         v.add_command(label=tr("Wide card"), accelerator="F11", command=self.toggle_wide)
         v.add_command(label=tr("Read field"), accelerator="Ctrl+E", command=self.open_reader)
         v.add_command(label=tr("Dust off: the longest unvisited"), accelerator="Ctrl+D",
@@ -14221,6 +15013,22 @@ class App:
         self.timeline = TimelineView(win, lambda: self.data, get_ids=self.timeline_ids,
                                      start_id=(self.current() or {}).get("id"),
                                      on_open=self.open_from_graph)
+        return "break"
+
+    def open_practice(self):
+        """View › Practice languages: the web app, opened on its practice page."""
+        import subprocess
+        exe = Path(sys.executable)
+        quiet = exe.with_name("pythonw.exe")
+        if sys.platform == "win32" and quiet.exists():
+            exe = quiet
+        try:
+            subprocess.Popen([str(exe), str(Path(__file__).resolve()), "web", "--page", "practice"],
+                             cwd=str(BASE))
+        except OSError as exc:
+            self.say(tr("The web version did not start: {why}", why=exc))
+            return "break"
+        self.say(tr("Practice opens in the browser."))
         return "break"
 
     def open_peritia(self):
@@ -16311,6 +17119,9 @@ class App:
                                  "form": tr("One per line:  name (language). gloss  -- or a line with "
                                             "just (ita) for the lines after it; with neither, the "
                                             "LANGUAGE above. Obsidian's name:;gloss works too."),
+                                 "concept": tr("One per line:  name. gloss  -- or with its forms "
+                                               "in each language:  name | gloss: form (ita); "
+                                               "form (deu)"),
                                  }.get(k, tr("One per line:  name. gloss")))
             later_summary()
 
@@ -16434,6 +17245,24 @@ class App:
                 if repeats:
                     said += " " + tr("{n} repeated, skipped.", n=len(repeats))
                 self.say(said)
+                return
+            if kind == "concept" and "|" in text:      # concepts with their forms
+                plan, bad = parse_bulk_concepts(text)
+                if bad:
+                    hint.configure(text=tr("Not understood, line(s) {lines}: write  name | gloss: "
+                                           "form (ita); form (deu)", lines=", ".join(map(str, bad))))
+                    return
+                try:
+                    done = save_bulk_concepts(plan, src)
+                except (ValueError, WebConflict, SystemExit) as exc:
+                    hint.configure(text=str(exc))
+                    return
+                win.destroy()
+                self.reload()
+                self.safe_mirror(load_json())
+                self.say(tr("{c} concept(s), {f} form(s) and {l} link(s) added; {r} concept(s) were "
+                            "already there.", c=done["concepts"], f=done["forms"], l=done["links"],
+                            r=done["reused"]))
                 return
             data = load_json()
             taken = set(by_id(data))
@@ -20755,6 +21584,8 @@ def main():
         return cmd_service(rest)
     if cmd == "backup":
         return cmd_backup(rest)
+    if cmd == "voices":
+        return cmd_voices(rest)
     if cmd == "migrate":
         return cmd_migrate()
     if cmd == "merge":
@@ -22627,6 +23458,194 @@ PT = {
         "Semear de novo para recomeçar",
     "r: start again":
         "r: recomeçar",
+    "Not understood, line(s) {lines}: write  name | gloss: form (ita); form (deu)":
+        "Não entendi a(s) linha(s) {lines}: escreva  nome | glosa: forma (ita); forma (deu)",
+    "{c} concept(s), {f} form(s) and {l} link(s) added; {r} concept(s) were already there.":
+        "{c} conceito(s), {f} forma(s) e {l} ligação(ões) adicionadas; {r} conceito(s) já existiam.",
+    "One per line:  name. gloss  -- or with its forms in each language:  name | gloss: form (ita); form (deu)":
+        "Um por linha:  nome. glosa  -- ou com suas formas em cada língua:  nome | glosa: forma (ita); forma (deu)",
+    "{n} word(s)":
+        "{n} palavra(s)",
+    "No sound for this word yet.":
+        "Ainda sem som para esta palavra.",
+    "Piper is not installed for this Python: {py} -m pip install piper-tts":
+        "O Piper não está instalado neste Python: {py} -m pip install piper-tts",
+    "Which language? One of: {langs}":
+        "Qual língua? Uma destas: {langs}",
+    "Piper: {yes}.":
+        "Piper: {yes}.",
+    "installed":
+        "instalado",
+    "not installed ({py} -m pip install piper-tts)":
+        "não instalado ({py} -m pip install piper-tts)",
+    "{voice}: {have} of {n} words with sound":
+        "{voice}: {have} de {n} palavras com som",
+    "no voice ({n} word(s)) -- python _kustos.py voices get {lang}":
+        "sem voz ({n} palavra(s)) -- python _kustos.py voices get {lang}",
+    "Piper has no voice for it":
+        "o Piper não tem voz para ela",
+    "Piper has no voice for {lang}.":
+        "O Piper não tem voz para {lang}.",
+    "No list from Piper (is this computer online?): {why}":
+        "Nenhuma lista do Piper (este computador está online?): {why}",
+    "Listen to them at https://rhasspy.github.io/piper-samples, then: python _kustos.py voices get {lang} <voice>":
+        "Ouça-as em https://rhasspy.github.io/piper-samples, depois: python _kustos.py voices get {lang} <voz>",
+    "No voice to start with for {lang}: python _kustos.py voices list {lang}":
+        "Nenhuma voz inicial para {lang}: python _kustos.py voices list {lang}",
+    "Not a Piper voice name: {voice}":
+        "Não é um nome de voz do Piper: {voice}",
+    "Downloading {voice} (tens of MB, once)...":
+        "Baixando {voice} (dezenas de MB, uma vez)...",
+    "The voice did not download: {why}":
+        "A voz não baixou: {why}",
+    "{lang} speaks with {voice}. Making its words' sound:":
+        "{lang} fala com {voice}. Fazendo o som das palavras:",
+    "{n} made.":
+        "{n} feitos.",
+    "{made} made, {removed} no longer needed removed.":
+        "{made} feitos, {removed} sem uso removidos.",
+    "{lang} no longer uses Piper; the device's voice speaks it.":
+        "{lang} não usa mais o Piper; a voz do aparelho a fala.",
+    "voices: status, list LANG, get LANG [VOICE], make [LANG] or remove LANG.":
+        "voices: status, list LÍNGUA, get LÍNGUA [VOZ], make [LÍNGUA] ou remove LÍNGUA.",
+    "Practice":
+        "Praticar",
+    "Nothing to practise yet: forms with a language and a gloss, or linked to a concept, are what is asked.":
+        "Nada para praticar ainda: o que se pergunta são formas com língua e glosa, ou ligadas a um conceito.",
+    "{n} words":
+        "{n} palavras",
+    "{n} due":
+        "{n} para hoje",
+    "{n} new":
+        "{n} novas",
+    "boxes 1 to 5":
+        "caixas 1 a 5",
+    "{n} answered today; up to {m} new words left today.":
+        "{n} respondidas hoje; ainda até {m} palavras novas hoje.",
+    "How":
+        "Como",
+    "Type the word":
+        "Digitar a palavra",
+    "Say it aloud":
+        "Dizer em voz alta",
+    "{n} form(s) cannot be asked: no gloss and no concept.":
+        "{n} forma(s) não podem ser perguntadas: sem glosa e sem conceito.",
+    "Start":
+        "Começar",
+    "Choose a language.":
+        "Escolha uma língua.",
+    "Nothing is due now. Come back tomorrow, or add words.":
+        "Nada para agora. Volte amanhã, ou acrescente palavras.",
+    "Listen":
+        "Ouvir",
+    "box {n}":
+        "caixa {n}",
+    "in {lang}":
+        "em {lang}",
+    "I do not know":
+        "Não sei",
+    "Check":
+        "Conferir",
+    "Say it aloud in {lang}, then show the answer.":
+        "Diga em voz alta em {lang} e depois mostre a resposta.",
+    "Show":
+        "Mostrar",
+    "Right":
+        "Certo",
+    "Almost":
+        "Quase",
+    "Not this time":
+        "Desta vez não",
+    "Back in {n} day(s).":
+        "Volta em {n} dia(s).",
+    "Back today.":
+        "Volta hoje.",
+    "Next":
+        "Próxima",
+    "Wrong":
+        "Errado",
+    "Done":
+        "Pronto",
+    "{right} right, {almost} almost, {wrong} to see again.":
+        "{right} certas, {almost} quase, {wrong} para rever.",
+    "Languages":
+        "Línguas",
+    "Practice languages (browser)":
+        "Praticar línguas (navegador)",
+    "The web version did not start: {why}":
+        "A versão web não iniciou: {why}",
+    "Practice opens in the browser.":
+        "A prática abre no navegador.",
+    "This word is no longer in the base, or changed.":
+        "Esta palavra não está mais na base, ou mudou.",
+    "Italian":
+        "italiano",
+    "German":
+        "alemão",
+    "French":
+        "francês",
+    "Spanish":
+        "espanhol",
+    "Portuguese":
+        "português",
+    "English":
+        "inglês",
+    "Polish":
+        "polonês",
+    "Turkish":
+        "turco",
+    "Dutch":
+        "holandês",
+    "Russian":
+        "russo",
+    "Greek":
+        "grego",
+    "Ancient Greek":
+        "grego antigo",
+    "Latin":
+        "latim",
+    "Catalan":
+        "catalão",
+    "Danish":
+        "dinamarquês",
+    "Finnish":
+        "finlandês",
+    "Hungarian":
+        "húngaro",
+    "Czech":
+        "tcheco",
+    "Romanian":
+        "romeno",
+    "Swedish":
+        "sueco",
+    "Norwegian":
+        "norueguês",
+    "Ukrainian":
+        "ucraniano",
+    "Arabic":
+        "árabe",
+    "Hebrew":
+        "hebraico",
+    "Persian":
+        "persa",
+    "Hindi":
+        "híndi",
+    "Chinese":
+        "chinês",
+    "Japanese":
+        "japonês",
+    "Korean":
+        "coreano",
+    "Vietnamese":
+        "vietnamita",
+    "Icelandic":
+        "islandês",
+    "Slovak":
+        "eslovaco",
+    "Serbian":
+        "sérvio",
+    "Slovenian":
+        "esloveno",
     "backup: setup, run, status, test or remove.":
         "backup: setup, run, status, test ou remove.",
     "Windows could not seal or open the backup's password (error {code}).":
