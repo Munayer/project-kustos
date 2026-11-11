@@ -151,6 +151,16 @@ Ideas that span several sections:
   MagicDNS name (`tailscale_name`), `tailscale serve --bg 8484` in front, and
   `serve_answers` to check the login answers. Test it with `run_ps`,
   `run_tailscale` and `sys.platform` stood in for.
+- **The backup** (`cmd_backup`, `_kustos_backup.cmd`): restic, never crypto
+  of our own. `BACKUP_FILE` (under `%LOCALAPPDATA%\Kustos`) holds the
+  repository and its password sealed by `seal` (Windows DPAPI, ctypes);
+  `backup_run` is what the daily task (`BACKUP_TASK`) runs: backup, then
+  when due `forget --prune` (`BACKUP_KEEP`), `check --read-data-subset=5%`
+  and `backup_restore_test`, which restores into a temporary folder (its
+  caches redirected there too), runs that copy's doctor and deletes it.
+  `BACKUP_STATE` feeds `backup_notice`, shown when the window opens. Test it
+  with the real restic, `seal` and `run_ps` stood in for, `LOCALAPPDATA` and
+  the repository in scratch folders.
 - **GEO** (`# ==== geo`): a field of every record but the drafts, kept as
   typed (points `lat, lon` one per line, or GeoJSON pasted whole) and read by
   `parse_geo` into GeoJSON geometries only when needed: the card's hint
@@ -218,7 +228,7 @@ The rules, in order:
    `Co-Authored-By: Claude <noreply@anthropic.com>`, then push.
 5. Copy to the instance (`tools\update-instance.cmd`, or copy
    `_kustos.py`, `_kustos.cmd`, `_kustos_logbook.cmd`, `_kustos_peritia.cmd`,
-   `_kustos_serve.cmd`, `kustos.ico`) **only when
+   `_kustos_serve.cmd`, `_kustos_backup.cmd`, `kustos.ico`) **only when
    Kustos is closed** — check that no `python`/`pythonw` process is running, or
    ask the owner — then verify the copies match (ignoring CRLF/LF). The
    always-on `web --serve` (task *Kustos web*) does not count: it holds nothing
