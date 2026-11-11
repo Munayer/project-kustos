@@ -7485,6 +7485,37 @@ f.addEventListener('submit', async ev => {
 """
 
 
+def passwd_ask(ask_secret, ask, with_code):
+    """The questions of `passwd`: (password, authenticator key or '')."""
+    password = ask_secret(tr("New password ({n} characters or more): ", n=PASSWORD_MIN))
+    if len(password) < PASSWORD_MIN:
+        raise SystemExit(tr("Too short: {n} characters or more. Nothing changed.", n=PASSWORD_MIN))
+    if ask_secret(tr("The same again: ")) != password:
+        raise SystemExit(tr("The two did not match. Nothing changed."))
+    if not with_code:
+        return password, ""
+    secret = base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
+    print()
+    print(tr("In your authenticator app (Aegis, 2FAS, Google Authenticator, 1Password...), "
+             "add an account by typing this key:"))
+    print()
+    print("    " + " ".join(secret[i:i + 4] for i in range(0, len(secret), 4)))
+    print()
+    print(tr("(time-based, 6 digits, 30 seconds; or paste the whole line below)"))
+    print(f"    otpauth://totp/Kustos:{HOST}?secret={secret}&issuer=Kustos&digits=6&period=30")
+    print()
+    print(tr("Type it on your phone: there is nothing to copy. Keep it to yourself -- not in a "
+             "message, a note or a screenshot: whoever has it can make your codes. Here, Ctrl+C "
+             "stops passwd without saving anything."))
+    print()
+    for _try in range(3):
+        got = ask(tr("The code the app shows now: ")).strip()
+        if totp_check(secret, got) is not None:
+            return password, secret
+        print(tr("That is not the code; wait for the next one and try again."))
+    raise SystemExit(tr("The code did not match. Nothing changed: run passwd again."))
+
+
 def cmd_passwd(rest=()):
     """Sets the web app's password and its authenticator code, asked in this
     terminal; --status says what is set and lists the last logins."""
@@ -7524,30 +7555,13 @@ def cmd_passwd(rest=()):
         access_log("logout-all")
         print(tr("Every session ends at its next request."))
         return 0
-    password = getpass.getpass(tr("New password ({n} characters or more): ", n=PASSWORD_MIN))
-    if len(password) < PASSWORD_MIN:
-        raise SystemExit(tr("Too short: {n} characters or more. Nothing changed.", n=PASSWORD_MIN))
-    if getpass.getpass(tr("The same again: ")) != password:
-        raise SystemExit(tr("The two did not match. Nothing changed."))
-    secret = ""
-    if "--no-code" not in rest:
-        secret = base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
+    try:
+        password, secret = passwd_ask(getpass.getpass, input, "--no-code" not in rest)
+    except (KeyboardInterrupt, EOFError):
+        # Ctrl+C in a Windows terminal stops the program; it is easy to press
+        # meaning "copy" -- nothing was saved, so nothing is half done
         print()
-        print(tr("In your authenticator app (Aegis, 2FAS, Google Authenticator, 1Password...), "
-                 "add an account by typing this key:"))
-        print()
-        print("    " + " ".join(secret[i:i + 4] for i in range(0, len(secret), 4)))
-        print()
-        print(tr("(time-based, 6 digits, 30 seconds; or paste the whole line below)"))
-        print(f"    otpauth://totp/Kustos:{HOST}?secret={secret}&issuer=Kustos&digits=6&period=30")
-        print()
-        for _try in range(3):
-            got = input(tr("The code the app shows now: ")).strip()
-            if totp_check(secret, got) is not None:
-                break
-            print(tr("That is not the code; wait for the next one and try again."))
-        else:
-            raise SystemExit(tr("The code did not match. Nothing changed: run passwd again."))
+        raise SystemExit(tr("Stopped: nothing was saved. Run passwd again when ready."))
     auth_set(password, secret)
     access_log("password set", code=bool(secret))
     print(tr("Saved in {file} (this machine only). Sessions opened before end now.", file=AUTH_FILE))
@@ -22007,6 +22021,10 @@ PT = {
         "Semear de novo para recomeçar",
     "r: start again":
         "r: recomeçar",
+    "Stopped: nothing was saved. Run passwd again when ready.":
+        "Interrompido: nada foi gravado. Rode o passwd de novo quando quiser.",
+    "Type it on your phone: there is nothing to copy. Keep it to yourself -- not in a message, a note or a screenshot: whoever has it can make your codes. Here, Ctrl+C stops passwd without saving anything.":
+        "Digite-a no celular: não há nada para copiar. Guarde-a só para você -- nada de mensagem, nota ou captura de tela: quem a tem gera os seus códigos. Aqui, Ctrl+C interrompe o passwd sem gravar nada.",
     "Log in to your base":
         "Entre na sua base",
     "Password":
