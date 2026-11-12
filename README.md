@@ -391,6 +391,16 @@ It refuses any folder it did not make, so it never touches a real base.
   load into PostGIS (`ogr2ogr -f PostgreSQL PG:dbname=… _kustos.geojson`);
   health records stay out unless you add `--all`. Nothing goes to the network:
   no geocoding, no map tiles.
+- **Observator**: an instance belongs to one person of the base, chosen under
+  Base › Observator… (or `python _kustos.py observator <p_id|name>`; the first
+  time, the corpus's person is taken). Every record and link saved from then on
+  carries `observator`, and every log line an `obs` beside the machine's name:
+  an observation is always made in someone's name. The eye in the status bar
+  and on the page's header says whose; a record's header says who observed it
+  (dashed eye: another observator; no mark: not signed yet). Records saved
+  before this existed stay unsigned until saved again (`is:unsigned`,
+  `obs:name` in the search); the doctor only warns about an observator that is
+  not a person of the base.
 - **Source**: free types (book, paper, thesis, law/bill, decisions, webpages, videos), citations in academic formats, BibTeX and CSL-JSON.
   Can import from Zotero via CSL-JSON or BibTeX without duplicating entries.
 - **Health (corpus)**: four kinds of record, each with its own fields —
@@ -430,6 +440,7 @@ It refuses any folder it did not make, so it never touches a real base.
   ^ab                               name that starts with "ab"
   tag:x lang:de type:book sys:renal dom:law id:c_
   is:org is:person is:geo           organizations / people who are not / records with a GEO
+  is:unsigned obs:ada obs:p_        no observator yet / signed by that observator (name or id)
   circle:influence                  in your circle of influence, or at either end of a link in it
   ```
 
@@ -471,6 +482,7 @@ python _kustos.py search <texto>
 python _kustos.py cite <id|texto> [abnt|abnt-autor-data|bibtex|csl-json|bruto]  pulls citation from source
 python _kustos.py export [bibtex|csl|abnt] [arquivo]
 python _kustos.py geojson [--all] [file]   every GEO as one GeoJSON file
+python _kustos.py observator [p_id|name]   who signs this instance; with an argument, chooses
 python _kustos.py import zotero <export.json|.bib>
 python _kustos.py mirror | corpus | merge | history <id> | replay
 python _kustos.py logbook                  the base as a logbook (read-only)

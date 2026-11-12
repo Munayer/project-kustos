@@ -184,6 +184,18 @@ Ideas that span several sections:
   mirror, `is:geo`, and `cmd_geojson`, which leaves health out unless `--all`.
   Keep it offline: no geocoding and no tiles (the page's CSP is
   `default-src 'none'`). A new collection with a GEO joins `GEO_COLLS`.
+- **Observator** (`# ==== observator`): `ui.observator` is the p_ id of the
+  person this instance belongs to (derived once from `ui.corpus_subject` by
+  `observator_default`, in `upgrade_vault` and on open). `save_record` stamps
+  `observator` on the record and on the links that are new in that save (an
+  old link keeps who made it); `log_append`/`log_many` put `obs` beside `host`,
+  kept current by `_remember_disk` (`_OBS`), so the cached vault never leaves
+  it stale. The eye is drawn from one set of points (`eye_points`): `draw_eye`
+  on a Tk canvas (status bar, `App.draw_observator`), `observator_svg` for the
+  page (header and record kicker, from `web_observator` in the boot data).
+  States: own / alienus (dashed lids: signed by someone else) / unsigned (no
+  mark). Nothing is rewritten on its own: an unsigned record stays so until
+  saved. The doctor warns, never errors. `cmd_observator` sets or shows it.
 - **Long texts are markdown**: `textfield(..., pages=True)` (every NOTES and the
   draft's text) gets `MarkdownKeys`, and `fit(opening=True)` paints it before
   the pages are measured. The text stored stays plain.

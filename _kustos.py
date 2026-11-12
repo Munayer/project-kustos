@@ -11,8 +11,9 @@ a source through its SOURCE field, and typed links cross collections.
 FILES (all side by side, same prefix)
     _kustos.json                  SOURCE OF TRUTH.
     _kustos.log.<machine>.jsonl   Append-only journal, one per machine: every
-                                  save appends the whole record. It is the
-                                  complete history (no .bak files).
+                                  save appends the whole record, with the
+                                  machine (host) and the observator (obs). It
+                                  is the complete history (no .bak files).
     _kustos.lock.<machine>.json   "Open over there" notice. Removed on close.
     _kustos_mirror.md             Readable mirror (Obsidian, phone).
     _kustos_peritia.html          Skills panel, read-only snapshot (Peritia).
@@ -61,6 +62,9 @@ USAGE
     python _kustos.py voices [list LANG | get LANG [VOICE] | make [LANG] | remove LANG]
                                       Piper's voices for Practice (pip install piper-tts)
     python _kustos.py doctor          check the structure, change nothing
+    python _kustos.py observator [p_id|name]
+                                      who signs this instance (ui.observator);
+                                      with an argument, chooses that person
     python _kustos.py real-dates [apply [order]]
                                       log entries whose text starts with a date:
                                       list them, or move that date into the entry
@@ -615,6 +619,7 @@ def blank_person(name="", org=False):
 
 def fix_person(p):
     p.setdefault("tags", [])
+    p.setdefault("observator", "")
     p.setdefault("links", [])
     p.setdefault("interactions", [])
     p.setdefault("aliases", [])
@@ -1325,6 +1330,7 @@ def format_edges(edges):
 
 def fix_entry(e):
     e.pop("_provisional", None)
+    e.setdefault("observator", "")
     e.setdefault("kind", "concept")
     e.setdefault("name", "")
     e.setdefault("gloss", "")
@@ -1475,6 +1481,7 @@ CITE_STYLES = ("abnt", "abnt-autor-data", "bibtex", "csl-json", "bruto")
 
 def fix_source(s):
     s.setdefault("type", "outro")
+    s.setdefault("observator", "")
     s.setdefault("name", "")
     s.setdefault("authors", [])
     for k in ("date", "container", "publisher", "place", "edition", "volume",
@@ -2083,6 +2090,7 @@ STATUS_LABEL = {"ok": "in range", "near": "near the limit", "out": "out",
 
 def fix_metric(m):
     m.setdefault("name", "")
+    m.setdefault("observator", "")
     m.setdefault("ctype", "measure")
     for k in ("dose", "frequency", "start", "end", "prescriber", "purpose",
               "target", "etype", "date", "doctor", "place"):
@@ -2209,6 +2217,7 @@ def save_note_cache(keep=None):
 
 def fix_note(n):
     n.setdefault("name", "")
+    n.setdefault("observator", "")
     n.setdefault("file", "")
     n.setdefault("tags", [])
     n.setdefault("updated", TODAY())
@@ -2670,6 +2679,131 @@ def cmd_geojson(rest=()):
     return 0
 
 
+# ================================================================ observator
+# The observer of an instance is a person of the base: every observation made
+# here is made in that person's name. `ui.observator` holds the p_ id (derived
+# once from `ui.corpus_subject` when empty); every record and link saved gets
+# an `observator` field, and every log line an `obs` key beside `host`. A
+# record saved before this existed keeps "" until it is saved again -- it is
+# shown as unsigned, never rewritten on its own. There is no observer-less
+# state for anything new: the status bar asks for one until it is chosen.
+# The eye (`eye_points`): one closed stroke for the lids, the iris, and in the
+# place of the pupil the mark of a distinction. Dashed lids mean the record on
+# screen was signed by another observator; no mark means a proposal not yet
+# observed (a later step).
+
+_OBS = [""]                 # the current observator's id, kept in step by fix_vault
+
+
+def observator_id(data=None):
+    if data is None:
+        return _OBS[0]
+    return ((data.get("ui") or {}).get("observator") or "").strip()
+
+
+def observator_name(data, pid=None):
+    """The observator's name, or the id when the person is missing, or ""."""
+    pid = observator_id(data) if pid is None else (pid or "")
+    if not pid:
+        return ""
+    p = next((p for p in data.get("people", []) if p.get("id") == pid), None)
+    return p["name"] if p else pid
+
+
+def observator_default(data):
+    """The person whose name is `ui.corpus_subject`, if there is exactly one
+    (the corpus already belongs to one person; the observer is the same one)."""
+    subject = " ".join(((data.get("ui") or {}).get("corpus_subject") or "").split()).casefold()
+    if not subject:
+        return ""
+    hits = [p["id"] for p in data.get("people", [])
+            if " ".join((p.get("name") or "").split()).casefold() == subject and not p.get("org")]
+    return hits[0] if len(hits) == 1 else ""
+
+
+def observator_state(data, rec_or_edge):
+    """own | alienus | unsigned: how the eye is drawn for what is on screen."""
+    who = (rec_or_edge or {}).get("observator") or ""
+    mine = observator_id(data)
+    if not who:
+        return "unsigned"
+    return "own" if who == mine else "alienus"
+
+
+def eye_points(x, y, size, steps=10):
+    """The lids as one closed polyline (two cubic arcs, drawn on a 24-unit
+    grid scaled to `size`), with the iris circle and the mark's three points."""
+    s = size / 24.0
+
+    def bez(p0, p1, p2, p3):
+        pts = []
+        for i in range(steps + 1):
+            t = i / steps
+            u = 1 - t
+            pts.append((x + s * (u ** 3 * p0[0] + 3 * u * u * t * p1[0] + 3 * u * t * t * p2[0] + t ** 3 * p3[0]),
+                        y + s * (u ** 3 * p0[1] + 3 * u * u * t * p1[1] + 3 * u * t * t * p2[1] + t ** 3 * p3[1])))
+        return pts
+
+    lids = bez((2, 12), (5.5, 6.5), (18.5, 6.5), (22, 12)) + bez((22, 12), (18.5, 17.5), (5.5, 17.5), (2, 12))[1:]
+    iris = (x + 12 * s, y + 12 * s, 3.75 * s)
+    mark = [(x + 10.25 * s, y + 10.5 * s), (x + 13.75 * s, y + 10.5 * s), (x + 13.75 * s, y + 13.5 * s)]
+    return lids, iris, mark
+
+
+def draw_eye(cv, x, y, size, colour, state="own"):
+    """Draws the eye on a Tk canvas: dashed lids for `alienus`, no mark for
+    `unsigned`. Clears the canvas first; the stroke scales with `size`."""
+    cv.delete("all")
+    lids, (cx, cy, r), mark = eye_points(x, y, size)
+    w = max(1, round(size / 16))
+    kw = {"fill": colour, "width": w, "smooth": True, "capstyle": "round", "joinstyle": "round"}
+    if state != "own":
+        kw["dash"] = (2, 2)
+    cv.create_line(*[c for pt in lids for c in pt], **kw)
+    cv.create_oval(cx - r, cy - r, cx + r, cy + r, outline=colour, width=w)
+    if state != "unsigned":
+        cv.create_line(*[c for pt in mark for c in pt], fill=colour, width=w,
+                       capstyle="round", joinstyle="round")
+
+
+OBSERVATOR_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="{size}" '
+                  'height="{size}" fill="none" stroke="currentColor" stroke-width="1.5" '
+                  'stroke-linecap="round" stroke-linejoin="round" role="img" aria-label="Observator">'
+                  '<path d="M2 12 C5.5 6.5 18.5 6.5 22 12 C18.5 17.5 5.5 17.5 2 12 Z"{dash}/>'
+                  '<circle cx="12" cy="12" r="3.75"/>{mark}</svg>')
+
+
+def observator_svg(size=16, state="own"):
+    dash = ' stroke-dasharray="2.2 1.6"' if state != "own" else ""
+    mark = '<path d="M10.25 10.5 H13.75 V13.5"/>' if state != "unsigned" else ""
+    return OBSERVATOR_SVG.format(size=size, dash=dash, mark=mark)
+
+
+def cmd_observator(rest):
+    """`observator`: who signs this instance; `observator <p_id|name>` sets it."""
+    data = load_json()
+    if rest:
+        want = " ".join(rest).strip()
+        idx = by_id(data)
+        pid = want if want in idx and coll_of(want) == "people" else ""
+        if not pid:
+            key = " ".join(want.split()).casefold()
+            hits = [p["id"] for p in data["people"]
+                    if " ".join((p.get("name") or "").split()).casefold() == key]
+            if len(hits) != 1:
+                print(tr("No single person named {name}: give the p_ id.", name=want))
+                return 1
+            pid = hits[0]
+        save_ui({"observator": pid})
+        data = load_json()
+    pid = observator_id(data)
+    if not pid:
+        print(tr("No observator chosen yet: python _kustos.py observator <p_id|name>"))
+        return 1
+    print(tr("observator: {name} · {id}", name=observator_name(data), id=pid))
+    return 0
+
+
 # ================================================================ file
 
 def blank_vault():
@@ -2707,7 +2841,10 @@ def fix_vault(data):
         a.setdefault("why", "")
         a.setdefault("source", "")
         a.setdefault("certainty", "established")
+        a.setdefault("observator", "")
         a["to"] = norm_ref(a.get("to"))
+    data["ui"].setdefault("observator", "")
+    _OBS[0] = observator_id(data)
     return data
 
 
@@ -2750,6 +2887,7 @@ def load_json():
 
 
 def _remember_disk(data, stamp):
+    _OBS[0] = observator_id(data)      # the log signs with what the base says now
     try:
         _DISK["blob"], _DISK["stamp"] = marshal.dumps(data), stamp
     except ValueError:           # something marshal cannot hold: just do not cache
@@ -2860,7 +2998,7 @@ def dust_order(records, seen):
 # ---- append-only log, one per machine
 
 def log_append(op, coll, payload):
-    line = {"t": NOW(), "host": HOST, "op": op, "coll": coll}
+    line = {"t": NOW(), "host": HOST, "obs": _OBS[0], "op": op, "coll": coll}
     line.update(payload)
     try:
         with LOG_FILE.open("a", encoding="utf-8") as f:
@@ -2874,7 +3012,7 @@ def log_many(lines):
     costs milliseconds on Windows (the antivirus looks at every opening)."""
     out = []
     for op, coll, payload in lines:
-        line = {"t": NOW(), "host": HOST, "op": op, "coll": coll}
+        line = {"t": NOW(), "host": HOST, "obs": _OBS[0], "op": op, "coll": coll}
         line.update(payload)
         out.append(json.dumps(line, ensure_ascii=False) + "\n")
     try:
@@ -3113,6 +3251,9 @@ def save_record(coll, rec, edges=None):
             if s.get("raw") and " ".join(s["raw"].split()) == src:
                 clean["source"] = s["id"]
                 break
+    obs = observator_id(data)
+    if obs:
+        clean["observator"] = obs       # every save is made in the observator's name
     rows = data[coll]
     for i, old in enumerate(rows):
         if old.get("id") == rid:
@@ -3129,6 +3270,11 @@ def save_record(coll, rec, edges=None):
             clean["reg"], clean["reg_n"] = d.get("reg"), d["reg_n"]
     data["deleted"] = [d for d in data["deleted"] if d.get("id") != rid]
     if edges is not None:
+        # a link keeps the observator who made it; only a new one is signed now
+        before = {(a.get("rel"), a.get("to")): a.get("observator") or ""
+                  for a in data["edges"] if a["from"] == rid}
+        for a in edges:
+            a["observator"] = before.get((a.get("rel"), a.get("to")), a.get("observator") or obs)
         data["edges"] = [a for a in data["edges"] if a["from"] != rid] + edges
     write_json(data)
     log_put(coll, clean)
@@ -3434,6 +3580,18 @@ def check(data):
             if len(g) > GEO_BIG:
                 warnings.append(tr("{id}: GEO of {n} characters; a simpler shape keeps the "
                                    "base light", id=r["id"], n=len(g)))
+    obs = observator_id(data)
+    if not obs:
+        warnings.append(tr("no observator chosen: Base › Observator…, or "
+                           "python _kustos.py observator <p_id|name>"))
+    elif obs not in idx or coll_of(obs) != "people":
+        warnings.append(tr("ui.observator points to {id}, which is not a person", id=obs))
+    for coll in COLLS:
+        for r in data[coll]:
+            who = r.get("observator") or ""
+            if who and (who not in idx or coll_of(who) != "people"):
+                warnings.append(tr("{id}: observator {who} is not a person of the base",
+                                   id=r["id"], who=who))
     atypical = []
     for i, a in enumerate(data["edges"]):
         src = idx.get(a["from"])
@@ -3623,6 +3781,8 @@ def write_mirror(data):
             meta.append(tr("source: ") + resolve_source(p["source"], data)[1])
         if p.get("geo"):
             meta.append("geo: " + geo_summary(p["geo"]))
+        if p.get("observator"):
+            meta.append("obs: " + observator_name(data, p["observator"]))
         if meta:
             out.append("  ·  ".join(meta))
         if p.get("aliases"):
@@ -3687,6 +3847,8 @@ def write_mirror(data):
             meta.append(tr("source: ") + resolve_source(e["source"], data)[1])
         if e.get("geo"):
             meta.append("geo: " + geo_summary(e["geo"]))
+        if e.get("observator"):
+            meta.append("obs: " + observator_name(data, e["observator"]))
         out.append("  ·  ".join(m for m in meta if m))
         out.append("")
         if e.get("gloss"):
@@ -3716,7 +3878,9 @@ def write_mirror(data):
         out.append(mirror_locus(s))
         out.append("  ·  ".join(x for x in (type_label(s.get("type", "")),
                                             "tags: " + ", ".join(s["tags"]) if s.get("tags") else "",
-                                            "geo: " + geo_summary(s["geo"]) if s.get("geo") else "")
+                                            "geo: " + geo_summary(s["geo"]) if s.get("geo") else "",
+                                            "obs: " + observator_name(data, s["observator"])
+                                            if s.get("observator") else "")
                                 if x))
         out += ["", cite(s, "abnt", data), ""]
         if s.get("notes"):
@@ -3752,6 +3916,8 @@ def write_mirror(data):
             meta.append(tr("source: ") + resolve_source(m["source"], data)[1])
         if m.get("geo"):
             meta.append("geo: " + geo_summary(m["geo"]))
+        if m.get("observator"):
+            meta.append("obs: " + observator_name(data, m["observator"]))
         if meta:
             out.append("  ·  ".join(meta))
         out.append("")
@@ -3800,7 +3966,7 @@ def cmd_mirror():
 
 SEARCH_SCOPES = {"p:": "people", "v:": "entries", "f:": "sources",
                  "c:": "corpus", "d:": "notes"}
-SEARCH_FIELDS = ("tag", "lang", "type", "sys", "dom", "id", "is", "circle")
+SEARCH_FIELDS = ("tag", "lang", "type", "sys", "dom", "id", "is", "circle", "obs")
 
 
 def parse_search(text):
@@ -3819,7 +3985,7 @@ def parse_search(text):
     return scope, prefix, fields, terms
 
 
-def search_field_ok(r, fields):
+def search_field_ok(r, fields, data=None):
     for k, v in fields.items():
         if k == "tag" and not any(v in t.lower() for t in r.get("tags", [])):
             return False
@@ -3844,6 +4010,15 @@ def search_field_ok(r, fields):
                 return False
             if v.startswith("geo") and not (r.get("geo") or "").strip():
                 return False
+            if v.startswith("unsign") and (r.get("observator") or ""):
+                return False
+        if k == "obs":                  # obs:p_… (an id) or obs:name (the observator's name)
+            who = (r.get("observator") or "").lower()
+            if not who:
+                return False
+            name = observator_name(data, who).lower() if data is not None else ""
+            if not (who.startswith(v) or (name and v in name)):
+                return False
     return True
 
 
@@ -3865,7 +4040,7 @@ def search_base(data, text):
             return False
         if circ and r.get("id") not in linked and not inside & set(r.get("circles") or []):
             return False
-        return search_field_ok(r, fields) if fields else True
+        return search_field_ok(r, fields, data) if fields else True
 
     return {c: ([r for r in data[c] if ok(r)] if qscope in (None, c) else [])
             for c in COLLS}
@@ -4216,6 +4391,8 @@ def upgrade_vault(data):
         report["regs"] = open_book(data)
     data["schema"] = SCHEMA
     data.setdefault("ui", {}).setdefault("corpus_subject", CORPUS_SUBJECT)
+    if not observator_id(data):
+        data["ui"]["observator"] = observator_default(data)
     return report
 
 
@@ -5261,7 +5438,7 @@ class SkillConflict(Exception):
 
 
 def fix_skill(s):
-    for k in ("name", "domain", "desc", "next"):
+    for k in ("name", "domain", "desc", "next", "observator"):
         s.setdefault(k, "")
     for k in ("requires", "links", "log"):
         s.setdefault(k, [])
@@ -7009,6 +7186,7 @@ WEB_KIND_LABEL = {"person": "person", "org": "organization", "concept": "concept
 # the strings the page's script shows, translated when the page is built
 WEB_STRINGS = (
     "People", "Verba", "Sources", "Corpus", "Drafts", "All",
+    "observed by {name}", "unsigned", "no observator", "observator: {name} · {id}",
     "Search", "New", "Edit", "Save", "Cancel", "Delete", "Back", "More",
     "Saved.", "Deleted. The previous version is in the log.", "Nothing found.",
     "Discard the changes made here?", 'Delete "{label}"?',
@@ -7536,6 +7714,9 @@ def web_record(data, rid):
            "n": rec.get("reg_n") or 0,
            "reg": stamp_label(rec.get("reg")) if rec.get("reg") else "",
            "updated": rec.get("updated") or "", "form": web_form(rec, data),
+           "observator": rec.get("observator") or "",
+           "observator_name": observator_name(data, rec.get("observator")) if rec.get("observator") else "",
+           "observator_state": observator_state(data, rec),
            "out": [dict(end(a["to"]), rel=link_rel_text(a),
                         why=a.get("why", ""), when=a.get("when", ""))
                    for a in edges_from(data, rid)],
@@ -7752,7 +7933,7 @@ def web_path(data, a, b):
             "records": len(idx)}
 
 
-def web_boot(token, auth=False):
+def web_boot(token, auth=False, data=None):
     """What the page needs before its first call. `auth`: behind the login
     (web --serve), so the page offers to log out and goes to the login when
     its session ends."""
@@ -7766,7 +7947,16 @@ def web_boot(token, auth=False):
                     ["corpus", "activity"], ["corpus", "event"], ["notes", "note"]],
             "linkColours": LINK_FAMILY_COLOUR,
             "circles": [[c, tr(c)] for c in CIRCLES],
+            "observator": web_observator(data if data is not None else load_json()),
             "T": {s: tr(s) for s in WEB_STRINGS}}
+
+
+def web_observator(data):
+    """Who signs this instance, for the page's header and every record."""
+    pid = observator_id(data)
+    return {"id": pid, "name": observator_name(data) if pid else "",
+            "svg": observator_svg(14, "own"), "svg_alienus": observator_svg(14, "alienus"),
+            "svg_unsigned": observator_svg(14, "unsigned")}
 
 
 def web_theme(data):
@@ -9008,7 +9198,7 @@ def cmd_web(rest=()):
                     data = load_json()
                     page = (peritia_page({"mode": "live", "token": tok, "api": "/api/skills/",
                                           "home": "/", "auth": serve}, data, nonce)
-                            if url.path == "/skills" else web_page(web_boot(tok, serve), data, nonce))
+                            if url.path == "/skills" else web_page(web_boot(tok, serve, data), data, nonce))
                 return self.answer(200, page, "text/html; charset=utf-8", self.page_csp(nonce))
             if method == "GET" and url.path in ("/health", "/corpus"):
                 with guard:
@@ -9138,6 +9328,12 @@ button { cursor: pointer; }
   border-bottom: 1px solid var(--rule); }
 .bar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .brand { font: 600 13px/1 var(--sans); letter-spacing: .24em; text-transform: uppercase; color: var(--soft); }
+.observator { display: inline-flex; align-items: center; gap: 6px; font: 12px/1 var(--mono);
+  color: var(--soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.observator svg { flex: none; }
+.observator.none { color: var(--faint); }
+.obsline { display: inline-flex; align-items: center; gap: 5px; }
+.obsline svg { vertical-align: -3px; }
 .grow { flex: 1; }
 .icon { min-width: 40px; height: 40px; border-radius: 20px; border: 1px solid var(--rule);
   background: var(--paper); font-size: 20px; line-height: 1; display: inline-grid;
@@ -9319,6 +9515,7 @@ textarea.prose { font: 17px/1.55 var(--serif); min-height: 10em; }
     <header class="top">
       <div class="bar">
         <span class="brand">Kustos</span>
+        <span class="observator" id="observator"></span>
         <span class="grow"></span>
         <button class="icon" data-act="menu" id="menuBtn">&#8943;</button>
         <button class="icon primary" data-act="new" id="newBtn">+</button>
@@ -9559,7 +9756,11 @@ function renderRecord(changed) {
   document.title = r.title + " · Kustos";
   const kicker = [r.kind_label, r.n ? "nº " + r.n : T("not registered"),
                   r.reg ? T("registered {stamp}", {stamp: r.reg}) : ""].filter(Boolean).join(" · ");
-  out.push(`<div class="kicker">${esc(kicker)}</div><h1 class="title${ch.has("name") ? " changed" : ""}">${esc(r.title)}</h1>`);
+  const eye = r.observator_state === "own" ? BOOT.observator.svg
+            : r.observator_state === "alienus" ? BOOT.observator.svg_alienus : BOOT.observator.svg_unsigned;
+  const obs = `<span class="obsline" title="${esc(r.observator || T("unsigned"))}">${eye} ${esc(
+    r.observator ? T("observed by {name}", {name: r.observator_name}) : T("unsigned"))}</span>`;
+  out.push(`<div class="kicker">${esc(kicker)} · ${obs}</div><h1 class="title${ch.has("name") ? " changed" : ""}">${esc(r.title)}</h1>`);
   if (r.facts && r.facts.length) out.push(`<div class="sub">${esc(r.facts.join(" · "))}</div>`);
   const quick = {person: ["interactions", "Add to the log"], org: ["interactions", "Add to the log"],
                  measure: ["readings", "Add a reading"],
@@ -11007,6 +11208,12 @@ $("#q").setAttribute("aria-label", T("Search"));
 $("#newBtn").setAttribute("aria-label", T("New"));
 $("#newBtn").title = T("New");
 $("#menuBtn").setAttribute("aria-label", T("More"));
+(() => {
+  const o = BOOT.observator || {}, el = $("#observator");
+  if (!el) return;
+  if (o.id) { el.innerHTML = o.svg + `<span>${esc(o.name)}</span>`; el.title = T("observator: {name} · {id}", {name: o.name, id: o.id}); }
+  else { el.className = "observator none"; el.innerHTML = o.svg_unsigned + `<span>${esc(T("no observator"))}</span>`; }
+})();
 renderTabs();
 loadList(false);
 route();
@@ -14705,6 +14912,77 @@ class App:
         self.status.pack(side="left", padx=12, pady=4)
         tk.Label(row, text=f"{HOST}  ·  {BASE}", bg=PAPER, fg=FAINT,
                  font=self.f_meta).pack(side="right", padx=12)
+        # the observator: the eye and the name of who signs this instance;
+        # a click opens the person, or the dialog when none is chosen yet
+        self.obs_label = tk.Label(row, text="", bg=PAPER, fg=SOFT, font=self.f_meta,
+                                  cursor="hand2")
+        self.obs_label.pack(side="right", padx=(0, 18))
+        self.obs_eye = tk.Canvas(row, width=20, height=20, bg=PAPER, highlightthickness=0,
+                                 cursor="hand2")
+        self.obs_eye.pack(side="right", padx=(0, 5))
+        for w in (self.obs_label, self.obs_eye):
+            w.bind("<Button-1>", lambda e: self.observator_click())
+        self.draw_observator()
+
+    def draw_observator(self):
+        """The eye and the name in the status bar, from `ui.observator`."""
+        if not getattr(self, "obs_eye", None):
+            return
+        pid = observator_id(self.data)
+        state = "own" if pid else "unsigned"
+        draw_eye(self.obs_eye, 0, 0, 20, SOFT if pid else FAINT, state)
+        name = observator_name(self.data) if pid else tr("no observator")
+        self.obs_label.configure(text=f"observator: {name}" if pid else name,
+                                 fg=SOFT if pid else FAINT)
+
+    def observator_click(self):
+        pid = observator_id(self.data)
+        if pid and pid in by_id(self.data):
+            self.open_record(pid)
+        else:
+            self.choose_observator()
+
+    def choose_observator(self):
+        """Base › Observator…: the person in whose name this instance observes."""
+        people = sorted((p for p in self.data.get("people", []) if not p.get("org")),
+                        key=lambda p: sort_key(p.get("name", "")))
+        win = self.dialog(tr("Observator"), 420, 480)
+        tk.Label(win, text=tr("OBSERVATOR"), bg=PAPER, fg=FAINT,
+                 font=self.f_label).pack(anchor="w", padx=18, pady=(14, 2))
+        tk.Label(win, text=tr("Every record and link saved here is signed in this\n"
+                              "person's name. Choose the person this instance belongs to."),
+                 bg=PAPER, fg=SOFT, font=self.f_meta, justify="left"
+                 ).pack(anchor="w", padx=18, pady=(0, 8))
+        box = tk.Listbox(win, height=14, width=34, font=self.f_meta, bg=PAPER, fg=INK,
+                         relief="flat", highlightthickness=0, selectbackground=SELBG,
+                         selectforeground=SELFG, activestyle="none")
+        box.pack(fill="both", expand=True, padx=18)
+        for p in people:
+            box.insert("end", p.get("name") or p["id"])
+        current = observator_id(self.data)
+        ids = [p["id"] for p in people]
+        if current in ids:
+            box.selection_set(ids.index(current))
+            box.see(ids.index(current))
+        row = tk.Frame(win, bg=PAPER)
+        row.pack(fill="x", padx=18, pady=12)
+
+        def apply():
+            sel = box.curselection()
+            if not sel:
+                return
+            save_ui({"observator": ids[sel[0]]})
+            win.destroy()
+            self.reload()
+            self.draw_observator()
+            self.say(tr("observator: {name} · {id}", name=observator_name(self.data),
+                        id=ids[sel[0]]))
+
+        ttk.Button(row, text=tr("Use"), command=apply).pack(side="left")
+        ttk.Button(row, text=tr("Cancel"), style="Quiet.TButton",
+                   command=win.destroy).pack(side="left", padx=(8, 0))
+        win.bind("<Escape>", lambda e: win.destroy())
+        box.bind("<Double-1>", lambda e: apply())
 
     def menu(self, parent):
         return tk.Menu(parent, tearoff=0, bg=PAPER, fg=INK, activebackground=SELBG,
@@ -14744,6 +15022,8 @@ class App:
         b.add_command(label=tr("Export drafts (one markdown file)"),
                       command=self.export_notes)
         b.add_command(label=tr("Real dates in the logs…"), command=self.real_dates_dialog)
+        b.add_separator()
+        b.add_command(label=tr("Observator…"), command=self.choose_observator)
         m.add_cascade(label=tr("Base"), menu=b)
 
         v = self.menu(m)
@@ -15739,6 +16019,7 @@ class App:
         """Reads the base again and rebuilds the search text of each record --
         only for records whose timestamp changed since the last time."""
         self.data = load_json()
+        self.draw_observator()
         cache = getattr(self, "_hay", {})
         fresh = {}
         makers = (("people", lambda r: haystack_person(r)),
@@ -15801,7 +16082,7 @@ class App:
         return parse_search(self.q.get())
 
     def field_ok(self, r, fields):
-        return search_field_ok(r, fields)
+        return search_field_ok(r, fields, self.data)
 
     def query_base(self):
         """What the search text alone finds, per collection: the words, ^prefix,
@@ -21512,6 +21793,10 @@ def cmd_app(open_id=None):
     if (CORPUS_SUBJECT and JSON_FILE.exists()
             and not (load_json().get("ui") or {}).get("corpus_subject")):
         save_ui({"corpus_subject": CORPUS_SUBJECT})
+    if JSON_FILE.exists() and not observator_id(load_json()):
+        guess = observator_default(load_json())
+        if guess:
+            save_ui({"observator": guess})
     reports = absorb_conflicts()
     if reports:
         notices.append(tr("Conflicts merged: ") + describe_merge(reports))
@@ -21621,6 +21906,8 @@ def main():
         return cmd_cite(rest[0], rest[1] if len(rest) > 1 else "abnt")
     if cmd == "geojson":
         return cmd_geojson(rest)
+    if cmd == "observator":
+        return cmd_observator(rest)
     if cmd == "export":
         return cmd_export(rest[0] if rest else "bibtex", rest[1] if len(rest) > 1 else None)
     print(__doc__)
@@ -24132,6 +24419,26 @@ PT = {
         "{id}: GEO {err}",
     "{id}: GEO of {n} characters; a simpler shape keeps the base light":
         "{id}: GEO de {n} caracteres; uma forma mais simples deixa a base leve",
+    # observator
+    "Observator": "Observador",
+    "OBSERVATOR": "OBSERVADOR",
+    "Observator…": "Observador…",
+    "no observator": "sem observador",
+    "unsigned": "sem assinatura",
+    "observed by {name}": "observado por {name}",
+    "observator: {name} · {id}": "observador: {name} · {id}",
+    "Every record and link saved here is signed in this\nperson's name. Choose the person this instance belongs to.":
+        "Todo registro e ligação gravados aqui são assinados em nome\ndesta pessoa. Escolha a pessoa a quem esta instância pertence.",
+    "No single person named {name}: give the p_ id.":
+        "Não há uma única pessoa chamada {name}: dê o id p_.",
+    "No observator chosen yet: python _kustos.py observator <p_id|name>":
+        "Nenhum observador escolhido ainda: python _kustos.py observator <p_id|nome>",
+    "no observator chosen: Base › Observator…, or python _kustos.py observator <p_id|name>":
+        "nenhum observador escolhido: Base › Observador…, ou python _kustos.py observator <p_id|nome>",
+    "ui.observator points to {id}, which is not a person":
+        "ui.observator aponta para {id}, que não é uma pessoa",
+    "{id}: observator {who} is not a person of the base":
+        "{id}: o observador {who} não é uma pessoa da base",
 }
 
 if __name__ == "__main__":
