@@ -93,6 +93,9 @@ def build(K, folder):
         return {"from": a, "rel": rel, "to": b, "when": "", "why": why, "source": "",
                 "certainty": "established"}
 
+    # the demo's observator: every record below is saved in Ada's name
+    K.save_ui({"observator": "p_ada00001"})
+
     # ---- people (phones in the 555-01xx range, kept for fiction; example.org addresses)
     put("people", {"id": "p_iss00004", "name": "Institute of Steering Studies", "org": True,
                    "place": "Lisboa", "tags": ["research"], "geo": "38.7075, -9.1364  office",
