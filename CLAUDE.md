@@ -196,6 +196,16 @@ Ideas that span several sections:
   States: own / alienus (dashed lids: signed by someone else) / unsigned (no
   mark). Nothing is rewritten on its own: an unsigned record stays so until
   saved. The doctor warns, never errors. `cmd_observator` sets or shows it.
+  **Signatures** (`# ---- signing the logs`): a person's `gpg` holds an
+  OpenPGP fingerprint as typed (`gpg_fpr` reads it). `cmd_sign` makes one
+  detached signature per run over a manifest (`sig_manifest`: who, machine,
+  the canonical `line_hash`es of the lines not signed yet) into `SIG_FILE`
+  (`_kustos.sig.<host>.jsonl`, ignored by git); `cmd_verify`/`verify_batch`
+  check every machine's against its log and the key the observator's record
+  names. GnuPG is optional and only called there (`gpg_run`). Test with a
+  throwaway keyring: `GNUPGHOME` in a short `%TEMP%` folder (the agent's
+  socket path has a length limit), a key made with `--quick-gen-key` and no
+  passphrase, never the owner's own.
 - **Long texts are markdown**: `textfield(..., pages=True)` (every NOTES and the
   draft's text) gets `MarkdownKeys`, and `fit(opening=True)` paints it before
   the pages are measured. The text stored stays plain.

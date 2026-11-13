@@ -401,6 +401,16 @@ It refuses any folder it did not make, so it never touches a real base.
   before this existed stay unsigned until saved again (`is:unsigned`,
   `obs:name` in the search); the doctor only warns about an observator that is
   not a person of the base.
+- **Signatures** (optional, needs [GnuPG](https://gnupg.org)): write the
+  fingerprint of your OpenPGP key in GPG on your own person's card, then
+  `python _kustos.py sign` signs the lines of this machine's log not signed
+  yet, one signature per run over a list of their hashes, kept in
+  `_kustos.sig.<machine>.jsonl` (the log itself never changes). `python
+  _kustos.py verify` checks every machine's signatures against the logs and
+  the keys the base names: a changed or missing line, a signature by another
+  key or a key not in this computer's keyring is reported. Without GnuPG
+  nothing else changes. A new key on the card makes the old signatures fail:
+  sign again after changing it.
 - **Source**: free types (book, paper, thesis, law/bill, decisions, webpages, videos), citations in academic formats, BibTeX and CSL-JSON.
   Can import from Zotero via CSL-JSON or BibTeX without duplicating entries.
 - **Health (corpus)**: four kinds of record, each with its own fields —
@@ -483,6 +493,7 @@ python _kustos.py cite <id|texto> [abnt|abnt-autor-data|bibtex|csl-json|bruto]  
 python _kustos.py export [bibtex|csl|abnt] [arquivo]
 python _kustos.py geojson [--all] [file]   every GEO as one GeoJSON file
 python _kustos.py observator [p_id|name]   who signs this instance; with an argument, chooses
+python _kustos.py sign | verify            OpenPGP signatures over the logs (GnuPG, optional)
 python _kustos.py import zotero <export.json|.bib>
 python _kustos.py mirror | corpus | merge | history <id> | replay
 python _kustos.py logbook                  the base as a logbook (read-only)

@@ -2,6 +2,7 @@
 _kustos.json
 _kustos.*.json
 _kustos.log.*.jsonl
+_kustos.sig.*.jsonl
 _kustos.lock.*.json
 _kustos.replay.json
 _kustos_mirror.md

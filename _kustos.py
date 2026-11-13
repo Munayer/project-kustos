@@ -14,6 +14,8 @@ FILES (all side by side, same prefix)
                                   save appends the whole record, with the
                                   machine (host) and the observator (obs). It
                                   is the complete history (no .bak files).
+    _kustos.sig.<machine>.jsonl   OpenPGP signatures over the log's lines,
+                                  made by `sign` (optional).
     _kustos.lock.<machine>.json   "Open over there" notice. Removed on close.
     _kustos_mirror.md             Readable mirror (Obsidian, phone).
     _kustos_peritia.html          Skills panel, read-only snapshot (Peritia).
@@ -65,6 +67,10 @@ USAGE
     python _kustos.py observator [p_id|name]
                                       who signs this instance (ui.observator);
                                       with an argument, chooses that person
+    python _kustos.py sign            sign this machine's new log lines with the
+                                      observator's OpenPGP key (GnuPG, optional)
+    python _kustos.py verify          check every machine's signatures against
+                                      the logs and the keys in the base
     python _kustos.py real-dates [apply [order]]
                                       log entries whose text starts with a date:
                                       list them, or move that date into the entry
@@ -632,6 +638,7 @@ def fix_person(p):
     p.setdefault("followup", None)
     p.setdefault("tasks", [])
     p.setdefault("org", False)          # an organization: a person record, marked so
+    p.setdefault("gpg", "")             # an OpenPGP fingerprint, as typed (# ---- signing)
     p["circles"] = parse_circles(p.get("circles"))
     fu = p.get("followup")
     if fu and (fu.get("text") or "").strip():
@@ -2804,6 +2811,210 @@ def cmd_observator(rest):
     return 0
 
 
+# ---- signing the logs (OpenPGP, optional, offline)
+# "In the name of" asks for a signature, not a label, once a base travels.
+# No crypto of our own: GnuPG, called by `sign` and `verify` only, as Piper is
+# by `voices`. A person's GPG field holds the fingerprint of their key (40 hex
+# digits, spaces allowed). `sign` covers the lines of this machine's log not
+# signed yet with ONE detached signature per run, over a manifest of their
+# hashes, kept in SIG_FILE; the log itself never changes. `verify` checks every
+# machine's manifests against the logs and the key the observator's record
+# names. A line is hashed in a canonical form (sorted keys, no spaces), so a
+# rewrite of the JSON that keeps the meaning keeps the hash.
+
+SIG_FILE = BASE / f"{STEM}.sig.{HOST}.jsonl"
+FPR_RE = re.compile(r"^[0-9A-F]{40}$")
+
+
+def sig_files():
+    return sorted(BASE.glob(f"{STEM}.sig.*.jsonl"))
+
+
+def gpg_fpr(text):
+    """A fingerprint as typed -> 40 upper-case hex digits, or "" if it is not one."""
+    fpr = re.sub(r"[\s:]", "", text or "").upper()
+    return fpr if FPR_RE.match(fpr) else ""
+
+
+def line_hash(raw):
+    """sha256 of a log line in canonical form; "" for a line that is not JSON."""
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return ""
+    canon = json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def log_hashes(path):
+    """The hashes of a log's lines, in order (lines that are not JSON left out)."""
+    out = []
+    try:
+        with path.open(encoding="utf-8") as f:
+            for raw in f:
+                if raw.strip():
+                    h = line_hash(raw)
+                    if h:
+                        out.append(h)
+    except OSError:
+        pass
+    return out
+
+
+def sig_batches(path):
+    out = []
+    try:
+        with path.open(encoding="utf-8") as f:
+            for raw in f:
+                try:
+                    b = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(b, dict) and isinstance(b.get("hashes"), list):
+                    out.append(b)
+    except OSError:
+        pass
+    return out
+
+
+def sig_manifest(batch):
+    """What a batch's signature covers: who, which machine, which lines."""
+    body = {k: batch.get(k) for k in ("t", "obs", "fpr", "host", "hashes")}
+    return json.dumps(body, sort_keys=True, ensure_ascii=False,
+                      separators=(",", ":")).encode("utf-8")
+
+
+def gpg_exe():
+    return shutil.which("gpg") or shutil.which("gpg2") or ""
+
+
+def gpg_run(args, data=b""):
+    """Runs gpg with no prompts but the agent's own; (returncode, stdout, stderr)."""
+    import subprocess
+    r = subprocess.run([gpg_exe(), "--batch", "--no-tty", "--status-fd", "1"] + args,
+                       input=data, capture_output=True)
+    return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
+
+
+def observator_fpr(data, pid=None):
+    pid = observator_id(data) if pid is None else pid
+    p = by_id(data).get(pid) if pid else None
+    return gpg_fpr(p.get("gpg", "")) if p and coll_of(pid) == "people" else ""
+
+
+def cmd_sign(rest=()):
+    """`sign`: one signature over the lines of this machine's log not signed yet."""
+    data = load_json()
+    pid = observator_id(data)
+    if not pid:
+        print(tr("No observator chosen yet: python _kustos.py observator <p_id|name>"))
+        return 1
+    fpr = observator_fpr(data)
+    if not fpr:
+        print(tr("{name} has no key: write the fingerprint of an OpenPGP key (40 hex "
+                 "digits) in GPG on that person's card.", name=observator_name(data)))
+        return 1
+    if not gpg_exe():
+        print(tr("GnuPG is not installed (gpg not found); nothing else needs it. "
+                 "On Windows: https://gpg4win.org"))
+        return 1
+    signed = {h for b in sig_batches(SIG_FILE) for h in b["hashes"]}
+    todo = [h for h in log_hashes(LOG_FILE) if h not in signed]
+    if not todo:
+        print(tr("Nothing to sign: every line of {name} is signed.", name=LOG_FILE.name))
+        return 0
+    batch = {"t": NOW(), "obs": pid, "fpr": fpr, "host": HOST, "hashes": todo}
+    code, out, err = gpg_run(["--local-user", fpr, "--detach-sign", "--armor"],
+                             sig_manifest(batch))
+    if code or "-----BEGIN PGP SIGNATURE-----" not in out:
+        print(tr("gpg did not sign:") + "\n" + (err.strip() or out.strip()))
+        return 1
+    batch["sig"] = out[out.index("-----BEGIN PGP SIGNATURE-----"):].strip() + "\n"
+    with SIG_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(batch, ensure_ascii=False) + "\n")
+    print(tr("{n} lines signed by {name} ({fpr}) -> {file}", n=len(todo),
+             name=observator_name(data), fpr=fpr[-16:], file=SIG_FILE.name))
+    return 0
+
+
+def verify_batch(batch, data):
+    """None if the batch's signature is good and made by the key its observator's
+    record names; else what is wrong, in words."""
+    import tempfile
+    want = observator_fpr(data, batch.get("obs") or "")
+    if not want:
+        return tr("{who} has no key in the base", who=batch.get("obs") or "?")
+    if gpg_fpr(batch.get("fpr", "")) != want:
+        return tr("signed with {got}, but the base names {want}",
+                  got=(batch.get("fpr") or "?")[-16:], want=want[-16:])
+    tmp = Path(tempfile.mkdtemp(prefix="kustos_verify_"))
+    try:
+        (tmp / "m").write_bytes(sig_manifest(batch))
+        (tmp / "m.asc").write_text(batch.get("sig", ""), encoding="utf-8")
+        code, out, err = gpg_run(["--verify", str(tmp / "m.asc"), str(tmp / "m")])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    good = None
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) > 2 and parts[1] == "VALIDSIG":
+            good = {parts[2].upper(), parts[-1].upper()}
+    if code or not good:
+        status = {l.split()[1] for l in out.splitlines() if len(l.split()) > 1}
+        if "NO_PUBKEY" in status:
+            return tr("the key {fpr} is not in this computer's keyring: gpg --import it",
+                      fpr=want[-16:])
+        return tr("bad signature")
+    if want not in good:
+        return tr("signed with {got}, but the base names {want}",
+                  got=sorted(good)[0][-16:], want=want[-16:])
+    return None
+
+
+def cmd_verify(rest=()):
+    """`verify`: every machine's signatures, against its log and the base's keys."""
+    data = load_json()
+    if not gpg_exe():
+        print(tr("GnuPG is not installed (gpg not found); nothing else needs it. "
+                 "On Windows: https://gpg4win.org"))
+        return 1
+    bad = 0
+    hosts = {}
+    for path in sig_files():
+        hosts[path.name[len(STEM) + 5:-len(".jsonl")]] = path
+    for path in log_files():
+        hosts.setdefault(path.name[len(STEM) + 5:-len(".jsonl")], None)
+    if not hosts:
+        print(tr("No logs here yet."))
+        return 0
+    for host in sorted(hosts):
+        log = BASE / f"{STEM}.log.{host}.jsonl"
+        lines = log_hashes(log)
+        present = set(lines)
+        covered = set()
+        print(f"{host}")
+        for b in sig_batches(hosts[host]) if hosts[host] else []:
+            label = f"  {(b.get('t') or '')[:16]}  {len(b['hashes'])}  " + \
+                observator_name(data, b.get("obs") or "")
+            problem = verify_batch(b, data)
+            missing = [h for h in b["hashes"] if h not in present]
+            if problem:
+                bad += 1
+                print(label + "  ✗ " + problem)
+            elif missing:
+                bad += 1
+                print(label + "  ✗ " + tr("{n} signed lines are no longer in the log, "
+                                          "or were changed", n=len(missing)))
+            else:
+                covered.update(b["hashes"])
+                print(label + "  ✓")
+        left = sum(1 for h in lines if h not in covered)
+        print("  " + tr("{n} of {total} lines signed", n=len(lines) - left, total=len(lines))
+              + ("" if not left else "  ·  " + tr("{n} not signed", n=left)))
+    print(tr("verify: {n} problem(s)", n=bad))
+    return 1 if bad else 0
+
+
 # ================================================================ file
 
 def blank_vault():
@@ -3586,6 +3797,9 @@ def check(data):
                            "python _kustos.py observator <p_id|name>"))
     elif obs not in idx or coll_of(obs) != "people":
         warnings.append(tr("ui.observator points to {id}, which is not a person", id=obs))
+    for p in data["people"]:
+        if (p.get("gpg") or "").strip() and not gpg_fpr(p["gpg"]):
+            warnings.append(tr("{id}: GPG is not a fingerprint (40 hex digits)", id=p["id"]))
     for coll in COLLS:
         for r in data[coll]:
             who = r.get("observator") or ""
@@ -3783,6 +3997,8 @@ def write_mirror(data):
             meta.append("geo: " + geo_summary(p["geo"]))
         if p.get("observator"):
             meta.append("obs: " + observator_name(data, p["observator"]))
+        if gpg_fpr(p.get("gpg")):
+            meta.append("gpg: " + gpg_fpr(p["gpg"]))
         if meta:
             out.append("  ·  ".join(meta))
         if p.get("aliases"):
@@ -7279,6 +7495,7 @@ def web_fields():
             f("born", "BORN  (2024-03-11, 1890, s. XVI)"), f("died", "DIED"),
             f("circles", "CIRCLES", "circles", opts=[[c, tr(c)] for c in CIRCLES]),
             tags, source, geo,
+            f("gpg", "GPG  (fingerprint of an OpenPGP key)", hint="40 hex digits"),
             f("tasks", "TASKS", "text", hint="one per line:  [ ] what  ~2026-09-10"),
             f("interactions", "LOG", "text", hint="one per line:  2026-08-01   what happened"),
             f("notes_raw", "NOTES", "md"),
@@ -7356,7 +7573,7 @@ def web_form(rec, data):
     if coll == "people":
         out.update(org="org" if rec.get("org") else "",
                    aliases=format_aliases(rec.get("aliases")), place=rec.get("place", ""),
-                   born=rec.get("born", ""), died=rec.get("died", ""),
+                   born=rec.get("born", ""), died=rec.get("died", ""), gpg=rec.get("gpg", ""),
                    circles=list(rec.get("circles", [])), source=rec.get("source", ""),
                    tasks=format_tasks(rec.get("tasks")),
                    interactions=format_log(rec.get("interactions")),
@@ -7434,7 +7651,7 @@ def web_gather(coll, old, form):
         put("geo", text("geo").strip())
     if coll == "people":
         put("notes_raw", text("notes_raw"))
-        for k in ("place", "born", "died", "source"):
+        for k in ("place", "born", "died", "source", "gpg"):
             put(k, text(k).strip())
         put("aliases", parse_aliases(text("aliases")))
         put("interactions", parse_log(text("interactions")))
@@ -11658,6 +11875,7 @@ class PersonCard:
                                     ("BORN  (2024-03-11, 1890, s. XVI)", "DIED"))
         self.e_source = app.source_field(c, pad)
         self.t_geo = app.geo_field(c, pad)
+        self.e_gpg = app.field(c, tr("GPG  (fingerprint of an OpenPGP key)"), app.f_meta, pad)
         self.circles = self.circle_panel(c, pad)
         self.t_alias = app.textfield(c, tr("ALSO KNOWN AS"), 2, app.f_meta, pad)
         self.t_links = app.textfield(c, tr("URLS  (sites, emails, phones)"), 2, app.f_meta, pad)
@@ -11731,11 +11949,12 @@ class PersonCard:
         ttk.Button(addrow, text="+ log", command=self.add_log
                    ).pack(side="left", padx=(8, 0))
 
-        for w in (self.e_name, self.e_tags, self.e_place, self.e_log, self.e_born, self.e_died):
+        for w in (self.e_name, self.e_tags, self.e_place, self.e_log, self.e_born, self.e_died,
+                  self.e_gpg):
             app.bind_undo(w)
         for w in (self.e_name, self.e_tags, self.e_place, self.e_source, self.t_notes,
                   self.t_links, self.t_alias, self.t_tasks, self.t_log, self.e_born,
-                  self.e_died, self.t_edges):
+                  self.e_died, self.t_edges, self.e_gpg):
             for ev in ("<KeyRelease>", "<<Paste>>", "<<Cut>>"):
                 w.bind(ev, app.mark_dirty, add="+")
 
@@ -11929,7 +12148,7 @@ class PersonCard:
     def enable(self, on):
         state = "normal" if on else "disabled"
         for w in (self.e_name, self.e_tags, self.e_place, self.e_log, self.e_source,
-                  self.e_born, self.e_died):
+                  self.e_born, self.e_died, self.e_gpg):
             w.configure(state=state)
         self.c_org.configure(state=state)
         for w in (self.t_notes, self.t_links, self.t_alias, self.t_tasks,
@@ -11939,7 +12158,7 @@ class PersonCard:
 
     def clear(self):
         for w in (self.e_name, self.e_tags, self.e_place, self.e_source, self.e_born,
-                  self.e_died):
+                  self.e_died, self.e_gpg):
             w.delete(0, "end")
         self.app.update_source_hint(self.e_source)
         self.app.geo_put(self.t_geo, "")
@@ -11971,6 +12190,8 @@ class PersonCard:
         self.e_source.insert(0, p.get("source", ""))
         self.app.update_source_hint(self.e_source)
         self.app.geo_put(self.t_geo, p.get("geo", ""))
+        self.e_gpg.delete(0, "end")
+        self.e_gpg.insert(0, p.get("gpg", ""))
         self.t_alias.delete("1.0", "end")
         self.t_alias.insert("1.0", format_aliases(p.get("aliases", [])))
         self.t_links.delete("1.0", "end")
@@ -12042,6 +12263,7 @@ class PersonCard:
             "died": self.e_died.get().strip(),
             "source": self.e_source.get().strip(),
             "geo": self.t_geo.get("1.0", "end-1c").strip(),
+            "gpg": self.e_gpg.get().strip(),
             "aliases": parse_aliases(self.t_alias.get("1.0", "end-1c")),
             "interactions": parse_log(self.t_log.get("1.0", "end-1c")),
             "tasks": parse_tasks(self.t_tasks.get("1.0", "end-1c")),
@@ -21908,6 +22130,10 @@ def main():
         return cmd_geojson(rest)
     if cmd == "observator":
         return cmd_observator(rest)
+    if cmd == "sign":
+        return cmd_sign(rest)
+    if cmd == "verify":
+        return cmd_verify(rest)
     if cmd == "export":
         return cmd_export(rest[0] if rest else "bibtex", rest[1] if len(rest) > 1 else None)
     print(__doc__)
@@ -24439,6 +24665,34 @@ PT = {
         "ui.observator aponta para {id}, que não é uma pessoa",
     "{id}: observator {who} is not a person of the base":
         "{id}: o observador {who} não é uma pessoa da base",
+    # signing the logs
+    "GPG  (fingerprint of an OpenPGP key)": "GPG  (impressão digital de uma chave OpenPGP)",
+    "40 hex digits": "40 dígitos hexadecimais",
+    "{id}: GPG is not a fingerprint (40 hex digits)":
+        "{id}: GPG não é uma impressão digital (40 dígitos hexadecimais)",
+    "{name} has no key: write the fingerprint of an OpenPGP key (40 hex digits) in GPG on that person's card.":
+        "{name} não tem chave: escreva a impressão digital de uma chave OpenPGP (40 dígitos "
+        "hexadecimais) em GPG, no cartão dessa pessoa.",
+    "GnuPG is not installed (gpg not found); nothing else needs it. On Windows: https://gpg4win.org":
+        "O GnuPG não está instalado (gpg não encontrado); nada mais depende dele. "
+        "No Windows: https://gpg4win.org",
+    "Nothing to sign: every line of {name} is signed.":
+        "Nada a assinar: todas as linhas de {name} estão assinadas.",
+    "gpg did not sign:": "o gpg não assinou:",
+    "{n} lines signed by {name} ({fpr}) -> {file}":
+        "{n} linhas assinadas por {name} ({fpr}) -> {file}",
+    "{who} has no key in the base": "{who} não tem chave na base",
+    "signed with {got}, but the base names {want}":
+        "assinado com {got}, mas a base indica {want}",
+    "bad signature": "assinatura inválida",
+    "the key {fpr} is not in this computer's keyring: gpg --import it":
+        "a chave {fpr} não está no chaveiro deste computador: importe-a com gpg --import",
+    "{n} signed lines are no longer in the log, or were changed":
+        "{n} linhas assinadas não estão mais no log, ou foram alteradas",
+    "{n} of {total} lines signed": "{n} de {total} linhas assinadas",
+    "{n} not signed": "{n} sem assinatura",
+    "verify: {n} problem(s)": "verify: {n} problema(s)",
+    "No logs here yet.": "Ainda não há logs aqui.",
 }
 
 if __name__ == "__main__":
