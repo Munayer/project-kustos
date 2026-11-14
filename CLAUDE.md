@@ -226,6 +226,25 @@ Ideas that span several sections:
   mirror, `is:geo`, and `cmd_geojson`, which leaves health out unless `--all`.
   Keep it offline: no geocoding and no tiles (the page's CSP is
   `default-src 'none'`). A new collection with a GEO joins `GEO_COLLS`.
+- **The map** (`# ==== map`, Ctrl+Shift+L, `map [id]`, the page's `#map`):
+  `map_features` (all of `GEO_COLLS`, accounts too; `geojson` keeps its own
+  rule) feeds `MapView` and `web_map` alike; the outline is
+  `kustos_basemap.json`, read lazily by `load_basemap` and served to the page
+  by `/api/basemap` with the token, never fetched from anywhere. It is made by
+  `tools/make_basemap.py` (Natural Earth, a pinned release; the only network
+  call, run by hand) and versioned; the map works without it. `MapView`
+  follows the window's search as the timeline does (`timeline_ids`,
+  `timeline_soon`), the chosen record drawn even outside it; only a new
+  search (`filter_sig`, its `get_key`) moves the view, not a save that
+  changes what it finds. A gesture only `move`s or `scale`s the canvas, and
+  `draw` runs once it stops. Tk fills a polygon even-odd: an area's holes
+  join its outer ring in one polygon, its edges drawn as lines. The
+  basemap's checks refuse what is not a finite position on the Earth.
+  Tk 9 costs ~50-100 µs a canvas item to draw
+  on every step, whatever its size: keep the item count down (markers that
+  would overlap are one, `MAP_MOVING_MARKS` while moving, no borders below
+  `MAP_BORDERS_K`), and time a change on 2 000 invented points. The page's
+  `mRender` is the same drawing as SVG, transformed while it moves.
 - **Observator** (`# ==== observator`): `ui.observator` is the p_ id of the
   person this instance belongs to (derived once from `ui.corpus_subject` by
   `observator_default`, in `upgrade_vault` and on open). `save_record` stamps
@@ -308,7 +327,8 @@ The rules, in order:
    `Co-Authored-By: Claude <noreply@anthropic.com>`, then push.
 5. Copy to the instance (`tools\update-instance.cmd`, or copy
    `_kustos.py`, `_kustos.cmd`, `_kustos_logbook.cmd`, `_kustos_peritia.cmd`,
-   `_kustos_serve.cmd`, `_kustos_backup.cmd`, `kustos.ico`) **only when
+   `_kustos_serve.cmd`, `_kustos_backup.cmd`, `kustos.ico`,
+   `kustos_basemap.json`) **only when
    Kustos is closed** — check that no `python`/`pythonw` process is running, or
    ask the owner — then verify the copies match (ignoring CRLF/LF). The
    always-on `web --serve` (task *Kustos web*) does not count: it holds nothing

@@ -391,6 +391,18 @@ It refuses any folder it did not make, so it never touches a real base.
   load into PostGIS (`ogr2ogr -f PostgreSQL PG:dbname=… _kustos.geojson`);
   health records and accounts stay out unless you add `--all`. Nothing goes to the network:
   no geocoding, no map tiles.
+- **Map** (Ctrl+Shift+L, View › Map, `python _kustos.py map [id]`, or *Map* in
+  the page's menu and on a record that has a GEO): every GEO on one map, over
+  the coastlines and land borders, each record in the colour of its collection.
+  The wheel (or a pinch) zooms where the pointer is, dragging moves, a click
+  opens the record; Home shows every place, `w` the world, `f` follows the
+  window's search and filters (the page's map follows the page's search and
+  tab). It opens on the current record's places when it has any. The outline
+  is `kustos_basemap.json`, beside the program: [Natural Earth](https://www.naturalearthdata.com/)
+  1:50m coastlines and land borders, which are in the public domain, simplified
+  by `tools/make_basemap.py` (run by hand, the only time anything is fetched;
+  it records the release and checksums it used). Without the file the map still
+  opens and draws the records alone. No tiles, no geocoding: nothing is sent out.
 - **Observator**: an instance belongs to one person of the base, chosen under
   Base › Observator… (or `python _kustos.py observator <p_id|name>`; the first
   time, the corpus's person is taken). Every record and link saved from then on
@@ -543,6 +555,7 @@ python _kustos.py search <texto>
 python _kustos.py cite <id|texto> [abnt|abnt-autor-data|bibtex|csl-json|bruto]  pulls citation from source
 python _kustos.py export [bibtex|csl|abnt] [arquivo]
 python _kustos.py geojson [--all] [file]   every GEO as one GeoJSON file
+python _kustos.py map [id]                  every GEO on one map, offline (read-only)
 python _kustos.py ledger [hledger|beancount] [file]   the accounts as a double-entry journal
 python _kustos.py observator [p_id|name]   who signs this instance; with an argument, chooses
 python _kustos.py sign | verify            OpenPGP signatures over the logs (GnuPG, optional)
@@ -570,4 +583,5 @@ __pycache__
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). The map's outline (`kustos_basemap.json`) is made
+from Natural Earth (naturalearthdata.com), which is in the public domain.

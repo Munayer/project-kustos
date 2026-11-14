@@ -22,7 +22,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-PROGRAM = ("_kustos.py", "_kustos.cmd", "_kustos_logbook.cmd", "_kustos_peritia.cmd", "kustos.ico")
+PROGRAM = ("_kustos.py", "_kustos.cmd", "_kustos_logbook.cmd", "_kustos_peritia.cmd", "kustos.ico",
+           "kustos_basemap.json")
 MARK = ".kustos-demo"
 
 
@@ -64,7 +65,8 @@ def main(argv):
     (folder / MARK).write_text("A base of invented records made by tools/demo_base.py; safe to delete.\n",
                                encoding="utf-8")
     for name in PROGRAM:
-        shutil.copy2(REPO / name, folder / name)
+        if (REPO / name).exists():      # the basemap is optional, as in Kustos
+            shutil.copy2(REPO / name, folder / name)
     spec = importlib.util.spec_from_file_location("kustos_demo_base", folder / "_kustos.py")
     K = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(K)          # works on the folder it sits in: the demo's

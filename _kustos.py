@@ -47,6 +47,7 @@ USAGE
     python _kustos.py graph [id]      the links as a living graph (read-only)
     python _kustos.py timeline [id]   everything dated, on one line of time (read-only)
     python _kustos.py monads [id]     what records share without links, as monads (read-only)
+    python _kustos.py map [id]        every GEO on one map, offline (read-only)
     python _kustos.py peritia         the skills panel, in the browser (on 127.0.0.1)
     python _kustos.py web [--stay] [--port N] [--no-open]
                                       the whole base in the browser, for a phone or a
@@ -8458,6 +8459,10 @@ WEB_STRINGS = (
     "Tap the record to reach.", "No chain of links joins them.", "{k} link(s) apart · {n} chain(s)",
     "Details", "Chain {i} of {n}",
     "Add an entry", "By month", "By category", "Largest outflows", "In", "Out",
+    "Map", "Every place", "The world", "tap or click: open · drag: move · pinch or wheel: zoom",
+    "No basemap (kustos_basemap.json): only the records are drawn.", "Nothing here has a GEO.",
+    "The basemap did not load: {why}", "(+{n} under it)", "{n} place(s) of {r} record(s) · {scope}", "following the search",
+    "the whole base", "100 px ≈ {dist}",
 )
 
 
@@ -9265,6 +9270,32 @@ def web_path(data, a, b):
             "records": len(idx)}
 
 
+def web_map(data, q="", coll="", rid=""):
+    """The page's map: the GEO of what the search and the tab let through (of
+    everything without either), as map_features, and where to look first --
+    `focus`, the box of `rid`'s places, or a note when it has none."""
+    web_prepare(data)
+    scope = parse_search(q)[0] or (coll if coll in COLLS else None)
+    filtered = bool((q or "").strip()) or scope is not None
+    ids = None
+    if filtered:
+        base = search_base(data, q)
+        ids = {r["id"] for c in COLLS if scope in (None, c) for r in base[c]} | ({rid} if rid else set())
+    feats = map_features(data, ids)
+    for f in feats:
+        f["name"] = one_liner(f["name"], 120)
+    focus, note = None, ""
+    if rid:
+        rec = by_id(data).get(rid)
+        focus = map_bounds(map_features(data, {rid})) if rec else None
+        if not focus:
+            note = (tr("{name} has no GEO; every place is shown.", name=one_liner(label_any(rec, data), 60))
+                    if rec else tr("{id} does not exist.", id=rid))
+    return {"features": feats, "filtered": filtered, "records": len({f["id"] for f in feats}),
+            "focus": list(focus) if focus else None, "note": note, "colours": MAP_COLOUR,
+            "other": LINK_FAMILY_COLOUR["other"]}
+
+
 def web_boot(token, auth=False, data=None):
     """What the page needs before its first call. `auth`: behind the login
     (web --serve), so the page offers to log out and goes to the login when
@@ -9368,6 +9399,12 @@ def web_api(method, path, query, body):
             except ValueError:
                 depth = 2
             return 200, web_graph(load_json(), arg("id"), depth)
+        if method == "GET" and path == "/api/map":
+            return 200, web_map(load_json(), arg("q"), arg("coll"), arg("id"))
+        if method == "GET" and path == "/api/basemap":      # the outline of the Earth, from beside the program
+            got = load_basemap()
+            return (200, got) if got else (404, {"error": tr(
+                "No basemap (kustos_basemap.json): only the records are drawn.")})
         if method != "POST":
             return 404, {"error": tr("Not found.")}
         if path == "/api/save":
@@ -10838,6 +10875,10 @@ textarea.prose { font: 17px/1.55 var(--serif); min-height: 10em; }
 .ask p { margin: 0 0 6px; white-space: pre-wrap; }
 .key { display: grid; grid-template-columns: 64px 1fr; gap: 8px 12px; align-items: center; margin-top: 10px; font-size: 14px; }
 .key svg { width: 64px; height: 14px; display: block; }
+.gcanvas svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.mb, .ml, .mframe { fill: none; vector-effect: non-scaling-stroke; stroke-linecap: round; stroke-linejoin: round; }
+.mborder { stroke-dasharray: 1 3; }
+.ma { vector-effect: non-scaling-stroke; fill-rule: evenodd; }
 #lq { width: 100%; padding: 10px 12px; font-size: 16px; border: 1px solid var(--rule); border-radius: var(--radius);
   background: var(--paper); margin-top: 12px; -webkit-appearance: none; appearance: none; }
 @media (prefers-reduced-motion: reduce) { #toast { transition: none; } }
@@ -10966,8 +11007,10 @@ function go(hash, replace) {
 function route() {
   here = location.hash;
   const h = decodeURIComponent(location.hash.slice(1));
-  if (h.startsWith("g/")) return showGraph(h.slice(2));
+  if (h.startsWith("g/")) { stopMap(); return showGraph(h.slice(2)); }
   stopGraph();
+  if (h === "map" || h.startsWith("map/")) return showMap(h.slice(4));
+  stopMap();
   if (h === "links") return showLinks();
   if (h === "practice") return showPractice();
   if (h.startsWith("r/")) return showRecord(h.slice(2));
@@ -11163,7 +11206,9 @@ function renderRecord(changed) {
   const foot = [r.id, r.updated ? T("updated {date}", {date: r.updated}) : "",
                 r.coll === "notes" ? T("file") + ": " + (r.file || T("(the file is made on saving)")) : ""];
   out.push(`<div class="foot">${foot.filter(Boolean).map(esc).join("<br>")}</div>`);
+  const geo = r.form && String(r.form.geo || "").trim();
   $("#rec").innerHTML = head(`<button class="btn quiet" data-act="graph">${esc(T("Graph"))}</button>` +
+                            (geo ? `<button class="btn quiet" data-act="map">${esc(T("Map"))}</button>` : "") +
                             `<button class="btn" data-act="edit">${esc(T("Edit"))}</button>`) +
     `<div class="card">${out.join("")}</div>`;
 }
@@ -11328,6 +11373,7 @@ function newSheet() {
 function menuSheet() {
   openSheet(`<div class="grid"><button class="btn" data-act="practice">${esc(T("Practice"))}</button>` +
     `<button class="btn" data-act="graph0">${esc(T("Link graph"))}</button>` +
+    `<button class="btn" data-act="map0">${esc(T("Map"))}</button>` +
     `<button class="btn" data-act="links">${esc(T("Links"))}</button>` +
     `<a class="btn" href="health" target="_blank" rel="noopener">${esc(T("Health report"))}</a>` +
     `<a class="btn" href="corpus" target="_blank" rel="noopener">${esc(T("Body map"))}</a>` +
@@ -12202,6 +12248,385 @@ function showLinks() {
 }
 let linksJob = null;
 
+/* ---------------------------------------------------------------- the map
+   The window's map (# ==== map) as SVG: every GEO the search and the tab let
+   through, over the outline of the Earth (kustos_basemap.json, asked once of
+   the server with the page's token; without it the records alone). No tiles
+   and nothing fetched from anywhere else. Equirectangular, x scaled by the
+   cosine of the latitude at the middle of the view. While the wheel turns or
+   the map is dragged or pinched the drawing is only transformed; it is drawn
+   again for the new view when the movement stops. As in the window, points
+   that would overlap are one marker, the others counted under it. */
+const M = {on: false, base: null, baseP: null, baseErr: "", seq: 0, key: null, feats: [], order: [], colours: {}, other: "#8a8578",
+           filtered: false, records: 0, note: "", cx: 0, cy: 20, k: 2, cos: 1, R: null, w: 0, h: 0,
+           want: null, anchor: null, ptr: new Map(), press: null, pinch: null, job: 0, C: null};
+const MAP_K_MAX = 400000, MAP_SPAN_MIN = 0.6, MAP_BORDERS_K = 5, MAP_POINT_R = 4;
+
+function showMap(id) {
+  document.body.classList.add("open");
+  S.rec = null; S.edit = null; S.sel = id || null;
+  markSel();
+  document.title = T("Map") + " · Kustos";
+  mapMount();
+  mapFetch(id);
+  window.scrollTo(0, 0);
+}
+function stopMap() {
+  if (!M.on) return;
+  M.on = false;
+  clearTimeout(M.job);
+  M.ptr.clear(); M.press = M.pinch = null;
+}
+function mapMount() {
+  $("#rec").innerHTML = `<div class="graph"><div class="gbar"><div class="grow-row">` +
+    `<button class="btn quiet back" data-act="back">&#8249; ${esc(T("Back"))}</button><span class="grow"></span>` +
+    `<button class="btn quiet" data-act="m-all">${esc(T("Every place"))}</button>` +
+    `<button class="btn quiet" data-act="m-world">${esc(T("The world"))}</button></div></div>` +
+    `<div class="gcanvas" id="mbox"><svg id="msvg" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="${esc(T("Map"))}"></svg>` +
+    `<div class="ghint">${esc(T("tap or click: open · drag: move · pinch or wheel: zoom"))}</div>` +
+    `<div class="gnote" id="mnote"></div></div>` +
+    `<div class="gstatus"><span class="who" id="mwho"></span><span id="mscale"></span></div></div>`;
+  M.on = true;
+  M.C = gColors();
+  const svg = $("#msvg");
+  svg.addEventListener("pointerdown", mDown);
+  svg.addEventListener("pointermove", mMove);
+  svg.addEventListener("pointerup", mUp);
+  svg.addEventListener("pointercancel", e => { M.ptr.delete(e.pointerId); M.pinch = null; if (!M.ptr.size) { M.press = null; mRender(); } });
+  svg.addEventListener("pointerleave", e => { if (e.pointerType === "mouse" && !M.press) mHover(null); });
+  svg.addEventListener("wheel", e => {
+    e.preventDefault();
+    const r = svg.getBoundingClientRect();
+    mZoomAt(e.clientX - r.left, e.clientY - r.top, gWheelZoom(e));
+  }, {passive: false});
+}
+// the outline of the Earth, asked once; asked again after a failure that was
+// not its absence (a 404: the file is not beside the program)
+function mapBase() {
+  if (!M.baseP) M.baseP = api("api/basemap").then(b => {
+    const base = {};
+    for (const [name, lines] of Object.entries(b.layers || {})) {
+      base[name] = lines.map(l => {
+        let w = 180, s = 90, e = -180, n = -90;
+        for (let i = 0; i < l.length; i += 2) {
+          w = Math.min(w, l[i]); e = Math.max(e, l[i]); s = Math.min(s, l[i + 1]); n = Math.max(n, l[i + 1]);
+        }
+        return [l, w, s, e, n];
+      });
+    }
+    M.base = base; M.baseErr = "";
+  }, e => {
+    M.base = null;
+    if (e.status === 404) M.baseErr = "";
+    else { M.baseErr = e.message; M.baseP = null; }
+  });
+  return M.baseP;
+}
+// a feature's largest area, in square degrees of its box (a loop: a spread
+// over a long ring overflows the stack)
+function mExtent(f) {
+  let most = 0;
+  for (const [kind, c] of f.shapes) {
+    if (kind !== "area") continue;
+    let w = Infinity, s = Infinity, e = -Infinity, n = -Infinity;
+    for (const [lon, lat] of c[0]) {
+      if (lon < w) w = lon;
+      if (lon > e) e = lon;
+      if (lat < s) s = lat;
+      if (lat > n) n = lat;
+    }
+    if (w !== Infinity) most = Math.max(most, (e - w) * (n - s));
+  }
+  return most;
+}
+async function mapFetch(id) {
+  const seq = ++M.seq;                  // only the latest call draws
+  let d;
+  try { d = await api("api/map?" + new URLSearchParams({q: S.q, coll: S.coll, id: id || ""})); }
+  catch (e) { if (seq === M.seq) toast(e.message, 4000); return; }
+  await mapBase();
+  if (!M.on || seq !== M.seq) return;
+  M.feats = d.features; M.colours = d.colours; M.other = d.other;
+  M.filtered = d.filtered; M.records = d.records; M.note = d.note || "";
+  M.sel = id || null;
+  // back on the map from a record: the same view, unless the search changed
+  const key = JSON.stringify([S.q, S.coll, id || ""]), same = key === M.key && M.R;
+  M.key = key;
+  // larger areas first, under the smaller ones; the chosen record's last, on top
+  M.order = M.feats.map((f, i) => [f.id === M.sel, -mExtent(f), i]).sort((a, b) => (a[0] - b[0]) || (a[1] - b[1]) || (a[2] - b[2])).map(x => x[2]);
+  M.want = same ? null : d.focus ? ["box", d.focus] : ["all"];
+  M.R = null;
+  mRender();
+}
+function mSize() { const b = $("#mbox"); M.w = b.clientWidth; M.h = b.clientHeight; }
+function mKmin() { return Math.max(0.05, 0.8 * Math.min(M.w / 360, M.h / 180)); }
+function mClamp() {
+  M.cx = Math.max(-180, Math.min(180, M.cx));
+  M.cy = Math.max(-85, Math.min(85, M.cy));
+  M.k = Math.max(mKmin(), Math.min(MAP_K_MAX, M.k));
+}
+function mBounds(feats) {
+  let w = Infinity, s = Infinity, e = -Infinity, n = -Infinity;
+  const take = c => {
+    if (typeof c[0] === "number") { w = Math.min(w, c[0]); e = Math.max(e, c[0]); s = Math.min(s, c[1]); n = Math.max(n, c[1]); }
+    else for (const x of c) take(x);
+  };
+  for (const f of feats) for (const [, c] of f.shapes) take(c);
+  return w === Infinity ? null : [w, s, e, n];
+}
+function mFit(box) {
+  let [w, s, e, n] = box;
+  const span = MAP_SPAN_MIN;
+  if (e - w < span) { const m = (w + e) / 2; w = m - span / 2; e = m + span / 2; }
+  if (n - s < span) { const m = (s + n) / 2; s = m - span / 2; n = m + span / 2; }
+  // the centre stops at 85 degrees: near a pole the box is fitted from there
+  M.cx = (w + e) / 2; M.cy = Math.max(-85, Math.min(85, (s + n) / 2));
+  const cos = Math.max(0.05, Math.cos(M.cy * Math.PI / 180)), half = Math.max(n - M.cy, M.cy - s);
+  M.k = Math.min(0.85 * M.w / ((e - w) * cos), 0.85 * M.h / (2 * half));
+  mClamp();
+}
+function mColour(f) { return BOOT.mono ? M.C.ink : (M.colours[f.coll] || M.other); }
+// a polyline (flat x, y ...) cut to a box: the runs inside it (Liang-Barsky), as map_clip
+function mClip(p, x0, y0, x1, y1) {
+  const runs = [];
+  let run = [], px = p[0], py = p[1];
+  for (let i = 2; i + 1 < p.length; i += 2) {
+    const qx = p[i], qy = p[i + 1], dx = qx - px, dy = qy - py;
+    let t0 = 0, t1 = 1, inside = true;
+    for (const [a, b] of [[-dx, px - x0], [dx, x1 - px], [-dy, py - y0], [dy, y1 - py]]) {
+      if (a === 0) { if (b < 0) { inside = false; break; } continue; }
+      const r = b / a;
+      if (a < 0) { if (r > t1) { inside = false; break; } t0 = Math.max(t0, r); }
+      else { if (r < t0) { inside = false; break; } t1 = Math.min(t1, r); }
+    }
+    if (inside) {
+      if (!run.length || t0 > 0) { if (run.length >= 4) runs.push(run); run = [px + t0 * dx, py + t0 * dy]; }
+      run.push(px + t1 * dx, py + t1 * dy);
+      if (t1 < 1) { runs.push(run); run = []; }
+    } else { if (run.length >= 4) runs.push(run); run = []; }
+    px = qx; py = qy;
+  }
+  if (run.length >= 4) runs.push(run);
+  return runs;
+}
+// a ring cut to a box (Sutherland-Hodgman), as map_clip_ring
+function mClipRing(p, x0, y0, x1, y1) {
+  let pts = [];
+  for (let i = 0; i + 1 < p.length; i += 2) pts.push([p[i], p[i + 1]]);
+  for (let edge = 0; edge < 4 && pts.length; edge++) {
+    const lim = [x0, x1, y0, y1][edge], ax = edge < 2 ? 0 : 1;
+    const inside = q => (edge % 2 === 0 ? q[ax] >= lim : q[ax] <= lim);
+    const cut = (a, b) => {
+      const t = (lim - a[ax]) / ((b[ax] - a[ax]) || 1e-12);
+      return ax === 0 ? [lim, a[1] + t * (b[1] - a[1])] : [a[0] + t * (b[0] - a[0]), lim];
+    };
+    const out = [];
+    let prev = pts[pts.length - 1];
+    for (const cur of pts) {
+      if (inside(cur)) { if (!inside(prev)) out.push(cut(prev, cur)); out.push(cur); }
+      else if (inside(prev)) out.push(cut(prev, cur));
+      prev = cur;
+    }
+    pts = out;
+  }
+  return pts.flat();
+}
+function mPath(p, close) {
+  let d = "";
+  for (let i = 0; i + 1 < p.length; i += 2) d += (i ? "L" : "M") + p[i].toFixed(1) + " " + p[i + 1].toFixed(1);
+  return close ? d + "Z" : d;
+}
+function mRender() {
+  clearTimeout(M.job);
+  if (!M.on) return;
+  mSize();
+  if (M.w < 20 || M.h < 20) return;
+  if (M.want) {
+    const box = M.want[0] === "all" ? mBounds(M.feats) : M.want[0] === "box" ? M.want[1] : null;
+    if (box) mFit(box);
+    else { M.cx = 0; M.cy = 15; M.k = mKmin(); mClamp(); }
+    M.want = null;
+  }
+  const W = M.w, H = M.h;
+  let cos = Math.max(0.05, Math.cos(M.cy * Math.PI / 180));
+  if (M.anchor != null && M.R) {         // the place under the pointer stays there
+    const a = M.anchor - W / 2;
+    M.cx += a / (M.k * M.cos) - a / (M.k * cos);
+    mClamp();
+    cos = Math.max(0.05, Math.cos(M.cy * Math.PI / 180));
+  }
+  M.anchor = null;
+  M.cos = cos;
+  const kx = M.k * cos, ky = M.k, ox = W / 2 - M.cx * kx, oy = H / 2 + M.cy * ky;
+  const lon0 = M.cx - W / kx, lon1 = M.cx + W / kx, lat0 = M.cy - H / ky, lat1 = M.cy + H / ky;
+  const bx0 = -W, by0 = -H, bx1 = 2 * W, by1 = 2 * H;
+  const seen = (w, s, e, n) => e >= lon0 && w <= lon1 && n >= lat0 && s <= lat1;
+  const big = (w, s, e, n) => (e - w) * kx > 3 * W || (n - s) * ky > 3 * H;
+  const proj = c => { const o = []; for (const [lon, lat] of c) o.push(ox + lon * kx, oy - lat * ky); return o; };
+  const C = M.C, sel = M.sel;
+  const areas = [], lines = [], marks = [];
+  for (const i of M.order) {
+    const f = M.feats[i], col = mColour(f), mine = f.id === sel;
+    for (const [kind, c] of f.shapes) {
+      if (kind === "point") {
+        if (c[0] >= lon0 && c[0] <= lon1 && c[1] >= lat0 && c[1] <= lat1) marks.push([i, ox + c[0] * kx, oy - c[1] * ky]);
+        continue;
+      }
+      const ring = kind === "area" ? c[0] : c;
+      let w = 180, s = 90, e = -180, n = -90;
+      for (const [lon, lat] of ring) { w = Math.min(w, lon); e = Math.max(e, lon); s = Math.min(s, lat); n = Math.max(n, lat); }
+      if (!seen(w, s, e, n)) continue;
+      if ((e - w) * kx < 5 && (n - s) * ky < 5) { marks.push([i, ox + (w + e) / 2 * kx, oy - (s + n) / 2 * ky]); continue; }
+      if (kind === "line") {
+        const runs = big(w, s, e, n) ? mClip(proj(c), bx0, by0, bx1, by1) : [proj(c)];
+        lines.push(`<path class="ml" data-u="${i}" stroke="${col}" stroke-width="${mine ? 3 : 2}" d="${runs.map(r => mPath(r)).join("")}"/>`);
+        continue;
+      }
+      const d = c.map(r => { const p = big(w, s, e, n) ? mClipRing(proj(r), bx0, by0, bx1, by1) : proj(r); return p.length >= 6 ? mPath(p, true) : ""; }).join("");
+      if (d) areas.push(`<path class="ma" data-u="${i}" fill="${mix(C.paper, col, 0.16)}" stroke="${col}" stroke-width="${mine ? 2 : 1}" d="${d}"/>`);
+    }
+  }
+  const base = [];
+  if (M.base) {
+    for (const name of ["borders", "coast"]) {
+      if (name === "borders" && M.k < MAP_BORDERS_K) continue;
+      let d = "";
+      for (const [l, w, s, e, n] of M.base[name] || []) {
+        if (!seen(w, s, e, n) || ((e - w) * kx < 3 && (n - s) * ky < 3)) continue;
+        const p = new Array(l.length);
+        for (let i = 0; i < l.length; i += 2) { p[i] = ox + l[i] * kx; p[i + 1] = oy - l[i + 1] * ky; }
+        for (const r of big(w, s, e, n) ? mClip(p, bx0, by0, bx1, by1) : [p]) d += mPath(r);
+      }
+      if (d) base.push(`<path class="mb${name === "borders" ? " mborder" : ""}" stroke="${mix(C.rule, C.soft, 0.45)}" d="${d}"/>`);
+    }
+  }
+  // the points: one marker where several would overlap, the chosen record's first
+  const R = MAP_POINT_R, D = 2 * R + 1, cells = new Map(), placed = [];
+  marks.sort((a, b) => (M.feats[a[0]].id !== sel) - (M.feats[b[0]].id !== sel));
+  for (const [i, x, y] of marks) {
+    const gx = Math.floor(x / D), gy = Math.floor(y / D);
+    let near = null;
+    for (let a = gx - 1; a <= gx + 1 && !near; a++) for (let b = gy - 1; b <= gy + 1 && !near; b++)
+      for (const m of cells.get(a + "," + b) || []) if ((m[0] - x) ** 2 + (m[1] - y) ** 2 < D * D) { near = m; break; }
+    if (near) near[2].push(i);
+    else { const m = [x, y, [i]]; const key = gx + "," + gy; if (!cells.has(key)) cells.set(key, []); cells.get(key).push(m); placed.push(m); }
+  }
+  placed.reverse();                     // the chosen record's markers last: on top
+  const dots = placed.map(([x, y, u]) => {
+    const f = M.feats[u[0]], mine = f.id === sel;
+    return `<circle data-u="${u.join(",")}" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${mine ? R + 2 : R}" fill="${mColour(f)}"` +
+           (mine ? ` stroke="${C.ink}" stroke-width="2"` : "") + `/>`;
+  });
+  const fx0 = Math.max(bx0, ox - 180 * kx), fy0 = Math.max(by0, oy - 90 * ky);
+  const fx1 = Math.min(bx1, ox + 180 * kx), fy1 = Math.min(by1, oy + 90 * ky);
+  const frame = fx1 > fx0 && fy1 > fy0 ? `<rect class="mframe" x="${fx0.toFixed(1)}" y="${fy0.toFixed(1)}" width="${(fx1 - fx0).toFixed(1)}" height="${(fy1 - fy0).toFixed(1)}" stroke="${C.rule}"/>` : "";
+  $("#msvg").innerHTML = `<g id="mw">${frame}${areas.join("")}${base.join("")}${lines.join("")}${dots.join("")}</g>`;
+  M.R = {cx: M.cx, cy: M.cy, k: M.k, cos: M.cos};
+  const notes = [];
+  if (!M.base) notes.push(M.baseErr ? T("The basemap did not load: {why}", {why: M.baseErr})
+                                     : T("No basemap (kustos_basemap.json): only the records are drawn."));
+  if (!M.feats.length) notes.push(T("Nothing here has a GEO."));
+  $("#mnote").textContent = notes.join(" ");
+  mHover(null);
+}
+// while it moves: the last drawing, transformed to the view as it is now
+function mTransform() {
+  const R = M.R, g = $("#mw");
+  if (!R || !g) return mRender();
+  const s = M.k / R.k, W = M.w, H = M.h;
+  const tx = W / 2 - s * W / 2 + (R.cx - M.cx) * M.k * R.cos;
+  const ty = H / 2 - s * H / 2 - (R.cy - M.cy) * M.k;
+  g.setAttribute("transform", `matrix(${s} 0 0 ${s} ${tx} ${ty})`);
+  mScale();
+}
+function mSettle() { clearTimeout(M.job); M.job = setTimeout(mRender, 150); }
+function mZoomAt(x, y, f) {
+  if (!M.R) return;
+  const k = Math.max(mKmin(), Math.min(MAP_K_MAX, M.k * f));
+  if (k === M.k) return;
+  const lon = M.cx + (x - M.w / 2) / (M.k * M.cos), lat = M.cy - (y - M.h / 2) / M.k;
+  M.cx = lon - (x - M.w / 2) / (k * M.cos); M.cy = lat + (y - M.h / 2) / k; M.k = k;
+  mClamp();
+  M.anchor = x;
+  mTransform();
+  mSettle();
+}
+function mPan(dx, dy) {
+  M.cx -= dx / (M.k * M.cos); M.cy += dy / M.k;
+  mClamp();
+  mTransform();
+}
+function mDown(e) {
+  const svg = $("#msvg");
+  try { svg.setPointerCapture(e.pointerId); } catch (err) { /* already gone */ }
+  M.ptr.set(e.pointerId, [e.clientX, e.clientY]);
+  if (M.ptr.size === 1) M.press = {x: e.clientX, y: e.clientY, moved: false, target: e.target};
+  else if (M.ptr.size === 2) {
+    const [a, b] = [...M.ptr.values()];
+    M.pinch = Math.hypot(a[0] - b[0], a[1] - b[1]) || 1;
+    if (M.press) M.press.moved = true;
+  }
+}
+function mMove(e) {
+  if (!M.ptr.has(e.pointerId)) { if (e.pointerType === "mouse") mHover(e.target); return; }
+  const last = M.ptr.get(e.pointerId);
+  M.ptr.set(e.pointerId, [e.clientX, e.clientY]);
+  if (M.pinch && M.ptr.size >= 2) {
+    const [a, b] = [...M.ptr.values()], r = $("#msvg").getBoundingClientRect();
+    const d = Math.hypot(a[0] - b[0], a[1] - b[1]) || 1;
+    mZoomAt((a[0] + b[0]) / 2 - r.left, (a[1] + b[1]) / 2 - r.top, d / M.pinch);
+    M.pinch = d;
+    return;
+  }
+  if (!M.press) return;
+  if (!M.press.moved && Math.abs(e.clientX - M.press.x) + Math.abs(e.clientY - M.press.y) < 5) return;
+  M.press.moved = true;
+  mPan(e.clientX - last[0], e.clientY - last[1]);
+}
+function mUp(e) {
+  M.ptr.delete(e.pointerId);
+  if (M.ptr.size < 2) M.pinch = null;
+  if (M.ptr.size) return;
+  const p = M.press;
+  M.press = null;
+  if (!p) return;
+  if (p.moved) { M.anchor = e.clientX - $("#msvg").getBoundingClientRect().left; mRender(); return; }
+  const el = p.target && p.target.closest ? p.target.closest("[data-u]") : null;
+  if (el) { const f = M.feats[+el.dataset.u.split(",")[0]]; if (f) { S.fromList = true; go("r/" + f.id); } }
+}
+function mHover(target) {
+  const el = target && target.closest ? target.closest("[data-u]") : null;
+  const u = el ? el.dataset.u.split(",").map(Number) : null, f = u ? M.feats[u[0]] : null;
+  $("#msvg").style.cursor = f ? "pointer" : "";
+  let text;
+  if (f) text = f.name + (f.label ? "  ·  " + f.label : "") + (u.length > 1 ? "  " + T("(+{n} under it)", {n: u.length - 1}) : "");
+  else if (M.note) text = M.note;
+  else text = T("{n} place(s) of {r} record(s) · {scope}", {n: M.feats.length, r: M.records,
+                scope: M.filtered ? T("following the search") : T("the whole base")});
+  $("#mwho").textContent = text;
+  mScale();
+}
+function mScale() {
+  const km = 100 / M.k * 111.32;
+  const dist = km >= 10 ? Math.round(km) + " km" : km >= 1 ? km.toFixed(1) + " km" : Math.round(km * 1000) + " m";
+  $("#mscale").textContent = T("100 px ≈ {dist}", {dist});
+}
+function mKey(e) {
+  const k = e.key;
+  if (k === "+" || k === "=") mZoomAt(M.w / 2, M.h / 2, 1.6);
+  else if (k === "-") mZoomAt(M.w / 2, M.h / 2, 1 / 1.6);
+  else if (k.startsWith("Arrow")) {
+    e.preventDefault();
+    mPan(k === "ArrowLeft" ? 120 : k === "ArrowRight" ? -120 : 0, k === "ArrowUp" ? 120 : k === "ArrowDown" ? -120 : 0);
+    mSettle();
+  }
+  else if (k === "Home") { M.want = ["all"]; mRender(); }
+  else if (k === "w") { M.want = ["world"]; mRender(); }
+  else return false;
+  return true;
+}
+window.addEventListener("resize", () => { if (M.on) mSettle(); });
+
 /* ---------------------------------------------------------------- practice
    The verba drilled in their languages (# ==== practice on the server): a
    meaning is shown, the word is typed -- or said aloud, then shown and graded
@@ -12484,6 +12909,10 @@ document.addEventListener("click", e => {
   else if (act === "mk") { closeSheet(); S.fromList = true; go("new/" + b.dataset.coll + "/" + b.dataset.kind); }
   else if (act === "graph") { S.fromList = true; go("g/" + S.rec.id); }
   else if (act === "graph0") { closeSheet(); S.fromList = true; go("g/" + (S.sel || "")); }
+  else if (act === "map") { S.fromList = true; go("map/" + S.rec.id); }
+  else if (act === "map0") { closeSheet(); S.fromList = true; go("map"); }
+  else if (act === "m-all") { M.want = ["all"]; mRender(); }
+  else if (act === "m-world") { M.want = ["world"]; mRender(); }
   else if (act === "gmode") { G.mode = b.dataset.m; if (G.mode === "life") gSeed(); gButtons(); gStatus(true); }
   else if (act === "gdepth") { G.depth = +b.dataset.d; gButtons(); graphFetch(G.center); }
   else if (act === "gpause") { G.paused = !G.paused; gButtons(); gStatus(true); }
@@ -12557,6 +12986,7 @@ document.addEventListener("keydown", e => {
   }
   if (typing || e.ctrlKey || e.metaKey || e.altKey) return;
   if (G.on && gKey(e)) return;
+  if (M.on && mKey(e)) return;
   if (e.key === "/") { e.preventDefault(); if (document.body.classList.contains("open") && innerWidth < 900) go(""); $("#q").focus(); }
   else if (e.key === "e" && S.rec && S.rec.id && !S.edit) startEdit();
   else if (e.key === "n") newSheet();
@@ -15330,6 +15760,17 @@ HELP_TIMELINE = (
 )
 
 
+# the Help › Shortcuts lines for the map
+HELP_MAP = (
+    "\n  Ctrl+Shift+L    map (second window, read-only): every GEO -- points, lines,"
+    "\n                  areas -- over the coastlines and borders, in the colour of"
+    "\n                  its collection, with no tiles and nothing sent out. The wheel"
+    "\n                  zooms where the pointer is, dragging or the arrows move, a"
+    "\n                  click opens a record here, Home shows every place, w the"
+    "\n                  world, f follows this window's search.\n"
+)
+
+
 # the Help › Shortcuts lines for the things of the house
 HELP_RES = (
     "\n  RES: the things of the house, one item each (r_): where it is, its status,"
@@ -16843,6 +17284,7 @@ class App:
                       command=self.open_timeline)
         v.add_command(label=tr("Monads"), accelerator="Ctrl+Shift+M",
                       command=self.open_monads)
+        v.add_command(label=tr("Map"), accelerator="Ctrl+Shift+L", command=self.open_map)
         v.add_command(label=tr("Skills (Peritia)"), command=self.open_peritia)
         v.add_command(label=tr("Practice languages (browser)"), command=self.open_practice)
         v.add_command(label=tr("Wide card"), accelerator="F11", command=self.toggle_wide)
@@ -16916,6 +17358,7 @@ class App:
         r.bind("<Control-G>", lambda e: self.open_graph())      # Ctrl+Shift+G
         r.bind("<Control-T>", lambda e: self.open_timeline())   # Ctrl+Shift+T
         r.bind("<Control-M>", lambda e: self.open_monads())     # Ctrl+Shift+M
+        r.bind("<Control-L>", lambda e: self.open_map())        # Ctrl+Shift+L
         r.bind("<F11>", lambda e: self.toggle_wide())
         r.bind("<Control-backslash>", lambda e: self.toggle_wide())
         r.bind("<Control-e>", lambda e: self.open_reader())
@@ -17102,6 +17545,25 @@ class App:
                                      on_open=self.open_from_graph)
         return "break"
 
+    def open_map(self):
+        """Ctrl+Shift+L: every GEO on one map, in a second window, on the
+        current record's places when it has any; it follows the search and the
+        filters of this one, as the timeline does."""
+        self.commit_if_dirty()
+        rid = (self.current() or {}).get("id")
+        m = getattr(self, "geomap", None)
+        if m and m.is_open():
+            m.root.lift()
+            if rid and map_features(self.data, {rid}):
+                m.refresh(rid)
+            else:
+                m.follow(rid)
+            return "break"
+        win = tk.Toplevel(self.root)
+        self.geomap = MapView(win, lambda: self.data, get_ids=self.timeline_ids, start_id=rid,
+                              on_open=self.open_from_graph, get_key=self.filter_sig)
+        return "break"
+
     def open_practice(self):
         """View › Practice languages: the web app, opened on its practice page."""
         import subprocess
@@ -17142,15 +17604,18 @@ class App:
         return {r["id"] for r in self.matches()}
 
     def timeline_soon(self):
-        tl = getattr(self, "timeline", None)
-        if not tl or not tl.is_open():
+        """The timeline and the map read the base, the search and the filters
+        again, a moment after they change."""
+        views = [v for v in (getattr(self, "timeline", None), getattr(self, "geomap", None))
+                 if v and v.is_open()]
+        if not views:
             return
         if getattr(self, "_tl_job", None):
             try:
                 self.root.after_cancel(self._tl_job)
             except tk.TclError:
                 pass
-        self._tl_job = self.root.after(300, tl.refresh)
+        self._tl_job = self.root.after(300, lambda: [v.refresh() for v in views if v.is_open()])
 
     def open_from_graph(self, rid):
         if rid not in by_id(self.data):
@@ -18477,7 +18942,8 @@ class App:
         self.dirty = False
         self.refit_card()
         self.front_card()
-        for view in (getattr(self, "graph", None), getattr(self, "monads", None)):
+        for view in (getattr(self, "graph", None), getattr(self, "monads", None),
+                     getattr(self, "geomap", None)):
             if view and view.is_open():
                 view.follow(rid)
         if self._dwell_job:
@@ -19812,7 +20278,7 @@ class App:
     def do_help(self):
         self.show_text(tr("Shortcuts"), tr(HELP_TEXT, conflicts=CONFLICT_DIR.name, stem=STEM)
                        + tr(HELP_READING) + tr(HELP_COPY) + tr(HELP_GRAPH) + tr(HELP_MONADS)
-                       + tr(HELP_NOTES) + tr(HELP_RES) + tr(HELP_TIMELINE))
+                       + tr(HELP_NOTES) + tr(HELP_RES) + tr(HELP_TIMELINE) + tr(HELP_MAP))
 
     # ------------------------------------------------------------ dialogs
     def dialog(self, title, width=520, height=None):
@@ -23690,6 +24156,775 @@ def cmd_timeline(open_id=None):
     return 0
 
 
+# ================================================================ map
+#
+# Where the records are, on one map (Ctrl+Shift+L, View › Map, or `python
+# _kustos.py map [id]`): every GEO -- points, lines, areas -- over an outline
+# of the Earth, each in the colour of its collection (the graph's, and the
+# dots of the page's list). The outline is kustos_basemap.json, beside the
+# program: Natural Earth's coastlines and land borders at 1:50m (public
+# domain), simplified by tools/make_basemap.py, which is run by hand and is the
+# only thing that ever went to the network for it. The map reads the file when
+# it opens, and without it draws the records alone. No tiles and no geocoding:
+# a place is where its GEO says. The projection is equirectangular, with x
+# scaled by the cosine of the latitude at the middle of the view. The wheel
+# zooms where the pointer is, dragging moves, a click opens a record on the
+# card; it follows the main window's search and filters (f), as the timeline
+# does. While the wheel turns or the map is dragged the drawing is only scaled
+# or moved (Canvas.scale, Canvas.move); it is drawn again, for that view, when
+# the movement stops. The page (# ==== web, #map) draws the same as SVG.
+# Health records and accounts are drawn too: the map is the owner's, as the
+# window is; only `geojson` leaves them out. Read-only.
+
+BASEMAP_FILE = BASE / "kustos_basemap.json"
+BASEMAP_LAYERS = ("borders", "coast")        # drawn in this order
+MAP_COLOUR = {"people": LINK_FAMILY_COLOUR["people"], "entries": LINK_FAMILY_COLOUR["verba"],
+              "sources": LINK_FAMILY_COLOUR["sources"], "corpus": LINK_FAMILY_COLOUR["corpus"],
+              "res": LINK_FAMILY_COLOUR["res"]}
+MAP_K_MAX = 400_000.0     # pixels a degree at most: about a quarter of a metre a pixel
+MAP_SPAN_MIN = 0.6        # degrees: the least a view fitted on one place shows around it
+MAP_SETTLE_MS = 150       # after the wheel stops, the view is drawn again in full
+MAP_MOVING_MARKS = 300    # markers kept on screen while the map moves
+MAP_BORDERS_K = 5.0       # pixels a degree from which the borders are drawn (not the whole world)
+MAP_KEYS = ("wheel: zoom   drag or arrows: move   click: open   Home: every place   "
+            "w: the world   f: follow the search   Esc: close")
+MAP_KEYS_ALONE = ("wheel: zoom   drag or arrows: move   Home: every place   "
+                  "w: the world   Esc: close")     # the map by itself: no search to follow
+MAP_SAID_MS = 8000        # how long the status line keeps a message before the counts come back
+_BASEMAP = {"key": None, "map": None}
+
+
+def load_basemap():
+    """The outline of the Earth, {"layers": {"coast": [line], "borders": [line]},
+    "about": text}, each line a flat list lon, lat, lon, lat... -- or None when
+    kustos_basemap.json is missing or does not read. Cached by the file's time
+    and size."""
+    try:
+        st = BASEMAP_FILE.stat()
+    except OSError:
+        return None
+    key = (st.st_mtime_ns, st.st_size)
+    if _BASEMAP["key"] != key:
+        got = None
+        try:
+            raw = json.loads(BASEMAP_FILE.read_text(encoding="utf-8"))
+            layers = {}
+            for name in BASEMAP_LAYERS:
+                layers[name] = [
+                    line for line in (raw["layers"].get(name) or [])
+                    if isinstance(line, list) and len(line) >= 4 and len(line) % 2 == 0
+                    and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in line)
+                    and all(-180 <= v <= 180 for v in line[0::2])      # NaN fails these too
+                    and all(-90 <= v <= 90 for v in line[1::2])]
+            got = {"layers": layers, "about": str(raw.get("about") or "")}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError):
+            got = None
+        _BASEMAP.update(key=key, map=got)
+    return _BASEMAP["map"]
+
+
+def map_shapes(g):
+    """A GeoJSON geometry as what the map draws: [kind, coordinates], kind
+    "point" ([lon, lat]), "line" ([[lon, lat], ...]) or "area" (its rings)."""
+    t, c = g.get("type"), g.get("coordinates")
+    pos = lambda p: [p[0], p[1]]
+    if t == "Point":
+        return [["point", pos(c)]]
+    if t == "MultiPoint":
+        return [["point", pos(p)] for p in c]
+    if t == "LineString":
+        return [["line", [pos(p) for p in c]]]
+    if t == "MultiLineString":
+        return [["line", [pos(p) for p in line]] for line in c]
+    if t == "Polygon":
+        return [["area", [[pos(p) for p in ring] for ring in c]]]
+    if t == "MultiPolygon":
+        return [["area", [[pos(p) for p in ring] for ring in poly]] for poly in c]
+    if t == "GeometryCollection":
+        return [s for part in g.get("geometries") or [] for s in map_shapes(part)]
+    return []
+
+
+def map_features(data, ids=None):
+    """Every GEO the map draws, one per part: [{id, coll, kind, n, name,
+    label, shapes}]; with `ids`, only those records'. All the collections that
+    have a GEO, health and accounts too (geojson keeps its own rule)."""
+    out = []
+    for f in geo_features(data, GEO_COLLS, accounts=True):
+        p = f["properties"]
+        if p["id"].startswith("__") or (ids is not None and p["id"] not in ids):
+            continue                    # a card not saved yet has no place to open
+        out.append({"id": p["id"], "coll": p["coll"], "kind": p["kind"], "n": p["reg_n"],
+                    "name": p["name"], "label": p["label"], "shapes": map_shapes(f["geometry"])})
+    return out
+
+
+def map_bounds(feats):
+    """(west, south, east, north) of the features, or None for none."""
+    lons, lats = [], []
+
+    def take(c):
+        if c and isinstance(c[0], (int, float)):
+            lons.append(c[0])
+            lats.append(c[1])
+        else:
+            for x in c:
+                take(x)
+
+    for f in feats:
+        for _kind, c in f["shapes"]:
+            take(c)
+    if not lons:
+        return None
+    return min(lons), min(lats), max(lons), max(lats)
+
+
+def map_extent(f):
+    """How much of the Earth a feature's areas cover, in square degrees of
+    their boxes: the larger are drawn first, under the smaller ones."""
+    most = 0.0
+    for kind, c in f["shapes"]:
+        if kind == "area":
+            lons, lats = [p[0] for p in c[0]], [p[1] for p in c[0]]
+            most = max(most, (max(lons) - min(lons)) * (max(lats) - min(lats)))
+    return most
+
+
+def map_clip(flat, x0, y0, x1, y1):
+    """A polyline (flat x, y, x, y ...) cut to a box: the runs inside it, each
+    a flat list (Liang-Barsky on each segment). Lines that reach far beyond the
+    window are cut before Tk draws them, zoomed in."""
+    runs, run = [], []
+    px, py = flat[0], flat[1]
+    for i in range(2, len(flat) - 1, 2):
+        qx, qy = flat[i], flat[i + 1]
+        dx, dy = qx - px, qy - py
+        t0, t1, inside = 0.0, 1.0, True
+        for p, q in ((-dx, px - x0), (dx, x1 - px), (-dy, py - y0), (dy, y1 - py)):
+            if p == 0:
+                if q < 0:
+                    inside = False
+                    break
+                continue
+            r = q / p
+            if p < 0:
+                if r > t1:
+                    inside = False
+                    break
+                t0 = max(t0, r)
+            else:
+                if r < t0:
+                    inside = False
+                    break
+                t1 = min(t1, r)
+        if inside:
+            if not run or t0 > 0:
+                if len(run) >= 4:
+                    runs.append(run)
+                run = [px + t0 * dx, py + t0 * dy]
+            run += [px + t1 * dx, py + t1 * dy]
+            if t1 < 1:
+                runs.append(run)
+                run = []
+        else:
+            if len(run) >= 4:
+                runs.append(run)
+            run = []
+        px, py = qx, qy
+    if len(run) >= 4:
+        runs.append(run)
+    return runs
+
+
+def map_clip_ring(flat, x0, y0, x1, y1):
+    """A closed ring (flat x, y ...) cut to a box (Sutherland-Hodgman): what is
+    left of it, flat, maybe nothing."""
+    pts = list(zip(flat[0::2], flat[1::2]))
+    for edge in range(4):
+        if not pts:
+            break
+        if edge < 2:
+            lim = x0 if edge == 0 else x1
+        else:
+            lim = y0 if edge == 2 else y1
+
+        def inside(p, edge=edge, lim=lim):
+            v = p[0] if edge < 2 else p[1]
+            return v >= lim if edge in (0, 2) else v <= lim
+
+        def cut(a, b, edge=edge, lim=lim):
+            (ax, ay), (bx, by) = a, b
+            if edge < 2:
+                t = (lim - ax) / ((bx - ax) or 1e-12)
+                return lim, ay + t * (by - ay)
+            t = (lim - ay) / ((by - ay) or 1e-12)
+            return ax + t * (bx - ax), lim
+
+        out, prev = [], pts[-1]
+        for cur in pts:
+            if inside(cur):
+                if not inside(prev):
+                    out.append(cut(prev, cur))
+                out.append(cur)
+            elif inside(prev):
+                out.append(cut(prev, cur))
+            prev = cur
+        pts = out
+    return [v for p in pts for v in p]
+
+
+class MapView:
+    TOP, BOTTOM = 24, 26       # the keys above, the status below
+    POINT_R = 4.0
+
+    def __init__(self, root, get_data, get_ids=None, start_id=None, on_open=None, get_key=None):
+        """`get_ids`: the ids the main window's search lets through (None:
+        all); `get_key`: what that search is, so that a save that only changes
+        what it finds does not move the view."""
+        self.root, self.get_data, self.get_ids, self.on_open = root, get_data, get_ids, on_open
+        self.get_key = get_key
+        self.follow_search = True
+        self.feats, self.items, self.records = [], {}, 0
+        self.cx, self.cy, self.k, self.cos = 0.0, 20.0, 2.0, 1.0
+        self.want = ("all",)            # what the next drawing fits first, if anything
+        self.drawn = False              # the canvas holds a drawing to move or scale
+        self.thin, self.moved = False, 0.0  # markers thinned out while moving; pixels moved
+        self.anchor = None              # x of the pointer when the view was last zoomed
+        self.sought = False             # the ids of the search followed (None: all)
+        self.sel, self.hover, self.drag = start_id, None, None
+        self.said, self.said_n = "", 0
+        self.found = None
+        self._job = self._settle = None
+        self.base = load_basemap()
+        self.lines = {}                 # layer -> [(flat, west, south, east, north)]
+        for name, lines in ((self.base or {}).get("layers") or {}).items():
+            self.lines[name] = [(ln, min(ln[0::2]), min(ln[1::2]), max(ln[0::2]), max(ln[1::2]))
+                                for ln in lines]
+        fams = set(tkfont.families(root))
+        mono = next((f for f in ("Cascadia Mono", "Consolas", "Lucida Console",
+                                 "DejaVu Sans Mono", "Courier New") if f in fams), "Courier")
+        self.f_small = tkfont.Font(root, family=mono, size=8)
+        self.f_status = tkfont.Font(root, family=mono, size=9)
+        self.c_base = mix(RULE, SOFT, 0.45)          # the outline: one quiet stroke
+        root.title(tr("Kustos · map (read-only)"))
+        root.configure(bg=PAPER)
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = min(1200, sw - 80), min(760, sh - 120)
+        root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
+        root.minsize(560, 360)
+        paint_frame(root)
+        self.cv = cv = tk.Canvas(root, bg=PAPER, highlightthickness=0, bd=0)
+        cv.pack(fill="both", expand=True)
+        cv.bind("<Configure>", lambda e: self.later())
+        cv.bind("<MouseWheel>", self.wheel)
+        bind_touchpad(cv.bind, self.wheel)          # sideways: along the parallels
+        cv.bind("<Button-4>", lambda e: self.zoom_at(e.x, e.y, 1.25))
+        cv.bind("<Button-5>", lambda e: self.zoom_at(e.x, e.y, 0.8))
+        cv.bind("<ButtonPress-1>", self.press)
+        cv.bind("<B1-Motion>", self.dragged)
+        cv.bind("<ButtonRelease-1>", self.release)
+        cv.bind("<Motion>", self.motion)
+        cv.bind("<Leave>", lambda e: self.set_hover(None))
+        b = root.bind
+        b("<Left>", lambda e: self.pan_px(120, 0, settle=True))
+        b("<Right>", lambda e: self.pan_px(-120, 0, settle=True))
+        b("<Up>", lambda e: self.pan_px(0, 120, settle=True))
+        b("<Down>", lambda e: self.pan_px(0, -120, settle=True))
+        for k in ("<plus>", "<equal>", "<KP_Add>"):
+            b(k, lambda e: self.zoom_at(None, None, 1.6))
+        for k in ("<minus>", "<KP_Subtract>"):
+            b(k, lambda e: self.zoom_at(None, None, 1 / 1.6))
+        b("<Home>", lambda e: self.fit_all())
+        b("<w>", lambda e: self.fit_world())
+        if get_ids:
+            b("<f>", lambda e: self.toggle_follow())
+        b("<Return>", lambda e: self.open_sel())
+        b("<Escape>", lambda e: root.destroy())
+        self.refresh(start_id)
+
+    # ---- data
+    def is_open(self):
+        try:
+            return bool(self.root.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def refresh(self, center=None):
+        """Reads the base again (and the search in force, when following it);
+        `center`: fits the view on that record's places."""
+        if not self.is_open():
+            return
+        data = self.get_data()
+        ids = self.get_ids() if (self.follow_search and self.get_ids) else None
+        self.scope = ids is not None
+        if self.get_key:
+            sought = (self.follow_search, self.get_key() if self.follow_search else None)
+        else:
+            sought = frozenset(ids) if ids is not None else None
+        if sought != self.sought:       # another search: the view goes to what it found
+            if self.sought is not False:
+                self.want = ("all",)
+            self.sought = sought
+        rec = by_id(data).get(center) if center else None
+        if rec:
+            self.sel = center
+        self.found = ids                # what "every place" fits: what the search found
+        if ids is not None and self.sel:
+            ids = set(ids) | {self.sel}     # the chosen record, even outside the search
+        self.feats = map_features(data, ids)
+        self.records = len({f["id"] for f in self.feats})
+        if center:
+            box = map_bounds(map_features(data, {center})) if rec else None
+            if box:
+                self.sel, self.want = center, ("box", box)
+            else:
+                self.say(tr("{name} has no GEO; every place is shown.",
+                            name=one_liner(label_any(rec, data), 60)) if rec
+                         else tr("{id} does not exist.", id=center))
+                self.want = ("all",)
+        self.later()
+
+    def follow(self, rid):
+        """The record opened in the main window is drawn as the chosen one,
+        even when the search leaves it out."""
+        if rid != self.sel:
+            self.sel = rid
+            if self.scope and rid and rid not in {f["id"] for f in self.feats}:
+                self.refresh()
+            else:
+                self.later()
+
+    def toggle_follow(self):
+        self.follow_search = not self.follow_search
+        self.refresh()
+
+    def colour(self, f):
+        if PAL["mono_only"]:
+            return INK
+        return MAP_COLOUR.get(f["coll"], LINK_FAMILY_COLOUR["other"])
+
+    # ---- the view
+    def size(self):
+        return max(1, self.cv.winfo_width()), max(1, self.cv.winfo_height())
+
+    def k_min(self):
+        w, h = self.size()
+        return max(0.05, 0.8 * min(w / 360, (h - self.TOP - self.BOTTOM) / 180))
+
+    def clamp(self):
+        self.cx = max(-180.0, min(180.0, self.cx))
+        self.cy = max(-85.0, min(85.0, self.cy))
+        self.k = max(self.k_min(), min(MAP_K_MAX, self.k))
+
+    def fit(self, box):
+        """The view on (west, south, east, north), with a margin."""
+        w, s, e, n = box
+        span = MAP_SPAN_MIN
+        if e - w < span:
+            w, e = (w + e) / 2 - span / 2, (w + e) / 2 + span / 2
+        if n - s < span:
+            s, n = (s + n) / 2 - span / 2, (s + n) / 2 + span / 2
+        W, H = self.size()
+        # the centre stops at 85 degrees: near a pole the box is fitted from there
+        self.cx, self.cy = (w + e) / 2, max(-85.0, min(85.0, (s + n) / 2))
+        cos = max(0.05, math.cos(math.radians(self.cy)))
+        half = max(n - self.cy, self.cy - s)
+        self.k = min(0.85 * W / ((e - w) * cos), 0.85 * (H - self.TOP - self.BOTTOM) / (2 * half))
+        self.clamp()
+
+    def fit_all(self):
+        self.want = ("all",)
+        self.later()
+
+    def fit_world(self):
+        self.want = ("world",)
+        self.later()
+
+    def zoom_at(self, x, y, f):
+        """Zooms by f, the place under (x, y) staying under it."""
+        W, H = self.size()
+        if x is None:
+            x, y = W / 2, H / 2
+        k = max(self.k_min(), min(MAP_K_MAX, self.k * f))
+        f = k / self.k
+        if abs(f - 1) < 1e-9:
+            return
+        kx = self.k * self.cos
+        lon, lat = self.cx + (x - W / 2) / kx, self.cy - (y - H / 2) / self.k
+        self.cx, self.cy, self.k = lon - (x - W / 2) / (k * self.cos), lat + (y - H / 2) / k, k
+        before = (self.cx, self.cy)
+        self.clamp()
+        if self.drawn and not self._job and before == (self.cx, self.cy):
+            self.thin_out()
+            self.anchor = x
+            self.cv.scale("world", x, y, f, f)
+            self.settle_soon()
+        else:
+            self.later()
+
+    def wheel(self, e):
+        u = wheel_units(e)                          # a fraction, from a touchpad
+        if e.state & 0x1:                           # Shift, or sideways: along the parallels
+            self.pan_px(-60 * u, 0, settle=True)
+        else:
+            self.zoom_at(e.x, e.y, 1.25 ** -u)
+
+    def pan_px(self, dx, dy, settle=False):
+        """Moves the map by (dx, dy) pixels: the drawing moves; the view is
+        drawn again once it stops (settle), or at the end of the drag."""
+        cx, cy = self.cx - dx / (self.k * self.cos), self.cy + dy / self.k
+        self.cx, self.cy = cx, cy
+        self.clamp()
+        dx += (cx - self.cx) * self.k * self.cos    # what the clamp held back
+        dy -= (cy - self.cy) * self.k
+        if self.drawn and not self._job:
+            self.thin_out()
+            self.cv.move("world", dx, dy)
+            self.moved += abs(dx) + abs(dy)
+        else:
+            self.later()
+        if settle:
+            self.settle_soon()
+
+    def settle_soon(self):
+        if self._settle:
+            try:
+                self.root.after_cancel(self._settle)
+            except tk.TclError:
+                pass
+        try:
+            self._settle = self.root.after(MAP_SETTLE_MS, self.draw)
+        except tk.TclError:
+            pass
+
+    # ---- the pointer
+    def press(self, e):
+        self.drag = [e.x, e.y, e.x, e.y, False]
+        self.cv.focus_set()
+
+    def dragged(self, e):
+        d = self.drag
+        if not d:
+            return
+        if not d[4] and abs(e.x - d[0]) + abs(e.y - d[1]) < 4:
+            return
+        d[4] = True
+        dx, dy = e.x - d[2], e.y - d[3]
+        d[2], d[3] = e.x, e.y
+        self.pan_px(dx, dy)
+
+    def release(self, e):
+        d, self.drag = self.drag, None
+        if d and d[4]:
+            # what was drawn reaches a screen beyond each side: a short move
+            # needs only the markers back, a long one (or far north or south,
+            # where the parallels' scale changes) a new drawing
+            W, H = self.size()
+            cos = max(0.05, math.cos(math.radians(self.cy)))
+            if self.moved > min(W, H) / 2 or abs(cos / self.cos - 1) > 0.02:
+                self.anchor = e.x
+                self.draw()
+            else:
+                self.thick_again()
+            return
+        i = self.hit(e.x, e.y)
+        if i:
+            self.open_feature(i[0])
+
+    def motion(self, e):
+        if not self.drag:
+            self.set_hover(self.hit(e.x, e.y))
+
+    def set_hover(self, i):
+        if i != self.hover:
+            self.hover = i
+            self.cv.configure(cursor="hand2" if i is not None else "")
+            self.draw_status()
+
+    def hit(self, x, y):
+        """The features under (x, y), as a tuple, the one drawn on top first;
+        None for none, and over the keys or the status."""
+        if y < self.TOP or y > self.size()[1] - self.BOTTOM:
+            return None
+        for item in reversed(self.cv.find_overlapping(x - 4, y - 4, x + 4, y + 4)):
+            under = self.items.get(item)
+            if under:
+                return under
+        return None
+
+    def open_feature(self, i):
+        if not 0 <= i < len(self.feats):
+            return
+        rid = self.feats[i]["id"]
+        self.sel = rid
+        if self.on_open:
+            self.on_open(rid)
+        else:
+            self.say(tr("Read-only here: open the map from Kustos (Ctrl+Shift+L) to send "
+                        "records to the card."))
+        self.later()
+
+    def open_sel(self):
+        i = self.hover[0] if self.hover else None
+        if i is None and self.sel:
+            i = next((n for n, f in enumerate(self.feats) if f["id"] == self.sel), None)
+        if i is not None:
+            self.open_feature(i)
+
+    def say(self, text):
+        """A message on the status line, for a while (MAP_SAID_MS)."""
+        self.said, self.said_n = text, self.said_n + 1
+        if self.drawn:
+            self.draw_status()
+        try:
+            self.root.after(MAP_SAID_MS, self.unsay, self.said_n)
+        except tk.TclError:
+            pass
+
+    def unsay(self, n):
+        if n == self.said_n and self.said and self.is_open():
+            self.said = ""
+            if self.drawn:
+                self.draw_status()
+
+    # ---- drawing
+    def later(self):
+        if self._job:
+            return
+        try:
+            self._job = self.root.after(16, self.draw)
+        except tk.TclError:
+            pass
+
+    def draw(self):
+        """The whole map, projected for the view as it is now."""
+        if self._job:
+            try:
+                self.root.after_cancel(self._job)
+            except tk.TclError:
+                pass
+        if self._settle:
+            try:
+                self.root.after_cancel(self._settle)
+            except tk.TclError:
+                pass
+        self._job = self._settle = None
+        if not self.is_open():
+            return
+        cv = self.cv
+        W, H = self.size()
+        if W < 50 or H < 50:
+            return
+        if self.want:
+            found = [f for f in self.feats if self.found is None or f["id"] in self.found]
+            box = map_bounds(found or self.feats) if self.want[0] == "all" else (
+                self.want[1] if self.want[0] == "box" else None)
+            if box:
+                self.fit(box)
+            else:
+                self.cx, self.cy, self.k = 0.0, 15.0, self.k_min()
+                self.clamp()
+            self.want = None
+        cos = max(0.05, math.cos(math.radians(self.cy)))
+        if self.anchor is not None and self.drawn:  # the place under the pointer stays as
+            ax = self.anchor - W / 2    # the parallels' scale changes with the latitude
+            self.cx += ax / (self.k * self.cos) - ax / (self.k * cos)
+            self.clamp()
+        self.anchor = None
+        self.cos = cos
+        kx, ky = self.k * cos, self.k
+        ox, oy = W / 2 - self.cx * kx, H / 2 + self.cy * ky
+        cv.delete("world")
+        self.items, self.hover = {}, None
+        # what is in sight, in degrees, with a margin; and the box lines are cut to
+        lon0, lon1 = self.cx - W / kx, self.cx + W / kx
+        lat0, lat1 = self.cy - H / ky, self.cy + H / ky
+        bx0, by0, bx1, by1 = -W, -H, 2 * W, 2 * H
+
+        def seen(w, s, e, n):
+            return e >= lon0 and w <= lon1 and n >= lat0 and s <= lat1
+
+        def project(coords):
+            return [v for lon, lat in coords for v in (ox + lon * kx, oy - lat * ky)]
+
+        def big(w, s, e, n):
+            return (e - w) * kx > 3 * W or (n - s) * ky > 3 * H
+
+        # the frame of the world, where it is in sight
+        fx0, fy0, fx1, fy1 = ox - 180 * kx, oy - 90 * ky, ox + 180 * kx, oy + 90 * ky
+        cv.create_rectangle(max(bx0, fx0), max(by0, fy0), min(bx1, fx1), min(by1, fy1),
+                            outline=RULE, tags=("world",))
+        order = sorted(range(len(self.feats)), key=lambda n: (self.feats[n]["id"] == self.sel,
+                                                               -map_extent(self.feats[n])))
+        marks = []                      # (i, x, y): a point, or a shape too small to see
+        lines = []                      # (i, flat) of the records' lines, drawn over the outline
+        for i in order:                 # the areas first, under the outline
+            f = self.feats[i]
+            col = self.colour(f)
+            for kind, c in f["shapes"]:
+                if kind == "point":
+                    lon, lat = c
+                    if lon0 <= lon <= lon1 and lat0 <= lat <= lat1:
+                        marks.append((i, ox + lon * kx, oy - lat * ky))
+                    continue
+                ring = c[0] if kind == "area" else c
+                lons, lats = [p[0] for p in ring], [p[1] for p in ring]
+                w, s, e, n = min(lons), min(lats), max(lons), max(lats)
+                if not seen(w, s, e, n):
+                    continue
+                if (e - w) * kx < 5 and (n - s) * ky < 5:
+                    marks.append((i, ox + (w + e) / 2 * kx, oy - (s + n) / 2 * ky))
+                    continue
+                if kind == "line":
+                    lines.append((i, project(c), big(w, s, e, n)))
+                    continue
+                rings = []
+                for r, rc in enumerate(c):
+                    flat = project(rc)
+                    if big(w, s, e, n):
+                        flat = map_clip_ring(flat, bx0, by0, bx1, by1)
+                    if len(flat) >= 6:
+                        rings.append(flat)
+                    elif r == 0:
+                        break       # no outer ring in sight: nothing of this area
+                if not rings:
+                    continue
+                wide, fill = 2 if f["id"] == self.sel else 1, mix(PAPER, col, 0.16)
+                if len(rings) == 1:
+                    item = cv.create_polygon(rings[0], fill=fill, outline=col, width=wide,
+                                             tags=("world",))
+                    self.items[item] = (i,)
+                    continue
+                # Tk fills even-odd: each hole joined to the outer ring by a seam
+                # walked there and back, which crosses nothing; the edges as lines
+                outer, joined = rings[0], list(rings[0])
+                for hole in rings[1:]:
+                    joined += hole + hole[:2] + outer[-2:]
+                item = cv.create_polygon(joined, fill=fill, outline="", tags=("world",))
+                self.items[item] = (i,)
+                for ring in rings:
+                    item = cv.create_line(ring + ring[:2], fill=col, width=wide, tags=("world",))
+                    self.items[item] = (i,)
+        for name in BASEMAP_LAYERS:     # the outline of the Earth, one quiet stroke
+            if name == "borders" and self.k < MAP_BORDERS_K:
+                continue
+            dash = "." if name == "borders" else ""
+            for flat, w, s, e, n in self.lines.get(name, ()):
+                if not seen(w, s, e, n) or ((e - w) * kx < 3 and (n - s) * ky < 3):
+                    continue            # out of sight, or a speck
+                it = iter(flat)
+                pts = [v for lon, lat in zip(it, it) for v in (ox + lon * kx, oy - lat * ky)]
+                for run in (map_clip(pts, bx0, by0, bx1, by1) if big(w, s, e, n) else (pts,)):
+                    cv.create_line(run, fill=self.c_base, dash=dash, tags=("world",))
+        for i, flat, cut in lines:
+            f = self.feats[i]
+            wide = 3 if f["id"] == self.sel else 2
+            for run in (map_clip(flat, bx0, by0, bx1, by1) if cut else (flat,)):
+                item = cv.create_line(run, fill=self.colour(f), width=wide, capstyle="round",
+                                      joinstyle="round", tags=("world",))
+                self.items[item] = (i,)
+        # the points: one marker where several would overlap (the chosen record's
+        # first), the others counted under it; a canvas item costs Tk the same
+        # to draw however small it is, and markers never overlapping is what
+        # keeps a dense map cheap
+        R = self.POINT_R
+        D = 2 * R + 1
+        cells, placed = {}, []          # [x, y, [feature, ...]]
+        for i, x, y in sorted(marks, key=lambda m: self.feats[m[0]]["id"] != self.sel):
+            gx, gy = int(x // D), int(y // D)
+            near = next((m for a in (gx - 1, gx, gx + 1) for b in (gy - 1, gy, gy + 1)
+                         for m in cells.get((a, b), ()) if (m[0] - x) ** 2 + (m[1] - y) ** 2 < D * D),
+                        None)
+            if near:
+                near[2].append(i)
+            else:
+                m = [x, y, [i]]
+                cells.setdefault((gx, gy), []).append(m)
+                placed.append(m)
+        n_sel = sum(1 for m in placed if self.feats[m[2][0]]["id"] == self.sel)
+        every = max(1, math.ceil(len(placed) / MAP_MOVING_MARKS))
+        for j, (x, y, under) in enumerate(placed[n_sel:] + placed[:n_sel]):
+            f = self.feats[under[0]]
+            if f["id"] == self.sel:
+                item = cv.create_oval(x - R - 2, y - R - 2, x + R + 2, y + R + 2, fill=self.colour(f),
+                                      outline=INK, width=2, tags=("world",))
+            else:                       # while the map moves, only a sample of them
+                item = cv.create_oval(x - R, y - R, x + R, y + R, fill=self.colour(f), outline="",
+                                      tags=("world", "spare") if j % every else ("world",))
+            self.items[item] = tuple(under)
+        self.drawn, self.thin = True, False
+        self.moved = 0.0
+        self.draw_status()
+
+    def thin_out(self):
+        """While the map moves: the markers beyond a sample hide, since Tk
+        draws every item again on every step; they come back when it stops."""
+        if self.drawn and not self.thin:
+            self.thin = True
+            self.cv.itemconfigure("spare", state="hidden")
+
+    def thick_again(self):
+        if self.thin:
+            self.thin = False
+            self.cv.itemconfigure("spare", state="normal")
+
+    def draw_status(self):
+        cv = self.cv
+        cv.delete("ui")
+        W, H = self.size()
+        cv.create_rectangle(0, 0, W, self.TOP, fill=PAPER, outline="", tags=("ui",))
+        cv.create_text(12, 6, anchor="nw", font=self.f_small, fill=FAINT,
+                       text=tr(MAP_KEYS if self.get_ids else MAP_KEYS_ALONE), tags=("ui",))
+        cv.create_rectangle(0, H - self.BOTTOM, W, H, fill=PAPER, outline="", tags=("ui",))
+        cv.create_line(0, H - self.BOTTOM, W, H - self.BOTTOM, fill=RULE, tags=("ui",))
+        f = (self.feats[self.hover[0]] if self.hover and self.hover[0] < len(self.feats)
+             else None)
+        if f:
+            text = f["name"] + (f"  ·  {f['label']}" if f["label"] else "")
+            if len(self.hover) > 1:
+                text += "  " + tr("(+{n} under it)", n=len(self.hover) - 1)
+            if self.on_open:
+                text += "   " + tr("(a click opens it)")
+        elif self.said:
+            text = self.said
+        else:
+            scope = tr("following the search") if self.scope else tr("the whole base")
+            text = tr("{n} place(s) of {r} record(s) · {scope}", n=len(self.feats),
+                      r=self.records, scope=scope)
+        cv.create_text(12, H - 8, anchor="sw", font=self.f_status, fill=INK if f else SOFT,
+                       text=one_liner(text, 160), tags=("ui",))
+        km = 100 / self.k * 111.32                  # 100 pixels, north to south
+        dist = f"{km:.0f} km" if km >= 10 else (f"{km:.1f} km" if km >= 1 else f"{km * 1000:.0f} m")
+        cv.create_text(W - 12, H - 8, anchor="se", font=self.f_status, fill=SOFT,
+                       text=tr("100 px ≈ {dist}", dist=dist), tags=("ui",))
+        notes = []
+        if self.base is None:
+            notes.append(tr("No basemap (kustos_basemap.json): only the records are drawn."))
+        if not self.feats:
+            notes.append(tr("Nothing here has a GEO."))
+        if notes:
+            cv.create_text(W / 2, self.TOP + 10, anchor="n", font=self.f_status, fill=SOFT,
+                           text="\n".join(notes), justify="center", tags=("ui",))
+        cv.tag_raise("ui")
+
+
+def cmd_map(open_id=None):
+    """Opens the map by itself, read-only."""
+    global tk, tkfont, ttk
+    try:
+        import tkinter as _tk
+        from tkinter import font as _tkfont, ttk as _ttk
+    except ImportError:
+        raise SystemExit(tr("This Python came without Tkinter. Reinstall it with tcl/tk."))
+    tk, tkfont, ttk = _tk, _tkfont, _ttk
+    load_palette((load_json().get("ui") or {}).get("theme", "paper"))
+    root = tk.Tk()
+    set_window_icon(root)
+    root.geomap = MapView(root, load_json, start_id=open_id)
+    root.mainloop()
+    return 0
+
+
 # ================================================================ app
 
 def cmd_app(open_id=None):
@@ -23787,6 +25022,8 @@ def main():
         return cmd_timeline(rest[0] if rest else None)
     if cmd == "monads":
         return cmd_monads(rest[0] if rest else None)
+    if cmd == "map":
+        return cmd_map(rest[0] if rest else None)
     if cmd == "peritia":
         return cmd_peritia(rest)
     if cmd == "web":
@@ -26570,6 +27807,35 @@ PT = {
     "generated by _kustos.py ledger -- do not edit by hand; made {when}":
         "gerado por _kustos.py ledger -- não editar à mão; feito em {when}",
     "{n} transaction(s) -> {name} ({fmt})": "{n} transação(ões) -> {name} ({fmt})",
+    "Kustos · map (read-only)": "Kustos · mapa (só leitura)",
+    "wheel: zoom   drag or arrows: move   click: open   Home: every place   "
+    "w: the world   f: follow the search   Esc: close":
+        "roda: zoom   arrastar ou setas: mover   clique: abrir   Home: todos os lugares   "
+        "w: o mundo   f: seguir a busca   Esc: fechar",
+    "wheel: zoom   drag or arrows: move   Home: every place   w: the world   Esc: close":
+        "roda: zoom   arrastar ou setas: mover   Home: todos os lugares   w: o mundo   Esc: fechar",
+    "{name} has no GEO; every place is shown.": "{name} não tem GEO; todos os lugares são mostrados.",
+    "Read-only here: open the map from Kustos (Ctrl+Shift+L) to send records to the card.":
+        "Aqui é só leitura: abra o mapa pelo Kustos (Ctrl+Shift+L) para levar registros ao cartão.",
+    "(a click opens it)": "(um clique o abre)",
+    "(+{n} under it)": "(+{n} embaixo)",
+    "{n} place(s) of {r} record(s) · {scope}": "{n} lugar(es) de {r} registro(s) · {scope}",
+    "100 px ≈ {dist}": "100 px ≈ {dist}",
+    "No basemap (kustos_basemap.json): only the records are drawn.":
+        "Sem mapa de fundo (kustos_basemap.json): só os registros são desenhados.",
+    "Nothing here has a GEO.": "Nada aqui tem GEO.",
+    "The basemap did not load: {why}": "O mapa de fundo não carregou: {why}",
+    "Every place": "Todos os lugares",
+    "The world": "O mundo",
+    "tap or click: open · drag: move · pinch or wheel: zoom":
+        "toque ou clique: abrir · arrastar: mover · pinça ou roda: zoom",
+    HELP_MAP:
+        "\n  Ctrl+Shift+L    mapa (segunda janela, só leitura): cada GEO -- pontos, linhas,"
+        "\n                  áreas -- sobre os litorais e as fronteiras, na cor da sua"
+        "\n                  coleção, sem blocos de mapa e sem nada enviado para fora. A"
+        "\n                  roda dá zoom onde está o ponteiro, arrastar ou as setas movem,"
+        "\n                  um clique abre um registro aqui, Home mostra todos os lugares,"
+        "\n                  w o mundo, f segue a busca desta janela.\n",
 }
 
 if __name__ == "__main__":
