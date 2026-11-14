@@ -99,6 +99,17 @@ def build(K, folder):
     # the demo's observator: every record below is saved in Ada's name
     K.save_ui({"observator": "p_ada00001"})
 
+    def on_day(n, fn):
+        """Runs fn with Kustos's clock n days from now (n < 0: in the past)."""
+        then = datetime.now() + timedelta(days=n)
+        real = K.NOW, K.TODAY
+        K.NOW = lambda: then.isoformat(timespec="seconds")
+        K.TODAY = lambda: then.date().isoformat()
+        try:
+            return fn()
+        finally:
+            K.NOW, K.TODAY = real
+
     # ---- people (phones in the 555-01xx range, kept for fiction; example.org addresses)
     put("people", {"id": "p_iss00004", "name": "Institute of Steering Studies", "org": True,
                    "place": "Lisboa", "tags": ["research"], "geo": "38.7075, -9.1364  office",
@@ -207,10 +218,14 @@ def build(K, folder):
                 "entries": K.parse_entries(f"{day(-31)}  +12,34  interest #interest")})
     put("res", {"id": "r_garden_shed", "name": "Garden shed", "category": "other",
                 "where": "home › garden", "bought": "2019-04", "geo": "41.1579, -8.6291  garden"})
-    put("res", {"id": "r_toolbox", "name": "Red toolbox", "category": "tools", "status": "stored",
-                "where": "home › garden › shed", "tags": ["diy"],
-                "log": [{"date": "2026-06-14", "text": "New set of screwdrivers."}]},
-        edges=[edge("r_toolbox", "kept_in", "r_garden_shed", "on the left shelf")])
+    # the toolbox was first saved forty days ago and saved again, changed, twelve
+    # days ago: Kustos observed it on each of those days (is:reobserved finds it)
+    toolbox = {"id": "r_toolbox", "name": "Red toolbox", "category": "tools", "status": "in use",
+               "where": "home › garage", "tags": ["diy"],
+               "log": [{"date": "2026-06-14", "text": "New set of screwdrivers."}]}
+    on_day(-40, lambda: put("res", dict(toolbox), edges=[]))
+    on_day(-12, lambda: put("res", dict(toolbox, status="stored", where="home › garden › shed"),
+                            edges=[edge("r_toolbox", "kept_in", "r_garden_shed", "on the left shelf")]))
     put("res", {"id": "r_city_bicycle", "name": "City bicycle", "category": "vehicle", "status": "lent",
                 "status_since": day(-75), "where": "home › garage", "bought": "2021-05-10",
                 "price": "1450,00 BRL", "serial": "BK-DEMO-7781",
@@ -307,6 +322,18 @@ def build(K, folder):
             r["updated_at"] = when.isoformat(timespec="seconds")
             r["updated"] = when.date().isoformat()
     K.write_json(data)
+    # ---- observations: every save above was observed by itself (a distinguo the
+    # first time); a few deliberate ones, by invented criteria. One criterion
+    # comes back three times without a concept of its own (`observe` lists it as
+    # an eigenform); one is a concept of the demo.
+    K.add_observation(["c_feedback_loop"], "a loop that corrects the output, not one that amplifies it",
+                      "sign of the feedback", 3, "s_okafor_2021_notes")
+    K.add_observation(["c_homeostasis"], "a steady state kept against change, not a fixed one",
+                      "sign of the feedback", 2)
+    K.add_observation(["s_weber_1979_valves"], "valves that regulate, apart from valves that only close",
+                      "sign of the feedback", 1, notes="Read again after the workshop visit.")
+    K.add_observation(["f_kybernetes"], "the steersman's image, apart from the governor's",
+                      "c_feedback_loop", 2)
 
 
 if __name__ == "__main__":

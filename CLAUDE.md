@@ -38,7 +38,8 @@ empty repository folder gives an empty base (and `doctor` passes on it).
 `_kustos.py` is split into sections marked `# ==== <name>`, in this order:
 language (`tr`), common, the collections (**people** `p_`, **verba**
 `c_`/`f_` concepts and forms, **sources** `s_`, **corpus** `h_` health
-records, **notes** `n_` — shown as "drafts", **res** `r_` things), then file, register, conflicts, lock, doctor, mirror, search,
+records, **notes** `n_` — shown as "drafts", **res** `r_` things), geo, observator,
+observations, then file, register, conflicts, lock, doctor, mirror, search,
 history, migration, upgrade, citation, health report, peritia, web, themes, motion,
 the Tk `*Card` editors, `App` (the main window), `BookView` (the logbook), the
 `cmd_*` functions and `main()`, and finally the `PT` dict.
@@ -267,6 +268,35 @@ Ideas that span several sections:
   throwaway keyring: `GNUPGHOME` in a short `%TEMP%` folder (the agent's
   socket path has a length limit), a key made with `--quick-gen-key` and no
   passphrase, never the owner's own.
+- **Observations** (`# ==== observations`, before `# ==== file`): the top-level
+  list `observations` (`o_<stamp>_<6 hex>`), a satellite like `skills`
+  (`SATELLITES`): saved, logged, merged (`merge_vault`, `absorb_conflicts`)
+  and replayed like records, but out of `COLLS` and the register;
+  `fix_observation` fills its defaults, no SCHEMA step. Fields: `observator`,
+  `t`, `updated_at`, `targets` (record ids), `kind` (`OBS_KINDS`: distinguo,
+  reobservo; alinho, proponho are accepted for later steps), `auto`,
+  `distinction`, `criterion` (text or `c_…`), `confidence` (1-3 or null),
+  `source`, `changed`, `before`, `prev` (the `updated_at` of the version
+  `before` describes), `status`, `notes`. `save_record` calls `observe_save`
+  for every record of COLLS saved while there is an observator: a
+  `distinguo` on the first save, a `reobservo` with `changed`/`before`
+  (`obs_diff`; bookkeeping keys in `OBS_IGNORED` are not changes; `links`
+  when the outgoing links differ), written in the same `write_json` and
+  logged with the record in one `log_many`. **Coalescing**: one automatic
+  observation per record, observator and local day -- a later save that day
+  updates it (union of `changed`, the earliest `before` kept; a distinguo
+  stays one). A value over `OBS_BEFORE_MAX` characters of compact JSON is
+  stored as null and `reobserve` reads it back from the logs
+  (`log_lines_of`, `logged_state` by `prev`). `add_observation` (the
+  window's `ObserveDialog`, Ctrl+Shift+O, and the page's `/api/observe`) makes
+  deliberate ones, never coalesced; `delete_observation` (`/api/observe/delete`)
+  deletes only one's own deliberate ones, with a tombstone. `record_observations`
+  is the one list the dialog, the page and `reobserve` show. `obs_index`,
+  `obs_recent`, `obs_stats` and `obs_crit_text` are cached per observations
+  list and day (`_OBS_CACHE`): they feed `is:reobserved`, `crit:`, the card's
+  line, the status bar's *re-obs* and `observe`. The doctor only warns.
+  Observations of health (`h_`) records and of accounts carry their earlier
+  values: any later export must leave them in the base.
 - **Long texts are markdown**: `textfield(..., pages=True)` (every NOTES and the
   draft's text) gets `MarkdownKeys`, and `fit(opening=True)` paints it before
   the pages are measured. The text stored stays plain.

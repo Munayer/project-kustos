@@ -31,7 +31,7 @@ HOW CONFLICTS ARE RESOLVED
     3. If another machine left its lock, the status bar says so.
 
 IDS: p_ person · c_ concept · f_ form · s_ source · h_ measurement ·
-r_ thing (res: an item or an account) · k_ skill (Peritia).
+r_ thing (res: an item or an account) · k_ skill (Peritia) · o_ observation.
 
 REGISTER: besides its id, every record has a registration stamp
 (YYYYMMDDhhmmss) and an order number (nº 1852). The number never changes and
@@ -92,6 +92,10 @@ USAGE
     python _kustos.py import <notes.md>   "- Name. Notes" -> people
     python _kustos.py merge           merge *.sync-conflict-* now
     python _kustos.py history <id>    versions of a record, from the logs
+    python _kustos.py reobserve <id>  the observations of a record, in order: who,
+                                      when, by what distinction, what changed
+    python _kustos.py observe         how much of the base is observed again (12
+                                      months), and the criteria without a concept
     python _kustos.py replay          rebuild the JSON from the logs alone (.replay.json)
     python _kustos.py upgrade         bring an older base up to date (runs on open)
     python _kustos.py migrate         old personne + verba files -> _kustos.json
@@ -2456,9 +2460,10 @@ def index_notes():
         if rec is not None:
             seen.add(rec["id"])
             if rec.get("file") != rel or rec.get("name") != path.stem:
+                was = dict(rec)
                 rec["file"], rec["name"] = rel, path.stem
                 touch(rec)
-                moved.append(rec)
+                moved.append((rec, was))
             continue
         if not nid.startswith("n_") or nid in taken:
             nid = new_note_id(taken)
@@ -2472,12 +2477,17 @@ def index_notes():
         new.append((rec, body))
     if not new and not moved:
         return 0, 0
+    obs = observator_id(data)        # taken in is seen: observed as any save (# ==== observations)
+    looks = [observe_save(data, "notes", rec["id"], was, rec, None, None, obs)
+             for rec, was in moved + [(r, None) for r, _b in new]] if obs else []
     write_json(data)                 # numbers the new ones
-    lines = [("put", "notes", {"id": r["id"], "rec": r}) for r in moved]
+    lines = [("put", "notes", {"id": r["id"], "rec": r}) for r, _was in moved]
     for rec, body in new:
         write_note_file(rec, body)   # its header now holds the id and the number
         lines += [("put", "notes", {"id": rec["id"], "rec": rec}),
                   ("text", "notes", {"id": rec["id"], "text": body})]
+    lines += [("put", "observations", {"id": o["id"], "rec": o})
+              for o in {id(o): o for o in looks if o is not None}.values()]
     log_many(lines)
     save_note_cache()
     return len(new), len(moved)
@@ -3862,11 +3872,567 @@ def cmd_verify(rest=()):
     return 1 if bad else 0
 
 
+# ================================================================ observations
+# Observatio, the act of observing. The base keeps not only what is recorded
+# but who looked at a record, when, and by what distinction: the top-level list
+# `observations` (ids o_…), a satellite of the collections as `skills` is -- it
+# saves, logs, merges and replays like records, but stays out of COLLS and out
+# of the register. Kinds (OBS_KINDS):
+#   distinguo  a record seen for the first time (automatic: its first save), or
+#              a distinction drawn on purpose about a record not observed yet
+#   reobservo  a record seen again: automatic when a save changes its fields
+#              (`changed`, and their values `before`), or deliberate
+#   alinho, proponho   accepted here; later steps make them
+# Every save_record of a record of COLLS made while there is an observator adds
+# an automatic one, in the same write and the same append to the log. At most
+# ONE automatic observation per record, per observator, per local day: a later
+# save that day updates it in place (`changed` grows; `before` keeps the value
+# each field had before the day's first change, the version whose stamp is in
+# `prev`). A value whose compact JSON is longer than OBS_BEFORE_MAX characters
+# is stored as null: `reobserve` reads it from the logs. Deliberate ones
+# (add_observation: the window's Observe…, the page's form) are never
+# coalesced, and only their own observator may delete them (a tombstone, as
+# records get). They hold earlier values of health records and of accounts:
+# no export may ever carry the observations of h_ or account records out.
+
+OBS_KINDS = ("distinguo", "reobservo", "alinho", "proponho")
+OBS_STATUSES = ("signed", "proposed")
+OBS_BEFORE_MAX = 240        # a longer previous value is elided: the logs have it
+OBS_EIGEN_MIN = 3           # a criterion used this often deserves a concept
+OBS_DAYS = 365              # "the last 12 months", for re-observation
+# bookkeeping, not what is observed: a save that changes only these changes nothing
+OBS_IGNORED = frozenset(("id", "updated", "updated_at", "observator", "reg", "reg_n",
+                         "reg_origem", "reg_n_anterior"))
+SATELLITES = ("skills", "observations")     # top-level lists saved like records
+
+
+def fix_observation(o):
+    for k in ("observator", "t", "updated_at", "distinction", "criterion", "source",
+              "notes", "prev"):
+        o.setdefault(k, "")
+    for k, kind in (("targets", list), ("changed", list), ("before", dict)):
+        if not isinstance(o.get(k), kind):      # a malformed one must not stop a save
+            o[k] = kind()
+    if not obs_value_kept("last4", o["before"].get("last4", "")):
+        o["before"]["last4"] = None             # a full number is never kept, not even here
+    o.setdefault("kind", "distinguo")
+    o.setdefault("auto", False)
+    o.setdefault("confidence", None)
+    o.setdefault("status", "signed")
+    o.setdefault("targets", [])
+    o.setdefault("changed", [])
+    o.setdefault("before", {})
+    return o
+
+
+def new_observation_id(taken=()):
+    """o_<when, to the second>_<six random hex digits>: unique between
+    machines without asking the other one."""
+    while True:
+        oid = "o_" + re.sub(r"\D", "", NOW()) + "_" + secrets.token_hex(3)
+        if oid not in taken:
+            return oid
+
+
+def _blank(v):
+    return v is None or v == "" or v == [] or v == {}
+
+
+def obs_value_kept(k, v):
+    """Whether a previous value may be kept at all: LAST 4 holding more than
+    four digits (refused on every save path) never is."""
+    return k != "last4" or last4_ok(v if isinstance(v, str) else "")
+
+
+def obs_elide(v):
+    """A previous value as stored in `before`: null when it is too long."""
+    try:
+        n = len(json.dumps(v, ensure_ascii=False, separators=(",", ":")))
+    except (TypeError, ValueError):
+        return None
+    return None if n > OBS_BEFORE_MAX else v
+
+
+def obs_link_key(edges):
+    """What a record's outgoing links say, for comparing two versions (who
+    signed each link is not part of it)."""
+    return sorted(tuple(str(a.get(k) or "") for k in ("rel", "to", "when", "circle", "why", "source"))
+                  + (a.get("certainty") or "established",) for a in edges or [])
+
+
+_FIX_OF = {}        # coll -> its fix_* function, filled on first use
+
+
+def obs_diff(coll, old, new, old_edges=None, new_edges=None, text=None):
+    """(changed fields, their previous values) between two versions of a record;
+    `links` when the outgoing links differ (only when the save gives them);
+    `text`, a draft's (text before, text now), when its file's text changes."""
+    if not _FIX_OF:
+        _FIX_OF.update(people=fix_person, entries=fix_entry, sources=fix_source,
+                       corpus=fix_metric, notes=fix_note, res=fix_res)
+    fix = _FIX_OF.get(coll)
+    if fix:                 # what the next read would see: defaults are not changes
+        new = fix(json.loads(json.dumps(new, ensure_ascii=False)))
+    changed, before = [], {}
+    for k in list(new) + [k for k in old if k not in new]:
+        if k in OBS_IGNORED or k.startswith("_"):
+            continue
+        a, b = old.get(k), new.get(k)
+        if a == b or (_blank(a) and _blank(b)):
+            continue
+        changed.append(k)
+        a = "" if a is None else a
+        before[k] = obs_elide(a) if obs_value_kept(k, a) else None
+    if new_edges is not None and obs_link_key(old_edges) != obs_link_key(new_edges):
+        changed.append("links")
+        before["links"] = obs_elide(format_edges(old_edges or []))
+    if text is not None and (text[0] or "") != (text[1] or ""):
+        changed.append("text")
+        before["text"] = obs_elide(text[0] or "")
+    return changed, before
+
+
+def observe_save(data, coll, rid, old, new, old_edges, new_edges, who, text=None):
+    """The automatic observation of one save, added to (or updated in) `data`;
+    returns it, or None when the save changed nothing."""
+    if old is None:
+        kind, changed, before, prev = "distinguo", [], {}, ""
+    else:
+        changed, before = obs_diff(coll, old, new, old_edges, new_edges, text)
+        if not changed:
+            return None
+        kind, prev = "reobservo", stamp_of(old)
+    rows = data.setdefault("observations", [])
+    day, now = TODAY(), NOW()
+    want, oid, clash = [rid], new_observation_id(), False
+    # one pass, newest first (recent ones are last): today's automatic one of
+    # this record, if there is one -- and whether the new id is taken
+    for o in reversed(rows):
+        if o.get("targets") == want and o.get("auto") and o.get("observator") == who \
+                and (o.get("t") or "")[:10] == day:
+            if o.get("kind") == "reobservo":
+                if not isinstance(o.get("changed"), list):
+                    o["changed"] = []           # a malformed copy must not stop the save
+                if not isinstance(o.get("before"), dict):
+                    o["before"] = {}
+                for k in changed:
+                    if k not in o["changed"]:       # the earliest value stays
+                        o["changed"].append(k)
+                        o["before"][k] = before.get(k)
+            o["updated_at"] = now
+            return o
+        clash = clash or o.get("id") == oid
+    if clash:
+        oid = new_observation_id({x.get("id") for x in rows})
+    o = fix_observation({"id": oid,
+                         "observator": who, "t": now, "updated_at": now, "targets": want,
+                         "kind": kind, "auto": True, "changed": changed, "before": before,
+                         "prev": prev, "status": "signed"})
+    rows.append(o)
+    return o
+
+
+# The observations of each record, and the counts that the search, the status
+# bar and `observe` read: computed once per list of observations (a new vault
+# read is a new list) and day.
+_OBS_CACHE = {"now": None}     # one snapshot, replaced whole: threads never mix two vaults'
+
+
+def _obs_cache(data):
+    rows = data.get("observations") or []
+    key = (id(data), id(rows), len(rows), TODAY())
+    c = _OBS_CACHE["now"]
+    keep = c["keep"] if c else None
+    if c is None or c["key"] != key or keep is None or keep[0] is not data or keep[1] is not rows:
+        cut = (date.today() - timedelta(days=OBS_DAYS)).isoformat()
+        idx, recent = {}, {}
+        for o in rows:
+            fresh = (o.get("updated_at") or o.get("t") or "") >= cut     # never before t
+            for t in o.get("targets") or ():
+                if t in idx:
+                    idx[t].append(o)
+                else:
+                    idx[t] = [o]
+                if fresh:
+                    recent[t] = recent.get(t, 0) + 1
+        # the references kept make sure no other object can take these ids
+        c = {"key": key, "keep": (data, rows), "idx": idx, "recent": recent, "stats": None,
+             "crit": None}
+        _OBS_CACHE["now"] = c
+    return c
+
+
+def obs_forget():
+    """After changing observations in place (the cache keys on the list)."""
+    _OBS_CACHE["now"] = None
+
+
+def obs_index(data):
+    """{record id: [its observations]}."""
+    return _obs_cache(data)["idx"]
+
+
+def obs_recent(data):
+    """{record id: how many of its observations fall in the last OBS_DAYS}."""
+    return _obs_cache(data)["recent"]
+
+
+def obs_stats(data):
+    """{coll: [records, observed in the last 12 months, re-observed]}, and
+    "all" for the whole base. Re-observed: two observations or more there."""
+    c = _obs_cache(data)
+    if c["stats"] is None:
+        recent = obs_recent(data)
+        out = {}
+        for coll in COLLS:
+            ids = [r.get("id") for r in data.get(coll, []) if not (r.get("id") or "").startswith("__")]
+            out[coll] = [len(ids), sum(1 for i in ids if recent.get(i)),
+                         sum(1 for i in ids if recent.get(i, 0) >= 2)]
+        out["all"] = [sum(v[i] for v in out.values()) for i in range(3)]
+        c["stats"] = out
+    return c["stats"]
+
+
+def obs_ratio(row):
+    """Re-observed per record, as a whole percentage ('' for an empty base)."""
+    return f"{round(100 * row[2] / row[0])}%" if row[0] else ""
+
+
+def obs_crit_text(data):
+    """{record id: the criteria of its observations, folded, with the names of
+    the concepts that a c_ criterion points at} -- for crit: in the search."""
+    c = _obs_cache(data)
+    if c["crit"] is None:
+        names = {e["id"]: e.get("name", "") for e in data.get("entries", [])}
+        out = {}
+        for rid, os_ in c["idx"].items():
+            bits = []
+            for o in os_:
+                crit = o.get("criterion") or ""
+                if crit:
+                    bits += [crit, names.get(crit, "")]
+            if bits:
+                out[rid] = "\n".join(b for b in bits if b).casefold()
+        c["crit"] = out
+    return c["crit"]
+
+
+def obs_eigenforms(data):
+    """Criteria used OBS_EIGEN_MIN times or more that are neither a c_ id nor
+    the name of a concept: [(criterion as first written, times)], most used first."""
+    concepts = {" ".join((e.get("name") or "").split()).casefold()
+                for e in data.get("entries", []) if e.get("kind", "concept") == "concept"}
+    count, first = {}, {}
+    for o in data.get("observations", []):
+        crit = " ".join((o.get("criterion") or "").split())
+        if not crit or re.fullmatch(r"c_\S+", crit):
+            continue
+        key = crit.casefold()
+        count[key] = count.get(key, 0) + 1
+        first.setdefault(key, crit)
+    return sorted(((first[k], n) for k, n in count.items()
+                   if n >= OBS_EIGEN_MIN and k not in concepts), key=lambda x: (-x[1], sort_key(x[0])))
+
+
+def obs_criterion(text, idx):
+    """CRITERION as typed: a concept's id alone, or a suggestion picked ('c_…
+    its name'), keeps the id; any other text stays as typed."""
+    text = " ".join(str(text or "").split())
+    first, _, rest = text.partition(" ")
+    if first.startswith("c_") and first in idx:
+        name = " ".join(str(idx[first].get("name") or "").split())
+        if not rest or rest.casefold() == name.casefold():
+            return first
+    return text
+
+
+def obs_confidence(v):
+    """CONFIDENCE as given: 1, 2 or 3, or None; ValueError for anything else."""
+    if v is None or v == "" or v == 0 or v == "0":
+        return None
+    if not isinstance(v, bool):
+        try:
+            n = int(str(v).strip())
+        except ValueError:
+            n = 0
+        if n in (1, 2, 3):
+            return n
+    raise ValueError(tr("CONFIDENCE is 1, 2 or 3, or none."))
+
+
+def criteria_suggestions(data):
+    """[[value, label]] for CRITERION: the criteria already used (most used
+    first), then the concepts of verba."""
+    count = {}
+    for o in data.get("observations", []):
+        crit = " ".join((o.get("criterion") or "").split())
+        if crit and not crit.startswith("c_"):
+            count[crit] = count.get(crit, 0) + 1
+    out = [[c, tr("used {n}×", n=n)] for c, n in sorted(count.items(), key=lambda x: (-x[1], sort_key(x[0])))]
+    out += [[e["id"], e.get("name", "")] for e in sorted(
+        (e for e in data.get("entries", []) if e.get("kind", "concept") == "concept"),
+        key=lambda e: sort_key(e.get("name", "")))]
+    return out
+
+
+def obs_value_text(v, limit=120):
+    """A previous value, short, as the lists show it ('…' when elided)."""
+    if v is None:
+        return "…"
+    if isinstance(v, str):
+        return one_liner(v, limit) if v.strip() else tr("(empty)")
+    return one_liner(json.dumps(v, ensure_ascii=False), limit)
+
+
+def record_observations(data, rid):
+    """The observations of a record, oldest first, ready to show -- the one
+    list the window's dialog, the page and `reobserve` all read."""
+    idx = by_id(data)
+    mine = observator_id(data)
+    out = []
+    for o in sorted(obs_index(data).get(rid, []), key=lambda o: o.get("t") or ""):   # ties: as saved
+        who = o.get("observator") or ""
+        crit = o.get("criterion") or ""
+        crit_label = crit
+        if re.fullmatch(r"c_\S+", crit):
+            crit_label = (f"{label_any(idx[crit], data)} ({crit})" if crit in idx
+                          else tr("{id} (no such concept)", id=crit))
+        src = o.get("source") or ""
+        t = o.get("t") or ""
+        out.append({"id": o.get("id", ""), "t": t, "date": t[:10], "time": t[11:16],
+                    "updated_at": o.get("updated_at") or "", "kind": o.get("kind", ""),
+                    "auto": bool(o.get("auto")), "observator": who,
+                    "who": observator_name(data, who) if who else tr("unsigned"),
+                    "own": bool(who) and who == mine,
+                    "distinction": o.get("distinction") or "", "criterion": crit,
+                    "criterion_label": crit_label, "confidence": o.get("confidence"),
+                    "source": resolve_source(src, data)[1] if src else "",
+                    "notes": o.get("notes") or "", "status": o.get("status") or "",
+                    "changed": list(o.get("changed") or []),
+                    "before": [[k, obs_value_text((o.get("before") or {}).get(k))]
+                               for k in o.get("changed") or []],
+                    "deletable": not o.get("auto") and bool(who) and who == mine})
+    return out
+
+
+def obs_summary_line(data, rid):
+    """'observed 3× · last 2026-11-14', or '' -- the card's line and the page's."""
+    rows = obs_index(data).get(rid) or []
+    if not rows:
+        return ""
+    last = max(max(o.get("t") or "", o.get("updated_at") or "") for o in rows)[:10]
+    return tr("observed {n}× · last {date}", n=len(rows), date=last)
+
+
+def add_observation(targets, distinction="", criterion="", confidence=None, source="", notes=""):
+    """A deliberate observation, in the observator's name: (vault, id). A
+    `reobservo` when a target was already observed, a `distinguo` otherwise.
+    ValueError says what is wrong."""
+    data = load_json()
+    idx = by_id(data)
+    targets = list(dict.fromkeys(str(t).strip() for t in (targets or []) if str(t).strip()))
+    if not targets:
+        raise ValueError(tr("An observation needs a record."))
+    for t in targets:
+        if t not in idx or t.startswith("__"):
+            raise ValueError(tr("{id} does not exist.", id=t))
+    distinction = " ".join(str(distinction or "").split())
+    criterion = obs_criterion(criterion, idx)
+    if not distinction and not criterion:
+        raise ValueError(tr("Say what was told apart (DISTINCTION), or the CRITERION."))
+    if not observator_id(data):
+        raise ValueError(tr("No observator chosen yet (Base › Observator…): an observation "
+                            "is made in someone's name."))
+    seen = obs_index(data)
+    now = NOW()
+    o = fix_observation({
+        "id": new_observation_id({x.get("id") for x in data.get("observations", [])}
+                                 | {d.get("id") for d in data.get("deleted", [])}),
+        "observator": observator_id(data), "t": now, "updated_at": now, "targets": targets,
+        "kind": "reobservo" if any(seen.get(t) for t in targets) else "distinguo",
+        "auto": False, "distinction": distinction, "criterion": criterion,
+        "confidence": obs_confidence(confidence), "source": " ".join(str(source or "").split()),
+        "notes": str(notes or "").strip(), "status": "signed"})
+    return save_record("observations", o), o["id"]
+
+
+def delete_observation(oid):
+    """Deletes one's own deliberate observation (a tombstone, logged); the
+    automatic ones and other observators' stay. Returns the vault."""
+    data = load_json()
+    o = next((x for x in data.get("observations", []) if x.get("id") == oid), None)
+    if o is None:
+        raise ValueError(tr("This observation no longer exists."))
+    if o.get("auto"):
+        raise ValueError(tr("An automatic observation is history: it stays."))
+    if not o.get("observator") or o.get("observator") != observator_id(data):
+        raise ValueError(tr("Only its own observator can delete an observation."))
+    data["observations"] = [x for x in data["observations"] if x.get("id") != oid]
+    name = one_liner(o.get("distinction") or o.get("criterion") or "", 60)
+    data["deleted"].append({"id": oid, "at": NOW(), "name": name})
+    write_json(data)
+    log_del("observations", oid, name)
+    return data
+
+
+def logged_state(lines, prev, t):
+    """(record, links as LINKS text, a draft's text) as they were in the version
+    saved with updated_at `prev` -- or, without it, just before `t` -- from the
+    record's log lines (log_lines_of). None for what the logs do not have:
+    never a later version in its place."""
+    rec = links = text = None
+    seen = False
+    for l in lines:
+        op = l.get("op")
+        if op == "put":
+            r = l.get("rec") or {}
+            if prev:
+                if seen and stamp_of(r) != prev:
+                    break
+                seen = seen or stamp_of(r) == prev
+            elif (l.get("t") or "") >= t:
+                break
+            rec = r
+        elif op == "edges":
+            links = l.get("edges") or []
+        elif op == "text" and not l.get("unsaved"):
+            text = l.get("text") or ""
+    if prev and not seen:
+        return None, None, None
+    return rec, (format_edges(links) if links is not None else None), text
+
+
+def mirror_observed(r, data):
+    n = len(obs_index(data).get(r.get("id"), []))
+    return tr("observed: {n}×", n=n) if n else ""
+
+
+def cmd_reobserve(rid):
+    """`reobserve <id>`: the record's observations in order, with what changed
+    and what it was before (the long values read back from the logs)."""
+    data = load_json()
+    rec = by_id(data).get(rid)
+    rows = record_observations(data, rid)
+    if rec is None and not rows:
+        print(tr("{id} does not exist.", id=rid))
+        return 1
+    print("\n" + (label_any(rec, data) if rec else tr("(deleted)")) + f"  ·  {rid}")
+    print(tr("{n} observation(s)", n=len(rows)) + "\n")
+    raw = {o.get("id"): o for o in obs_index(data).get(rid, [])}
+    lines = None
+    for row in rows:
+        o = raw[row["id"]]
+        when = row["t"].replace("T", " ")
+        if row["updated_at"] and row["updated_at"] != row["t"]:
+            when += "  " + tr("(last {time})", time=row["updated_at"].replace("T", " ")[11:16]
+                              if row["updated_at"][:10] == row["t"][:10] else row["updated_at"][:16].replace("T", " "))
+        print(f"{when}  {row['kind']:9}  {tr('automatic') if row['auto'] else tr('deliberate'):10}  {row['who']}")
+        for label, value in ((tr("distinction"), row["distinction"]),
+                             (tr("criterion"), row["criterion_label"]),
+                             (tr("confidence"), row["confidence"] or ""),
+                             (tr("source"), row["source"]), (tr("notes"), row["notes"])):
+            if value:
+                print(f"    {label}: {value}")
+        if row["changed"]:
+            print("    " + tr("changed: {fields}", fields=", ".join(row["changed"])))
+        before = o.get("before") or {}
+        for k in row["changed"]:
+            v = before.get(k)
+            if v is None:           # elided: the version before, from the logs
+                if lines is None:
+                    lines = log_lines_of(rid)
+                old, links, body = logged_state(lines, o.get("prev") or "", o.get("t") or "")
+                v = {"links": links, "text": body}.get(k) if k in ("links", "text") \
+                    else (old or {}).get(k)
+                if v is None and (old is None or k in ("links", "text")):
+                    v = tr("(not in the logs)")
+                elif v is None:
+                    v = ""
+                if not obs_value_kept(k, v):
+                    v = tr("(not kept: more than the last four digits)")
+            text = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+            text = text if text.strip() else tr("(empty)")
+            first, *more = text.splitlines() or [""]
+            print(f"    {tr('before')} {k}: {first}")
+            for x in more:
+                print(f"        {x}")
+        print()
+    return 0
+
+
+def cmd_observe():
+    """`observe`: how much of the base is looked at again, per collection, and
+    the criteria that keep coming back without a concept of their own."""
+    data = load_json()
+    stats = obs_stats(data)
+    rows = data.get("observations", [])
+    cut = (date.today() - timedelta(days=OBS_DAYS)).isoformat()
+    print("\n" + tr("{n} observation(s): {auto} automatic, {deliberate} deliberate", n=len(rows),
+                    auto=sum(1 for o in rows if o.get("auto")),
+                    deliberate=sum(1 for o in rows if not o.get("auto"))))
+    print(tr("observed and re-observed: in the last 12 months (since {date})", date=cut) + "\n")
+    head = (tr("collection"), tr("records"), tr("observed"), tr("re-observed"), tr("ratio"))
+    print(f"  {head[0]:12} {head[1]:>9} {head[2]:>11} {head[3]:>13} {head[4]:>6}")
+    for coll in COLLS + ("all",):
+        r = stats[coll]
+        name = tr(COLL_LABEL[coll]) if coll in COLL_LABEL else tr("all")
+        if coll == "all":
+            print("  " + "-" * 55)
+        print(f"  {name:12} {r[0]:>9} {r[1]:>11} {r[2]:>13} {obs_ratio(r) or '-':>6}")
+    eig = obs_eigenforms(data)
+    print()
+    if eig:
+        print(tr("Eigenforms without an entry (criteria used {n}× or more): make each a concept",
+                 n=OBS_EIGEN_MIN))
+        for crit, n in eig:
+            print(f"  {n:>4}×  {crit}")
+    else:
+        print(tr("No recurring criterion without a concept."))
+    print()
+    return 0
+
+
+def check_observations(data, idx, warnings):
+    """The doctor's look at the observations: warnings only, never errors."""
+    tombs = {d.get("id") for d in data.get("deleted", [])}
+    seen = set()
+    for o in data.get("observations", []):
+        oid = o.get("id") or "?"
+        if oid in seen:
+            warnings.append(tr("{id}: repeated observation id", id=oid))
+        seen.add(oid)
+        if o.get("kind") not in OBS_KINDS:
+            warnings.append(tr("{id}: unknown kind of observation {kind}", id=oid, kind=repr(o.get("kind"))))
+        c = o.get("confidence")
+        if c is not None and (isinstance(c, bool) or c not in (1, 2, 3)):
+            warnings.append(tr("{id}: confidence {value} is not 1, 2 or 3", id=oid, value=repr(c)))
+        if (o.get("status") or "signed") not in OBS_STATUSES:
+            warnings.append(tr("{id}: unknown status {status}", id=oid, status=repr(o.get("status"))))
+        who = o.get("observator") or ""
+        if who and (who not in idx or coll_of(who) != "people"):
+            warnings.append(tr("{id}: observator {who} is not a person of the base", id=oid, who=who))
+        if not o.get("targets"):
+            warnings.append(tr("{id}: an observation of nothing (no targets)", id=oid))
+        for t in o.get("targets") or []:
+            if t not in idx and t not in tombs:
+                warnings.append(tr("{id}: observes {target}, which neither exists nor was deleted",
+                                   id=oid, target=t))
+        crit = (o.get("criterion") or "").strip()
+        if re.fullmatch(r"c_\S+", crit) and crit not in idx:
+            warnings.append(tr("{id}: CRITERION points to {crit}, which does not exist", id=oid, crit=crit))
+    eig = obs_eigenforms(data)
+    if eig:
+        warnings.append(tr("{n} recurring criteria without a concept (make each a concept): {list}",
+                           n=len(eig), list=", ".join(f"{c} ({k}×)" for c, k in eig[:8])
+                           + (" …" if len(eig) > 8 else "")))
+
+
 # ================================================================ file
 
 def blank_vault():
     return {"schema": SCHEMA, "ui": {}, "people": [], "entries": [],
-            "sources": [], "corpus": [], "notes": [], "res": [], "skills": [], "edges": [],
+            "sources": [], "corpus": [], "notes": [], "res": [], "skills": [], "observations": [],
+            "edges": [],
             "deleted": [],
             "book": {"opened": NOW()}}
 
@@ -3879,6 +4445,7 @@ def fix_vault(data):
     data.setdefault("edges", [])
     data.setdefault("deleted", [])
     data.setdefault("skills", [])
+    data.setdefault("observations", [])
     for p in data["people"]:
         fix_person(p)
     for e in data["entries"]:
@@ -3893,6 +4460,8 @@ def fix_vault(data):
         fix_res(r)
     for k in data["skills"]:
         fix_skill(k)
+    for o in data["observations"]:
+        fix_observation(o)
     for coll in COLLS:
         for r in data[coll]:
             if r.get("id") and r["id"][:2] not in PREFIX:
@@ -4316,8 +4885,11 @@ def save_record(coll, rec, edges=None):
     if obs:
         clean["observator"] = obs       # every save is made in the observator's name
     rows = data[coll]
+    prior = next((r for r in rows if r.get("id") == rid), None)
     if coll == "res":
-        res_stamp_status(clean, next((r for r in rows if r.get("id") == rid), None))
+        res_stamp_status(clean, prior)
+    # the automatic observation compares with the links as they were
+    links_before = [a for a in data["edges"] if a["from"] == rid] if edges is not None else None
     for i, old in enumerate(rows):
         if old.get("id") == rid:
             for k in ("reg", "reg_n", "reg_origem", "reg_n_anterior"):
@@ -4339,10 +4911,17 @@ def save_record(coll, rec, edges=None):
         for a in edges:
             a["observator"] = before.get((a.get("rel"), a.get("to")), a.get("observator") or obs)
         data["edges"] = [a for a in data["edges"] if a["from"] != rid] + edges
+    # every save of a record is an observation of it (# ==== observations)
+    seen = observe_save(data, coll, rid, prior, clean, links_before, edges, obs,
+                        rec.get("_text") if coll == "notes" else None) \
+        if obs and coll in COLLS and not rid.startswith("__") else None
     write_json(data)
-    log_put(coll, clean)
+    lines = [("put", coll, {"id": rid, "rec": clean})]
     if edges is not None:
-        log_edges(rid, edges)
+        lines.append(("edges", "edges", {"id": rid, "edges": edges}))
+    if seen is not None:
+        lines.append(("put", "observations", {"id": seen["id"], "rec": seen}))
+    log_many(lines)
     return data
 
 
@@ -4375,7 +4954,15 @@ def rename_id(coll, old, new):
             a["from"] = new
         if a["to"] == old:
             a["to"] = new
+    moved = []                      # the observations of it now point at the new id
+    for o in data.get("observations", []):
+        if old in (o.get("targets") or []):
+            o["targets"] = [new if t == old else t for t in o["targets"]]
+            o["updated_at"] = NOW()
+            moved.append(("put", "observations", {"id": o["id"], "rec": o}))
     write_json(data)
+    if moved:
+        log_many(moved)
     return data
 
 
@@ -4404,7 +4991,7 @@ def merge_vault(base, other):
     tomb_other = {d["id"]: d.get("at", "") for d in other.get("deleted", [])}
     winners_from_other = set()
 
-    for coll in COLLS + ("skills",):
+    for coll in COLLS + SATELLITES:
         base.setdefault(coll, [])
         idx = {r["id"]: i for i, r in enumerate(base[coll])}
         for rec in other.get(coll, []):
@@ -4427,12 +5014,15 @@ def merge_vault(base, other):
                 winners_from_other.add(rid)
                 report["added"].append((coll, rid, rec.get("name", "")))
         # tombstones from the other side delete here what was created before them
+        # (looked up by id: each deletion moves the positions of what follows)
+        here, dead = {r.get("id"): r for r in base[coll]}, set()
         for rid, at in tomb_other.items():
-            if rid in idx and rid not in winners_from_other:
-                mine = base[coll][idx[rid]]
-                if at > stamp_of(mine):
-                    base[coll] = [r for r in base[coll] if r["id"] != rid]
-                    report["skipped_deleted"].append((coll, rid, mine.get("name", "")))
+            mine = here.get(rid)
+            if mine is not None and rid not in winners_from_other and at > stamp_of(mine):
+                dead.add(rid)
+                report["skipped_deleted"].append((coll, rid, mine.get("name", "")))
+        if dead:
+            base[coll] = [r for r in base[coll] if r.get("id") not in dead]
     if winners_from_other:
         base["edges"] = [a for a in base["edges"]
                          if a["from"] not in winners_from_other]
@@ -4448,7 +5038,7 @@ def merge_vault(base, other):
     for d in base.get("deleted", []) + other.get("deleted", []):
         if d.get("id") and d.get("at", "") >= tombs.get(d["id"], {}).get("at", ""):
             tombs[d["id"]] = d
-    live = set(by_id(base)) | {k.get("id") for k in base.get("skills", [])}
+    live = set(by_id(base)) | {k.get("id") for coll in SATELLITES for k in base.get(coll, [])}
     base["deleted"] = [d for d in tombs.values() if d["id"] not in live]
     return report
 
@@ -4491,17 +5081,17 @@ def absorb_conflicts():
         # what the merge changed goes into the log as if typed here, so that
         # `replay` rebuilds the same state
         idx = by_id(data)
-        skills = {k.get("id"): k for k in data.get("skills", [])}
+        side = {k.get("id"): k for coll in SATELLITES for k in data.get(coll, [])}
         for coll, rid, _ in report["added"] + report["replaced"]:
-            if coll == "skills" and rid in skills:
-                log_put(coll, skills[rid])
+            if coll in SATELLITES and rid in side:
+                log_put(coll, side[rid])
             elif coll == "peritia":
                 log_append("put", "peritia", {"id": "peritia", "rec": data.get("peritia")})
             elif rid in idx:
                 log_put(coll, idx[rid])
                 log_edges(rid, edges_from(data, rid))
         for coll, rid, name in report["skipped_deleted"]:
-            if rid not in idx and rid not in skills:
+            if rid not in idx and rid not in side:
                 log_del(coll, rid, name)
         CONFLICT_DIR.mkdir(exist_ok=True)
         try:
@@ -4779,6 +5369,7 @@ def check(data):
         warnings.append(tr("Syncthing conflict copy of a draft: {file} (compare it with "
                            "the draft, then delete it)", file=x.relative_to(BASE).as_posix()))
     check_skills(data, errors, warnings)
+    check_observations(data, idx, warnings)
     check_book(data, errors, warnings)
     return errors, warnings
 
@@ -4830,7 +5421,9 @@ def summary(data):
         + "".join(" · " + tr(label, n=n) for label, n in (
             ("{n} items", sum(1 for r in data.get("res", []) if rtype(r) == "item")),
             ("{n} accounts", sum(1 for r in data.get("res", []) if rtype(r) == "account"))) if n) \
-        + (" · " + tr("{n} skills", n=len(data["skills"])) if data.get("skills") else "")
+        + (" · " + tr("{n} skills", n=len(data["skills"])) if data.get("skills") else "") \
+        + (" · " + tr("{n} observations", n=len(data["observations"]))
+           if data.get("observations") else "")
 
 
 def cmd_doctor():
@@ -4921,6 +5514,8 @@ def write_mirror(data):
             meta.append("geo: " + geo_summary(p["geo"]))
         if p.get("observator"):
             meta.append("obs: " + observator_name(data, p["observator"]))
+        if (seen := mirror_observed(p, data)):
+            meta.append(seen)
         if gpg_fpr(p.get("gpg")):
             meta.append("gpg: " + gpg_fpr(p["gpg"]))
         if meta:
@@ -4989,6 +5584,8 @@ def write_mirror(data):
             meta.append("geo: " + geo_summary(e["geo"]))
         if e.get("observator"):
             meta.append("obs: " + observator_name(data, e["observator"]))
+        if (seen := mirror_observed(e, data)):
+            meta.append(seen)
         out.append("  ·  ".join(m for m in meta if m))
         out.append("")
         if e.get("gloss"):
@@ -5020,7 +5617,8 @@ def write_mirror(data):
                                             "tags: " + ", ".join(s["tags"]) if s.get("tags") else "",
                                             "geo: " + geo_summary(s["geo"]) if s.get("geo") else "",
                                             "obs: " + observator_name(data, s["observator"])
-                                            if s.get("observator") else "")
+                                            if s.get("observator") else "",
+                                            mirror_observed(s, data))
                                 if x))
         out += ["", cite(s, "abnt", data), ""]
         if s.get("notes"):
@@ -5058,6 +5656,8 @@ def write_mirror(data):
             meta.append("geo: " + geo_summary(m["geo"]))
         if m.get("observator"):
             meta.append("obs: " + observator_name(data, m["observator"]))
+        if (seen := mirror_observed(m, data)):
+            meta.append(seen)
         if meta:
             out.append("  ·  ".join(meta))
         out.append("")
@@ -5087,6 +5687,8 @@ def write_mirror(data):
             meta.append("geo: " + geo_summary(r["geo"]))
         if r.get("observator"):
             meta.append("obs: " + observator_name(data, r["observator"]))
+        if (seen := mirror_observed(r, data)):
+            meta.append(seen)
         out += ["  ·  ".join(meta), ""]
         if r.get("notes"):
             out += [r["notes"], ""]
@@ -5127,8 +5729,9 @@ def write_mirror(data):
         out += ["# " + tr("Drafts"), ""]
         for n in sorted(data["notes"], key=lambda x: sort_key(x.get("name", ""))):
             out += [f"## {n.get('name', '')}", mirror_locus(n), ""]
-            if n.get("tags"):
-                out += ["tags: " + ", ".join(n["tags"]), ""]
+            meta = ["tags: " + ", ".join(n["tags"]) if n.get("tags") else "", mirror_observed(n, data)]
+            if any(meta):
+                out += ["  ·  ".join(x for x in meta if x), ""]
             if n.get("file"):
                 out += [f"[{n['file']}](<{n['file']}>)", ""]
             out += [f"`{n['id']}`", ""]
@@ -5153,6 +5756,9 @@ def cmd_mirror():
 #      is:org is:person is:geo   organizations, people who are not, records with a GEO
 #      status:lent      a form's status, or an item's (its key or its label)
 #      atype:card       an account's type (its key or its label)
+#      is:reobserved    observed twice or more in the last 12 months
+#      crit:kinship     observed by a criterion with that text (or that c_ id,
+#                       or a concept whose name has it)
 # The rest are literal terms, all required, looked up in each record's search
 # text (`_h`, made by the haystack_* functions). type: and sys: match the
 # stored key or its label in the current language.
@@ -5160,7 +5766,7 @@ def cmd_mirror():
 SEARCH_SCOPES = {"p:": "people", "v:": "entries", "f:": "sources",
                  "c:": "corpus", "d:": "notes", "r:": "res"}
 SEARCH_FIELDS = ("tag", "lang", "type", "sys", "dom", "id", "is", "circle", "obs", "status",
-                 "atype")
+                 "atype", "crit")
 
 
 def parse_search(text):
@@ -5211,6 +5817,11 @@ def search_field_ok(r, fields, data=None):
             if v.startswith("geo") and not (r.get("geo") or "").strip():
                 return False
             if v.startswith("unsign") and (r.get("observator") or ""):
+                return False
+            if v.startswith("reobs") and (data is None or obs_recent(data).get(r.get("id"), 0) < 2):
+                return False
+        if k == "crit":                 # crit:text or crit:c_… -- a criterion of its observations
+            if data is None or v.casefold() not in obs_crit_text(data).get(r.get("id"), ""):
                 return False
         if k == "obs":                  # obs:p_… (an id) or obs:name (the observator's name)
             who = (r.get("observator") or "").lower()
@@ -5359,8 +5970,14 @@ def cmd_search(query):
 
 # ================================================================ history
 
+def log_lines_of(rid, lines=None):
+    """The log lines of one record, in time order: what `history` shows and
+    where `reobserve` finds the values an observation elided."""
+    return [l for l in (read_logs() if lines is None else lines) if l.get("id") == rid]
+
+
 def cmd_history(rid):
-    lines = [l for l in read_logs() if l.get("id") == rid]
+    lines = log_lines_of(rid)
     if not lines:
         print(tr("no log lines for {id}", id=rid))
         return 1
@@ -5395,7 +6012,7 @@ def cmd_replay():
             regs.update(l.get("regs", {}))
             continue
         op, coll, rid = l.get("op"), l.get("coll"), l.get("id")
-        if op == "put" and coll in COLLS + ("skills",):
+        if op == "put" and coll in COLLS + SATELLITES:
             rec = l.get("rec", {})
             if rid in idx:
                 rows = data[coll]
@@ -8463,6 +9080,11 @@ WEB_STRINGS = (
     "No basemap (kustos_basemap.json): only the records are drawn.", "Nothing here has a GEO.",
     "The basemap did not load: {why}", "(+{n} under it)", "{n} place(s) of {r} record(s) · {scope}", "following the search",
     "the whole base", "100 px ≈ {dist}",
+    "Observations", "Observe", "DISTINCTION", "CRITERION", "CONFIDENCE", "SOURCE", "none",
+    "what was told apart from what, in one sentence", "the rule applied: text, or a concept (c_…)",
+    "automatic", "deliberate", "changed: {fields}", "before", "confidence {n}",
+    "Delete this observation?", "Observation saved.", "Observation deleted.",
+    "Not observed yet: a save observes it, or say here what you tell apart in it.",
 )
 
 
@@ -8875,6 +9497,7 @@ def web_save(body):
         links, unparsed = web_links(form, out["id"], out, inverse)
         web_drafts(out, unparsed)
         touch(out)
+        out["_text"] = (before, text)       # for the observation: the text lives in the file
         data = save_record("notes", out, edges=links)
         write_note_file(by_id(data)[out["id"]], text, when)
         if text != before:
@@ -9055,6 +9678,8 @@ def web_record(data, rid):
                   for a in edges_to(data, rid)],
            "contacts": contact_lines(rec.get("links", [])),
            "skills": record_skills(data, rid),
+           "observations": record_observations(data, rid),
+           "observed": obs_summary_line(data, rid),
            "html": {}}
     for k in ("notes_raw", "notes", "body"):
         if out["form"].get(k):
@@ -9384,6 +10009,8 @@ def web_api(method, path, query, body):
         if method == "GET" and path == "/api/path":
             got = web_path(load_json(), arg("a"), arg("b"))
             return (200, got) if got else (404, {"error": tr("This record no longer exists.")})
+        if method == "GET" and path == "/api/observe/criteria":
+            return 200, {"criteria": criteria_suggestions(load_json())}
         if method == "GET" and path == "/api/drill":
             return 200, drill_overview(load_json())
         if method == "GET" and path == "/api/drill/session":
@@ -9412,6 +10039,16 @@ def web_api(method, path, query, body):
             return 200, {"record": web_record(data, rid), "message": message, "data": data}
         if path == "/api/delete":
             return 200, {"ok": True, "data": web_delete(body)}
+        if path == "/api/observe":             # a deliberate observation of the record
+            rid = str(body.get("id") or "")
+            data, _oid = add_observation([rid], body.get("distinction"), body.get("criterion"),
+                                         body.get("confidence"), body.get("source"), body.get("notes"))
+            return 200, {"record": web_record(data, rid), "message": tr("Observation saved."),
+                         "data": data}
+        if path == "/api/observe/delete":      # one's own deliberate observation
+            data = delete_observation(str(body.get("obs") or ""))
+            return 200, {"record": web_record(data, str(body.get("id") or "")),
+                         "message": tr("Observation deleted."), "data": data}
         if path == "/api/link":
             data = web_link(body)
             return 200, {"link": web_link_details(data, str(body.get("from") or ""),
@@ -10813,6 +11450,15 @@ textarea.prose { font: 17px/1.55 var(--serif); min-height: 10em; }
 .st-out { color: var(--warn); font-weight: 700; } .st-near { color: var(--soft); font-style: italic; }
 .changed { box-shadow: inset 3px 0 0 var(--accent); padding-left: 12px; }
 .foot { margin-top: 28px; font: 12px var(--mono); color: var(--faint); }
+.obs .k { font: 12px var(--mono); color: var(--faint); }
+.obs .why { display: block; font-size: 14px; color: var(--soft); overflow-wrap: anywhere; }
+.obs .was { display: block; font: 13px/1.45 var(--mono); color: var(--soft); overflow-wrap: anywhere; }
+.obs .btn { margin-top: 4px; padding: 3px 8px; font-size: 12px; }
+#obsform .field { margin-top: 10px; }
+#obsform .conf { display: flex; flex-wrap: wrap; gap: 6px; }
+#obsform .conf label { display: inline-flex; gap: 6px; align-items: center; border: 1px solid var(--rule);
+  border-radius: 999px; padding: 5px 12px; }
+#obsform .go-on { margin-top: 12px; }
 .empty { padding: 48px 16px; color: var(--faint); text-align: center; }
 .seg { display: flex; flex-wrap: wrap; gap: 8px; }
 .small { font-size: 13px; }
@@ -11203,6 +11849,7 @@ function renderRecord(changed) {
   if (r.in.length) out.push(sec(T("Cited by"), `<ul class="links">${r.in.map(a => goItem(a, false)).join("")}</ul>`));
   if (r.skills && r.skills.length) out.push(sec(T("Skills"), `<ul class="links">${r.skills.map(k =>
     `<li><a class="go" href="skills#${encodeURIComponent(k.id)}"><span class="rel">${esc(k.level)}</span>${esc(k.name)}</a></li>`).join("")}</ul>`));
+  out.push(sec(T("Observations") + (r.observed ? " · " + r.observed : ""), obsHtml(r)));
   const foot = [r.id, r.updated ? T("updated {date}", {date: r.updated}) : "",
                 r.coll === "notes" ? T("file") + ": " + (r.file || T("(the file is made on saving)")) : ""];
   out.push(`<div class="foot">${foot.filter(Boolean).map(esc).join("<br>")}</div>`);
@@ -11211,6 +11858,82 @@ function renderRecord(changed) {
                             (geo ? `<button class="btn quiet" data-act="map">${esc(T("Map"))}</button>` : "") +
                             `<button class="btn" data-act="edit">${esc(T("Edit"))}</button>`) +
     `<div class="card">${out.join("")}</div>`;
+}
+
+/* the record's observations (record_observations, shared with the window),
+   oldest first, and the form for a deliberate one: what was told apart, by
+   what criterion, how sure, from where */
+function obsHtml(r) {
+  const list = r.observations || [], shown = S.all.obs ? list : list.slice(-12);
+  let h = list.length ? "" : `<div class="hint">${esc(T("Not observed yet: a save observes it, or say here what you tell apart in it."))}</div>`;
+  if (list.length > shown.length) h += `<button class="btn quiet" data-act="all" data-k="obs">${esc(T("show all {n}", {n: list.length}))}</button>`;
+  h += `<ul class="log obs">` + shown.map(o => {
+    const head = [o.kind, T(o.auto ? "automatic" : "deliberate"), o.who].filter(Boolean).join(" · ");
+    const facts = [o.criterion_label ? T("CRITERION") + ": " + o.criterion_label : "",
+                   o.confidence ? T("confidence {n}", {n: o.confidence}) : "",
+                   o.source ? T("SOURCE") + ": " + o.source : ""].filter(Boolean).join(" · ");
+    return `<li><span class="d">${esc(o.date)}</span><span><span class="k">${esc(head)}</span>` +
+      (o.distinction ? `<span class="why">${esc(o.distinction)}</span>` : "") +
+      (facts ? `<span class="why">${esc(facts)}</span>` : "") +
+      (o.notes ? `<span class="why">${esc(o.notes)}</span>` : "") +
+      (o.changed.length ? `<span class="why">${esc(T("changed: {fields}", {fields: o.changed.join(", ")}))}</span>` : "") +
+      o.before.map(b => `<span class="was">${esc(T("before") + " " + b[0] + ": " + b[1])}</span>`).join("") +
+      (o.deletable ? `<button class="btn quiet danger" data-act="obs-del" data-id="${esc(o.id)}">${esc(T("Delete"))}</button>` : "") +
+      `</span></li>`;
+  }).join("") + `</ul>`;
+  const conf = [["", T("none")], ["1", "1"], ["2", "2"], ["3", "3"]].map(([v, l]) =>
+    `<label><input type="radio" name="confidence" value="${v}"${v ? "" : " checked"}> ${esc(l)}</label>`).join("");
+  h += `<form id="obsform" autocomplete="off">` +
+    `<div class="field"><label class="lbl" for="ob-dist">${esc(T("DISTINCTION"))}</label>` +
+    `<input class="f" id="ob-dist" name="distinction" placeholder="${esc(T("what was told apart from what, in one sentence"))}"></div>` +
+    `<div class="field"><label class="lbl" for="ob-crit">${esc(T("CRITERION"))}</label>` +
+    `<input class="f" id="ob-crit" name="criterion" list="dl-ob-crit" placeholder="${esc(T("the rule applied: text, or a concept (c_…)"))}">` +
+    `<datalist id="dl-ob-crit"></datalist></div>` +
+    `<div class="field"><span class="lbl">${esc(T("CONFIDENCE"))}</span><div class="conf">${conf}</div></div>` +
+    `<div class="field"><label class="lbl" for="ob-src">${esc(T("SOURCE"))}</label>` +
+    `<input class="f" id="ob-src" name="source" placeholder="${esc(T("s_… of a source, or free text"))}"></div>` +
+    `<div class="go-on"><button class="btn primary">${esc(T("Observe"))}</button></div></form>`;
+  return h;
+}
+let obsCriteria = null;
+async function obsFillCriteria() {
+  // the suggestions (criteria used, then the concepts) come once, when first wanted
+  const dl = $("#dl-ob-crit");
+  if (!dl) return;
+  if (!obsCriteria) {
+    try { obsCriteria = (await api("api/observe/criteria")).criteria || []; }
+    catch (e) { return; }
+  }
+  if (dl.childElementCount) return;
+  for (const [v, l] of obsCriteria) {
+    const o = document.createElement("option");
+    o.value = v; o.label = l;
+    dl.appendChild(o);
+  }
+}
+async function observe(form) {
+  const r = S.rec;
+  if (!r || !r.id) return;
+  const body = {id: r.id, distinction: form.elements.distinction.value,
+                criterion: form.elements.criterion.value, source: form.elements.source.value,
+                confidence: (form.querySelector('input[name="confidence"]:checked') || {}).value || ""};
+  let j;
+  try { j = await api("api/observe", body); }
+  catch (e) { toast(e.message, 4000); return; }
+  obsCriteria = null;
+  S.rec = j.record || S.rec;
+  renderRecord();
+  toast(j.message || T("Observation saved."));
+}
+async function observeDelete(oid) {
+  const r = S.rec;
+  if (!r || !confirm(T("Delete this observation?"))) return;
+  let j;
+  try { j = await api("api/observe/delete", {id: r.id, obs: oid}); }
+  catch (e) { toast(e.message, 4000); return; }
+  S.rec = j.record || S.rec;
+  renderRecord();
+  toast(j.message || T("Observation deleted."));
 }
 
 /* a line of URLS, read on the server (contact_line): a site, an email, a
@@ -12941,13 +13664,16 @@ document.addEventListener("click", e => {
   else if (act === "lk-cancel") { if (LK.card.edges.length) linkCard(LK.card.a.id, LK.card.b.id, LK.card); else closeSheet(); }
   else if (act === "lk-which") { L.which = b.dataset.k; loadLinks(false); }
   else if (act === "lk-more") loadLinks(true);
+  else if (act === "obs-del") observeDelete(b.dataset.id);
 });
+document.addEventListener("focusin", e => { if (e.target.id === "ob-crit") obsFillCriteria(); });
 document.addEventListener("submit", e => {
   e.preventDefault();
   const form = e.target;
   if (form.dataset.quick) quickAdd(form.dataset.quick, form.elements.line.value);
   else if (form.id === "drform") drillCheck();
   else if (form.id === "editor") save(false);
+  else if (form.id === "obsform") observe(form);
 });
 document.addEventListener("input", e => {
   const t = e.target;
@@ -15788,6 +16514,20 @@ HELP_RES = (
 )
 
 
+# the Help › Shortcuts lines for observations
+HELP_OBS = (
+    "\n  Ctrl+Shift+O    observe the open record (Base › Observe…, or the line beside"
+    "\n                  the register): its observations, oldest first -- who, when,"
+    "\n                  what changed and what it was -- and a deliberate one: the"
+    "\n                  DISTINCTION drawn, its CRITERION (text, or a concept c_…),"
+    "\n                  CONFIDENCE 1-3, SOURCE. Every save is observed by itself, once"
+    "\n                  a day per record. is:reobserved finds what was observed twice"
+    "\n                  or more in 12 months; crit:text by criterion. The status bar's"
+    "\n                  re-obs is the share of the base re-observed. python _kustos.py"
+    "\n                  reobserve <id> · observe (the report).\n"
+)
+
+
 # the Help › Shortcuts lines for drafts
 HELP_NOTES = (
     "\n  DRAFTS: free notes in markdown, one .md file each in notes/ beside the"
@@ -16825,6 +17565,12 @@ class App:
         self.locus = tk.Label(self.cardbox, text="", bg=PAPER, fg=FAINT,
                               font=self.f_label, anchor="w", padx=22)
         self.locus.pack(fill="x", pady=(8, 0))
+        # under it, the record's observations: how many, the last, and the way to
+        # observe it (a line of its own: beside the register it was cut short)
+        self.obs_line = tk.Label(self.cardbox, text="", bg=PAPER, fg=FAINT, font=self.f_label,
+                                 anchor="w", padx=22, cursor="hand2")
+        self.obs_line.pack(fill="x")
+        self.obs_line.bind("<Button-1>", lambda e: self.observe_dialog())
         pw.add(self.cardbox, stretch="always", minsize=320)
         self.pw = pw
         self.apply_pane_lock()
@@ -17168,6 +17914,9 @@ class App:
         self.obs_eye.pack(side="right", padx=(0, 5))
         for w in (self.obs_label, self.obs_eye):
             w.bind("<Button-1>", lambda e: self.observator_click())
+        # how much of the base was observed again in the last 12 months
+        self.reobs_label = tk.Label(row, text="", bg=PAPER, fg=SOFT, font=self.f_meta)
+        self.reobs_label.pack(side="right", padx=(0, 14))
         self.draw_observator()
 
     def draw_observator(self):
@@ -17180,6 +17929,8 @@ class App:
         name = observator_name(self.data) if pid else tr("no observator")
         self.obs_label.configure(text=f"observator: {name}" if pid else name,
                                  fg=SOFT if pid else FAINT)
+        ratio = obs_ratio(obs_stats(self.data)["all"])
+        self.reobs_label.configure(text=tr("re-obs {ratio}", ratio=ratio) if ratio else "")
 
     def observator_click(self):
         pid = observator_id(self.data)
@@ -17261,6 +18012,8 @@ class App:
         b.add_separator()
         b.add_command(label=tr("Merge sync conflicts"), command=self.do_merge)
         b.add_command(label=tr("History of the open record"), command=self.do_history)
+        b.add_command(label=tr("Observe the open record…"), accelerator="Ctrl+Shift+O",
+                      command=self.observe_dialog)
         b.add_separator()
         b.add_command(label=tr("Import sources from Zotero (CSL-JSON or BibTeX)…"),
                       command=self.do_import_zotero)
@@ -17359,6 +18112,7 @@ class App:
         r.bind("<Control-T>", lambda e: self.open_timeline())   # Ctrl+Shift+T
         r.bind("<Control-M>", lambda e: self.open_monads())     # Ctrl+Shift+M
         r.bind("<Control-L>", lambda e: self.open_map())        # Ctrl+Shift+L
+        r.bind("<Control-O>", lambda e: self.observe_dialog())  # Ctrl+Shift+O
         r.bind("<F11>", lambda e: self.toggle_wide())
         r.bind("<Control-backslash>", lambda e: self.toggle_wide())
         r.bind("<Control-e>", lambda e: self.open_reader())
@@ -18515,7 +19269,17 @@ class App:
         self.top = max(0, i - self.rows // 2)
         self.refresh_list()
 
+    def set_obs_line(self, rec):
+        """'observed 3× · last 2026-11-14 · observe…' beside the register line."""
+        rid = (rec or {}).get("id") or ""
+        if not rid or rid.startswith("__"):
+            self.obs_line.configure(text="")
+            return
+        line = obs_summary_line(self.data, rid)
+        self.obs_line.configure(text=(line + "  ·  " if line else "") + tr("observe…"))
+
     def set_locus(self, rec):
+        self.set_obs_line(rec)
         if not rec:
             self.locus.configure(text="")
             return
@@ -19289,6 +20053,7 @@ class App:
         else:
             out.pop("edge_drafts", None)
         touch(out)
+        out["_text"] = (before, body)       # for the observation: the text lives in the file
         self.data = save_record("notes", out, edges=links)
         self.data = self.write_inverse(inverse) or self.data
         saved = by_id(self.data)[out["id"]]
@@ -20107,6 +20872,17 @@ class App:
             cmd_history(rec["id"])
         self.show_text(tr("History · {label}", label=label_any(rec)), buf.getvalue())
 
+    def observe_dialog(self):
+        """Ctrl+Shift+O, Base › Observe…, or the line beside the register: the
+        open record's observations, and a deliberate one."""
+        self.commit_if_dirty()          # what is observed is what is saved
+        rec = self.current()
+        if not rec or rec["id"].startswith("__"):
+            self.say(tr("Open a saved record first."))
+            return "break"
+        ObserveDialog(self, rec["id"])
+        return "break"
+
     def do_import_zotero(self):
         from tkinter import filedialog
         path = filedialog.askopenfilename(
@@ -20278,7 +21054,8 @@ class App:
     def do_help(self):
         self.show_text(tr("Shortcuts"), tr(HELP_TEXT, conflicts=CONFLICT_DIR.name, stem=STEM)
                        + tr(HELP_READING) + tr(HELP_COPY) + tr(HELP_GRAPH) + tr(HELP_MONADS)
-                       + tr(HELP_NOTES) + tr(HELP_RES) + tr(HELP_TIMELINE) + tr(HELP_MAP))
+                       + tr(HELP_NOTES) + tr(HELP_RES) + tr(HELP_TIMELINE) + tr(HELP_MAP)
+                       + tr(HELP_OBS))
 
     # ------------------------------------------------------------ dialogs
     def dialog(self, title, width=520, height=None):
@@ -20352,6 +21129,186 @@ class App:
         self.flush_seen()
         self.stop_carets()
         self.root.destroy()
+
+
+class ObserveDialog:
+    """Ctrl+Shift+O: the record's observations, oldest first (record_observations,
+    the list the page and `reobserve` show too), and below them the form of a
+    deliberate one, saved through add_observation as the page's are. One's own
+    deliberate observations carry a [delete]."""
+
+    def __init__(self, app, rid):
+        self.app, self.rid = app, rid
+        self.win = win = app.dialog(tr("Observations"), 700, 660)
+        rec = by_id(app.data).get(rid)
+        tk.Label(win, text=tr("OBSERVATIONS"), bg=PAPER, fg=FAINT,
+                 font=app.f_label).pack(anchor="w", padx=18, pady=(14, 0))
+        tk.Label(win, text=one_liner(label_any(rec, app.data), 70) + "   " + rid, bg=PAPER, fg=INK,
+                 font=app.f_body).pack(anchor="w", padx=18, pady=(0, 8))
+        foot = tk.Frame(win, bg=PAPER)
+        foot.pack(side="bottom", fill="x", padx=18, pady=12)
+        ttk.Button(foot, text=tr("Observe"), command=self.save).pack(side="left")
+        ttk.Button(foot, text=tr("Close"), style="Quiet.TButton",
+                   command=win.destroy).pack(side="left", padx=(8, 0))
+        self.msg = tk.Label(foot, text="", bg=PAPER, fg=OXIDE, font=app.f_meta,
+                            wraplength=440, justify="left")
+        self.msg.pack(side="left", padx=(14, 0))
+        form = tk.Frame(win, bg=PAPER)
+        form.pack(side="bottom", fill="x", padx=18)
+        form.columnconfigure(1, weight=1)
+
+        def label(row, text):
+            tk.Label(form, text=text, bg=PAPER, fg=FAINT, font=app.f_label).grid(
+                row=row, column=0, sticky="nw", padx=(0, 12), pady=(8, 0))
+
+        label(0, tr("DISTINCTION"))
+        self.e_dist = ttk.Entry(form)
+        self.e_dist.grid(row=0, column=1, sticky="we", pady=(8, 0))
+        tk.Label(form, text=tr("what was told apart from what, in one sentence"), bg=PAPER, fg=FAINT,
+                 font=app.f_label).grid(row=1, column=1, sticky="w")
+        label(2, tr("CRITERION"))
+        self.v_crit = tk.StringVar()
+        self.e_crit = ttk.Entry(form, textvariable=self.v_crit)
+        self.e_crit.grid(row=2, column=1, sticky="we", pady=(8, 0))
+        # what can be picked: the criteria already used, then the concepts
+        self.box = tk.Listbox(form, height=4, font=app.f_meta, bg=PAPER, fg=SOFT, relief="flat",
+                              highlightthickness=1, highlightbackground=RULE, selectbackground=SELBG,
+                              selectforeground=SELFG, activestyle="none")
+        self.box.grid(row=3, column=1, sticky="we", pady=(2, 0))
+        tk.Label(form, text=tr("the rule applied: text, or a concept (c_…)"), bg=PAPER, fg=FAINT,
+                 font=app.f_label).grid(row=4, column=1, sticky="w")
+        label(5, tr("CONFIDENCE"))
+        self.v_conf = tk.StringVar(value="")
+        row = tk.Frame(form, bg=PAPER)
+        row.grid(row=5, column=1, sticky="w", pady=(8, 0))
+        for value, text in (("", tr("none")), ("1", "1"), ("2", "2"), ("3", "3")):
+            tk.Radiobutton(row, text=text, value=value, variable=self.v_conf, indicatoron=False,
+                           bg=PAPER, fg=INK, selectcolor=SELBG, activebackground=PAPER,
+                           activeforeground=INK, font=app.f_meta, padx=12, pady=2, bd=1,
+                           relief="flat", offrelief="flat", highlightthickness=0,
+                           cursor="hand2").pack(side="left", padx=(0, 6))
+        label(6, tr("SOURCE"))
+        self.e_src = ttk.Entry(form)
+        self.e_src.grid(row=6, column=1, sticky="we", pady=(8, 0))
+        tk.Label(form, text=tr("s_… of a source, or free text"), bg=PAPER, fg=FAINT,
+                 font=app.f_label).grid(row=7, column=1, sticky="w")
+        self.text = tk.Text(win, font=app.f_meta, bg=PAPER, fg=INK, relief="flat", wrap="word",
+                            padx=8, pady=6, highlightthickness=1, highlightbackground=RULE,
+                            cursor="arrow")
+        self.text.pack(fill="both", expand=True, padx=18, pady=(0, 6))
+        self.text.tag_configure("head", foreground=INK)
+        self.text.tag_configure("soft", foreground=SOFT)
+        self.text.tag_configure("faint", foreground=FAINT)
+        self.text.tag_configure("del", foreground=OXIDE, underline=True)
+        self.v_crit.trace_add("write", lambda *a: self.suggest())
+        self.e_crit.bind("<Down>", lambda e: self.into_box())
+        self.box.bind("<Return>", lambda e: self.pick())
+        self.box.bind("<Double-Button-1>", lambda e: self.pick())
+        self.box.bind("<Escape>", lambda e: (self.e_crit.focus_set(), "break")[1])
+        for w in (self.e_dist, self.e_crit, self.e_src):
+            w.bind("<Return>", lambda e: self.save())
+        win.bind("<Escape>", lambda e: win.destroy())
+        self.criteria = criteria_suggestions(app.data)
+        self.fill()
+        self.suggest()
+        self.e_dist.focus_set()
+
+    def fill(self):
+        t = self.text
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        rows = record_observations(self.app.data, self.rid)
+        if not rows:
+            t.insert("end", tr("Not observed yet: a save observes it, or say here what you tell "
+                               "apart in it."), "faint")
+        for o in rows:
+            t.insert("end", f"{o['date']} {o['time']}  ", "faint")
+            t.insert("end", " · ".join([o["kind"], tr("automatic" if o["auto"] else "deliberate"),
+                                        o["who"]]) + "\n", "head")
+            if o["distinction"]:
+                t.insert("end", "    " + o["distinction"] + "\n", "head")
+            facts = [tr("criterion") + ": " + o["criterion_label"] if o["criterion"] else "",
+                     tr("confidence {n}", n=o["confidence"]) if o["confidence"] else "",
+                     tr("source") + ": " + o["source"] if o["source"] else ""]
+            if any(facts):
+                t.insert("end", "    " + " · ".join(x for x in facts if x) + "\n", "soft")
+            if o["changed"]:
+                t.insert("end", "    " + tr("changed: {fields}", fields=", ".join(o["changed"])) + "\n",
+                         "soft")
+            for k, v in o["before"]:
+                t.insert("end", f"      {tr('before')} {k}: {v}\n", "faint")
+            if o["deletable"]:
+                tag = "del:" + o["id"]
+                t.insert("end", "    ", "faint")
+                t.insert("end", tr("delete"), ("del", tag))
+                t.insert("end", "\n")
+                t.tag_bind(tag, "<Button-1>", lambda e, oid=o["id"]: self.delete(oid))
+                t.tag_bind(tag, "<Enter>", lambda e: t.configure(cursor="hand2"))
+                t.tag_bind(tag, "<Leave>", lambda e: t.configure(cursor="arrow"))
+            t.insert("end", "\n")
+        t.configure(state="disabled")
+        t.see("end")
+
+    def suggest(self):
+        q = sort_key(self.v_crit.get().strip())[0]
+        self.picks = [(v, l) for v, l in self.criteria
+                      if not q or q in sort_key(v)[0] or q in sort_key(l)[0]][:40]
+        self.box.delete(0, "end")
+        for v, l in self.picks:
+            self.box.insert("end", f"{v}   {l}" if v.startswith("c_") else f"{v}   ({l})")
+
+    def into_box(self):
+        if self.picks:
+            self.box.focus_set()
+            self.box.selection_clear(0, "end")
+            self.box.selection_set(0)
+            self.box.activate(0)
+        return "break"
+
+    def pick(self):
+        cur = self.box.curselection()
+        if cur and cur[0] < len(self.picks):
+            v, l = self.picks[cur[0]]
+            self.v_crit.set(f"{v}  {l}" if v.startswith("c_") else v)
+            self.e_crit.icursor("end")
+        self.e_crit.focus_set()
+        return "break"
+
+    def save(self):
+        try:
+            add_observation([self.rid], self.e_dist.get(), self.v_crit.get(), self.v_conf.get(),
+                            self.e_src.get())
+        except ValueError as exc:
+            self.msg.configure(text=str(exc))
+            return "break"
+        self.msg.configure(text="")
+        for e in (self.e_dist, self.e_src):
+            e.delete(0, "end")
+        self.v_crit.set("")
+        self.v_conf.set("")
+        self.after_change(tr("Observation saved."))
+        self.e_dist.focus_set()
+        return "break"
+
+    def delete(self, oid):
+        if not self.app.confirm(tr("Delete this observation?"),
+                                tr("The log keeps it.")):
+            return
+        try:
+            delete_observation(oid)
+        except ValueError as exc:
+            self.msg.configure(text=str(exc))
+            return
+        self.after_change(tr("Observation deleted."))
+
+    def after_change(self, said):
+        app = self.app
+        app.reload()
+        app.set_obs_line(app.current())
+        self.criteria = criteria_suggestions(app.data)
+        self.suggest()
+        self.fill()
+        app.say(said)
 
 
 # ================================================================ livro
@@ -25056,6 +26013,10 @@ def main():
         return cmd_search(" ".join(rest))
     if cmd == "history" and rest:
         return cmd_history(rest[0])
+    if cmd == "reobserve" and rest:
+        return cmd_reobserve(rest[0])
+    if cmd == "observe":
+        return cmd_observe()
     if cmd == "replay":
         return cmd_replay()
     if cmd == "import" and rest:
@@ -27824,6 +28785,9 @@ PT = {
     "No basemap (kustos_basemap.json): only the records are drawn.":
         "Sem mapa de fundo (kustos_basemap.json): só os registros são desenhados.",
     "Nothing here has a GEO.": "Nada aqui tem GEO.",
+    "(not kept: more than the last four digits)": "(não guardado: mais que os quatro últimos dígitos)",
+    "No observator chosen yet (Base › Observator…): an observation is made in someone's name.":
+        "Nenhum observador escolhido (Base › Observador…): uma observação é feita em nome de alguém.",
     "The basemap did not load: {why}": "O mapa de fundo não carregou: {why}",
     "Every place": "Todos os lugares",
     "The world": "O mundo",
@@ -27836,6 +28800,86 @@ PT = {
         "\n                  roda dá zoom onde está o ponteiro, arrastar ou as setas movem,"
         "\n                  um clique abre um registro aqui, Home mostra todos os lugares,"
         "\n                  w o mundo, f segue a busca desta janela.\n",
+    # ---- observations
+    "(deleted)": "(apagado)",
+    "(empty)": "(vazio)",
+    "(last {time})": "(última {time})",
+    "(not in the logs)": "(não está nos logs)",
+    "An automatic observation is history: it stays.":
+        "Uma observação automática é história: ela fica.",
+    "An observation needs a record.": "Uma observação precisa de um registro.",
+    "CONFIDENCE": "CONFIANÇA",
+    "CONFIDENCE is 1, 2 or 3, or none.": "CONFIANÇA é 1, 2 ou 3, ou nenhuma.",
+    "CRITERION": "CRITÉRIO",
+    "Close": "Fechar",
+    "DISTINCTION": "DISTINÇÃO",
+    "Delete this observation?": "Apagar esta observação?",
+    "Eigenforms without an entry (criteria used {n}× or more): make each a concept":
+        "Formas próprias sem verbete (critérios usados {n}× ou mais): faça de cada uma um conceito",
+    "No recurring criterion without a concept.": "Nenhum critério recorrente sem conceito.",
+    "Not observed yet: a save observes it, or say here what you tell apart in it.":
+        "Ainda não observado: salvar o observa, ou diga aqui o que você distingue nele.",
+    "OBSERVATIONS": "OBSERVAÇÕES",
+    "Observation deleted.": "Observação apagada.",
+    "Observation saved.": "Observação gravada.",
+    "Observations": "Observações",
+    "Observe": "Observar",
+    "Observe the open record…": "Observar o registro aberto…",
+    "Only its own observator can delete an observation.":
+        "Só o próprio observador pode apagar uma observação.",
+    "Say what was told apart (DISTINCTION), or the CRITERION.":
+        "Diga o que foi distinguido (DISTINÇÃO), ou o CRITÉRIO.",
+    "The log keeps it.": "O log a guarda.",
+    "This observation no longer exists.": "Esta observação não existe mais.",
+    "all": "tudo",
+    "automatic": "automática",
+    "before": "antes",
+    "changed: {fields}": "mudou: {fields}",
+    "collection": "acervo",
+    "confidence": "confiança",
+    "confidence {n}": "confiança {n}",
+    "criterion": "critério",
+    "delete": "apagar",
+    "deliberate": "deliberada",
+    "distinction": "distinção",
+    "observed": "observados",
+    "observed and re-observed: in the last 12 months (since {date})":
+        "observados e reobservados: nos últimos 12 meses (desde {date})",
+    "observed {n}× · last {date}": "observado {n}× · último {date}",
+    "observed: {n}×": "observado: {n}×",
+    "observe…": "observar…",
+    "ratio": "razão",
+    "re-obs {ratio}": "reobs {ratio}",
+    "re-observed": "reobservados",
+    "records": "registros",
+    "the rule applied: text, or a concept (c_…)": "a regra aplicada: texto, ou um conceito (c_…)",
+    "used {n}×": "usado {n}×",
+    "what was told apart from what, in one sentence": "o que foi distinguido do quê, numa frase",
+    "{id} (no such concept)": "{id} (conceito inexistente)",
+    "{id}: CRITERION points to {crit}, which does not exist":
+        "{id}: CRITÉRIO aponta para {crit}, que não existe",
+    "{id}: an observation of nothing (no targets)": "{id}: uma observação de nada (sem alvos)",
+    "{id}: confidence {value} is not 1, 2 or 3": "{id}: confiança {value} não é 1, 2 nem 3",
+    "{id}: observes {target}, which neither exists nor was deleted":
+        "{id}: observa {target}, que nem existe nem foi apagado",
+    "{id}: repeated observation id": "{id}: id de observação repetido",
+    "{id}: unknown kind of observation {kind}": "{id}: tipo de observação desconhecido {kind}",
+    "{n} observation(s)": "{n} observação(ões)",
+    "{n} observation(s): {auto} automatic, {deliberate} deliberate":
+        "{n} observação(ões): {auto} automática(s), {deliberate} deliberada(s)",
+    "{n} observations": "{n} observações",
+    "{n} recurring criteria without a concept (make each a concept): {list}":
+        "{n} critério(s) recorrente(s) sem conceito (faça de cada um um conceito): {list}",
+    HELP_OBS:
+        "\n  Ctrl+Shift+O    observar o registro aberto (Base › Observar…, ou a linha ao lado"
+        "\n                  do registro): suas observações, da mais antiga -- quem, quando,"
+        "\n                  o que mudou e o que era -- e uma deliberada: a DISTINÇÃO"
+        "\n                  traçada, seu CRITÉRIO (texto, ou um conceito c_…), CONFIANÇA"
+        "\n                  1-3, FONTE. Cada gravação se observa sozinha, uma vez por dia"
+        "\n                  e por registro. is:reobserved acha o observado duas vezes ou"
+        "\n                  mais em 12 meses; crit:texto, pelo critério. O reobs da barra"
+        "\n                  de status é a parte da base reobservada. python _kustos.py"
+        "\n                  reobserve <id> · observe (o relatório).\n",
 }
 
 if __name__ == "__main__":

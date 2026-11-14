@@ -413,6 +413,22 @@ It refuses any folder it did not make, so it never touches a real base.
   before this existed stay unsigned until saved again (`is:unsigned`,
   `obs:name` in the search); the doctor only warns about an observator that is
   not a person of the base.
+- **Observations** (`observatio`, the act of observing): every save of a record
+  made while there is an observator is itself an observation, kept in the base
+  beside the records -- a *distinguo* the first time, a *reobservo* when the
+  save changed something, with the fields that changed and what they were
+  before (at most one a day per record and observator: a day's edits make one).
+  Deliberate ones are made with **Ctrl+Shift+O** (Base › Observe…, or the line
+  under the register number) and on the page's record: the DISTINCTION drawn,
+  its CRITERION (free text, or a concept of verba), a CONFIDENCE of 1 to 3 and
+  a SOURCE; only their observator can delete them. `is:reobserved` finds what
+  was observed twice or more in the last 12 months, `crit:text` what was
+  observed by a criterion; the status bar shows *re-obs*, the share of the
+  base observed again. `python _kustos.py reobserve <id>` lists a record's
+  observations with who, when and what changed (long earlier values come back
+  from the logs); `python _kustos.py observe` reports, per collection, how much
+  is re-observed, and the criteria that keep coming back without a concept of
+  their own ("make it a concept").
 - **Signatures** (optional, needs [GnuPG](https://gnupg.org)): write the
   fingerprint of your OpenPGP key in GPG on your own person's card, then
   `python _kustos.py sign` signs the lines of this machine's log not signed
@@ -515,6 +531,7 @@ It refuses any folder it did not make, so it never touches a real base.
   circle:influence                  in your circle of influence, or at either end of a link in it
   status:lent                       an item's status (or a form's: status:reconstructed)
   atype:card                        an account's type (checking, savings, card, wallet…)
+  is:reobserved crit:kinship        observed twice or more in 12 months / by that criterion
   ```
 
   The search always runs over the whole base. The rail keeps every category
@@ -561,6 +578,8 @@ python _kustos.py observator [p_id|name]   who signs this instance; with an argu
 python _kustos.py sign | verify            OpenPGP signatures over the logs (GnuPG, optional)
 python _kustos.py import zotero <export.json|.bib>
 python _kustos.py mirror | corpus | merge | history <id> | replay
+python _kustos.py reobserve <id>           a record's observations: who, when, what changed
+python _kustos.py observe                  how much is observed again; criteria without a concept
 python _kustos.py logbook                  the base as a logbook (read-only)
 python _kustos.py peritia [--no-open] [--port N]   the web version, opened on its Skills page
 python _kustos.py web [--stay] [--no-open] [--port N]   the whole base, in the browser (phone or desk)
