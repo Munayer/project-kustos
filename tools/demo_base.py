@@ -334,6 +334,27 @@ def build(K, folder):
                       "sign of the feedback", 1, notes="Read again after the workshop visit.")
     K.add_observation(["f_kybernetes"], "the steersman's image, apart from the governor's",
                       "c_feedback_loop", 2)
+    # ---- proposals: what comes in without being typed -- a source imported as
+    # CSL-JSON (as a research agent's output would come), forty-five days ago,
+    # and the bulk entry's concepts with their forms -- stays unsigned until Ada
+    # signs it (is:proposed finds them; `doctor --observe` lists the old one).
+    # The bulk line for Steering gives Ada's form κυβερνήτης a second concept,
+    # unsigned: a form in conflict. One concept is signed, the rest wait.
+    def import_one():
+        data = K.load_json()
+        K.import_sources([K.source_from_csl({
+            "type": "article-journal", "title": "Governors and the Helm",
+            "author": [{"family": "Lindqvist", "given": "Maren"}], "issued": {"date-parts": [[2016]]},
+            "container-title": "Invented Review of Control", "volume": "4", "page": "1-19"})],
+            data, proposed=True)
+        K.write_json(data)
+    on_day(-45, import_one)
+    plan, _bad = K.parse_bulk_concepts(
+        "Feedforward | acting on a disturbance before it shows: Vorsteuerung (deu); anticipazione (ita)\n"
+        "Setpoint drift | a target that moves by itself: deriva (ita)\n"
+        "Steering | guiding a course by small corrections: κυβερνήτης (grc)")
+    K.save_bulk_concepts(plan, "")
+    K.sign_proposals([e["id"] for e in K.load_json()["entries"] if e.get("name") == "Feedforward"])
 
 
 if __name__ == "__main__":

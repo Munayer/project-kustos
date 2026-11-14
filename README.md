@@ -429,6 +429,36 @@ It refuses any folder it did not make, so it never touches a real base.
   from the logs); `python _kustos.py observe` reports, per collection, how much
   is re-observed, and the criteria that keep coming back without a concept of
   their own ("make it a concept").
+- **Proposals**: what comes into the base without being typed here -- an
+  import of sources from Zotero or any CSL-JSON or BibTeX file (`python
+  _kustos.py import [zotero] <file>`, which is also how a research agent's
+  output comes in) and the bulk entry's concepts with their forms (`name |
+  gloss: form (lang)`) -- is born a *proposal*: a new record is not signed,
+  its new links neither, and it gets an observation *proponho*, pending; a
+  record already in the base (a known form the bulk entry gives a new concept)
+  keeps who signed it, and only its new links wait. The eye of an unsigned one
+  has no mark (under the register number in the window, in the record's header
+  on the page), and the window's line says **PROPOSAL · sign it**. Signing it
+  (a click there, **Base › Sign this proposal**, the page's **Sign**, or
+  `python _kustos.py sign-proposals [<id> … | --all]`) puts it and the links it
+  brought in the observator's name (an older unsigned link stays as it was);
+  the *proponho* stays, signed, as the trace that it began as a proposal.
+  Saving a change to a proposal signs it too, and the change is a *reobservo*
+  of what was proposed; a save that changes nothing, or a link written to it
+  from another record's card, leaves it pending. A pending proposal does not
+  count as observed. `is:proposed` finds them, and the doctor warns about
+  those pending more than 30 days, and about a proposal whose signing did not
+  take because another machine saved it meanwhile (`sign-proposals` signs it
+  again). What was imported before stays as it was.
+- **The audit** (`python _kustos.py doctor --observe [--days N]`): a report on
+  the observing itself, which writes nothing (no base, no log, no visit, no
+  mirror) -- the distinctions that changed (re-observations with earlier
+  values), forms whose signed `expresses` links point at different concepts by
+  different observators, criteria used again and again without a concept,
+  atypical links with neither a reason nor a CRITERION, how cold each
+  collection is (records not visited in N days, the coldest named) and the
+  proposals pending more than N days (30 by default). Every line names the
+  ids to open. Plain `doctor` stays the structure check.
 - **Signatures** (optional, needs [GnuPG](https://gnupg.org)): write the
   fingerprint of your OpenPGP key in GPG on your own person's card, then
   `python _kustos.py sign` signs the lines of this machine's log not signed
@@ -532,6 +562,7 @@ It refuses any folder it did not make, so it never touches a real base.
   status:lent                       an item's status (or a form's: status:reconstructed)
   atype:card                        an account's type (checking, savings, card, wallet…)
   is:reobserved crit:kinship        observed twice or more in 12 months / by that criterion
+  is:proposed                       a proposal (an import, the bulk entry) not signed yet
   ```
 
   The search always runs over the whole base. The rail keeps every category
@@ -568,6 +599,7 @@ ABNT citations stay in Portuguese, as the standard itself is.
 
 ```
 python _kustos.py doctor                data-health check
+python _kustos.py doctor --observe [--days N]   the audit of the observing (read-only)
 python _kustos.py search <texto>
 python _kustos.py cite <id|texto> [abnt|abnt-autor-data|bibtex|csl-json|bruto]  pulls citation from source
 python _kustos.py export [bibtex|csl|abnt] [arquivo]
@@ -576,7 +608,8 @@ python _kustos.py map [id]                  every GEO on one map, offline (read-
 python _kustos.py ledger [hledger|beancount] [file]   the accounts as a double-entry journal
 python _kustos.py observator [p_id|name]   who signs this instance; with an argument, chooses
 python _kustos.py sign | verify            OpenPGP signatures over the logs (GnuPG, optional)
-python _kustos.py import zotero <export.json|.bib>
+python _kustos.py import [zotero] <export.json|.bib>   sources, as proposals
+python _kustos.py sign-proposals [<id> … | --all]    sign proposals; alone, list them
 python _kustos.py mirror | corpus | merge | history <id> | replay
 python _kustos.py reobserve <id>           a record's observations: who, when, what changed
 python _kustos.py observe                  how much is observed again; criteria without a concept

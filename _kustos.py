@@ -66,6 +66,11 @@ USAGE
     python _kustos.py voices [list LANG | get LANG [VOICE] | make [LANG] | remove LANG]
                                       Piper's voices for Practice (pip install piper-tts)
     python _kustos.py doctor          check the structure, change nothing
+    python _kustos.py doctor --observe [--days N]
+                                      the audit of the observing, read-only: what was
+                                      re-observed, forms in conflict, criteria without a
+                                      concept, atypical links without a criterion, cold
+                                      collections, proposals pending (N: 30 days)
     python _kustos.py observator [p_id|name]
                                       who signs this instance (ui.observator);
                                       with an argument, chooses that person
@@ -88,7 +93,9 @@ USAGE
     python _kustos.py ledger [hledger|beancount] [file]
                                       the accounts (res) as a plain-text journal, in
                                       double entry (_kustos.ledger / _kustos.beancount)
-    python _kustos.py import zotero <export.json|.bib>
+    python _kustos.py import [zotero] <export.json|.bib>
+                                      sources from Zotero or any CSL-JSON / BibTeX file
+                                      (a research agent's output too): as proposals
     python _kustos.py import <notes.md>   "- Name. Notes" -> people
     python _kustos.py merge           merge *.sync-conflict-* now
     python _kustos.py history <id>    versions of a record, from the logs
@@ -96,6 +103,10 @@ USAGE
                                       when, by what distinction, what changed
     python _kustos.py observe         how much of the base is observed again (12
                                       months), and the criteria without a concept
+    python _kustos.py sign-proposals [<id> ... | --all]
+                                      sign what came in as a proposal (an import, the
+                                      bulk entry's concepts) in the observator's name;
+                                      with nothing, list the pending ones
     python _kustos.py replay          rebuild the JSON from the logs alone (.replay.json)
     python _kustos.py upgrade         bring an older base up to date (runs on open)
     python _kustos.py migrate         old personne + verba files -> _kustos.json
@@ -1125,6 +1136,7 @@ def save_bulk_concepts(plan, source=""):
     save_record (a new form with its `expresses` link); one already in the base
     -- same name, a form also the same language -- is reused unchanged, and a
     form there without the link gets it (write_link, a save of that form).
+    Nobody typed them here: each save is a proposal (# ---- proposals).
     {concepts, forms, links, reused}."""
     data = load_json()
     key = lambda x: unicodedata.normalize("NFC", x or "").casefold().strip()
@@ -1144,7 +1156,7 @@ def save_bulk_concepts(plan, source=""):
             rec = fix_entry({"id": cid, "kind": "concept", "name": c["name"], "gloss": c["gloss"],
                              "source": source})
             touch(rec)
-            save_record("entries", rec)
+            save_record("entries", rec, proposed=True)
             concepts[key(c["name"])] = rec
             done["concepts"] += 1
         else:
@@ -1160,13 +1172,13 @@ def save_bulk_concepts(plan, source=""):
                 touch(f)
                 save_record("entries", f, edges=[{"from": fid, "rel": "expresses", "to": rec["id"],
                                                   "when": "", "why": "", "source": source,
-                                                  "certainty": "established"}])
+                                                  "certainty": "established"}], proposed=True)
                 forms[(key(fname), lang)] = f
                 links.add((fid, rec["id"]))
                 done["forms"] += 1
                 done["links"] += 1
             elif (f["id"], rec["id"]) not in links:
-                write_link(f["id"], rec["id"], "expresses", "", source)
+                write_link(f["id"], rec["id"], "expresses", "", source, proposed=True)
                 links.add((f["id"], rec["id"]))
                 done["links"] += 1
     return done
@@ -1327,7 +1339,7 @@ def write_inverse_links(inverse):
         try:
             data = write_link(a["from"], a["to"], a["rel"], a.get("why", ""), a.get("source", ""),
                               a.get("when", ""), old={"rel": a["rel"], "to": a["to"]} if have else None,
-                              circle=a.get("circle", ""))
+                              circle=a.get("circle", ""), aside=True)
             went.append(a["from"])
         except (ValueError, WebConflict, SystemExit) as exc:
             problems.append(f"{a['from']}: {exc}")
@@ -3908,7 +3920,7 @@ SATELLITES = ("skills", "observations")     # top-level lists saved like records
 
 def fix_observation(o):
     for k in ("observator", "t", "updated_at", "distinction", "criterion", "source",
-              "notes", "prev"):
+              "notes", "prev", "signed_at"):
         o.setdefault(k, "")
     for k, kind in (("targets", list), ("changed", list), ("before", dict)):
         if not isinstance(o.get(k), kind):      # a malformed one must not stop a save
@@ -3992,9 +4004,18 @@ def obs_diff(coll, old, new, old_edges=None, new_edges=None, text=None):
     return changed, before
 
 
-def observe_save(data, coll, rid, old, new, old_edges, new_edges, who, text=None):
+def obs_coalesces(o, want, who, day):
+    """Whether `o` is today's automatic observation of the record by `who`, the
+    one a later save that day updates. A proponho never is: what a save
+    changes in a signed proposal is a reobservo of it."""
+    return o.get("targets") == want and o.get("auto") and o.get("observator") == who \
+        and (o.get("t") or "")[:10] == day and o.get("kind") != "proponho"
+
+
+def observe_save(data, coll, rid, old, new, old_edges, new_edges, who, text=None, at=None):
     """The automatic observation of one save, added to (or updated in) `data`;
-    returns it, or None when the save changed nothing."""
+    returns it, or None when the save changed nothing. `at` (put_index): many
+    saves in one vault find today's observations once, not once each."""
     if old is None:
         kind, changed, before, prev = "distinguo", [], {}, ""
     else:
@@ -4004,31 +4025,51 @@ def observe_save(data, coll, rid, old, new, old_edges, new_edges, who, text=None
         kind, prev = "reobservo", stamp_of(old)
     rows = data.setdefault("observations", [])
     day, now = TODAY(), NOW()
-    want, oid, clash = [rid], new_observation_id(), False
-    # one pass, newest first (recent ones are last): today's automatic one of
-    # this record, if there is one -- and whether the new id is taken
-    for o in reversed(rows):
-        if o.get("targets") == want and o.get("auto") and o.get("observator") == who \
-                and (o.get("t") or "")[:10] == day:
-            if o.get("kind") == "reobservo":
-                if not isinstance(o.get("changed"), list):
-                    o["changed"] = []           # a malformed copy must not stop the save
-                if not isinstance(o.get("before"), dict):
-                    o["before"] = {}
-                for k in changed:
-                    if k not in o["changed"]:       # the earliest value stays
-                        o["changed"].append(k)
-                        o["before"][k] = before.get(k)
-            o["updated_at"] = now
-            return o
-        clash = clash or o.get("id") == oid
-    if clash:
-        oid = new_observation_id({x.get("id") for x in rows})
+    want, oid = [rid], new_observation_id()
+    if at is None:
+        # one pass, newest first (recent ones are last): today's automatic one
+        # of this record, if there is one -- and whether the new id is taken
+        found, clash = None, False
+        for o in reversed(rows):
+            if obs_coalesces(o, want, who, day):
+                found = o
+                break
+            clash = clash or o.get("id") == oid
+        if clash:
+            oid = new_observation_id({x.get("id") for x in rows})
+    else:
+        mine = at.get("obs")
+        if mine is None or mine["key"] != (who, day) or mine["rows"] is not rows:
+            mine = at["obs"] = {"key": (who, day), "rows": rows, "today": {},
+                                "ids": {x.get("id") for x in rows}}
+            for o in rows:                  # the newest one wins, as in the pass above
+                if isinstance(o.get("targets"), list) and len(o["targets"]) == 1 \
+                        and obs_coalesces(o, o["targets"], who, day):
+                    mine["today"][o["targets"][0]] = o
+        found = mine["today"].get(rid)
+        if found is None and oid in mine["ids"]:
+            oid = new_observation_id(mine["ids"])
+    if found is not None:
+        o = found
+        if o.get("kind") == "reobservo":
+            if not isinstance(o.get("changed"), list):
+                o["changed"] = []           # a malformed copy must not stop the save
+            if not isinstance(o.get("before"), dict):
+                o["before"] = {}
+            for k in changed:
+                if k not in o["changed"]:       # the earliest value stays
+                    o["changed"].append(k)
+                    o["before"][k] = before.get(k)
+        o["updated_at"] = now
+        return o
     o = fix_observation({"id": oid,
                          "observator": who, "t": now, "updated_at": now, "targets": want,
                          "kind": kind, "auto": True, "changed": changed, "before": before,
                          "prev": prev, "status": "signed"})
     rows.append(o)
+    if at is not None:
+        mine["today"][rid] = o
+        mine["ids"].add(oid)
     return o
 
 
@@ -4047,7 +4088,9 @@ def _obs_cache(data):
         cut = (date.today() - timedelta(days=OBS_DAYS)).isoformat()
         idx, recent = {}, {}
         for o in rows:
-            fresh = (o.get("updated_at") or o.get("t") or "") >= cut     # never before t
+            # a pending proposal is listed with the record's observations, but
+            # nobody has looked at it yet: it counts in no tally
+            fresh = not is_pending(o) and (o.get("updated_at") or o.get("t") or "") >= cut
             for t in o.get("targets") or ():
                 if t in idx:
                     idx[t].append(o)
@@ -4057,7 +4100,7 @@ def _obs_cache(data):
                     recent[t] = recent.get(t, 0) + 1
         # the references kept make sure no other object can take these ids
         c = {"key": key, "keep": (data, rows), "idx": idx, "recent": recent, "stats": None,
-             "crit": None}
+             "crit": None, "prop": None}
         _OBS_CACHE["now"] = c
     return c
 
@@ -4215,9 +4258,14 @@ def record_observations(data, rid):
     return out
 
 
+def obs_looked(rows):
+    """The observations someone made: a pending proposal is nobody's yet."""
+    return [o for o in rows or () if not is_pending(o)]
+
+
 def obs_summary_line(data, rid):
     """'observed 3× · last 2026-11-14', or '' -- the card's line and the page's."""
-    rows = obs_index(data).get(rid) or []
+    rows = obs_looked(obs_index(data).get(rid))
     if not rows:
         return ""
     last = max(max(o.get("t") or "", o.get("updated_at") or "") for o in rows)[:10]
@@ -4249,7 +4297,7 @@ def add_observation(targets, distinction="", criterion="", confidence=None, sour
         "id": new_observation_id({x.get("id") for x in data.get("observations", [])}
                                  | {d.get("id") for d in data.get("deleted", [])}),
         "observator": observator_id(data), "t": now, "updated_at": now, "targets": targets,
-        "kind": "reobservo" if any(seen.get(t) for t in targets) else "distinguo",
+        "kind": "reobservo" if any(obs_looked(seen.get(t)) for t in targets) else "distinguo",
         "auto": False, "distinction": distinction, "criterion": criterion,
         "confidence": obs_confidence(confidence), "source": " ".join(str(source or "").split()),
         "notes": str(notes or "").strip(), "status": "signed"})
@@ -4303,7 +4351,7 @@ def logged_state(lines, prev, t):
 
 
 def mirror_observed(r, data):
-    n = len(obs_index(data).get(r.get("id"), []))
+    n = len(obs_looked(obs_index(data).get(r.get("id"))))
     return tr("observed: {n}×", n=n) if n else ""
 
 
@@ -4425,6 +4473,277 @@ def check_observations(data, idx, warnings):
         warnings.append(tr("{n} recurring criteria without a concept (make each a concept): {list}",
                            n=len(eig), list=", ".join(f"{c} ({k}×)" for c, k in eig[:8])
                            + (" …" if len(eig) > 8 else "")))
+
+
+# ---- proposals
+# What enters the base without the observator typing it -- an import from
+# Zotero or any CSL-JSON/BibTeX file (a research agent's output comes in so),
+# the bulk entry's concepts with their forms -- is born a PROPOSAL: put_record
+# with `proposed` keeps the record's `observator` empty and its new links
+# unsigned, and gives it an observation `proponho`, `status: "proposed"`, with
+# no observator and no distinguo (nobody has looked at it yet; a later proposed
+# save of it updates that same one, `changed` growing). The proponho lists the
+# links it brought (`links`, [rel, to] each). A record already in the base
+# keeps its `observator`: a proposed save of a signed one (the bulk entry
+# giving a known form a new concept) proposes only its new links. The eye
+# shows a new one unsigned, and a pending proponho counts in no tally.
+# Signing (sign_proposals: the card's line, Base › Sign this proposal, the
+# page's Sign, `sign-proposals`) is save_record's work with `sign`: an
+# unsigned record gets the observator, the links the proponho lists that are
+# still unsigned get it too (older unsigned links keep who made them), and the
+# proponho turns `signed` with the observator and `signed_at`; its kind stays
+# proponho, the trace that it began as a proposal. Signing changes no observed
+# field, so it adds no reobservo. A save by the observator that changes
+# something in an unsigned proposal signs it as well (it is their typing now),
+# and what it changed is a reobservo of the proposed version; a save that
+# changes nothing leaves it a proposal, and so does a link written to it from
+# another record's card (`aside`: an inverse line). What came in before this
+# stays as it was.
+
+PROPOSAL_DAYS = 30          # the doctor warns of a proposal pending longer than this
+
+
+def is_pending(o):
+    return o.get("kind") == "proponho" and o.get("status") == "proposed"
+
+
+def proposal_of(data, rid):
+    """The pending proposal of a record (its proponho not signed yet), or None."""
+    for o in reversed(data.get("observations") or ()):
+        if is_pending(o) and rid in (o.get("targets") or ()):
+            return o
+    return None
+
+
+def obs_proposed(data):
+    """{record id: its pending proposal}, cached with the other counts."""
+    c = _obs_cache(data)
+    if c["prop"] is None:
+        c["prop"] = {t: o for o in data.get("observations") or () if is_pending(o)
+                     for t in o.get("targets") or ()}
+    return c["prop"]
+
+
+def proposal_info(data, rid):
+    """{id, since} of a record's pending proposal, for the page; or None."""
+    o = obs_proposed(data).get(rid)
+    return {"id": o.get("id", ""), "since": (o.get("t") or "")[:10]} if o else None
+
+
+_PROPOSAL_IDS = {"rows": None, "n": -1, "ids": set()}
+
+
+def _proposal_id(rows):
+    """A new o_ id not in `rows`; an import makes many in the same second, so
+    the ids taken are kept while the list only grows by these."""
+    c = _PROPOSAL_IDS
+    if c["rows"] is not rows or c["n"] != len(rows):
+        c.update(rows=rows, ids={x.get("id") for x in rows})
+    oid = new_observation_id(c["ids"])
+    c["ids"].add(oid)
+    c["n"] = len(rows) + 1          # the caller appends it
+    return oid
+
+
+def propose_save(data, coll, rid, old, new, old_edges=None, new_edges=None):
+    """The proposal of one save that is nobody's typing, added to (or, when the
+    record has one pending, updated in) `data`; returns it."""
+    changed, before, prev = [], {}, ""
+    if old is not None:
+        changed, before = obs_diff(coll, old, new, old_edges, new_edges)
+        prev = stamp_of(old)
+    had = {(a.get("rel"), a.get("to")) for a in old_edges or ()}
+    brought = [[a.get("rel"), a.get("to")] for a in new_edges or ()
+               if (a.get("rel"), a.get("to")) not in had and not a.get("observator")]
+    now = NOW()
+    o = proposal_of(data, rid) if old is not None else None
+    if o is not None:
+        if not isinstance(o.get("changed"), list):
+            o["changed"] = []               # a malformed copy must not stop the save
+        if not isinstance(o.get("before"), dict):
+            o["before"] = {}
+        if not isinstance(o.get("links"), list):
+            o["links"] = []
+        for k in changed:
+            if k not in o["changed"]:       # the earliest value stays
+                o["changed"].append(k)
+                o["before"][k] = before.get(k)
+        for k in brought:
+            if k not in o["links"]:
+                o["links"].append(k)
+        o["updated_at"] = now
+        obs_forget()                        # changed in place
+        return o
+    rows = data.setdefault("observations", [])
+    o = fix_observation({"id": _proposal_id(rows), "observator": "", "t": now, "updated_at": now,
+                         "targets": [rid], "kind": "proponho", "auto": True, "changed": changed,
+                         "before": before, "prev": prev, "status": "proposed", "links": brought})
+    rows.append(o)
+    return o
+
+
+def proposal_brought(o, data, rid):
+    """The links a proposal brought to `rid`, as {(rel, to)}: its `links`. A
+    proponho written before it listed them brought every unsigned link of
+    the record, as signing then took them."""
+    keys = o.get("links")
+    if isinstance(keys, list):
+        return {tuple(k) for k in keys if isinstance(k, list) and len(k) == 2}
+    return {(a.get("rel"), a.get("to")) for a in data["edges"]
+            if a["from"] == rid and not a.get("observator")}
+
+
+def sign_brought(data, o, rid, who):
+    """Signs the links proposal `o` brought to `rid` that are still unsigned
+    (an older unsigned link keeps nobody). True when one was signed."""
+    brought = proposal_brought(o, data, rid)
+    signed = False
+    for a in data["edges"]:
+        if a["from"] == rid and not a.get("observator") and (a.get("rel"), a.get("to")) in brought:
+            a["observator"] = who
+            signed = True
+    return signed
+
+
+def seal_proposal(data, o, rid, who):
+    """Signs a pending proposal in `data`: the observation, and the links it
+    brought that are still unsigned. True when a link was signed."""
+    signed = sign_brought(data, o, rid, who)
+    now = NOW()
+    o.update(observator=who, status="signed", signed_at=now, updated_at=now)
+    obs_forget()
+    return signed
+
+
+def proposal_signed_of(data, rid):
+    """The latest signed proposal of a record, or None."""
+    for o in reversed(data.get("observations") or ()):
+        if o.get("kind") == "proponho" and o.get("status") == "signed" \
+                and rid in (o.get("targets") or ()):
+            return o
+    return None
+
+
+def no_observator_text():
+    return tr("Signing needs an observator: Base › Observator…, or "
+              "python _kustos.py observator <p_id|name>")
+
+
+def proposals_astray(data, idx=None):
+    """Records whose proposal was signed, but the signing did not take: two
+    machines, one signing while the other saved the record, whose copy won --
+    the record unsigned, or links the proposal brought still unsigned (not
+    brought again by one pending now). {id: that proponho}; sign-proposals
+    signs them."""
+    idx = by_id(data) if idx is None else idx
+    unsigned = {}
+    for a in data.get("edges") or ():
+        if not a.get("observator"):
+            unsigned.setdefault(a["from"], set()).add((a.get("rel"), a.get("to")))
+    waiting = {}
+    for o in data.get("observations") or ():
+        if is_pending(o):
+            for t in o.get("targets") or ():
+                waiting.setdefault(t, set()).update(proposal_brought(o, data, t))
+    out = {}
+    for o in data.get("observations") or ():
+        if o.get("kind") != "proponho" or o.get("status") != "signed":
+            continue
+        keys = o.get("links") if isinstance(o.get("links"), list) else ()
+        brought = {tuple(k) for k in keys if isinstance(k, list) and len(k) == 2}
+        for t in o.get("targets") or ():
+            if t in idx and (not idx[t].get("observator")
+                             or brought & unsigned.get(t, set()) - waiting.get(t, set())):
+                out[t] = o
+    return out
+
+
+def sign_proposals(ids=None, base=None):
+    """Signs the pending proposals of `ids` (every pending one when None) in the
+    observator's name: save_record's work with `sign` for each record (put_record),
+    one write and one append to the log for them all. (vault, ids signed, ids
+    that are not pending proposals). ValueError without an observator.
+    `base` {id: stamp}: what the card or page showed; a record changed on disk
+    since then is a WebConflict, and nothing is signed."""
+    data = load_json()
+    if not observator_id(data):
+        raise ValueError(no_observator_text())
+    pending = obs_proposed(data)
+    idx = by_id(data)
+    astray = proposals_astray(data, idx)
+    if ids is None:
+        want = [rid for rid in pending if rid in idx] + sorted(set(astray) - set(pending))
+    else:
+        want = list(dict.fromkeys(str(i).strip() for i in ids if str(i).strip()))
+    for rid, stamp in (base or {}).items():
+        if rid in idx and stamp_of(idx[rid]) != (stamp or ""):
+            raise WebConflict(tr("This record changed on disk since it was opened "
+                                 "(in the window, or on another machine)."))
+    done, left, lines = [], [], []
+    at = put_index(data)
+    for rid in want:
+        if rid not in pending and rid not in astray or rid not in idx:
+            left.append(rid)
+            continue
+        rec = {k: v for k, v in idx[rid].items() if not k.startswith("_")}
+        touch(rec)
+        lines += put_record(data, coll_of(rid), rec, sign=True, at=at)
+        done.append(rid)
+    if done:
+        write_json(data)
+        log_many(lines)
+    return data, done, left
+
+
+def cmd_sign_proposals(rest):
+    """`sign-proposals <id> ... | --all`: signs proposals in the observator's
+    name; with nothing, lists the pending ones."""
+    data = load_json()
+    idx = by_id(data)
+    pending = sorted(((o.get("t") or "", rid) for rid, o in obs_proposed(data).items() if rid in idx))
+    if not rest:
+        print("\n" + tr("{n} proposal(s) pending", n=len(pending)) + "\n")
+        for t, rid in pending:
+            print(f"  {t[:10]}  {rid:30} {one_liner(label_any(idx[rid], data), 60)}")
+        print("\n  python _kustos.py sign-proposals <id> ... | --all\n")
+        return 0
+    odd = [x for x in rest if x.startswith("-") and x != "--all"]
+    if odd:
+        print(tr("Unknown option: {opt}", opt=odd[0]))
+        print("  python _kustos.py sign-proposals <id> ... | --all")
+        return 2
+    ids = None if "--all" in rest else list(rest)
+    try:
+        data, done, left = sign_proposals(ids)
+    except ValueError as exc:
+        print(exc)
+        return 1
+    print(tr("{n} proposal(s) signed by {name}.", n=len(done), name=observator_name(data)))
+    for rid in left:
+        print("  " + tr("{id} is not a pending proposal.", id=rid))
+    if done:
+        write_mirror(data)
+    return 1 if left and not done else 0
+
+
+def check_proposals(data, idx, warnings):
+    """The doctor on proposals, warnings only: pending too long, or a record
+    left unsigned although its proposal was signed (sign-proposals signs it)."""
+    cut = (date.today() - timedelta(days=PROPOSAL_DAYS)).isoformat()
+    old = []
+    for o in data.get("observations", []):
+        if not is_pending(o):
+            continue
+        for rid in o.get("targets") or []:
+            if rid in idx and (o.get("t") or "") < cut:
+                old.append(rid)
+    for rid in sorted(proposals_astray(data, idx)):
+        warnings.append(tr("{id}: its proposal was signed while another machine saved it, so the "
+                           "signing did not take (sign-proposals {id} signs it again)", id=rid))
+    if old:
+        warnings.append(tr("{n} proposal(s) pending for more than {days} days (sign each, or "
+                           "python _kustos.py sign-proposals): {ids}", n=len(old), days=PROPOSAL_DAYS,
+                           ids=", ".join(old[:8]) + (" …" if len(old) > 8 else "")))
 
 
 # ================================================================ file
@@ -4869,10 +5188,32 @@ def find_by_reg(data, key):
 
 # ---- the write operations. All of them reread the disk first.
 
-def save_record(coll, rec, edges=None):
+def save_record(coll, rec, edges=None, proposed=False, sign=False, aside=False):
     """Saves ONE record: rereads the JSON, replaces only that record, writes,
-    logs. `edges`, if given, replaces the links going out of it. Returns the vault."""
+    logs. `edges`, if given, replaces the links going out of it. `proposed`:
+    the save is nobody's typing (an import, the bulk entry), so what it adds is
+    a proposal; `sign`: the observator signs its proposal; `aside`: a save made
+    from another record's card (# ---- proposals). Returns the vault."""
     data = load_json()
+    lines = put_record(data, coll, rec, edges, proposed, sign, aside)
+    write_json(data)
+    log_many(lines)
+    return data
+
+
+def put_index(data):
+    """For many put_record calls on one vault (an import, signing many): where
+    each record sits and which ids have a tombstone, found once instead of once
+    per record. Valid while only put_record changes the vault."""
+    return {"pos": {}, "dead": {d.get("id") for d in data.get("deleted", [])}}
+
+
+def put_record(data, coll, rec, edges=None, proposed=False, sign=False, aside=False, at=None):
+    """save_record's work on a vault in memory: the record, its links and its
+    observation put in `data`. Returns the log lines; the caller writes the
+    vault, then logs them (an import puts many records and writes once, with
+    `at` from put_index). `aside`: the save is made from another record's card
+    (an inverse link): what it writes is signed, the record's proposal stays one."""
     rid = rec["id"]
     clean = {k: v for k, v in rec.items() if not k.startswith("_")}
     src = " ".join((clean.get("source") or "").split())
@@ -4882,47 +5223,95 @@ def save_record(coll, rec, edges=None):
                 clean["source"] = s["id"]
                 break
     obs = observator_id(data)
-    if obs:
-        clean["observator"] = obs       # every save is made in the observator's name
+    if sign and not obs:
+        raise ValueError(no_observator_text())
     rows = data[coll]
-    prior = next((r for r in rows if r.get("id") == rid), None)
+    if at is None:
+        i = next((i for i, r in enumerate(rows) if r.get("id") == rid), None)
+    else:
+        pos = at["pos"].get(coll)
+        if pos is None:
+            pos = at["pos"][coll] = {}
+            for j, r in enumerate(rows):
+                pos.setdefault(r.get("id"), j)      # the first, as the scan finds it
+        i = pos.get(rid)
+    prior = rows[i] if i is not None else None
+    signer = (prior or {}).get("observator") or ""
+    if proposed:
+        # nobody's typing: a proposal (# ---- proposals); a record already there
+        # keeps who signed it, and only what the save adds waits to be signed
+        clean["observator"] = signer
+    elif obs:
+        clean["observator"] = obs       # every save is made in the observator's name
     if coll == "res":
         res_stamp_status(clean, prior)
     # the automatic observation compares with the links as they were
     links_before = [a for a in data["edges"] if a["from"] == rid] if edges is not None else None
-    for i, old in enumerate(rows):
-        if old.get("id") == rid:
-            for k in ("reg", "reg_n", "reg_origem", "reg_n_anterior"):
-                if old.get(k) and not clean.get(k):
-                    clean[k] = old[k]
-            rows[i] = clean
-            break
+    if prior is not None:
+        for k in ("reg", "reg_n", "reg_origem", "reg_n_anterior"):
+            if prior.get(k) and not clean.get(k):
+                clean[k] = prior[k]
+        rows[i] = clean
     else:
         rows.append(clean)
-    for d in data["deleted"]:
-        # the id exists again: it takes back the number it had before deletion
-        if d.get("id") == rid and d.get("reg_n") and not clean.get("reg_n"):
-            clean["reg"], clean["reg_n"] = d.get("reg"), d["reg_n"]
-    data["deleted"] = [d for d in data["deleted"] if d.get("id") != rid]
+        if at is not None:
+            pos[rid] = len(rows) - 1
+    if rid in at["dead"] if at is not None else any(d.get("id") == rid for d in data["deleted"]):
+        for d in data["deleted"]:
+            # the id exists again: it takes back the number it had before deletion
+            if d.get("id") == rid and d.get("reg_n") and not clean.get("reg_n"):
+                clean["reg"], clean["reg_n"] = d.get("reg"), d["reg_n"]
+        data["deleted"] = [d for d in data["deleted"] if d.get("id") != rid]
+        if at is not None:
+            at["dead"].discard(rid)
     if edges is not None:
         # a link keeps the observator who made it; only a new one is signed now
         before = {(a.get("rel"), a.get("to")): a.get("observator") or ""
                   for a in data["edges"] if a["from"] == rid}
+        mark = "" if proposed else obs
         for a in edges:
-            a["observator"] = before.get((a.get("rel"), a.get("to")), a.get("observator") or obs)
+            a["observator"] = before.get((a.get("rel"), a.get("to")), a.get("observator") or mark)
         data["edges"] = [a for a in data["edges"] if a["from"] != rid] + edges
-    # every save of a record is an observation of it (# ==== observations)
-    seen = observe_save(data, coll, rid, prior, clean, links_before, edges, obs,
-                        rec.get("_text") if coll == "notes" else None) \
-        if obs and coll in COLLS and not rid.startswith("__") else None
-    write_json(data)
+    # every save of a record is an observation of it (# ==== observations), or
+    # the proposal of it, when nobody typed it (# ---- proposals)
+    seen = sealed = None
+    links_signed = False
+    if coll in COLLS and not rid.startswith("__"):
+        if proposed:
+            seen = propose_save(data, coll, rid, prior, clean, links_before, edges)
+        elif obs:
+            pending = proposal_of(data, rid) if prior is not None and (
+                sign or not signer) else None
+            seen = observe_save(data, coll, rid, prior, clean, links_before, edges, obs,
+                                rec.get("_text") if coll == "notes" else None, at)
+            if pending is not None:
+                if not sign and (seen is None or aside):
+                    # nothing changed, or written from another card: still a proposal
+                    clean["observator"] = signer
+                else:
+                    if signer:              # signed already: what waited was its new links
+                        clean["observator"] = signer
+                    sealed = pending
+                    links_signed = seal_proposal(data, pending, rid, obs)
+            elif sign and prior is not None:
+                # a proposal signed on one machine while another saved the record
+                # (proposals_astray): what that signing did not reach is signed now
+                if signer:
+                    clean["observator"] = signer        # signing never changes who signed it
+                stray = proposal_signed_of(data, rid)
+                if stray is not None:
+                    links_signed = sign_brought(data, stray, rid, stray.get("observator") or obs)
     lines = [("put", coll, {"id": rid, "rec": clean})]
     if edges is not None:
         lines.append(("edges", "edges", {"id": rid, "edges": edges}))
+    elif links_signed:
+        lines.append(("edges", "edges", {"id": rid, "edges": [a for a in data["edges"]
+                                                               if a["from"] == rid]}))
     if seen is not None:
         lines.append(("put", "observations", {"id": seen["id"], "rec": seen}))
-    log_many(lines)
-    return data
+    if sealed is not None:
+        lines.append(("put", "observations", {"id": sealed["id"], "rec": sealed}))
+    return lines
 
 
 def delete_record(coll, rid, name=""):
@@ -5370,6 +5759,7 @@ def check(data):
                            "the draft, then delete it)", file=x.relative_to(BASE).as_posix()))
     check_skills(data, errors, warnings)
     check_observations(data, idx, warnings)
+    check_proposals(data, idx, warnings)
     check_book(data, errors, warnings)
     return errors, warnings
 
@@ -5445,6 +5835,140 @@ def cmd_doctor():
         print("\n  " + tr("{n} conflict file(s) waiting: run `merge`.", n=len(pend)))
     print()
     return 1 if errors else 0
+
+
+# ---- doctor --observe: the observing itself, looked at (read-only)
+# Plain `doctor` checks the structure; `doctor --observe` looks at how the base
+# is observed and only reports: it writes nothing -- no JSON, no log line, no
+# visit file, no mirror. Each line names the ids to open. The sections:
+# distinctions that changed (reobservations with earlier values), forms whose
+# `expresses` links (form -> concept, RELS) point at different concepts by
+# different observators (an unsigned link counts as one), criteria used again
+# and again without a concept (obs_eigenforms), atypical links with neither a
+# reason nor an observation with a CRITERION of the record they start from,
+# cold collections (last_visit over the visit files, dust_order), and the
+# proposals pending longer than the days asked.
+
+AUDIT_SHOWN = 40            # lines shown per section; the rest are counted
+
+
+def observe_audit(data, days=PROPOSAL_DAYS, seen=None):
+    """[(title, hint, [lines])]: the sections of doctor --observe."""
+    idx = by_id(data)
+    cut = (date.today() - timedelta(days=days)).isoformat()
+    rows_o = data.get("observations", [])
+
+    def name(rid):
+        return one_liner(label_any(idx[rid], data), 48) if rid in idx else tr("(deleted)")
+
+    def who(pid):
+        return observator_name(data, pid) if pid else tr("unsigned")
+
+    out = []
+    # distinctions that changed: what a reobservation says it was before
+    got = []
+    for o in rows_o:
+        when = max(o.get("t") or "", o.get("updated_at") or "")
+        if o.get("kind") != "reobservo" or not o.get("before") or when < cut:
+            continue
+        for rid in o.get("targets") or []:
+            got.append((when, f"{when[:10]}  {rid}  {name(rid)} · " + tr(
+                "changed: {fields}", fields=", ".join(o.get("changed") or [])) + f" · {who(o.get('observator'))} · {o.get('id')}"))
+    out.append((tr("Distinctions that changed (in the last {days} days)", days=days),
+                tr("python _kustos.py reobserve <id> shows what each one was before."),
+                [x for _, x in sorted(got, reverse=True)]))
+    # forms in conflict: one form, several concepts, several observators
+    express = {r for r, ends in RELS.items() if ends == ("form", "concept")}
+    by_form = {}
+    for a in data.get("edges", []):
+        if a.get("rel") in express:
+            by_form.setdefault(a["from"], []).append(a)
+    got = []
+    for fid, links in sorted(by_form.items()):
+        if len({a["to"] for a in links}) < 2 or len({a.get("observator") for a in links
+                                                         if a.get("observator")}) < 2:
+            continue
+        got.append(f"{fid}  {name(fid)}: " + "; ".join(f"{a['to']} {name(a['to'])} — {who(a.get('observator'))}"
+                                           for a in sorted(links, key=lambda a: a["to"])))
+    out.append((tr("Forms in conflict (one form, several concepts, by different observators)"),
+                tr("Open the form and keep the reading you hold. Unsigned links (proposals, or older "
+                   "than the observator) are not counted."), got))
+    # recurring criteria without a concept, with the records they were applied to
+    uses = {}
+    for o in rows_o:
+        key = " ".join((o.get("criterion") or "").split()).casefold()
+        if key:
+            uses.setdefault(key, []).extend(o.get("targets") or [])
+    got = []
+    for crit, n in obs_eigenforms(data):
+        ids = list(dict.fromkeys(uses.get(crit.casefold(), [])))
+        got.append(f"{n:>3}×  {crit}: " + ", ".join(ids[:6]) + (" …" if len(ids) > 6 else ""))
+    out.append((tr("Recurring criteria without a concept (used {n}× or more)", n=OBS_EIGEN_MIN),
+                tr("Make each a concept of verba; then observe with its c_ id."), got))
+    # atypical links that say neither why nor by what criterion
+    judged = {t for o in rows_o if (o.get("criterion") or "").strip() for t in o.get("targets") or []}
+    got = []
+    for a in data.get("edges", []):
+        if not (a.get("certainty") == "atypical" or a.get("rel") not in RELS):
+            continue
+        if (a.get("why") or "").strip() or a["from"] in judged:
+            continue
+        got.append(f"{a['from']} -{a['rel']}-> {a['to']}  ({name(a['from'])} → {name(a['to'])})")
+    out.append((tr("Atypical links without a reason or a criterion"),
+                tr("Observe the record each one starts from with a CRITERION (Ctrl+Shift+O, or the "
+                   "page's Observations): the rule by which the link was drawn."), got))
+    # cold collections: how much of each has gone the days without a visit
+    seen = seen_read() if seen is None else seen
+    got = []
+    for coll in COLLS:
+        recs = [r for r in data.get(coll, []) if not (r.get("id") or "").startswith("__")]
+        if not recs:
+            continue
+        cold = [r for r in recs if last_visit(r, seen) < cut]
+        share = round(100 * len(cold) / len(recs))
+        coldest = ", ".join(f"{r['id']} ({last_visit(r, seen)[:10] or tr('never')})"
+                            for r in dust_order(cold, seen)[:3])
+        got.append((-share, coll, f"{tr(COLL_LABEL.get(coll, coll)):10} " + tr(
+            "{cold} of {n} not visited in {days} days ({share}%)", cold=len(cold), n=len(recs),
+            days=days, share=share) + (" · " + tr("coldest: {ids}", ids=coldest) if coldest else "")))
+    out.append((tr("Cold collections (coldest first)"),
+                tr("Ctrl+D (dust off) opens the coldest record of the list."),
+                [x for _, _, x in sorted(got)]))
+    # proposals pending longer than the days
+    got = []
+    for rid, o in obs_proposed(data).items():
+        t = o.get("t") or ""
+        if rid in idx and t < cut:
+            got.append((t, f"{t[:10]}  {rid}  {name(rid)}"))
+    out.append((tr("Proposals pending for more than {days} days", days=days),
+                tr("Sign each on its card or page, or python _kustos.py sign-proposals <id> ... | --all."),
+                [x for _, x in sorted(got)]))
+    return out
+
+
+def cmd_doctor_observe(rest):
+    """`doctor --observe [--days N]`: observe_audit, printed. Writes nothing."""
+    days = PROPOSAL_DAYS
+    if "--days" in rest:
+        try:
+            days = max(1, int(rest[rest.index("--days") + 1]))
+        except (IndexError, ValueError):
+            print(tr("--days takes a number of days."))
+            return 1
+    data = load_json()
+    since = (date.today() - timedelta(days=days)).isoformat()
+    print("\n" + tr("doctor --observe · the last {days} days (since {date}) · read-only, nothing is written",
+                    days=days, date=since))
+    for n, (title, hint, lines) in enumerate(observe_audit(data, days), 1):
+        print(f"\n{n}. {title}: {len(lines)}")
+        for x in lines[:AUDIT_SHOWN]:
+            print("     " + x)
+        if len(lines) > AUDIT_SHOWN:
+            print("     " + tr("… and {n} more", n=len(lines) - AUDIT_SHOWN))
+        if lines:
+            print("   → " + hint)
+    print()
+    return 0
 
 
 # ================================================================ mirror
@@ -5757,6 +6281,7 @@ def cmd_mirror():
 #      status:lent      a form's status, or an item's (its key or its label)
 #      atype:card       an account's type (its key or its label)
 #      is:reobserved    observed twice or more in the last 12 months
+#      is:proposed      a proposal not signed yet (# ---- proposals)
 #      crit:kinship     observed by a criterion with that text (or that c_ id,
 #                       or a concept whose name has it)
 # The rest are literal terms, all required, looked up in each record's search
@@ -5819,6 +6344,8 @@ def search_field_ok(r, fields, data=None):
             if v.startswith("unsign") and (r.get("observator") or ""):
                 return False
             if v.startswith("reobs") and (data is None or obs_recent(data).get(r.get("id"), 0) < 2):
+                return False
+            if v.startswith("propos") and (data is None or r.get("id") not in obs_proposed(data)):
                 return False
         if k == "crit":                 # crit:text or crit:c_… -- a criterion of its observations
             if data is None or v.casefold() not in obs_crit_text(data).get(r.get("id"), ""):
@@ -6358,9 +6885,11 @@ def cmd_export(fmt, path_str=None):
     return 0
 
 
-def import_sources(items, data):
+def import_sources(items, data, proposed=False):
     """Sources from outside come in without duplicates: the same DOI, the same
-    URL or the same (first author, year, title) is the same source."""
+    URL or the same (first author, year, title) is the same source. Each is put
+    as save_record puts it (put_record) and logged; the caller writes the
+    vault. `proposed`: they come in as proposals (# ---- proposals)."""
     def key_of(s):
         if s.get("doi"):
             return "doi:" + s["doi"].lower()
@@ -6371,6 +6900,8 @@ def import_sources(items, data):
     have = {key_of(s): s for s in data["sources"]}
     taken = set(by_id(data))
     added = skipped = 0
+    lines = []
+    at = put_index(data)
     for s in items:
         k = key_of(s)
         if k in have:
@@ -6379,10 +6910,11 @@ def import_sources(items, data):
         s["id"] = new_source_id(s, taken)
         taken.add(s["id"])
         touch(s)
-        data["sources"].append(s)
+        lines += put_record(data, "sources", s, proposed=proposed, at=at)
         have[k] = s
-        log_put("sources", s)
         added += 1
+    if lines:
+        log_many(lines)
     return added, skipped
 
 
@@ -6399,11 +6931,14 @@ def cmd_import_zotero(path_str):
             raw = raw.get("items", [raw])
         items = [source_from_csl(it) for it in raw]
     data = load_json()
-    added, skipped = import_sources(items, data)
+    added, skipped = import_sources(items, data, proposed=True)
     write_json(data)
     write_mirror(data)
     print(tr("{added} sources imported from {name}, {skipped} already existed.",
              added=added, name=path.name, skipped=skipped))
+    if added:
+        print(tr("They came in as proposals: is:proposed finds them; sign each on its card, "
+                 "or python _kustos.py sign-proposals --all."))
     return 0
 
 
@@ -9085,6 +9620,7 @@ WEB_STRINGS = (
     "automatic", "deliberate", "changed: {fields}", "before", "confidence {n}",
     "Delete this observation?", "Observation saved.", "Observation deleted.",
     "Not observed yet: a save observes it, or say here what you tell apart in it.",
+    "proposal since {date}, not signed", "Sign", "Signed.",
 )
 
 
@@ -9671,6 +10207,7 @@ def web_record(data, rid):
            "observator": rec.get("observator") or "",
            "observator_name": observator_name(data, rec.get("observator")) if rec.get("observator") else "",
            "observator_state": observator_state(data, rec),
+           "proposal": proposal_info(data, rid),
            "out": [dict(end(a["to"]), rel=link_rel_text(a),
                         why=a.get("why", ""), when=a.get("when", ""))
                    for a in edges_from(data, rid)],
@@ -9775,12 +10312,14 @@ def web_link_details(data, a, b):
 EDGE_WHEN = re.compile(r"-?\d{1,4}(?:/-?\d{0,4})?")
 
 
-def write_link(a, b, rel="", why="", source="", when="", old=None, delete=False, circle=""):
+def write_link(a, b, rel="", why="", source="", when="", old=None, delete=False, circle="",
+               proposed=False, aside=False):
     """Adds, changes or removes ONE link, as a change of the record it comes
     from: its links are reread, the one named by `old` ({rel, to}) is replaced
     or removed, and the record is saved with save_record. The web page and the
     window's graph both write links here. Returns the vault; ValueError for
-    what cannot be saved, WebConflict when the link changed meanwhile."""
+    what cannot be saved, WebConflict when the link changed meanwhile.
+    `proposed`, `aside`: as save_record's."""
     b = norm_ref(b or "")
     data = load_json()
     idx = by_id(data)
@@ -9825,7 +10364,7 @@ def write_link(a, b, rel="", why="", source="", when="", old=None, delete=False,
         edges.insert(at, edge)
     rec = {k: v for k, v in idx[a].items() if not k.startswith("_")}
     touch(rec)
-    return save_record(coll_of(a), rec, edges=edges)
+    return save_record(coll_of(a), rec, edges=edges, proposed=proposed, aside=aside)
 
 
 def web_link(body):
@@ -10045,6 +10584,13 @@ def web_api(method, path, query, body):
                                          body.get("confidence"), body.get("source"), body.get("notes"))
             return 200, {"record": web_record(data, rid), "message": tr("Observation saved."),
                          "data": data}
+        if path == "/api/sign":                # the observator signs a proposal
+            rid = str(body.get("id") or "")
+            data, done, _left = sign_proposals([rid], {rid: str(body.get("base") or "")})
+            if not done:
+                raise WebConflict(tr("{id} is not a pending proposal.", id=rid))
+            return 200, {"record": web_record(data, rid),
+                         "message": tr("Signed by {name}.", name=observator_name(data)), "data": data}
         if path == "/api/observe/delete":      # one's own deliberate observation
             data = delete_observation(str(body.get("obs") or ""))
             return 200, {"record": web_record(data, str(body.get("id") or "")),
@@ -11796,8 +12342,10 @@ function renderRecord(changed) {
                   r.reg ? T("registered {stamp}", {stamp: r.reg}) : ""].filter(Boolean).join(" · ");
   const eye = r.observator_state === "own" ? BOOT.observator.svg
             : r.observator_state === "alienus" ? BOOT.observator.svg_alienus : BOOT.observator.svg_unsigned;
-  const obs = `<span class="obsline" title="${esc(r.observator || T("unsigned"))}">${eye} ${esc(
-    r.observator ? T("observed by {name}", {name: r.observator_name}) : T("unsigned"))}</span>`;
+  // a proposal (an import, the bulk entry) has no mark and says so, with a Sign button above
+  const said = r.proposal ? T("proposal since {date}, not signed", {date: r.proposal.since})
+             : r.observator ? T("observed by {name}", {name: r.observator_name}) : T("unsigned");
+  const obs = `<span class="obsline" title="${esc(r.observator || T("unsigned"))}">${eye} ${esc(said)}</span>`;
   out.push(`<div class="kicker">${esc(kicker)} · ${obs}</div><h1 class="title${ch.has("name") ? " changed" : ""}">${esc(r.title)}</h1>`);
   if (r.facts && r.facts.length) out.push(`<div class="sub">${esc(r.facts.join(" · "))}</div>`);
   const quick = {person: ["interactions", "Add to the log"], org: ["interactions", "Add to the log"],
@@ -11856,6 +12404,7 @@ function renderRecord(changed) {
   const geo = r.form && String(r.form.geo || "").trim();
   $("#rec").innerHTML = head(`<button class="btn quiet" data-act="graph">${esc(T("Graph"))}</button>` +
                             (geo ? `<button class="btn quiet" data-act="map">${esc(T("Map"))}</button>` : "") +
+                            (r.proposal ? `<button class="btn primary" data-act="sign">${esc(T("Sign"))}</button>` : "") +
                             `<button class="btn" data-act="edit">${esc(T("Edit"))}</button>`) +
     `<div class="card">${out.join("")}</div>`;
 }
@@ -11924,6 +12473,18 @@ async function observe(form) {
   S.rec = j.record || S.rec;
   renderRecord();
   toast(j.message || T("Observation saved."));
+}
+async function signProposal() {
+  // the observator signs the open proposal (sign_proposals): its eye gets the mark
+  const r = S.rec;
+  if (!r || !r.id || !r.proposal) return;
+  let j;
+  try { j = await api("api/sign", {id: r.id, base: r.base}); }
+  catch (e) { if (e.data && e.data.record) { S.rec = e.data.record; renderRecord(); } toast(e.message, 4000); return; }
+  S.rec = j.record || S.rec;
+  renderRecord();
+  loadList(false, true);
+  toast(j.message || T("Signed."));
 }
 async function observeDelete(oid) {
   const r = S.rec;
@@ -13665,6 +14226,7 @@ document.addEventListener("click", e => {
   else if (act === "lk-which") { L.which = b.dataset.k; loadLinks(false); }
   else if (act === "lk-more") loadLinks(true);
   else if (act === "obs-del") observeDelete(b.dataset.id);
+  else if (act === "sign") signProposal();
 });
 document.addEventListener("focusin", e => { if (e.target.id === "ob-crit") obsFillCriteria(); });
 document.addEventListener("submit", e => {
@@ -16528,6 +17090,20 @@ HELP_OBS = (
 )
 
 
+# the Help › Shortcuts lines for proposals and the audit
+HELP_PROPOSALS = (
+    "\n  PROPOSALS: what comes in without being typed here -- Base › Import sources"
+    "\n                  from Zotero, any CSL-JSON or BibTeX file, Ctrl+Q's concepts"
+    "\n                  with their forms (name | gloss: form (lang)) -- is a proposal:"
+    "\n                  the eye under the register has no mark, and the line says"
+    "\n                  PROPOSAL. A click there, or Base › Sign this proposal, signs it"
+    "\n                  in the observator's name; saving a change to it signs it too."
+    "\n                  is:proposed finds them. python _kustos.py sign-proposals"
+    "\n                  [<id> … | --all]; doctor --observe audits the observing"
+    "\n                  (read-only).\n"
+)
+
+
 # the Help › Shortcuts lines for drafts
 HELP_NOTES = (
     "\n  DRAFTS: free notes in markdown, one .md file each in notes/ beside the"
@@ -17566,11 +18142,20 @@ class App:
                               font=self.f_label, anchor="w", padx=22)
         self.locus.pack(fill="x", pady=(8, 0))
         # under it, the record's observations: how many, the last, and the way to
-        # observe it (a line of its own: beside the register it was cut short)
-        self.obs_line = tk.Label(self.cardbox, text="", bg=PAPER, fg=FAINT, font=self.f_label,
-                                 anchor="w", padx=22, cursor="hand2")
-        self.obs_line.pack(fill="x")
+        # observe it (a line of its own: beside the register it was cut short);
+        # first the eye of who signed the record (no mark: a proposal, or not
+        # signed yet), and for a proposal the way to sign it
+        obs_row = tk.Frame(self.cardbox, bg=PAPER)
+        obs_row.pack(fill="x")
+        self.rec_eye = tk.Canvas(obs_row, width=16, height=16, bg=PAPER, highlightthickness=0)
+        self.rec_eye.pack(side="left", padx=(20, 3))
+        self.obs_line = tk.Label(obs_row, text="", bg=PAPER, fg=FAINT, font=self.f_label,
+                                 anchor="w", cursor="hand2")
+        self.obs_line.pack(side="left")
         self.obs_line.bind("<Button-1>", lambda e: self.observe_dialog())
+        self.sign_line = tk.Label(obs_row, text="", bg=PAPER, fg=OXIDE, font=self.f_label,
+                                  anchor="w", cursor="hand2")
+        self.sign_line.bind("<Button-1>", lambda e: self.sign_open())
         pw.add(self.cardbox, stretch="always", minsize=320)
         self.pw = pw
         self.apply_pane_lock()
@@ -18014,6 +18599,7 @@ class App:
         b.add_command(label=tr("History of the open record"), command=self.do_history)
         b.add_command(label=tr("Observe the open record…"), accelerator="Ctrl+Shift+O",
                       command=self.observe_dialog)
+        b.add_command(label=tr("Sign this proposal"), command=self.sign_open)
         b.add_separator()
         b.add_command(label=tr("Import sources from Zotero (CSL-JSON or BibTeX)…"),
                       command=self.do_import_zotero)
@@ -19270,13 +19856,57 @@ class App:
         self.refresh_list()
 
     def set_obs_line(self, rec):
-        """'observed 3× · last 2026-11-14 · observe…' beside the register line."""
+        """'observed 3× · last 2026-11-14 · observe…' under the register line,
+        after the eye of who signed the record; a proposal adds the way to sign it."""
         rid = (rec or {}).get("id") or ""
         if not rid or rid.startswith("__"):
             self.obs_line.configure(text="")
+            self.rec_eye.delete("all")
+            self.sign_line.pack_forget()
             return
+        state = observator_state(self.data, rec)
+        draw_eye(self.rec_eye, 0, 0, 16, SOFT if state == "own" else FAINT, state)
         line = obs_summary_line(self.data, rid)
         self.obs_line.configure(text=(line + "  ·  " if line else "") + tr("observe…"))
+        if rid in obs_proposed(self.data):
+            self.sign_line.configure(text=tr("PROPOSAL · sign it"))
+            self.sign_line.pack(side="left", padx=(14, 0))
+        else:
+            self.sign_line.pack_forget()
+
+    def sign_open(self):
+        """Base › Sign this proposal, or the card's line: the open record, a
+        proposal (an import, the bulk entry), signed in the observator's name."""
+        was = self.current()
+        was = was["id"] if was and was["id"] in obs_proposed(self.data) else ""
+        self.commit_if_dirty()          # a change typed here signs it by itself
+        rec = self.current()
+        if not rec or rec["id"].startswith("__"):
+            self.say(tr("Open a saved record first."))
+            return "break"
+        rid = rec["id"]
+        if rid not in obs_proposed(self.data):
+            if rid == was:              # the change just typed signed it
+                self.say(tr("Signed by {name}.", name=observator_name(self.data)) + "  " + rid)
+            else:
+                self.say(tr("{id} is not a pending proposal.", id=rid))
+            self.set_locus(rec)
+            return "break"
+        try:
+            self.data, _done, _left = sign_proposals([rid], {rid: stamp_of(rec)})
+        except WebConflict as exc:
+            self.notify(tr("Not signed"), str(exc))
+            self.reload()
+            self.open_record(rid)
+            return "break"
+        except (ValueError, SystemExit) as exc:
+            self.notify(tr("Not signed"), str(exc))
+            return "break"
+        self.safe_mirror(self.data)
+        self.reload()
+        self.open_record(rid)
+        self.say(tr("Signed by {name}.", name=observator_name(self.data)) + "  " + rid)
+        return "break"
 
     def set_locus(self, rec):
         self.set_obs_line(rec)
@@ -20667,7 +21297,9 @@ class App:
                 self.safe_mirror(load_json())
                 self.say(tr("{c} concept(s), {f} form(s) and {l} link(s) added; {r} concept(s) were "
                             "already there.", c=done["concepts"], f=done["forms"], l=done["links"],
-                            r=done["reused"]))
+                            r=done["reused"])
+                         + (" " + tr("They are proposals until signed (is:proposed).")
+                            if done["concepts"] or done["forms"] or done["links"] else ""))
                 return
             data = load_json()
             taken = set(by_id(data))
@@ -21055,7 +21687,7 @@ class App:
         self.show_text(tr("Shortcuts"), tr(HELP_TEXT, conflicts=CONFLICT_DIR.name, stem=STEM)
                        + tr(HELP_READING) + tr(HELP_COPY) + tr(HELP_GRAPH) + tr(HELP_MONADS)
                        + tr(HELP_NOTES) + tr(HELP_RES) + tr(HELP_TIMELINE) + tr(HELP_MAP)
-                       + tr(HELP_OBS))
+                       + tr(HELP_OBS) + tr(HELP_PROPOSALS))
 
     # ------------------------------------------------------------ dialogs
     def dialog(self, title, width=520, height=None):
@@ -25998,7 +26630,7 @@ def main():
     if cmd == "merge":
         return cmd_merge()
     if cmd == "doctor":
-        return cmd_doctor()
+        return cmd_doctor_observe(rest) if "--observe" in rest else cmd_doctor()
     if cmd == "real-dates":
         return cmd_real_dates(rest)
     if cmd == "mirror":
@@ -26022,6 +26654,8 @@ def main():
     if cmd == "import" and rest:
         if rest[0] == "zotero" and len(rest) > 1:
             return cmd_import_zotero(rest[1])
+        if rest[0].lower().endswith((".bib", ".json")):     # CSL-JSON or BibTeX: sources
+            return cmd_import_zotero(rest[0])
         return cmd_import(rest[0])
     if cmd == "normalize":
         return cmd_normalize()
@@ -26038,6 +26672,8 @@ def main():
         return cmd_observator(rest)
     if cmd == "sign":
         return cmd_sign(rest)
+    if cmd == "sign-proposals":
+        return cmd_sign_proposals(rest)
     if cmd == "verify":
         return cmd_verify(rest)
     if cmd == "export":
@@ -28880,6 +29516,75 @@ PT = {
         "\n                  mais em 12 meses; crit:texto, pelo critério. O reobs da barra"
         "\n                  de status é a parte da base reobservada. python _kustos.py"
         "\n                  reobserve <id> · observe (o relatório).\n",
+    # ---- proposals and doctor --observe
+    "--days takes a number of days.": "--days pede um número de dias.",
+    "Atypical links without a reason or a criterion": "Ligações atípicas sem razão nem critério",
+    "Cold collections (coldest first)": "Acervos frios (o mais frio primeiro)",
+    "Ctrl+D (dust off) opens the coldest record of the list.":
+        "Ctrl+D (tirar o pó) abre o registro mais frio da lista.",
+    "Distinctions that changed (in the last {days} days)":
+        "Distinções que mudaram (nos últimos {days} dias)",
+    "Forms in conflict (one form, several concepts, by different observators)":
+        "Formas em conflito (uma forma, vários conceitos, por observadores diferentes)",
+    "Make each a concept of verba; then observe with its c_ id.":
+        "Faça de cada um um conceito de verba; depois observe com o seu id c_.",
+    "Not signed": "Não assinado",
+    "Observe the record each one starts from with a CRITERION (Ctrl+Shift+O, or the page's "
+    "Observations): the rule by which the link was drawn.":
+        "Observe o registro de onde cada uma parte com um CRITÉRIO (Ctrl+Shift+O, ou Observações "
+        "na página): a regra pela qual a ligação foi traçada.",
+    "Open the form and keep the reading you hold. Unsigned links (proposals, or older than the "
+    "observator) are not counted.":
+        "Abra a forma e fique com a leitura que você sustenta. Ligações sem assinatura (propostas, "
+        "ou anteriores ao observador) não contam.",
+    "PROPOSAL · sign it": "PROPOSTA · assinar",
+    "Proposals pending for more than {days} days": "Propostas pendentes há mais de {days} dias",
+    "Recurring criteria without a concept (used {n}× or more)":
+        "Critérios recorrentes sem conceito (usados {n}× ou mais)",
+    "Sign": "Assinar",
+    "Sign each on its card or page, or python _kustos.py sign-proposals <id> ... | --all.":
+        "Assine cada uma no cartão ou na página, ou python _kustos.py sign-proposals <id> ... | --all.",
+    "Sign this proposal": "Assinar esta proposta",
+    "Signed by {name}.": "Assinado por {name}.",
+    "Signed.": "Assinado.",
+    "Signing needs an observator: Base › Observator…, or python _kustos.py observator <p_id|name>":
+        "Assinar pede um observador: Base › Observador…, ou python _kustos.py observator <p_id|nome>",
+    "They are proposals until signed (is:proposed).": "São propostas até serem assinadas (is:proposed).",
+    "They came in as proposals: is:proposed finds them; sign each on its card, or python _kustos.py "
+    "sign-proposals --all.":
+        "Entraram como propostas: is:proposed as acha; assine cada uma no cartão, ou python "
+        "_kustos.py sign-proposals --all.",
+    "coldest: {ids}": "mais frios: {ids}",
+    "doctor --observe · the last {days} days (since {date}) · read-only, nothing is written":
+        "doctor --observe · os últimos {days} dias (desde {date}) · só leitura, nada é gravado",
+    "never": "nunca",
+    "proposal since {date}, not signed": "proposta desde {date}, não assinada",
+    "python _kustos.py reobserve <id> shows what each one was before.":
+        "python _kustos.py reobserve <id> mostra o que cada uma era antes.",
+    "{cold} of {n} not visited in {days} days ({share}%)": "{cold} de {n} sem visita há {days} dias ({share}%)",
+    "{id} is not a pending proposal.": "{id} não é uma proposta pendente.",
+    "{id}: its proposal was signed while another machine saved it, so the signing did not take "
+    "(sign-proposals {id} signs it again)":
+        "{id}: a sua proposta foi assinada enquanto outra máquina o salvava, e a assinatura não "
+        "pegou (sign-proposals {id} assina de novo)",
+    "Unknown option: {opt}": "Opção desconhecida: {opt}",
+    "{n} proposal(s) pending": "{n} proposta(s) pendente(s)",
+    "{n} proposal(s) pending for more than {days} days (sign each, or python _kustos.py "
+    "sign-proposals): {ids}":
+        "{n} proposta(s) pendente(s) há mais de {days} dias (assine cada uma, ou python _kustos.py "
+        "sign-proposals): {ids}",
+    "{n} proposal(s) signed by {name}.": "{n} proposta(s) assinada(s) por {name}.",
+    "… and {n} more": "… e mais {n}",
+    HELP_PROPOSALS:
+        "\n  PROPOSTAS: o que entra sem ser digitado aqui -- Base › Importar fontes"
+        "\n                  do Zotero, qualquer arquivo CSL-JSON ou BibTeX, os conceitos"
+        "\n                  do Ctrl+Q com as suas formas (nome | glosa: forma (língua)) --"
+        "\n                  é uma proposta: o olho sob o registro fica sem marca, e a linha"
+        "\n                  diz PROPOSTA. Um clique ali, ou Base › Assinar esta proposta,"
+        "\n                  a assina em nome do observador; gravar uma mudança nela também"
+        "\n                  a assina. is:proposed acha as propostas. python _kustos.py"
+        "\n                  sign-proposals [<id> … | --all]; doctor --observe audita o"
+        "\n                  observar (só leitura).\n",
 }
 
 if __name__ == "__main__":

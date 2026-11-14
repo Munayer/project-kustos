@@ -297,6 +297,44 @@ Ideas that span several sections:
   line, the status bar's *re-obs* and `observe`. The doctor only warns.
   Observations of health (`h_`) records and of accounts carry their earlier
   values: any later export must leave them in the base.
+- **Proposals** (`# ---- proposals`, at the end of `# ==== observations`):
+  `save_record` is now `put_record` (the work on a vault in memory, returning
+  the log lines) plus the write and the log; both take `proposed`, `sign` and
+  `aside`. A batch (`import_sources`, `sign_proposals`) passes `put_record` an
+  `at` from `put_index`, so each record, tombstone and today's observation is
+  found once, not once per record: keep a new per-record scan out of
+  `put_record`, or give it a place in `at`.
+  `proposed` (the imports through `import_sources(..., proposed=True)`, which
+  `cmd_import_zotero` and `import <file.bib|.json>` use, and
+  `save_bulk_concepts`, also through `write_link(..., proposed=True)`) keeps a
+  new record's `observator` "" (a record already there keeps its own) and its
+  new links unsigned, and `propose_save` adds (or updates) a `proponho` with
+  `status: "proposed"`, no observator, `auto`, no distinguo, and `links`: the
+  [rel, to] of the links it brought. `sign` (`sign_proposals`: the window's
+  `sign_open`, `/api/sign`, `sign-proposals`) stamps an unsigned record, and
+  `seal_proposal` the proponho's `links` still unsigned (an older unsigned
+  link keeps nobody) and turns the proponho `signed` with `observator` and
+  `signed_at` (kind stays proponho); obs_diff ignores `observator`, so no
+  reobservo. A save of a pending proposal by the observator that changes
+  something signs it (and its reobservo is against the proposed version); one
+  that changes nothing keeps it a proposal, and so does `aside`
+  (`write_inverse_links`: a line typed on another record's card). A pending
+  proponho counts in no tally (`obs_looked`, `recent` in `_obs_cache`), and no
+  later save coalesces into a proponho (`obs_coalesces`). `proposal_of` finds a
+  record's pending one (looked for only when the record is unsigned, or on
+  `sign`, so the ordinary save pays nothing), `obs_proposed` (in `_OBS_CACHE`)
+  feeds `is:proposed`, the card's line, `proposal_info` for the page and
+  `check_proposals` (warnings: pending over `PROPOSAL_DAYS`, or a proposal
+  whose signing did not take, the record or the links it brought left
+  unsigned by another machine's save -- `proposals_astray`, which
+  `sign_proposals` signs again, with `sign_brought`). `proposal_brought` is
+  the one reading of a proponho's `links` (one written without them brought
+  every unsigned link). The page and the window sign with the stamp the
+  record was shown with (`base`): one changed since is a WebConflict.
+- **doctor --observe** (`# ---- doctor --observe`, after `cmd_doctor`):
+  `observe_audit(data, days, seen)` returns the sections, `cmd_doctor_observe`
+  prints them; it must stay read-only -- `load_json`, `seen_read` and no
+  write of any kind. Test it on invented data in memory (`seen={}`).
 - **Long texts are markdown**: `textfield(..., pages=True)` (every NOTES and the
   draft's text) gets `MarkdownKeys`, and `fit(opening=True)` paints it before
   the pages are measured. The text stored stays plain.
