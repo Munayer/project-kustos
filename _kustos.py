@@ -31,7 +31,7 @@ HOW CONFLICTS ARE RESOLVED
     3. If another machine left its lock, the status bar says so.
 
 IDS: p_ person · c_ concept · f_ form · s_ source · h_ measurement ·
-r_ thing (res: an item) · k_ skill (Peritia).
+r_ thing (res: an item or an account) · k_ skill (Peritia).
 
 REGISTER: besides its id, every record has a registration stamp
 (YYYYMMDDhhmmss) and an order number (nº 1852). The number never changes and
@@ -83,7 +83,10 @@ USAGE
     python _kustos.py export [bibtex|csl|abnt] [file]
     python _kustos.py geojson [--all] [file]
                                       every GEO as one GeoJSON file (QGIS, PostGIS);
-                                      health records only with --all
+                                      health records and accounts only with --all
+    python _kustos.py ledger [hledger|beancount] [file]
+                                      the accounts (res) as a plain-text journal, in
+                                      double entry (_kustos.ledger / _kustos.beancount)
     python _kustos.py import zotero <export.json|.bib>
     python _kustos.py import <notes.md>   "- Name. Notes" -> people
     python _kustos.py merge           merge *.sync-conflict-* now
@@ -111,6 +114,7 @@ import textwrap
 import time
 import unicodedata
 from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 BASE = Path(__file__).parent
@@ -177,8 +181,8 @@ def coll_of(rid):
 
 
 def kind_of(rec):
-    """person | concept | form | source | metric | note | item -- what links are
-    checked against."""
+    """person | concept | form | source | metric | note | item | account -- what
+    links are checked against."""
     coll = coll_of(rec.get("id", ""))
     if coll == "entries":
         return rec.get("kind", "concept")
@@ -954,6 +958,7 @@ RELS = {
     "bought_from":   ("item", "org"),
     "manual_in":     ("item", "source"),
     "kept_in":       ("item", "item"),
+    "paid_from":     ("item", "account"),
 }
 REL_LABEL = {
     "expresses": "expresses", "derives_from": "derives from",
@@ -970,7 +975,7 @@ REL_LABEL = {
     "translates": "translates", "comments_on": "comments on", "responds_to": "responds to",
     "affects": "affects", "correlates": "correlates with",
     "lent_to": "lent to", "bought_from": "bought from", "manual_in": "manual in",
-    "kept_in": "kept in",
+    "kept_in": "kept in", "paid_from": "paid from",
 }
 
 
@@ -2502,12 +2507,14 @@ def haystack_note(n):
 # ================================================================ res
 #
 # Res, the things of the house: each record (r_) has an internal type,
-# `rtype`, as the corpus has `ctype`. For now the only type is the ITEM -- a
-# thing owned: where it is in the home, its state, when it was bought and
-# for how much, until when its warranty runs, and a LOG of what happened to it
-# (dated lines, as people's). The code is laid out per type (RES_TYPES,
-# RES_TYPE_LABEL, the `only` of the page's fields) so that another type --
-# accounts and their entries -- can join it.
+# `rtype`, as the corpus has `ctype`. The ITEM is a thing owned: where it is
+# in the home, its state, when it was bought and for how much, until when its
+# warranty runs, and a LOG of what happened to it (dated lines, as people's).
+# The ACCOUNT is where money is kept or owed, with its entries (`# ---- accounts`
+# below). The code is laid out per type (RES_TYPES, RES_TYPE_LABEL, the `only`
+# of the page's fields, the blocks of ResCard). A record's type is chosen when
+# it is made and does not change: an item and an account share only the
+# common fields.
 #
 # CATEGORY is free text with suggestions; the suggestions are stored by their
 # English key and shown translated (res_category_label / res_category_key, as
@@ -2515,8 +2522,8 @@ def haystack_note(n):
 # `status_since` is when the status last changed: save_record stamps it when
 # the status changes, unless the date was typed by hand.
 
-RES_TYPES = ("item",)
-RES_TYPE_LABEL = {"item": "item"}
+RES_TYPES = ("item", "account")
+RES_TYPE_LABEL = {"item": "item", "account": "account"}
 RES_CATEGORIES = ("furniture", "electronics", "tools", "books", "clothes", "kitchen",
                   "documents", "vehicle", "other")
 RES_STATUSES = ("in use", "stored", "lent", "in repair", "discarded")
@@ -2598,6 +2605,12 @@ def fix_res(r):
             r.setdefault(k, "")
         r.setdefault("status", "in use")
         r.setdefault("log", [])
+    elif rtype(r) == "account":
+        r.setdefault("atype", "checking")
+        r.setdefault("currency", ACCOUNT_CURRENCY)
+        for k in ("institution", "last4", "opening", "opening_date"):
+            r.setdefault(k, "")
+        r.setdefault("entries", [])
     r.setdefault("source", "")
     r.setdefault("geo", "")
     r.setdefault("notes", "")
@@ -2676,8 +2689,9 @@ def res_due_date(r, today=None):
     return min(dates) if dates else "9999"
 
 
-def res_facts(r, data=None):
-    """The type-specific facts of a res record, as short phrases."""
+def res_facts(r, data=None, sums=True):
+    """The type-specific facts of a res record, as short phrases; an
+    account's balance among them when `data` is given and `sums`."""
     out = []
     if rtype(r) == "item":
         if r.get("category"):
@@ -2699,6 +2713,22 @@ def res_facts(r, data=None):
             out.append(tr("warranty until {date}", date=r["warranty_until"]))
         if r.get("serial"):
             out.append(tr("serial {serial}", serial=r["serial"]))
+    elif rtype(r) == "account":
+        out.append(account_type_label(r.get("atype")))
+        if r.get("institution"):
+            out.append(who_is(r["institution"], data))
+        if r.get("last4"):
+            out.append("…" + str(r["last4"]))
+        if data is not None and sums:
+            s = account_summary(r, data)
+            out.append(tr("balance {amount}", amount=money(s["balance"], s["currency"])))
+            if s["statement"] is not None:
+                out.append(tr("this month's statement {amount}",
+                              amount=money(s["statement"], s["currency"])))
+            if s["bad"]:
+                out.append("(!) " + tr("{n} line(s) not read", n=len(s["bad"])))
+        else:
+            out.append(acct_currency(r))
     return out
 
 
@@ -2711,9 +2741,593 @@ def haystack_res(r, data):
              " ".join(r.get("tags", [])), " ".join(r.get("links", []))]
     for it in r.get("log", []):
         parts.append(f"{it.get('date', '')} {it.get('text', '')}")
+    if rtype(r) == "account":
+        parts += [r.get("atype", ""), account_type_label(r.get("atype")), r.get("currency", ""),
+                  r.get("institution", ""), who_is(r.get("institution"), data)]
+        parts += [entry_line(e) for e in r.get("entries") or []]
     for a in edges_from(data, r["id"]):
         parts.append(f"{a['rel']} {a['to']} {a.get('why', '')}")
     return "  ".join(str(x) for x in parts).lower()
+
+
+# ---------------------------------------------------------------- accounts
+#
+# An ACCOUNT (rtype "account") is where money is kept or owed: a checking or
+# savings account, a card, a wallet, an investment, or a category kept as an
+# account of its own (ACCOUNT_TYPES, stored by key). LAST 4 holds the last four
+# digits of a card or an account, to tell two apart -- never more: anything but
+# four digits is refused when saving and is an error for the doctor, so a full
+# number is never stored. INSTITUTION is free text or an organization's p_.
+#
+# ENTRIES are kept inside the account, single-entry, one line each, the way the
+# corpus keeps its readings: parse_entries reads the card's lines into
+# {date, amount, text} -- `amount` a canonical decimal string ("-45.90"),
+# `text` the rest of the line as typed, marks included -- and entry_line
+# writes them back:
+#     2026-11-09  -45,90  market #food → r_fridge
+#     2026-11-10  +3200   salary #income
+#     2026-11-12  -500    > r_savings  reserve
+# `#category` (the first one) groups the entry; `→ id` (or `-> id`) is what it
+# refers to; `> r_…` makes it a transfer to another account, whose other half
+# is computed there (ledger_index) and never stored twice. A line with no date
+# gets today's. A line that does not read is kept as typed ({"raw": line}), so
+# nothing typed is lost: the doctor warns and the card's hint points at it.
+#
+# Money is decimal.Decimal, never float. How a value reads (parse_amount):
+#   * an entry needs its sign: + money in, - money out (an opening balance
+#     without a sign is positive);
+#   * with both . and , in it, the last one is the decimal mark and the other
+#     groups thousands: 1.234,56 and 1,234.56 are the same;
+#   * one mark used more than once groups thousands: 1.234.567;
+#   * one mark used once is the decimal mark -- 45,90 or 45.90 -- except when
+#     exactly three digits follow it and one to three digits, not starting
+#     with 0, come before it: 1.234 could be either, and is refused;
+#   * thousands go in groups of three;
+#   * at most AMOUNT_WHOLE digits before the decimal mark and AMOUNT_DECIMALS
+#     after it (sums stay exact within Decimal's 28 digits).
+# The card writes values back with no thousands mark and the interface's
+# decimal mark (amount_typed), so they read again the same. An entry is
+# stored as its canonical value; an OPENING BALANCE too (account_opening),
+# but one that does not read is kept as typed, so the stored text is always
+# read by the same rule (opening_of) -- 1.500 typed and kept stays refused,
+# never 1.5.
+#
+# A transfer to a missing record, to a record that is not an account, to the
+# account itself or to an account in another currency (there are no exchange
+# rates) is a doctor warning and not a transfer: the entry still moves its own
+# account, as an ordinary entry. Sums never cross currencies.
+
+ACCOUNT_TYPES = ("checking", "savings", "card", "wallet", "investment", "category")
+ACCOUNT_CURRENCY = "BRL"
+CURRENCY_RE = re.compile(r"^[A-Z][A-Z0-9'._-]{0,22}[A-Z0-9]$")   # beancount's rule: 2 to 24
+LAST4_RE = re.compile(r"^\d{4}$")
+LEDGER_MONTHS = 6           # months on the card's summary
+LEDGER_CATS = 8             # categories on the card's summary
+LEDGER_LARGEST = 5          # largest outflows shown
+AMOUNT_WHOLE = 15           # digits before the decimal mark, at most
+AMOUNT_DECIMALS = 8         # and after it
+ENTRY_RE = re.compile(r"^(?:(\d{4}-\d{2}-\d{2})\s+)?([+\-−]?\d[\d.,]*)(?:\s+(.*))?$")
+ENTRY_CAT_RE = re.compile(r"(?:^|(?<=\s))#(\w[\w\-]*(?::\w[\w\-]*)*)")
+ENTRY_REF_RE = re.compile(r"(?:→|->)\s*([a-z]_[\w\-]+)")
+ENTRY_XFER_RE = re.compile(r"(?:^|(?<=\s))>\s*([a-z]_[\w\-]+)")
+
+
+def account_type_label(key):
+    return tr(key) if key in ACCOUNT_TYPES else (key or "")
+
+
+def acct_currency(r):
+    return (r.get("currency") or ACCOUNT_CURRENCY).strip().upper()
+
+
+def last4_ok(text):
+    return not str(text or "").strip() or bool(LAST4_RE.match(str(text).strip()))
+
+
+def parse_amount(text, signed=True):
+    """A value as typed -> (Decimal, "") or (None, why). The rule is in the
+    comment above; `signed` asks for the sign an entry needs."""
+    t = (text or "").strip().replace("−", "-")
+    m = re.fullmatch(r"([+-]?)(\d(?:[\d.,]*\d)?)", t)
+    if not m:
+        return None, "not a value"
+    sign, num = m.groups()
+    if signed and not sign:
+        return None, "the value needs a sign: + in, - out"
+    marks = {c for c in num if c in ".,"}
+
+    def grouped(parts):
+        return 1 <= len(parts[0]) <= 3 and all(len(p) == 3 for p in parts[1:])
+
+    if not marks:
+        plain = num
+    elif len(marks) == 2:
+        dec = num[max(num.rfind("."), num.rfind(","))]
+        whole, frac = num.rsplit(dec, 1)
+        parts = whole.split("," if dec == "." else ".")
+        if dec in whole or not grouped(parts):
+            return None, "thousands go in groups of three"
+        plain = "".join(parts) + "." + frac
+    else:
+        mark = marks.pop()
+        parts = num.split(mark)
+        if len(parts) > 2:
+            if not grouped(parts):
+                return None, "thousands go in groups of three"
+            plain = "".join(parts)
+        else:
+            whole, frac = parts
+            if len(frac) == 3 and len(whole) <= 3 and whole[0] != "0":
+                return None, "ambiguous value: write 1234, or 1.234,00 (1,234.00)"
+            plain = whole + "." + frac
+    whole, _, frac = plain.partition(".")
+    if len(whole.lstrip("0")) > AMOUNT_WHOLE or len(frac) > AMOUNT_DECIMALS:
+        return None, "too many digits: at most 15 before the decimal mark and 8 after"
+    d = Decimal(plain)
+    return (-d if sign == "-" else d), ""
+
+
+def amount_of(value):
+    """A stored amount -> Decimal, or None."""
+    try:
+        d = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        return None
+    return d if d.is_finite() else None
+
+
+def amount_typed(d, signed=True):
+    """A value as the card writes it: its sign, no thousands mark, the
+    interface's decimal mark; three decimals get a fourth (1,2340), so that
+    the value cannot read as thousands."""
+    whole, _, frac = format(abs(d), "f").partition(".")
+    if len(frac) == 3 and len(whole) <= 3 and whole[0] != "0":
+        frac += "0"
+    text = whole + (("," if LANG == "pt" else ".") + frac if frac else "")
+    return ("-" if d < 0 else "+" if signed else "") + text
+
+
+def two_decimals(d):
+    """format(d, "f") with at least two decimals, padded, never rounded
+    (quantize fails on a value of 27 digits or more)."""
+    whole, _, frac = format(d, "f").partition(".")
+    return whole + "." + frac.ljust(2, "0")
+
+
+def money(d, cur="", plus=False):
+    """A value to read: thousands grouped, at least two decimals, in the
+    interface's marks (1.234,56 BRL in Portuguese, 1,234.56 BRL in English)."""
+    if d is None:
+        return ""
+    whole, _, frac = two_decimals(abs(d)).partition(".")
+    th, dec = (".", ",") if LANG == "pt" else (",", ".")
+    groups = []
+    while len(whole) > 3:
+        groups.insert(0, whole[-3:])
+        whole = whole[:-3]
+    text = th.join([whole] + groups) + dec + frac
+    sign = "-" if d < 0 else ("+" if plus and d > 0 else "")
+    return sign + text + (" " + cur if cur else "")
+
+
+def read_entry(line):
+    """One line of ENTRIES -> (entry, "") or (None, why)."""
+    m = ENTRY_RE.match((line or "").strip())
+    if not m:
+        return None, "it begins with neither a date nor a value"
+    day, amount, rest = m.groups()
+    if day:
+        try:
+            date.fromisoformat(day)
+        except ValueError:
+            return None, "not a real date"
+    d, why = parse_amount(amount)
+    if d is None:
+        return None, why
+    return {"date": day or TODAY(), "amount": format(d, "f"), "text": (rest or "").strip()}, ""
+
+
+def parse_entries(text):
+    """The card's ENTRIES -> [entry]; a line that does not read is kept as
+    {"raw": line}, in its place."""
+    out = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line:
+            e, _why = read_entry(line)
+            out.append(e if e else {"raw": line})
+    return out
+
+
+def entry_line(e):
+    """An entry as the card shows it (the line it was typed as, for a raw one)."""
+    if not isinstance(e, dict):
+        return str(e)
+    if "raw" in e:
+        return str(e["raw"])
+    d = amount_of(e.get("amount"))
+    amount = amount_typed(d) if d is not None else str(e.get("amount", ""))
+    return f"{e.get('date', '')}  {amount}  {e.get('text', '')}".rstrip()
+
+
+def format_entries(items):
+    return "\n".join(entry_line(e) for e in (items or []))
+
+
+def entry_problem(e):
+    """Why an entry does not count, or ""."""
+    if not isinstance(e, dict):
+        return "not a value"
+    if "raw" in e:
+        return read_entry(e["raw"])[1] or "it begins with neither a date nor a value"
+    if amount_of(e.get("amount")) is None:
+        return "not a value"
+    day = str(e.get("date") or "")
+    try:
+        if len(day) != 10:
+            raise ValueError
+        date.fromisoformat(day)
+    except ValueError:
+        return "not a real date"
+    return ""
+
+
+def entry_marks(text):
+    """(category, [ids referred to], transfer target) of an entry's text."""
+    t = text or ""
+    c = ENTRY_CAT_RE.search(t)
+    x = ENTRY_XFER_RE.search(t)
+    return (c.group(1).lower() if c else ""), ENTRY_REF_RE.findall(t), (x.group(1) if x else "")
+
+
+def entry_memo(text):
+    """An entry's text without its marks."""
+    t = ENTRY_CAT_RE.sub(" ", ENTRY_XFER_RE.sub(" ", ENTRY_REF_RE.sub(" ", text or "")))
+    return " ".join(t.split())
+
+
+def account_opening(text):
+    """OPENING BALANCE as typed -> its canonical value; what does not read is
+    kept as typed (the doctor points at it). The canonical value reads back
+    the same through parse_amount: three decimals that could be thousands get
+    a fourth (012,125 -> 12.1250)."""
+    d, _why = parse_amount(text, signed=False)
+    if d is None:
+        return (text or "").strip()
+    out = format(d, "f")
+    return out if parse_amount(out, signed=False)[0] == d else out + "0"
+
+
+def opening_problem(r):
+    """(the stored OPENING BALANCE as a Decimal or None, why it does not read
+    or ""). Read by parse_amount, as it was typed: one kept as typed because
+    it did not read (1.500) never reads as another value (1.5)."""
+    text = str(r.get("opening") or "").strip()
+    if not text:
+        return None, ""
+    return parse_amount(text, signed=False)
+
+
+def opening_of(r):
+    return opening_problem(r)[0]
+
+
+def accounts_of(data):
+    return [r for r in data.get("res", []) if rtype(r) == "account"
+            and not r.get("id", "").startswith("__")]
+
+
+def account_posts(r, entries, acc, ids):
+    """An account's entries read: (posts, bad lines, bad transfers). A post is
+    {date, amount (Decimal), cat, refs, to, text, n (its line)}; `to` is kept
+    only for a transfer that holds (acc: {id: account}, ids: every id)."""
+    posts, bad, xbad = [], [], []
+    aid, cur = r.get("id", ""), acct_currency(r)
+    for n, e in enumerate(entries or [], 1):
+        why = entry_problem(e)
+        if why:
+            bad.append((n, entry_line(e), why))
+            continue
+        cat, refs, to = entry_marks(e.get("text"))
+        p = {"date": e["date"], "amount": amount_of(e["amount"]), "cat": cat, "refs": refs,
+             "to": to, "text": e.get("text", ""), "n": n}
+        if to:
+            other = acc.get(to)
+            why = ("a transfer to the account itself" if to == aid
+                   else "not an account" if other is None and to in ids
+                   else "no such record" if other is None
+                   else "another currency ({cur})" if acct_currency(other) != cur else "")
+            if why:
+                xbad.append((n, to, why, acct_currency(other) if other else ""))
+                p["to"] = ""
+        posts.append(p)
+    return posts, bad, xbad
+
+
+_LEDGER = {"now": None}     # (key, what keeps the key's ids alive, the index)
+
+
+def ledger_index(data):
+    """Every account's entries read once: {"acc": {id: account}, "own": {id:
+    [post]}, "in": {id: [post]}, "bad": {id: [...]}, "xbad": {id: [...]}}.
+    "in" holds the other half of each transfer, computed: the amount turned
+    round and `from` the account it came from. Kept while the accounts and
+    their entries are the same objects (a reload makes new ones)."""
+    accts = accounts_of(data)
+    key = tuple((id(r), id(r.get("entries")), len(r.get("entries") or ()), r.get("currency"))
+                for r in accts)
+    now = _LEDGER["now"]
+    if now and now[0] == key:
+        return now[2]
+    acc = {r["id"]: r for r in accts}
+    ids = {x.get("id") for c in COLLS for x in data.get(c, [])}
+    out = {"acc": acc, "own": {}, "in": {a: [] for a in acc}, "bad": {}, "xbad": {}}
+    for r in accts:
+        aid = r["id"]
+        posts, out["bad"][aid], out["xbad"][aid] = account_posts(r, r.get("entries"), acc, ids)
+        out["own"][aid] = posts
+        for p in posts:
+            if p["to"]:
+                out["in"][p["to"]].append(dict(p, amount=-p["amount"], to="", cat="", came=aid))
+    _LEDGER["now"] = (key, [(r, r.get("entries")) for r in accts], out)
+    return out
+
+
+def account_summary(r, data, entries=None, today=None):
+    """What an account's card, page and mirror show: {currency, opening,
+    balance, own, incoming, months: [(YYYY-MM, in, out)], cats: [(category,
+    total)], largest: [post], statement, bad, xbad}. `entries` are the lines
+    being edited (else the stored ones). Transfers stay out of the categories
+    and of the largest outflows (money moved, not spent). A card's statement
+    is its own entries, transfers apart, in the current calendar month, as a
+    positive total."""
+    idx = ledger_index(data)
+    aid = r.get("id", "")
+    if entries is None and aid in idx["own"]:
+        own, bad, xbad = idx["own"][aid], idx["bad"][aid], idx["xbad"][aid]
+    else:
+        ids = {x.get("id") for c in COLLS for x in data.get(c, [])}
+        own, bad, xbad = account_posts(r, r.get("entries") if entries is None else entries,
+                                       idx["acc"], ids)
+    incoming = idx["in"].get(aid, [])
+    zero = Decimal(0)
+    opening = opening_of(r)
+    balance = (opening or zero) + sum((p["amount"] for p in own), zero) \
+        + sum((p["amount"] for p in incoming), zero)
+    months = {}
+    for p in list(own) + list(incoming):
+        m = months.setdefault(p["date"][:7], [zero, zero])
+        m[0 if p["amount"] > 0 else 1] += p["amount"]
+    cats = {}
+    for p in own:
+        if not p["to"]:
+            cats[p["cat"]] = cats.get(p["cat"], zero) + p["amount"]
+    spent = sorted((p for p in own if not p["to"] and p["amount"] < 0),
+                   key=lambda p: (p["amount"], p["date"]))
+    statement = None
+    if r.get("atype") == "card":
+        month = (today or TODAY())[:7]
+        statement = -sum((p["amount"] for p in own if not p["to"] and p["date"][:7] == month),
+                         zero)
+    return {"currency": acct_currency(r), "opening": opening, "balance": balance,
+            "own": own, "incoming": incoming,
+            "months": [(k, v[0], v[1]) for k, v in sorted(months.items())],
+            "cats": sorted(cats.items(), key=lambda kv: (-abs(kv[1]), kv[0])),
+            "largest": spent[:LEDGER_LARGEST], "statement": statement, "bad": bad, "xbad": xbad}
+
+
+def account_name(aid, data):
+    r = ledger_index(data)["acc"].get(aid)
+    return r.get("name", "") if r else aid
+
+
+def account_report(r, data, s=None):
+    """The summary of an account as lines of text, for the card, the mirror
+    and the logbook."""
+    s = s or account_summary(r, data)
+    cur = s["currency"]
+    out = [tr("balance {amount}", amount=money(s["balance"], cur))
+           + (" · " + tr("opening {amount} on {date}", amount=money(s["opening"], cur),
+                         date=r.get("opening_date") or "?") if s["opening"] is not None else "")]
+    if s["statement"] is not None:
+        out.append(tr("this month's statement {amount}", amount=money(s["statement"], cur)))
+    if s["months"]:
+        out.append(tr("by month:") + "  " + "  ·  ".join(
+            f"{k} {money(i, plus=True)} {money(o)}" for k, i, o in s["months"][-LEDGER_MONTHS:]))
+    if s["cats"]:
+        out.append(tr("by category:") + "  " + "  ·  ".join(
+            f"{('#' + k) if k else tr('(none)')} {money(v, plus=True)}"
+            for k, v in s["cats"][:LEDGER_CATS]))
+    if s["largest"]:
+        out.append(tr("largest outflows:") + "  " + "  ·  ".join(
+            f"{p['date']} {money(p['amount'])} {one_liner(entry_memo(p['text']), 24)}".rstrip()
+            for p in s["largest"]))
+    if s["incoming"]:
+        out.append(tr("transfers in:") + "  " + "  ·  ".join(
+            f"{p['date']} {money(p['amount'], plus=True)} "
+            + tr("from {name}", name=one_liner(account_name(p["came"], data), 24))
+            for p in s["incoming"][-5:]))
+    return out
+
+
+# ---- the ledger export
+#
+# `ledger [hledger|beancount] [file]` writes the accounts as a plain-text
+# journal in double entry, for hledger or beancount. Each entry becomes a
+# transaction of two postings that sum to zero, in the account's currency:
+#   * the account itself: Assets:<Name>, or Liabilities:<Name> for a card;
+#     a `category` account is Expenses:<Name> -- an expense account in its own
+#     right, whose balance is what was moved into it by transfers (`> r_food`
+#     from the checking account); an entry typed in it directly has no other
+#     account and goes against Equity:Adjustments;
+#   * the other side: the account of a transfer (each transfer once, from the
+#     account it was typed in), else Expenses:<Category> for money out and
+#     Income:<Category> for money in (#food -> Expenses:Food; #food:market ->
+#     Expenses:Food:Market), or Expenses:Uncategorized / Income:Uncategorized;
+#   * an opening balance: one transaction against Equity:Opening-Balances, on
+#     the opening date (else the account's first entry, else today).
+# Each account gets a name of its own (the id, then a number, after a name
+# already taken), and a category never shares an account's: #food beside an
+# account Food goes to Expenses:Food-2, with a note, so that every account's
+# balance in the journal is the one Kustos shows.
+# Names are made ASCII for both tools (ledger_component): accents dropped,
+# anything but letters, digits and hyphens turned into hyphens, the first
+# letter a capital. A currency that is not a code (CURRENCY_RE) leaves its
+# account out, with a note. Lines that do not read and zero entries are left
+# out; a transfer that does not hold is an ordinary entry, as everywhere.
+
+LEDGER_FILES = {"hledger": BASE / f"{STEM}.ledger", "beancount": BASE / f"{STEM}.beancount"}
+LEDGER_ROOT = {"checking": "Assets", "savings": "Assets", "wallet": "Assets",
+               "investment": "Assets", "card": "Liabilities", "category": "Expenses"}
+
+
+def ledger_component(text):
+    """One part of an account name: ASCII letters, digits and hyphens,
+    starting with a capital letter or a digit."""
+    t = unicodedata.normalize("NFKD", text or "")
+    t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    t = re.sub(r"[^A-Za-z0-9]+", "-", t.encode("ascii", "ignore").decode()).strip("-")
+    return (t[:1].upper() + t[1:]) if t else "X"
+
+
+def ledger_transactions(data, today=None):
+    """(transactions, accounts, notes): each transaction is (date, narration,
+    [(account, Decimal, currency)], meta); `accounts` {name: (currency or "",
+    first date)}; `notes` what was left out, as phrases."""
+    idx = ledger_index(data)
+    names, taken, notes = {}, set(), []
+    for r in sorted(idx["acc"].values(), key=lambda x: (sort_key(x.get("name", "")), x["id"])):
+        if not CURRENCY_RE.match(acct_currency(r)):
+            notes.append(tr("{id}: left out, its CURRENCY is not a code: {value}", id=r["id"],
+                            value=r.get("currency")))
+            continue
+        root = LEDGER_ROOT.get(r.get("atype"), "Assets")
+        name = f"{root}:{ledger_component(r.get('name') or r['id'])}"
+        if name in taken:
+            name += "-" + ledger_component(r["id"][2:])
+        base, n = name, 2
+        while name in taken:
+            name, n = f"{base}-{n}", n + 1
+        taken.add(name)
+        names[r["id"]] = name
+    heads = {}          # Expenses:Food -> the name its categories go under
+
+    def category(cat, amount):
+        root = "Expenses" if amount < 0 else "Income"
+        parts = [ledger_component(c) for c in cat.split(":") if c] if cat else ["Uncategorized"]
+        head = f"{root}:{parts[0]}"
+        if head not in heads:
+            top, n = head, 2
+            while top in taken:
+                top, n = f"{head}-{n}", n + 1
+            heads[head] = top
+            if top != head:
+                notes.append(tr("{name} is an account: its namesake category goes to {other}",
+                                name=head, other=top))
+        return ":".join([heads[head]] + parts[1:])
+
+    txns, today = [], today or TODAY()
+    for aid, mine in names.items():
+        r = idx["acc"][aid]
+        cur = acct_currency(r)
+        own = [p for p in idx["own"][aid] if p["amount"] != 0]
+        opening = opening_of(r)
+        if opening:
+            od = str(r.get("opening_date") or "").strip()
+            if not (len(od) == 10 and res_date_ok(od)):
+                od = min((p["date"] for p in own), default=today)
+            txns.append((od, tr("Opening balance") + f" — {r.get('name', '')}",
+                         [(mine, opening, cur), ("Equity:Opening-Balances", -opening, cur)], {}))
+        for p in own:
+            if p["to"] and p["to"] in names:
+                other = names[p["to"]]
+            elif r.get("atype") == "category":
+                other = "Equity:Adjustments"
+            else:
+                other = category(p["cat"], p["amount"])
+            memo = entry_memo(p["text"]) or (f"#{p['cat']}" if p["cat"] else "") \
+                or (tr("transfer") if p["to"] else "") or r.get("name", "")
+            meta = {"kustos": f"{aid} {p['n']}"}
+            if p["refs"]:
+                meta["ref"] = " ".join(p["refs"])
+            txns.append((p["date"], memo, [(mine, p["amount"], cur), (other, -p["amount"], cur)],
+                         meta))
+    txns.sort(key=lambda t: t[0])
+    accounts = {}
+    for day, _memo, posts, _meta in txns:
+        for acct, _amount, cur in posts:
+            seen = accounts.setdefault(acct, [set(), day])
+            seen[0].add(cur)
+            seen[1] = min(seen[1], day)
+    return txns, {a: ((next(iter(c)) if len(c) == 1 else ""), d) for a, (c, d) in accounts.items()}, notes
+
+
+def ledger_amount(d):
+    """A plain amount for both tools: a dot, no thousands, at least two decimals."""
+    return two_decimals(d)
+
+
+def ledger_journal(data, fmt="hledger", today=None):
+    """The journal's text, and the notes on what was left out."""
+    txns, accounts, notes = ledger_transactions(data, today)
+    head = tr("generated by _kustos.py ledger -- do not edit by hand; made {when}", when=NOW())
+    out = [f"; {head}", ""]
+    commodities = sorted({cur for _a, (cur, _d) in accounts.items() if cur}
+                         | {c for t in txns for _a, _v, c in t[2]})
+    if fmt == "beancount":
+        opened = min((d for _c, d in accounts.values()), default=today or TODAY())
+        for acct in sorted(accounts):
+            cur = accounts[acct][0]
+            out.append(f"{opened} open {acct}" + (f" {cur}" if cur and
+                                                   acct.startswith(("Assets:", "Liabilities:")) else ""))
+        out.append("")
+        for day, memo, posts, meta in txns:
+            text = " ".join(memo.split()).replace("\\", "\\\\").replace('"', '\\"')
+            out.append(f'{day} * "{text}"')
+            for k, v in meta.items():
+                out.append(f'  {k}: "{v}"')
+            for acct, amount, cur in posts:
+                out.append(f"  {acct}  {ledger_amount(amount)} {cur}")
+            out.append("")
+    else:
+        def sym(cur):        # hledger: a symbol of letters only goes bare
+            return cur if cur.isalpha() else f'"{cur}"'
+        places = {}
+        for _day, _memo, posts, _meta in txns:
+            for _acct, amount, cur in posts:
+                places[cur] = max(places.get(cur, 2), len(two_decimals(amount).partition(".")[2]))
+        for cur in commodities:
+            out.append(f"commodity 1000.{'0' * places.get(cur, 2)} {sym(cur)}")
+        out.append("")
+        for acct in sorted(accounts):
+            out.append(f"account {acct}")
+        out.append("")
+        for day, memo, posts, meta in txns:
+            text = " ".join(memo.replace(";", ",").split()).lstrip("*!( ") or "-"
+            tags = ", ".join(f"{k}:{v}" for k, v in meta.items())
+            out.append(f"{day} {text}" + (f"  ; {tags}" if tags else ""))
+            for acct, amount, cur in posts:
+                out.append(f"    {acct}    {ledger_amount(amount)} {sym(cur)}")
+            out.append("")
+    return "\n".join(out).rstrip() + "\n", notes, len(txns)
+
+
+def cmd_ledger(rest=()):
+    """`ledger [hledger|beancount] [file]`: the accounts as a journal."""
+    rest = list(rest)
+    fmt = "hledger"
+    if rest and rest[0].lower() in LEDGER_FILES:
+        fmt = rest.pop(0).lower()
+    data = load_json()
+    body, notes, n = ledger_journal(data, fmt)
+    out = Path(rest[0]) if rest else LEDGER_FILES[fmt]
+    tmp = out.with_name(out.name + ".tmp")
+    tmp.write_text(body, encoding="utf-8")
+    os.replace(tmp, out)
+    for line in notes:
+        print("  " + line)
+    print(tr("{n} transaction(s) -> {name} ({fmt})", n=n, name=out.name, fmt=fmt))
+    return 0
 
 
 # ================================================================ geo
@@ -2733,7 +3347,8 @@ def haystack_res(r, data):
 
 GEO_FILE = BASE / f"{STEM}.geojson"
 GEO_COLLS = ("people", "entries", "sources", "corpus", "res")
-GEO_EXPORT = ("people", "entries", "sources", "res")      # health only when asked (--all)
+GEO_EXPORT = ("people", "entries", "sources", "res")      # health only when asked (--all),
+                                                           # and accounts too (geo_features)
 GEO_BIG = 100_000          # characters: a GEO longer than this gets a warning
 GEO_TYPES = ("Point", "MultiPoint", "LineString", "MultiLineString", "Polygon",
              "MultiPolygon", "GeometryCollection")
@@ -2879,12 +3494,15 @@ def geo_summary(text):
     return tr("{n} shapes", n=len(parts))
 
 
-def geo_features(data, colls=GEO_EXPORT):
+def geo_features(data, colls=GEO_EXPORT, accounts=False):
     """Every GEO of the base as GeoJSON Features, one per part, with the
-    record's id, register number, name, collection and kind as properties."""
+    record's id, register number, name, collection and kind as properties.
+    Accounts (res) only with `accounts`, as health only with its collection."""
     out = []
     for coll in colls:
         for r in data[coll]:
+            if coll == "res" and rtype(r) == "account" and not accounts:
+                continue
             parts, _errors = parse_geo(r.get("geo"))
             for p in parts:
                 out.append({"type": "Feature", "geometry": p["geometry"],
@@ -2901,7 +3519,7 @@ def cmd_geojson(rest=()):
     every = "--all" in rest
     rest = [a for a in rest if a != "--all"]
     data = load_json()
-    feats = geo_features(data, GEO_COLLS if every else GEO_EXPORT)
+    feats = geo_features(data, GEO_COLLS if every else GEO_EXPORT, accounts=every)
     out = Path(rest[0]) if rest else GEO_FILE
     body = ('{"type": "FeatureCollection", "features": [\n'
             + ",\n".join(json.dumps(f, ensure_ascii=False) for f in feats) + "\n]}\n")
@@ -2910,7 +3528,7 @@ def cmd_geojson(rest=()):
     os.replace(tmp, out)
     print(tr("{n} feature(s) -> {name}", n=len(feats), name=out.name))
     if not every:
-        print(tr("(health records left out; --all puts them in)"))
+        print(tr("(health records and accounts left out; --all puts them in)"))
     return 0
 
 
@@ -3952,6 +4570,54 @@ def drop_lock():
 
 # ================================================================ doctor
 
+def check_account(r, data, idx, errors, warnings):
+    """The doctor on one account: a LAST 4 that is not four digits is an error
+    (a full number must never be stored); the rest are warnings."""
+    rid = r["id"]
+    if not (r.get("name") or "").strip():
+        errors.append(tr("{id}: account without a name", id=rid))
+    if not last4_ok(r.get("last4")):
+        errors.append(tr("{id}: LAST 4 must be exactly four digits (never a full account or "
+                         "card number)", id=rid))
+    if r.get("atype") not in ACCOUNT_TYPES:
+        warnings.append(tr("{id}: unknown account type {type}", id=rid, type=repr(r.get("atype"))))
+    if not CURRENCY_RE.match(acct_currency(r)):
+        warnings.append(tr("{id}: CURRENCY is not a code (BRL, EUR, USD…): {value}", id=rid,
+                           value=r.get("currency")))
+    inst = (r.get("institution") or "").strip()
+    if inst.startswith("p_") and inst not in idx:
+        warnings.append(tr("{id}: INSTITUTION points to {ref}, which does not exist", id=rid, ref=inst))
+    opening, why = opening_problem(r)
+    if why:
+        warnings.append(tr("{id}: OPENING BALANCE is not a value ({why}): {value}", id=rid,
+                           why=tr(why), value=r.get("opening")))
+    od = str(r.get("opening_date") or "").strip()
+    if od and not (len(od) == 10 and res_date_ok(od)):
+        warnings.append(tr("{id}: {field} is not a date (2026-03-11): {value}", id=rid,
+                           field=tr("OPENING DATE"), value=od))
+    s = account_summary(r, data)
+    for n, line, why in s["bad"]:
+        warnings.append(tr("{id}: entry line {n} not read ({why}): {line}", id=rid, n=n,
+                           why=tr(why), line=one_liner(line, 60)))
+    for n, to, why, cur in s["xbad"]:
+        warnings.append(tr("{id}: entry line {n}: the transfer to {to} does not count ({why})",
+                           id=rid, n=n, to=to, why=tr(why, cur=cur)))
+    back = {}           # each account's transfers to this one: (date, amount)
+    for p in s["own"]:
+        for ref in p["refs"]:
+            if ref not in idx:
+                warnings.append(tr("{id}: entry line {n} refers to {ref}, which does not exist",
+                                   id=rid, n=p["n"], ref=ref))
+        if p["to"] and rid < p["to"]:        # each pair of accounts looked at once
+            if p["to"] not in back:
+                back[p["to"]] = {(q["date"], q["amount"]) for q in
+                                 ledger_index(data)["own"].get(p["to"], []) if q["to"] == rid}
+            if (p["date"], -p["amount"]) in back[p["to"]]:
+                warnings.append(tr("{id}: entry line {n}: the transfer to {to} is typed in both "
+                                   "accounts; keep it in one (the other half is computed)",
+                                   id=rid, n=p["n"], to=p["to"]))
+
+
 def check(data):
     idx = by_id(data)
     errors, warnings = [], []
@@ -4014,6 +4680,9 @@ def check(data):
         seen.add(r["id"])
         if (r.get("rtype") or "item") not in RES_TYPES:
             errors.append(tr("{id}: unknown type {type}", id=r["id"], type=repr(r.get("rtype"))))
+            continue
+        if rtype(r) == "account":
+            check_account(r, data, idx, errors, warnings)
             continue
         if not (r.get("name") or "").strip():
             errors.append(tr("{id}: item without a name", id=r["id"]))
@@ -4157,7 +4826,9 @@ def summary(data):
               concepts=n_c, forms=n_f, sources=len(data.get("sources", [])),
               metrics=len(data.get("corpus", [])), readings=n_r, links=len(data["edges"])) \
         + (" · " + tr("{n} drafts", n=len(data["notes"])) if data.get("notes") else "") \
-        + (" · " + tr("{n} items", n=len(data["res"])) if data.get("res") else "") \
+        + "".join(" · " + tr(label, n=n) for label, n in (
+            ("{n} items", sum(1 for r in data.get("res", []) if rtype(r) == "item")),
+            ("{n} accounts", sum(1 for r in data.get("res", []) if rtype(r) == "account"))) if n) \
         + (" · " + tr("{n} skills", n=len(data["skills"])) if data.get("skills") else "")
 
 
@@ -4405,7 +5076,7 @@ def write_mirror(data):
     for r in sorted(data.get("res", []), key=lambda x: sort_key(x.get("name", ""))):
         out.append(f"## {r.get('name', '')}")
         out.append(mirror_locus(r))
-        meta = [tr(RES_TYPE_LABEL[rtype(r)])] + res_facts(r, data)
+        meta = [tr(RES_TYPE_LABEL[rtype(r)])] + res_facts(r, data, sums=False)
         meta += ["(!) " + x for x in res_reminders(r, data)]
         if r.get("tags"):
             meta.append("tags: " + ", ".join(r["tags"]))
@@ -4422,6 +5093,16 @@ def write_mirror(data):
             for it in r["log"]:
                 out.append(f"- {it.get('date', '')} — {it.get('text', '')}")
             out.append("")
+        if rtype(r) == "account":
+            s = account_summary(r, data)
+            out += ["- " + x for x in account_report(r, data, s)] + [""]
+            if r.get("entries"):
+                out += ["```"] + [entry_line(e) for e in r["entries"]] + ["```", ""]
+            for n, line, why in s["bad"]:
+                out.append("- (!) " + tr("line {n} not read ({why}): {line}", n=n, why=tr(why),
+                                         line=line))
+            if s["bad"]:
+                out.append("")
         outgoing = edges_from(data, r["id"])
         if outgoing:
             for a in outgoing:
@@ -4470,13 +5151,15 @@ def cmd_mirror():
 #      tag:x lang:de type:book sys:renal dom:law id:c_measure
 #      is:org is:person is:geo   organizations, people who are not, records with a GEO
 #      status:lent      a form's status, or an item's (its key or its label)
+#      atype:card       an account's type (its key or its label)
 # The rest are literal terms, all required, looked up in each record's search
 # text (`_h`, made by the haystack_* functions). type: and sys: match the
 # stored key or its label in the current language.
 
 SEARCH_SCOPES = {"p:": "people", "v:": "entries", "f:": "sources",
                  "c:": "corpus", "d:": "notes", "r:": "res"}
-SEARCH_FIELDS = ("tag", "lang", "type", "sys", "dom", "id", "is", "circle", "obs", "status")
+SEARCH_FIELDS = ("tag", "lang", "type", "sys", "dom", "id", "is", "circle", "obs", "status",
+                 "atype")
 
 
 def parse_search(text):
@@ -4511,6 +5194,9 @@ def search_field_ok(r, fields, data=None):
             return False
         if k == "status" and not any(v in x.lower() for x in
                                      ((r.get("status") or ""), tr(r["status"]) if r.get("status") else "")):
+            return False
+        if k == "atype" and not any(v in x.lower() for x in
+                                    ((r.get("atype") or ""), account_type_label(r.get("atype")))):
             return False
         if k == "id" and not r.get("id", "").lower().startswith(v):
             return False
@@ -4588,6 +5274,17 @@ def list_row_text(r, data, due=None):
         else:
             sub = tr(HEALTH_TYPE_LABEL[t]) + " · " + " · ".join(health_facts(r, data))
         return r["name"], sub
+    if coll == "res" and rtype(r) == "account":
+        bits = [account_type_label(r.get("atype")), who_is(r.get("institution"), data)]
+        if r.get("last4"):
+            bits.append("…" + str(r["last4"]))
+        s = account_summary(r, data) if data is not None else None
+        if s:
+            bits.append(money(s["balance"], s["currency"]))
+        sub = " · ".join(x for x in bits if x)
+        if s and (s["bad"] or s["xbad"]):
+            sub = "(!) " + tr("{n} line(s) not read", n=len(s["bad"]) + len(s["xbad"])) + " · " + sub
+        return r.get("name", ""), sub
     if coll == "res":
         bits = [res_category_label(r.get("category")), r.get("where", ""),
                 res_status_label(r.get("status"))]
@@ -6738,7 +7435,7 @@ let OPEN_AT = 2;
 const DEFAULT_PARAMS = { xp: { estudo: 1, pratica: 3, prova: 8 },
   levels: [{ xp: 4, p: 0 }, { xp: 10, p: 1 }, { xp: 30, p: 3 }, { xp: 70, p: 6 }],
   open_at: 2, fresh: { viva: 30, morna: 90 } };
-const KIND_LABEL = { person: `@@person@@`, concept: `@@concept@@`, form: `@@form@@`, source: `@@source@@`, metric: 'corpus', note: `@@draft@@`, item: `@@item@@`, skill: `@@skill@@` };
+const KIND_LABEL = { person: `@@person@@`, concept: `@@concept@@`, form: `@@form@@`, source: `@@source@@`, metric: 'corpus', note: `@@draft@@`, item: `@@item@@`, account: `@@account@@`, skill: `@@skill@@` };
 const NAT = { fundamentado: `@@grounded@@`, adaptado: `@@adapted@@`, convencao: `@@convention@@` };
 
 let state = { skills: [], params: DEFAULT_PARAMS, domains: [], labels: {}, today: '' };
@@ -7708,12 +8405,12 @@ def drill_answer(data, key, answer=None, grade=None):
 WEB_IDLE = 120              # seconds without a request before the server stops
 WEB_ROWS = 60               # rows of the list sent at a time
 WEB_KINDS = ("person", "org", "concept", "form", "source",
-             "measure", "medication", "activity", "event", "note", "item")
+             "measure", "medication", "activity", "event", "note", "item", "account")
 # what each kind of record is called on the page
 WEB_KIND_LABEL = {"person": "person", "org": "organization", "concept": "concept", "form": "form",
                   "source": "source", "measure": "measurement", "medication": "medication",
                   "activity": "activity or habit", "event": "event", "note": "draft",
-                  "item": "item"}
+                  "item": "item", "account": "account"}
 # the strings the page's script shows, translated when the page is built
 WEB_STRINGS = (
     "People", "Verba", "Sources", "Corpus", "Drafts", "Res", "All",
@@ -7760,6 +8457,7 @@ WEB_STRINGS = (
     "Path", "How are they related?", "From", "To", "Search a record", "Tap a record in the graph",
     "Tap the record to reach.", "No chain of links joins them.", "{k} link(s) apart · {n} chain(s)",
     "Details", "Chain {i} of {n}",
+    "Add an entry", "By month", "By category", "Largest outflows", "In", "Out",
 )
 
 
@@ -7886,6 +8584,16 @@ def web_fields():
             f("warranty_until", "WARRANTY UNTIL", only=["item"], hint="2026-03-11"),
             f("serial", "SERIAL NUMBER", only=["item"]),
             f("log", "LOG", "text", only=["item"], hint="one per line:  2026-08-01   what happened"),
+            f("atype", "ACCOUNT TYPE", "choice", only=["account"],
+              opts=[[k, tr(k)] for k in ACCOUNT_TYPES]),
+            f("currency", "CURRENCY", only=["account"], hint="BRL, EUR, USD…"),
+            f("institution", "INSTITUTION  (an organization's p_…, or a name)", only=["account"]),
+            f("last4", "LAST 4", only=["account"],
+              hint="only the last four digits, to tell it apart — never the full number"),
+            f("opening", "OPENING BALANCE", only=["account"], hint="e.g. 1500,00"),
+            f("opening_date", "OPENING DATE", only=["account"], hint="2026-03-11"),
+            f("entries", "ENTRIES", "text", only=["account"],
+              hint="one per line:  2026-11-09  -45,90  market #food → r_…   (> r_… a transfer)"),
             source, geo, tags, f("notes", "NOTES", "md"), edges, links,
         ],
     }
@@ -7935,6 +8643,14 @@ def web_form(rec, data):
                    status=rec.get("status") or "", log=format_log(rec.get("log")))
         for k in ("where", "status_since", "bought", "price", "warranty_until", "serial"):
             out[k] = str(rec.get(k, "") or "")
+        if rtype(rec) == "account":
+            op = opening_of(rec)
+            out.update(atype=rec.get("atype") or "", currency=rec.get("currency") or "",
+                       institution=rec.get("institution") or "", last4=str(rec.get("last4") or ""),
+                       opening=amount_typed(op, signed=False) if op is not None
+                       else str(rec.get("opening") or ""),
+                       opening_date=rec.get("opening_date") or "",
+                       entries=format_entries(rec.get("entries")))
     else:
         got = read_note_file(note_path(rec)) if rec.get("file") else None
         meta = got[1] if got else {}
@@ -8037,16 +8753,27 @@ def web_gather(coll, old, form):
     elif coll == "res":
         if text("rtype") in RES_TYPES:
             out["rtype"] = text("rtype")
-        put("category", res_category_key(text("category")))
-        if has("qty"):
-            out["qty"] = res_qty(text("qty"))
-        for k in ("where", "status_since", "bought", "price", "warranty_until", "serial", "source"):
-            put(k, text(k).strip())
-        if has("status"):
-            out["status"] = text("status") if text("status") in RES_STATUSES \
-                else (old.get("status") or "in use")
+        put("source", text("source").strip())
         put("notes", text("notes").strip())
-        put("log", parse_log(text("log")))
+        if rtype(out) == "account":         # a new record's form carries every field, empty
+            if has("atype"):
+                out["atype"] = text("atype") if text("atype") in ACCOUNT_TYPES \
+                    else (old.get("atype") or "checking")
+            put("currency", text("currency").strip().upper() or ACCOUNT_CURRENCY)
+            for k in ("institution", "last4", "opening_date"):
+                put(k, text(k).strip())
+            put("opening", account_opening(text("opening")))
+            put("entries", parse_entries(text("entries")))
+        else:
+            put("category", res_category_key(text("category")))
+            if has("qty"):
+                out["qty"] = res_qty(text("qty"))
+            for k in ("where", "status_since", "bought", "price", "warranty_until", "serial"):
+                put(k, text(k).strip())
+            if has("status"):
+                out["status"] = text("status") if text("status") in RES_STATUSES \
+                    else (old.get("status") or "in use")
+            put("log", parse_log(text("log")))
     else:
         if has("name"):
             out["name"] = " ".join(text("name").split())
@@ -8103,7 +8830,10 @@ def web_save(body):
                              "sources": "A source needs a name.",
                              "corpus": "A measurement needs a name.",
                              "notes": "A draft needs a title.",
-                             "res": "An item needs a name."}[coll]))
+                             "res": "An account needs a name." if rtype(out) == "account"
+                             else "An item needs a name."}[coll]))
+    if coll == "res" and not last4_ok(out.get("last4")):
+        raise ValueError(tr("LAST 4 takes only the last four digits — never the full number."))
     taken = set(by_id(data))
     message = ""
     inverse = []
@@ -8272,6 +9002,26 @@ def record_skills(data, rid):
     return sorted(out, key=lambda x: sort_key(x["name"]))
 
 
+def web_ledger(rec, data):
+    """An account's entries and sums, ready to show: every line (its own, the
+    transfers it receives, those that do not read), newest last, the months,
+    the categories and the largest outflows."""
+    s = account_summary(rec, data)
+    rows = [{"date": p["date"], "amount": money(p["amount"], plus=True), "text": p["text"],
+             "n": p["n"]} for p in s["own"]]
+    rows += [{"date": p["date"], "amount": money(p["amount"], plus=True), "n": 0,
+              "text": tr("from {name}", name=account_name(p["came"], data))
+              + (" — " + entry_memo(p["text"]) if entry_memo(p["text"]) else "")}
+             for p in s["incoming"]]
+    rows.sort(key=lambda x: x["date"])
+    rows += [{"date": "", "amount": "(!)", "text": f"{line}  ({tr(why)})", "n": n, "bad": True}
+             for n, line, why in s["bad"]]
+    return {"currency": s["currency"], "rows": rows,
+            "months": [[k, money(i, plus=True), money(o)] for k, i, o in s["months"]],
+            "cats": [[("#" + k) if k else tr("(none)"), money(v, plus=True)] for k, v in s["cats"]],
+            "largest": [[p["date"], money(p["amount"]), entry_memo(p["text"])] for p in s["largest"]]}
+
+
 def web_record(data, rid):
     """Everything the page shows of one record, or None."""
     idx = by_id(data)
@@ -8321,6 +9071,9 @@ def web_record(data, rid):
         out["readings"] = [dict(r, status=reading_status(rec, r.get("value")))
                            for r in rec.get("readings", [])]
         out["sessions"] = rec.get("sessions", [])
+    elif coll == "res" and rtype(rec) == "account":
+        out["facts"] = res_facts(rec, data)
+        out["ledger"] = web_ledger(rec, data)
     elif coll == "res":
         out["facts"] = ["(!) " + x for x in res_reminders(rec, data)]
         out["log"] = rec.get("log", [])
@@ -8524,7 +9277,7 @@ def web_boot(token, auth=False, data=None):
             "new": [["people", "person"], ["people", "org"], ["entries", "concept"], ["entries", "form"],
                     ["sources", "source"], ["corpus", "measure"], ["corpus", "medication"],
                     ["corpus", "activity"], ["corpus", "event"], ["notes", "note"],
-                    ["res", "item"]],
+                    ["res", "item"], ["res", "account"]],
             "linkColours": LINK_FAMILY_COLOUR,
             "circles": [[c, tr(c)] for c in CIRCLES],
             "observator": web_observator(data if data is not None else load_json()),
@@ -10323,6 +11076,21 @@ function readingsHtml(r) {
   return svg + `<table class="readings">${rows}</table>` +
     (rs.length > 12 && !S.all.readings ? `<button class="btn quiet" data-act="all" data-k="readings">${esc(T("show all {n}", {n: rs.length}))}</button>` : "");
 }
+/* an account's entries, newest first, with the transfers it receives
+   (computed on the server, never stored here) and its sums */
+function ledgerHtml(r) {
+  const L = r.ledger, all = (L.rows || []).slice().reverse();
+  const rows = S.all.entries ? all : all.slice(0, 12);
+  const table = (head, body) => `<table class="readings">` + (head ? `<tr>${head.map(h => `<td>${esc(h)}</td>`).join("")}</tr>` : "") +
+    body.map(c => `<tr>${c.map((x, i) => `<td${i === 1 ? ' class="v"' : ""}>${esc(x)}</td>`).join("")}</tr>`).join("") + `</table>`;
+  let h = table(null, rows.map(x => [x.date, x.amount, x.text]));
+  if (all.length > rows.length) h += `<button class="btn quiet" data-act="all" data-k="entries">${esc(T("show all {n}", {n: all.length}))}</button>`;
+  if ((L.months || []).length) h += `<span class="lbl">${esc(T("By month"))}</span>` +
+    table(["", T("In"), T("Out")], L.months.slice().reverse().slice(0, 12));
+  if ((L.cats || []).length) h += `<span class="lbl">${esc(T("By category"))}</span>` + table(null, L.cats.map(c => ["", c[1], c[0]]));
+  if ((L.largest || []).length) h += `<span class="lbl">${esc(T("Largest outflows"))}</span>` + table(null, L.largest);
+  return h;
+}
 function goItem(a, relFirst) {
   const label = `<span class="${a.missing ? "missing" : ""}">${esc(a.title)}</span>`;
   const rel = `<span class="rel">${esc(a.rel)}</span>`;
@@ -10344,7 +11112,8 @@ function renderRecord(changed) {
   out.push(`<div class="kicker">${esc(kicker)} · ${obs}</div><h1 class="title${ch.has("name") ? " changed" : ""}">${esc(r.title)}</h1>`);
   if (r.facts && r.facts.length) out.push(`<div class="sub">${esc(r.facts.join(" · "))}</div>`);
   const quick = {person: ["interactions", "Add to the log"], org: ["interactions", "Add to the log"],
-                 item: ["log", "Add to the log"], measure: ["readings", "Add a reading"],
+                 item: ["log", "Add to the log"], account: ["entries", "Add an entry"],
+                 measure: ["readings", "Add a reading"],
                  activity: ["sessions", "Add a session"]}[r.kind];
   if (quick) out.push(`<form class="quick" data-quick="${quick[0]}"><input class="f" name="line" autocomplete="off" ` +
     `enterkeyhint="done" placeholder="${esc(T(quick[1]))}"><button class="btn primary">${esc(T("Add"))}</button></form>`);
@@ -10358,6 +11127,7 @@ function renderRecord(changed) {
       if (v && v.length) { flush(); put(sec(label, `<div class="chips">${v.map(c => `<span class="chip">${esc(optLabel(fd, c))}</span>`).join("")}</div>`)); }
       continue;
     }
+    if (fd.k === "entries" && r.ledger) { flush(); put(sec(label, ledgerHtml(r))); continue; }
     if (v == null || v === "") continue;
     const linked = fd.k === "source" && r.source && r.source.id;
     if ((fd.w === "line" || fd.w === "choice" || fd.w === "suggest") && !linked && !["tags", "domains"].includes(fd.k) && String(v).length <= 48) {
@@ -10470,7 +11240,11 @@ function startNew(coll, kind) {
   for (const fd of BOOT.fields[coll]) form[fd.k] = fd.w === "circles" ? [] : "";
   if (coll === "sources") form.type = "outro";
   if (coll === "corpus") form.ctype = kind;
-  if (coll === "res") { form.rtype = kind; if (kind === "item") { form.status = "in use"; form.qty = "1"; } }
+  if (coll === "res") {
+    form.rtype = kind;
+    if (kind === "item") { form.status = "in use"; form.qty = "1"; }
+    if (kind === "account") { form.atype = "checking"; form.currency = "BRL"; }
+  }
   if (coll === "entries") form.status = "attested";
   if (coll === "people") form.org = kind === "org" ? "org" : "";
   const q = S.q.trim();
@@ -13992,19 +14766,26 @@ class MetricCard:
         self.app.save()
 
 
-class ItemCard:
-    """The card of a thing (res, an item): where it is, its state, when it was
-    bought, its warranty, and a LOG of what happened to it. Laid out as the
-    health card; the reminders (a warranty ending, a long loan) show in red
-    under the dates."""
+class ResCard:
+    """The card of a thing (res). Its fields follow the record's type, chosen
+    when the record is made (File › New item, New account): an ITEM -- where
+    it is, its state, when it was bought, its warranty, a LOG of what happened
+    to it, with the reminders (a warranty ending, a long loan) in red under
+    the dates -- or an ACCOUNT -- its type, currency, institution, last four
+    digits, opening balance and ENTRIES, one per line, with the sums under
+    them worked out from what is typed. Laid out as the health card, one block
+    per type."""
 
     small = MetricCard.small
     combo = MetricCard.combo
+    LEDGER_DELAY = 250          # ms after the last key before the sums are worked out again
 
     def __init__(self, app, parent):
         self.app = app
         self.frame = tk.Frame(parent, bg=PAPER)
         self.in_ids, self.out_ids = [], []
+        self.rtype = "item"
+        self._ledger_job = None
         self.build()
 
     def build(self):
@@ -14034,7 +14815,13 @@ class ItemCard:
         self.stamp.pack(side="right")
         tk.Frame(c, bg=STAMP, height=2).pack(fill="x", pady=(6, 0), **pad)
 
-        row = tk.Frame(c, bg=PAPER)
+        # one block of fields per type, as on the health card
+        self.typebox = tk.Frame(c, bg=PAPER)
+        self.typebox.pack(fill="x")
+        self.blocks = {t: tk.Frame(self.typebox, bg=PAPER) for t in RES_TYPES}
+
+        b = self.blocks["item"]
+        row = tk.Frame(b, bg=PAPER)
         row.pack(fill="x", **pad)
         self.v_cat = tk.StringVar()
         self.e_cat = self.combo(row, tr("CATEGORY"), self.v_cat,
@@ -14046,16 +14833,59 @@ class ItemCard:
         self.e_status.bind("<<ComboboxSelected>>", self.status_changed)
         self.e_since = self.small(row, tr("SINCE"), 11)
         self.e_qty = self.small(row, tr("QTY"), 5)
-        self.e_where = app.field(c, tr("WHERE  (home › office › shelf 2)"), app.f_body, pad)
-        row = tk.Frame(c, bg=PAPER)
+        self.e_where = app.field(b, tr("WHERE  (home › office › shelf 2)"), app.f_body, pad)
+        row = tk.Frame(b, bg=PAPER)
         row.pack(fill="x", **pad)
         self.e_bought = self.small(row, tr("BOUGHT"), 11)
         self.e_price = self.small(row, tr("PRICE  (e.g. 1290,00 BRL)"), 14)
         self.e_warranty = self.small(row, tr("WARRANTY UNTIL"), 11)
-        self.e_serial = app.field(c, tr("SERIAL NUMBER"), app.f_meta, pad)
-        self.due = tk.Label(c, text="", bg=PAPER, fg=OXIDE, font=app.f_meta, anchor="w",
+        self.e_serial = app.field(b, tr("SERIAL NUMBER"), app.f_meta, pad)
+        self.due = tk.Label(b, text="", bg=PAPER, fg=OXIDE, font=app.f_meta, anchor="w",
                             justify="left")
         self.due.pack(fill="x", pady=(4, 0), **pad)
+
+        b = self.blocks["account"]
+        row = tk.Frame(b, bg=PAPER)
+        row.pack(fill="x", **pad)
+        self.v_atype = tk.StringVar()
+        self.atype_of = {tr(k): k for k in ACCOUNT_TYPES}
+        self.e_atype = self.combo(row, tr("ACCOUNT TYPE"), self.v_atype, list(self.atype_of), 12, True)
+        self.e_atype.bind("<<ComboboxSelected>>", self.atype_changed)
+        self.e_currency = self.small(row, tr("CURRENCY"), 6)
+        self.e_last4 = self.small(row, tr("LAST 4"), 6)
+        self.e_inst = app.field(b, tr("INSTITUTION  (an organization's p_…, or a name)"),
+                                app.f_meta, pad)
+        row = tk.Frame(b, bg=PAPER)
+        row.pack(fill="x", **pad)
+        self.e_opening = self.small(row, tr("OPENING BALANCE"), 14)
+        self.e_opening_date = self.small(row, tr("OPENING DATE"), 11)
+        # the ENTRIES, as the LOG: read in pages, newest last
+        ent_row = tk.Frame(b, bg=PAPER)
+        ent_row.pack(fill="x", pady=(6, 2), **pad)
+        ent_label = tk.Label(ent_row, text=tr("ENTRIES  (2026-11-09  -45,90  market #food → r_…   "
+                                              "> r_… a transfer)"),
+                             bg=PAPER, fg=FAINT, font=app.f_label, anchor="w")
+        ent_label.pack(side="left")
+        self.t_entries = tk.Text(b, height=3, width=1, font=app.f_meta, bg=PAPER, fg=INK,
+                                 relief="flat", wrap="word", insertbackground=INK,
+                                 highlightthickness=0, padx=0, spacing1=1, spacing3=3,
+                                 undo=True, autoseparators=True, maxundo=-1)
+        app.block_caret(self.t_entries, app.f_meta)
+        app.bind_undo(self.t_entries, text=True)
+        self.t_entries.pack(fill="x", **pad)
+        self.entry_pages = FieldPages(app, self.t_entries, ent_row)
+        app.autogrow(self.t_entries, minrows=3, tail=True, pages=self.entry_pages)
+        app.readable(ent_label, self.t_entries, tr("ENTRIES"))
+        tk.Frame(b, bg=RULE, height=1).pack(fill="x", pady=(4, 0), **pad)
+        self.ledger_hint = tk.Label(b, text="", bg=PAPER, fg=OXIDE, font=app.f_label,
+                                    anchor="w", justify="left")
+        self.ledger_hint.pack(fill="x", **pad)
+        self.ledger_sum = tk.Label(b, text="", bg=PAPER, fg=SOFT, font=app.f_meta, anchor="w",
+                                   justify="left")
+        self.ledger_sum.pack(fill="x", pady=(2, 0), **pad)
+        for lbl in (self.ledger_hint, self.ledger_sum):
+            lbl.bind("<Configure>", lambda e: e.widget.configure(wraplength=max(200, e.width)))
+        self.e_entry = MetricCard.add_row(self, b, tr("+ entry"), self.add_entry, pad)
 
         self.e_source = app.source_field(c, pad)
         self.t_geo = app.geo_field(c, pad)
@@ -14081,13 +14911,16 @@ class ItemCard:
         self.inbox = app.listbox(c, pad)
         self.inbox.bind("<Double-Button-1>", lambda e: app.jump(self.inbox, self.in_ids))
 
-        # the LOG, as on a person's card: dated lines, read in pages, newest last
-        log_row = tk.Frame(c, bg=PAPER)
+        # an item's LOG, as on a person's card: dated lines, read in pages, newest last
+        self.tail = tk.Frame(c, bg=PAPER)
+        self.tail.pack(fill="x")
+        self.logbox = tk.Frame(self.tail, bg=PAPER)
+        log_row = tk.Frame(self.logbox, bg=PAPER)
         log_row.pack(fill="x", pady=(6, 2), **pad)
         log_label = tk.Label(log_row, text="LOG", bg=PAPER, fg=FAINT, font=app.f_label,
                              anchor="w")
         log_label.pack(side="left")
-        self.t_log = tk.Text(c, height=2, width=1, font=app.f_meta, bg=PAPER, fg=INK,
+        self.t_log = tk.Text(self.logbox, height=2, width=1, font=app.f_meta, bg=PAPER, fg=INK,
                              relief="flat", wrap="word", insertbackground=INK,
                              highlightthickness=0, padx=0, spacing1=1, spacing3=3,
                              undo=True, autoseparators=True, maxundo=-1)
@@ -14097,20 +14930,36 @@ class ItemCard:
         self.log_pages = FieldPages(app, self.t_log, log_row)
         app.autogrow(self.t_log, minrows=2, tail=True, pages=self.log_pages)
         app.readable(log_label, self.t_log, "LOG")
-        self.e_log = MetricCard.add_row(self, c, "+ log", self.add_log, pad)
+        self.e_log = MetricCard.add_row(self, self.logbox, "+ log", self.add_log, pad)
         self.t_links = app.textfield(c, tr("URLS"), 2, app.f_meta, pad)
         tk.Frame(c, bg=PAPER, height=12).pack(fill="x")
 
         self.entries = [self.e_name, self.e_since, self.e_qty, self.e_where, self.e_bought,
                         self.e_price, self.e_warranty, self.e_serial, self.e_source,
-                        self.e_tags, self.e_log]
-        self.texts = [self.t_notes, self.t_edges, self.t_log, self.t_links, self.t_geo]
+                        self.e_tags, self.e_log, self.e_currency, self.e_last4, self.e_inst,
+                        self.e_opening, self.e_opening_date, self.e_entry]
+        self.texts = [self.t_notes, self.t_edges, self.t_log, self.t_links, self.t_geo,
+                      self.t_entries]
         app.bind_undo(self.e_name)
         for w in self.entries + self.texts + [self.e_cat]:
             for ev in ("<KeyRelease>", "<<Paste>>", "<<Cut>>"):
                 w.bind(ev, app.mark_dirty, add="+")
         for w in (self.e_since, self.e_warranty):
             w.bind("<KeyRelease>", lambda e: self.refresh_due(), add="+")
+        for w in (self.t_entries, self.e_opening, self.e_opening_date, self.e_currency,
+                  self.e_last4):
+            for ev in ("<KeyRelease>", "<<Paste>>", "<<Cut>>"):
+                w.bind(ev, lambda e: self.ledger_soon(), add="+")
+        self.apply_type()
+
+    def apply_type(self):
+        for f in self.blocks.values():
+            f.pack_forget()
+        self.blocks[self.rtype].pack(fill="x")
+        if self.rtype == "item":
+            self.logbox.pack(fill="x")
+        else:
+            self.logbox.pack_forget()
 
     def status_key(self):
         # a status the drop-down does not know (typed by hand, or by a newer
@@ -14119,12 +14968,24 @@ class ItemCard:
         return self.status_of.get(label, self.kept_status if label == self.kept_status_label
                                   else "in use")
 
+    def atype_key(self):
+        label = self.v_atype.get()
+        return self.atype_of.get(label, self.kept_atype if label == self.kept_atype_label
+                                 else "checking")
+
     def status_changed(self, _e=None):
         self.app.mark_dirty()
         self.refresh_due()
 
+    def atype_changed(self, _e=None):
+        self.app.mark_dirty()
+        self.refresh_ledger()
+
     def refresh_due(self):
         """The reminders, from what the fields hold now."""
+        if self.rtype != "item":
+            self.due.configure(text="")
+            return
         rec = {"id": self.app.sel or "r_", "rtype": "item", "status": self.status_key(),
                "status_since": self.e_since.get().strip(),
                "warranty_until": self.e_warranty.get().strip()}
@@ -14133,48 +14994,108 @@ class ItemCard:
         due = res_reminders(rec, self.app.data)
         self.due.configure(text="  ·  ".join("(!) " + x for x in due))
 
+    def ledger_soon(self):
+        if self._ledger_job:
+            self.app.root.after_cancel(self._ledger_job)
+        self._ledger_job = self.app.root.after(self.LEDGER_DELAY, self.refresh_ledger)
+
+    def refresh_ledger(self, saved=None):
+        """The sums and the lines that do not read, from what the fields hold
+        now (the transfers coming in are the base's, as saved). `saved`, the
+        record as stored, when the card opens: its sums come from the base's
+        index, without reading the lines again."""
+        self._ledger_job = None
+        if self.rtype != "account":
+            return
+        app = self.app
+        rec = saved or {"id": app.sel or "", "rtype": "account", "atype": self.atype_key(),
+                        "currency": self.e_currency.get().strip().upper() or ACCOUNT_CURRENCY,
+                        "opening": account_opening(self.e_opening.get()),
+                        "opening_date": self.e_opening_date.get().strip()}
+        s = account_summary(rec, app.data, entries=None if saved else
+                            parse_entries(self.t_entries.get("1.0", "end-1c")))
+        hints = []
+        if not last4_ok(self.e_last4.get()):
+            hints.append("(!) " + tr("LAST 4 takes only the last four digits — never the full number."))
+        _op, why = opening_problem(rec)
+        if why:
+            hints.append("(!) " + tr("OPENING BALANCE is not a value ({why}): {value}", why=tr(why),
+                                     value=rec["opening"]))
+        for n, line, why in s["bad"][:3]:
+            hints.append("(!) " + tr("line {n} not read ({why}): {line}", n=n, why=tr(why),
+                                     line=one_liner(line, 50)))
+        for n, to, why, cur in s["xbad"][:3]:
+            hints.append("(!) " + tr("line {n}: the transfer to {to} does not count ({why})",
+                                     n=n, to=to, why=tr(why, cur=cur)))
+        more = len(s["bad"]) + len(s["xbad"]) - min(3, len(s["bad"])) - min(3, len(s["xbad"]))
+        if more > 0:
+            hints.append("(!) " + tr("and {n} more (python _kustos.py doctor)", n=more))
+        self.ledger_hint.configure(text="\n".join(hints))
+        self.ledger_sum.configure(text="\n".join(account_report(rec, app.data, s)))
+
     def enable(self, on):
         state = "normal" if on else "disabled"
         for w in self.entries + self.texts:
             w.configure(state=state)
         self.e_cat.configure(state="normal" if on else "disabled")
-        self.e_status.configure(state="readonly" if on else "disabled")
+        for box in (self.e_status, self.e_atype):
+            box.configure(state="readonly" if on else "disabled")
 
     def clear(self):
         for w in self.entries:
             w.delete(0, "end")
         for t in self.texts:
             t.delete("1.0", "end")
-        self.v_cat.set("")
-        self.v_status.set("")
+        for v in (self.v_cat, self.v_status, self.v_atype):
+            v.set("")
         self.outbox.delete(0, "end")
         self.inbox.delete(0, "end")
         self.app.update_geo_hint(self.t_geo)
         self.app.update_source_hint(self.e_source)
-        self.due.configure(text="")
-        self.stamp.configure(text="")
-        self.msg.configure(text="")
+        for lbl in (self.due, self.ledger_hint, self.ledger_sum, self.stamp, self.msg):
+            lbl.configure(text="")
 
     def open(self, r):
         self.enable(True)
+        if rtype(r) != self.rtype:
+            # the other block comes up empty and is laid out before it is filled:
+            # a Text measured before it has its width wraps at every letter,
+            # which made a long ENTRIES take seconds to open
+            self.t_entries.delete("1.0", "end")
+            self.t_log.delete("1.0", "end")
+            self.rtype = rtype(r)
+            self.apply_type()
+            self.typebox.update_idletasks()
+        op = opening_of(r)
         for w, value in ((self.e_name, r.get("name", "")), (self.e_since, r.get("status_since", "")),
                          (self.e_qty, res_qty_text(r.get("qty"))), (self.e_where, r.get("where", "")),
                          (self.e_bought, r.get("bought", "")), (self.e_price, r.get("price", "")),
                          (self.e_warranty, r.get("warranty_until", "")),
                          (self.e_serial, r.get("serial", "")), (self.e_source, r.get("source", "")),
-                         (self.e_tags, ", ".join(r.get("tags", [])))):
+                         (self.e_tags, ", ".join(r.get("tags", []))),
+                         (self.e_currency, r.get("currency", "")), (self.e_last4, r.get("last4", "")),
+                         (self.e_inst, r.get("institution", "")),
+                         (self.e_opening, amount_typed(op, signed=False) if op is not None
+                          else r.get("opening", "")),
+                         (self.e_opening_date, r.get("opening_date", ""))):
             w.delete(0, "end")
             w.insert(0, str(value or ""))
         self.e_log.delete(0, "end")
+        self.e_entry.delete(0, "end")
         self.app.update_source_hint(self.e_source)
         self.v_cat.set(res_category_label(r.get("category")))
         self.kept_status = r.get("status") or ""
         self.kept_status_label = res_status_label(self.kept_status)
         self.v_status.set(self.kept_status_label)
+        self.kept_atype = r.get("atype") or ""
+        self.kept_atype_label = account_type_label(self.kept_atype)
+        self.v_atype.set(self.kept_atype_label)
         self.t_notes.delete("1.0", "end")
         self.t_notes.insert("1.0", r.get("notes", ""))
         self.t_log.delete("1.0", "end")
         self.t_log.insert("1.0", format_log(r.get("log", [])))
+        self.t_entries.delete("1.0", "end")
+        self.t_entries.insert("1.0", format_entries(r.get("entries", [])))
         self.app.geo_put(self.t_geo, r.get("geo", ""))
         self.t_links.delete("1.0", "end")
         self.t_links.insert("1.0", "\n".join(r.get("links", [])))
@@ -14188,31 +15109,49 @@ class ItemCard:
         self.msg.configure(text="")
         self.refresh_neighbours(r["id"])
         self.refresh_due()
+        if self._ledger_job:
+            self.app.root.after_cancel(self._ledger_job)
+        self.refresh_ledger(saved=r if rtype(r) == "account" else None)
 
     refresh_neighbours = MetricCard.refresh_neighbours
 
     def gather(self, r):
+        """The record as the card holds it: the common fields and those of its
+        type only."""
         out = {k: v for k, v in r.items() if not k.startswith("_")}
         out.update({
             "rtype": rtype(r),
             "name": self.e_name.get().strip(),
-            "category": res_category_key(self.v_cat.get()),
-            "qty": res_qty(self.e_qty.get()),
-            "where": self.e_where.get().strip(),
-            "status": self.status_key(),
-            "status_since": self.e_since.get().strip(),
-            "bought": self.e_bought.get().strip(),
-            "price": self.e_price.get().strip(),
-            "warranty_until": self.e_warranty.get().strip(),
-            "serial": self.e_serial.get().strip(),
             "source": self.e_source.get().strip(),
             "geo": self.t_geo.get("1.0", "end-1c").strip(),
             "tags": [t.strip() for t in self.e_tags.get().split(",") if t.strip()],
             "notes": self.t_notes.get("1.0", "end-1c").strip(),
-            "log": parse_log(self.t_log.get("1.0", "end-1c")),
             "links": [l.strip() for l in self.t_links.get("1.0", "end-1c").splitlines()
                       if l.strip()],
         })
+        if out["rtype"] == "account":
+            out.update({
+                "atype": self.atype_key(),
+                "currency": self.e_currency.get().strip().upper() or ACCOUNT_CURRENCY,
+                "institution": self.e_inst.get().strip(),
+                "last4": self.e_last4.get().strip(),
+                "opening": account_opening(self.e_opening.get()),
+                "opening_date": self.e_opening_date.get().strip(),
+                "entries": parse_entries(self.t_entries.get("1.0", "end-1c")),
+            })
+        else:
+            out.update({
+                "category": res_category_key(self.v_cat.get()),
+                "qty": res_qty(self.e_qty.get()),
+                "where": self.e_where.get().strip(),
+                "status": self.status_key(),
+                "status_since": self.e_since.get().strip(),
+                "bought": self.e_bought.get().strip(),
+                "price": self.e_price.get().strip(),
+                "warranty_until": self.e_warranty.get().strip(),
+                "serial": self.e_serial.get().strip(),
+                "log": parse_log(self.t_log.get("1.0", "end-1c")),
+            })
         return out
 
     def edges_text(self):
@@ -14227,6 +15166,22 @@ class ItemCard:
         self.t_log.delete("1.0", "end")
         self.t_log.insert("1.0", (existing + "\n" + line) if existing else line)
         self.e_log.delete(0, "end")
+        self.app.mark_dirty()
+        self.app.refit_card()
+        self.app.save()
+
+    def add_entry(self):
+        """+ entry: the line goes at the end of ENTRIES (with today's date when
+        it has none) and the account is saved."""
+        text = self.e_entry.get().strip()
+        if not self.app.current() or not text:
+            return
+        m = ENTRY_RE.match(text)
+        line = text if m and m.group(1) else f"{TODAY()}  {text}"
+        t = self.t_entries
+        last = t.get("end-2c", "end-1c")
+        t.insert("end", ("\n" if last and last != "\n" else "") + line)
+        self.e_entry.delete(0, "end")
         self.app.mark_dirty()
         self.app.refit_card()
         self.app.save()
@@ -14382,7 +15337,13 @@ HELP_RES = (
     "\n                  r: in the search, Ctrl+6 the scope, status:lent finds by status."
     "\n                  Links: lent_to p_…, bought_from (an organization), manual_in s_…,"
     "\n                  kept_in r_…. A warranty ending within 30 days and a loan older"
-    "\n                  than 60 days show with (!) and under THINGS in the rail.\n"
+    "\n                  than 60 days show with (!) and under THINGS in the rail."
+    "\n  ACCOUNTS (res): File › New account. ENTRIES, one per line:"
+    "\n                  2026-11-09  -45,90  market #food → r_…   (+ in, - out)"
+    "\n                  > r_… makes it a transfer: its other half shows in that account."
+    "\n                  LAST 4 takes only four digits, never a full number. atype:card"
+    "\n                  finds by type; paid_from links an item to the account that paid."
+    "\n                  python _kustos.py ledger [beancount] writes a journal.\n"
 )
 
 
@@ -15433,9 +16394,9 @@ class App:
         self.sc = SourceCard(self, self.deck)
         self.mc = MetricCard(self, self.deck)
         self.nc = NoteCard(self, self.deck)
-        self.rc = ItemCard(self, self.deck)
+        self.rc = ResCard(self, self.deck)
         self.cards = {"person": self.pc, "entry": self.vc, "source": self.sc,
-                      "metric": self.mc, "note": self.nc, "item": self.rc}
+                      "metric": self.mc, "note": self.nc, "res": self.rc}
         self.front = None
         self.reader = Reader(self)
         for card in self.cards.values():
@@ -15841,6 +16802,7 @@ class App:
         f.add_command(label=tr("New source"), command=self.new_source)
         f.add_command(label=tr("New health record (corpus)"), command=self.new_metric)
         f.add_command(label=tr("New item (res)"), command=self.new_item)
+        f.add_command(label=tr("New account (res)"), command=self.new_account)
         f.add_command(label=tr("Bulk entries…"), accelerator="Ctrl+Q", command=self.bulk_add)
         f.add_separator()
         f.add_command(label=tr("Save"), accelerator="Ctrl+S", command=self.save)
@@ -16906,7 +17868,7 @@ class App:
 
     def rec_kind(self, rec):
         return {"people": "person", "entries": "entry", "sources": "source",
-                "corpus": "metric", "notes": "note", "res": "item"}[coll_of((rec or {}).get("id", ""))]
+                "corpus": "metric", "notes": "note", "res": "res"}[coll_of((rec or {}).get("id", ""))]
 
     def refresh_list_soon(self):
         """The list redraws 150 ms after the last keystroke, not on every one."""
@@ -16987,7 +17949,10 @@ class App:
             for r in base["res"]:
                 if self.view_rstatus == "due" and not res_reminders(r):
                     continue
-                if self.view_rstatus not in (None, "due") and r.get("status") != self.view_rstatus:
+                if self.view_rstatus == "accounts" and rtype(r) != "account":
+                    continue
+                if self.view_rstatus not in (None, "due", "accounts") and \
+                        (rtype(r) != "item" or r.get("status") != self.view_rstatus):
                     continue
                 out.append(r)
         out.sort(key=lambda r: sort_key(label_any(r, self.data) if coll_of(r["id"]) == "sources"
@@ -17215,11 +18180,15 @@ class App:
             due = sum(1 for r in things if res_reminders(r))
             item("r:due", "! " + tr("need attention"), due, self.view_rstatus == "due",
                  ("late",) if due else ())
-            present = {r.get("status") for r in data["res"]}
+            present = {r.get("status") for r in data["res"] if rtype(r) == "item"}
             for st in RES_STATUSES:
                 if st in present:
-                    item("r:" + st, "  " + tr(st), sum(1 for r in things if r.get("status") == st),
+                    item("r:" + st, "  " + tr(st), sum(1 for r in things if rtype(r) == "item"
+                                                     and r.get("status") == st),
                          self.view_rstatus == st)
+            accounts = sum(1 for r in things if rtype(r) == "account")
+            if accounts:
+                item("r:accounts", "  " + tr("accounts"), accounts, self.view_rstatus == "accounts")
         self.apply_rail(out)
 
     def apply_rail(self, rows):
@@ -17264,7 +18233,7 @@ class App:
         if attr == "view_system":
             return system_label(value) or tr("(no system)")
         if attr == "view_rstatus":
-            return tr("need attention") if value == "due" else tr(value)
+            return {"due": tr("need attention"), "accounts": tr("accounts")}.get(value, tr(value))
         return value
 
     def drop_filter(self, attr):
@@ -17795,6 +18764,17 @@ class App:
         self.rc.e_name.focus_set()
         self.say(tr("New item. The id is generated when saved with a name."))
 
+    def new_account(self):
+        self.clear_drafts()
+        self.draft = fix_res({"id": "__draft_r__", "rtype": "account", "name": self.q.get().strip(),
+                              "updated": None})
+        self.draft["_h"] = ""
+        self.data["res"].append(self.draft)
+        self.refresh_list()
+        self.open_record("__draft_r__")
+        self.rc.e_name.focus_set()
+        self.say(tr("New account. The id is generated when saved with a name."))
+
     def new_note(self):
         self.clear_drafts()
         self.draft = fix_note({"id": "__draft_n__", "name": self.q.get().strip(),
@@ -18008,7 +18988,24 @@ class App:
                                            tr("A source needs a name."))
             elif kind == "note":
                 new_id = self._save_note(rec, auto)
-            elif kind == "item":
+            elif kind == "res" and rtype(rec) == "account":
+                last4 = self.rc.e_last4.get().strip()
+                if not last4_ok(last4):
+                    if not auto:
+                        self.flash(tr("LAST 4 takes only the last four digits — never the full number."))
+                        return None
+                    # saving by itself: the rest is saved, LAST 4 stays as it was
+                    kept = str(rec.get("last4") or "").strip()
+                    self.rc.e_last4.delete(0, "end")
+                    if last4_ok(kept):
+                        self.rc.e_last4.insert(0, kept)
+                    self.say(tr("LAST 4 was not changed: it takes only the last four digits."))
+                # a line read again (a date given, a value rewritten) shows as saved
+                typed = self.rc.t_entries.get("1.0", "end-1c")
+                self._reshaped = format_entries(parse_entries(typed)) != typed.strip()
+                new_id = self._save_linked("res", self.rc, rec, auto, new_res_id,
+                                           tr("An account needs a name."))
+            elif kind == "res":
                 # a new status gets its date on saving: the card shows it again
                 self._reshaped = self.rc.status_key() != rec.get("status")
                 new_id = self._save_linked("res", self.rc, rec, auto, new_res_id,
@@ -18113,7 +19110,8 @@ class App:
         ekind = (rec or {}).get("kind", "concept")
         if self.save() is not None:
             {"person": self.new_person, "source": self.new_source,
-             "metric": self.new_metric, "note": self.new_note, "item": self.new_item,
+             "metric": self.new_metric, "note": self.new_note,
+             "res": self.new_account if rtype(rec) == "account" else self.new_item,
              "entry": lambda: self.new_entry(ekind)}[kind]()
 
     def delete(self):
@@ -18158,6 +19156,7 @@ class App:
         "health": ("+ health", "New health record", "NAME", "NOTES"),
         "draft": ("+ draft", "New draft", "TITLE", "TEXT  (markdown)"),
         "item": ("+ item", "New item", "NAME", "NOTES"),
+        "account": ("+ account", "New account", "NAME", "NOTES"),
     }
 
     def create(self, kind, name, text="", lang=""):
@@ -18168,6 +19167,7 @@ class App:
         else:
             {"person": self.new_person, "org": lambda: self.new_person(org=True),
              "health": self.new_metric, "draft": self.new_note, "item": self.new_item,
+             "account": self.new_account,
              "concept": lambda: self.new_entry("concept"),
              "form": lambda: self.new_entry("form")}[kind]()
             self.card.e_name.delete(0, "end")
@@ -18262,7 +19262,8 @@ class App:
                      anchor="w").pack(fill="x", pady=(0, 2))
             return c
 
-        kinds = {tr(k): k for k in ("person", "form", "concept", "source", "health", "draft", "item")}
+        kinds = {tr(k): k for k in ("person", "form", "concept", "source", "health", "draft", "item",
+                                    "account")}
         v_kind = tk.StringVar(value=tr("person"))
         kb = ttk.Combobox(col(tr("KIND"), 10, 0), textvariable=v_kind, state="readonly",
                           values=list(kinds), width=10, font=self.f_meta)
@@ -18286,6 +19287,7 @@ class App:
                                  "health": tr("One per line:  name. notes"),
                                  "draft": tr("One per line:  title. text"),
                                  "item": tr("One per line:  name. notes"),
+                                 "account": tr("One per line:  name. notes"),
                                  "source": tr("One reference per line, as you would write it "
                                               "(SURNAME, Name. Title. Place: Publisher, year)."),
                                  "form": tr("One per line:  name (language). gloss  -- or a line with "
@@ -18358,7 +19360,7 @@ class App:
                     bits.append(tr("{n} were already there", n=identical))
                 self.say(" · ".join(bits) or tr("Nothing to add."))
                 return
-            if kind in ("health", "draft", "item"):
+            if kind in ("health", "draft", "item", "account"):
                 lines = [l.strip().removeprefix("- ").removeprefix("* ").strip()
                          for l in text.splitlines()]
                 made = 0
@@ -18903,9 +19905,10 @@ BOOK_CHAPTERS = [("register", "Register"), ("people", "People"),
                  ("entries", "Verba"), ("sources", "Sources"), ("corpus", "Corpus"),
                  ("notes", "Drafts"), ("res", "Res")]
 KIND_TAG = {"person": "person", "concept": "concept", "form": "form",
-            "source": "source", "metric": "measurement", "note": "draft", "item": "item"}
+            "source": "source", "metric": "measurement", "note": "draft", "item": "item",
+            "account": "account"}
 KIND_SHORT = {"person": "per", "concept": "con", "form": "frm",
-              "source": "src", "metric": "msr", "note": "drf", "item": "itm"}
+              "source": "src", "metric": "msr", "note": "drf", "item": "itm", "account": "acc"}
 
 
 class BookView:
@@ -19294,9 +20297,14 @@ class BookView:
             if o.get("log"):
                 out.append((tr("log"), "\n".join(
                     f"{x.get('date', '')}  {x.get('text', '')}" for x in o["log"][-8:])))
+        if rk == "account":
+            out.append(("", "  ·  ".join(res_facts(o, d, sums=False))))
+            out.append((tr("sums"), "\n".join(account_report(o, d))))
+            if o.get("entries"):
+                out.append((tr("entries"), "\n".join(entry_line(e) for e in o["entries"][-8:])))
         if o.get("source") and rk != "source":
             out.append((tr("source"), resolve_source(o["source"], d)[1]))
-        if rk in ("concept", "form", "metric", "item"):
+        if rk in ("concept", "form", "metric", "item", "account"):
             out.append((tr("notes"), o.get("notes")))
         if rk == "note":
             if o.get("tags"):
@@ -19625,6 +20633,7 @@ REL_FAMILY = {
     "translates": "sources", "comments_on": "sources", "responds_to": "sources",
     "affects": "corpus", "correlates": "corpus",
     "lent_to": "res", "bought_from": "res", "manual_in": "res", "kept_in": "res",
+    "paid_from": "res",
 }
 # the same hues as the collections' dots in the web page's list
 LINK_FAMILY_COLOUR = {"verba": "#a0783a", "people": "#3f7d99", "sources": "#6f8a3a",
@@ -22825,6 +23834,8 @@ def main():
         return cmd_cite(rest[0], rest[1] if len(rest) > 1 else "abnt")
     if cmd == "geojson":
         return cmd_geojson(rest)
+    if cmd == "ledger":
+        return cmd_ledger(rest)
     if cmd == "observator":
         return cmd_observator(rest)
     if cmd == "sign":
@@ -25336,8 +26347,8 @@ PT = {
         "linha {n}: longitude {lon} além de ±180",
     "{n} feature(s) -> {name}":
         "{n} feição(ões) -> {name}",
-    "(health records left out; --all puts them in)":
-        "(registros de saúde de fora; --all os inclui)",
+    "(health records and accounts left out; --all puts them in)":
+        "(registros de saúde e contas de fora; --all os inclui)",
     "{id}: GEO {err}":
         "{id}: GEO {err}",
     "{id}: GEO of {n} characters; a simpler shape keeps the base light":
@@ -25449,7 +26460,116 @@ PT = {
         "\n                  r: na busca, Ctrl+6 o escopo, status:emprestado busca pela situação."
         "\n                  Vínculos: lent_to p_…, bought_from (uma organização), manual_in s_…,"
         "\n                  kept_in r_…. Uma garantia que acaba em até 30 dias e um empréstimo"
-        "\n                  de mais de 60 dias aparecem com (!) e em COISAS, no trilho.\n",
+        "\n                  de mais de 60 dias aparecem com (!) e em COISAS, no trilho."
+        "\n  CONTAS (res): Arquivo › Nova conta. LANÇAMENTOS, um por linha:"
+        "\n                  2026-11-09  -45,90  mercado #comida → r_…   (+ entra, - sai)"
+        "\n                  > r_… faz dele uma transferência: a outra metade aparece na outra conta."
+        "\n                  FINAL 4 só aceita quatro dígitos, nunca o número inteiro. atype:card"
+        "\n                  busca pelo tipo; paid_from liga um objeto à conta que o pagou."
+        "\n                  python _kustos.py ledger [beancount] escreve um diário contábil.\n",
+    # res: accounts and their entries
+    "account": "conta",
+    "accounts": "contas",
+    "{n} accounts": "{n} contas",
+    "checking": "conta corrente",
+    "savings": "poupança",
+    "card": "cartão",
+    "wallet": "carteira",
+    "investment": "investimento",
+    "category": "categoria",
+    "paid from": "pago com",
+    "ACCOUNT TYPE": "TIPO DE CONTA",
+    "CURRENCY": "MOEDA",
+    "BRL, EUR, USD…": "BRL, EUR, USD…",
+    "INSTITUTION  (an organization's p_…, or a name)": "INSTITUIÇÃO  (o p_… de uma organização, ou um nome)",
+    "LAST 4": "FINAL 4",
+    "only the last four digits, to tell it apart — never the full number":
+        "só os quatro últimos dígitos, para distinguir — nunca o número inteiro",
+    "LAST 4 takes only the last four digits — never the full number.":
+        "FINAL 4 só aceita os quatro últimos dígitos — nunca o número inteiro.",
+    "LAST 4 was not changed: it takes only the last four digits.":
+        "FINAL 4 não foi alterado: só aceita os quatro últimos dígitos.",
+    "OPENING BALANCE": "SALDO INICIAL",
+    "OPENING DATE": "DATA DO SALDO INICIAL",
+    "e.g. 1500,00": "ex.: 1500,00",
+    "ENTRIES": "LANÇAMENTOS",
+    "ENTRIES  (2026-11-09  -45,90  market #food → r_…   > r_… a transfer)":
+        "LANÇAMENTOS  (2026-11-09  -45,90  mercado #comida → r_…   > r_… uma transferência)",
+    "one per line:  2026-11-09  -45,90  market #food → r_…   (> r_… a transfer)":
+        "um por linha:  2026-11-09  -45,90  mercado #comida → r_…   (> r_… uma transferência)",
+    "+ entry": "+ lançamento",
+    "+ account": "+ conta",
+    "New account": "Nova conta",
+    "New account (res)": "Nova conta (res)",
+    "New account. The id is generated when saved with a name.":
+        "Nova conta. O id é gerado ao salvar com um nome.",
+    "An account needs a name.": "Uma conta precisa de um nome.",
+    "Add an entry": "Lançar",
+    "By month": "Por mês",
+    "By category": "Por categoria",
+    "Largest outflows": "Maiores saídas",
+    "In": "Entra",
+    "Out": "Sai",
+    "(none)": "(nenhuma)",
+    "balance {amount}": "saldo {amount}",
+    "opening {amount} on {date}": "inicial {amount} em {date}",
+    "this month's statement {amount}": "fatura deste mês {amount}",
+    "by month:": "por mês:",
+    "by category:": "por categoria:",
+    "largest outflows:": "maiores saídas:",
+    "transfers in:": "transferências recebidas:",
+    "from {name}": "de {name}",
+    "sums": "somas",
+    "entries": "lançamentos",
+    "transfer": "transferência",
+    "Opening balance": "Saldo inicial",
+    "{n} line(s) not read": "{n} linha(s) não lida(s)",
+    "line {n} not read ({why}): {line}": "linha {n} não lida ({why}): {line}",
+    "line {n}: the transfer to {to} does not count ({why})":
+        "linha {n}: a transferência para {to} não conta ({why})",
+    "and {n} more (python _kustos.py doctor)": "e mais {n} (python _kustos.py doctor)",
+    "OPENING BALANCE is not a value ({why}): {value}":
+        "SALDO INICIAL não é um valor ({why}): {value}",
+    "too many digits: at most 15 before the decimal mark and 8 after":
+        "dígitos demais: no máximo 15 antes da vírgula e 8 depois",
+    "{name} is an account: its namesake category goes to {other}":
+        "{name} é uma conta: a categoria de mesmo nome vai para {other}",
+    "not a value": "não é um valor",
+    "the value needs a sign: + in, - out": "o valor precisa de sinal: + entra, - sai",
+    "thousands go in groups of three": "os milhares vão em grupos de três",
+    "ambiguous value: write 1234, or 1.234,00 (1,234.00)":
+        "valor ambíguo: escreva 1234, ou 1.234,00 (1,234.00)",
+    "it begins with neither a date nor a value": "não começa nem com uma data nem com um valor",
+    "not a real date": "não é uma data real",
+    "a transfer to the account itself": "uma transferência para a própria conta",
+    "not an account": "não é uma conta",
+    "another currency ({cur})": "outra moeda ({cur})",
+    "{id}: account without a name": "{id}: conta sem nome",
+    "{id}: LAST 4 must be exactly four digits (never a full account or card number)":
+        "{id}: FINAL 4 tem de ter exatamente quatro dígitos (nunca o número inteiro de uma conta "
+        "ou de um cartão)",
+    "{id}: unknown account type {type}": "{id}: tipo de conta desconhecido {type}",
+    "{id}: CURRENCY is not a code (BRL, EUR, USD…): {value}":
+        "{id}: MOEDA não é um código (BRL, EUR, USD…): {value}",
+    "{id}: INSTITUTION points to {ref}, which does not exist":
+        "{id}: INSTITUIÇÃO aponta para {ref}, que não existe",
+    "{id}: OPENING BALANCE is not a value ({why}): {value}":
+        "{id}: SALDO INICIAL não é um valor ({why}): {value}",
+    "{id}: entry line {n} not read ({why}): {line}":
+        "{id}: lançamento da linha {n} não lido ({why}): {line}",
+    "{id}: entry line {n}: the transfer to {to} does not count ({why})":
+        "{id}: linha {n}: a transferência para {to} não conta ({why})",
+    "{id}: entry line {n}: the transfer to {to} is typed in both accounts; keep it in one "
+    "(the other half is computed)":
+        "{id}: linha {n}: a transferência para {to} está lançada nas duas contas; deixe-a numa "
+        "só (a outra metade é calculada)",
+    "{id}: entry line {n} refers to {ref}, which does not exist":
+        "{id}: a linha {n} remete a {ref}, que não existe",
+    "{id}: left out, its CURRENCY is not a code: {value}":
+        "{id}: deixada de fora, sua MOEDA não é um código: {value}",
+    "generated by _kustos.py ledger -- do not edit by hand; made {when}":
+        "gerado por _kustos.py ledger -- não editar à mão; feito em {when}",
+    "{n} transaction(s) -> {name} ({fmt})": "{n} transação(ões) -> {name} ({fmt})",
 }
 
 if __name__ == "__main__":

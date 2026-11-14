@@ -94,19 +94,47 @@ Ideas that span several sections:
   replay and conflict merges stay right; one that does not fit stays a draft.
   RELS ends may list alternatives (`"source|person"`, read by `kind_fits`).
 - **Res** (`# ==== res`): the things of the house, wired as the corpus is --
-  an internal type `rtype` (`RES_TYPES`, only `item` for now; `kind_of` and
-  `graph_kind` give `item`, a pentagon on the graphs), `fix_res`,
-  `new_res_id`, `haystack_res`, the page's fields with `only=["item"]`, and
-  `ItemCard` in the window (`App.new_item`, Ctrl+6, the rail's THINGS). A
-  new type adds itself to `RES_TYPES`/`RES_TYPE_LABEL`, its defaults in
-  `fix_res`, its block on the card and its fields with their `only`.
-  CATEGORY is free text whose suggestions (`RES_CATEGORIES`) are stored by
-  their English key (`res_category_key`/`res_category_label`); STATUS is a
+  an internal type `rtype` (`RES_TYPES`: `item`, `account`; `kind_of` gives
+  it, `graph_kind` gives `item` for both, a pentagon on the graphs),
+  `fix_res`, `new_res_id`, `haystack_res`, the page's fields with their
+  `only`, and `ResCard` in the window, one block per type (`App.new_item`,
+  `App.new_account`, Ctrl+6, the rail's THINGS). The type is chosen when a
+  record is made and never changes (no TYPE choice on the card; the page's
+  *New* has one entry per type). A new type adds itself to
+  `RES_TYPES`/`RES_TYPE_LABEL`, its defaults in `fix_res`, its block on the
+  card, its `gather` branch and its fields with their `only`.
+  Items: CATEGORY is free text whose suggestions (`RES_CATEGORIES`) are stored
+  by their English key (`res_category_key`/`res_category_label`); STATUS is a
   key of `RES_STATUSES`. `save_record` stamps `status_since` when the status
   changes (`res_stamp_status`) unless the date was typed; `res_reminders`
   (`RES_WARRANTY_DAYS`, `RES_LENT_DAYS`) feeds the list's `(!)`, the page's
   `warn`, the rail's *need attention* and a notice when the window opens.
-  Links: `lent_to`, `bought_from` (an `org`), `manual_in`, `kept_in`.
+  Links: `lent_to`, `bought_from` (an `org`), `manual_in`, `kept_in`,
+  `paid_from` (item -> account).
+- **Accounts** (`# ---- accounts`, inside res): money is `decimal.Decimal`,
+  never float. ENTRIES are stored inside the account as `{date, amount,
+  text}` (amount a canonical decimal string, text as typed with its marks),
+  as readings are; a line that does not read is kept as `{"raw": line}`.
+  `parse_entries`/`entry_line` read and write the card's lines,
+  `parse_amount` holds the rule for values (sign required; with `.` and `,`
+  the last is the decimal mark; a lone mark before exactly three digits is
+  refused; `AMOUNT_WHOLE`/`AMOUNT_DECIMALS` digits at most), `amount_typed`
+  writes values back so they read the same, `money` shows them. OPENING
+  BALANCE is stored canonical by `account_opening`, or as typed when it does
+  not read, so it is always read by `opening_of` (the same rule), never by
+  `amount_of`: a kept `1.500` must not become 1.5. `entry_marks`: `#category`, `→`/`->` refs, `> r_…` transfers.
+  `ledger_index` reads every account once (cached while the records and
+  their `entries` lists are the same objects) and computes the other half of
+  each transfer (`in`); `account_summary` gives balance, months, categories,
+  largest outflows and a card's statement (current calendar month), from the
+  stored entries or from the lines being edited; `account_report` turns it
+  into lines for the card, mirror and logbook, `web_ledger` for the page.
+  LAST 4 (`last4_ok`) is refused on every save path and an error for the
+  doctor (`check_account`): a full number must never be stored. Accounts stay
+  out of `MONAD_COLLS` and out of `geojson` unless `--all` (`geo_features`).
+  `cmd_ledger` writes hledger or beancount (`ledger_transactions`,
+  `ledger_journal`, names made ASCII by `ledger_component`); check a change
+  to it with a script that sums each transaction per commodity.
 - **Monads** (`# ==== monads`): read-only view; `MonadIndex` weighs shared words
   and links, `MonadView` draws them with no lines. `MONAD_COLLS` keeps health,
   drafts and res out, also as bridges between records; keep it that way. To measure its

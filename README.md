@@ -389,7 +389,7 @@ It refuses any folder it did not make, so it never touches a real base.
   `python _kustos.py geojson` writes them all as `_kustos.geojson`, one feature
   per point or shape with the record's id, number and name, to open in QGIS or
   load into PostGIS (`ogr2ogr -f PostgreSQL PG:dbname=… _kustos.geojson`);
-  health records stay out unless you add `--all`. Nothing goes to the network:
+  health records and accounts stay out unless you add `--all`. Nothing goes to the network:
   no geocoding, no map tiles.
 - **Observator**: an instance belongs to one person of the base, chosen under
   Base › Observator… (or `python _kustos.py observator <p_id|name>`; the first
@@ -434,6 +434,44 @@ It refuses any folder it did not make, so it never touches a real base.
   shed). A warranty ending within 30 days and a loan older than 60 days are
   reminders: they show with `(!)` in the list, under *THINGS › need
   attention* in the rail, and when Kustos opens.
+- **Res, accounts**: an *account* is where money is kept or owed — checking,
+  savings, card, wallet, investment, or a category kept as an account — with
+  its currency (`BRL` unless you say otherwise), its institution (a name, or
+  an organization's `p_…`), the last four digits of its number (only those:
+  anything longer is refused, and the doctor calls it an error), an opening
+  balance and its ENTRIES, one per line:
+
+  ```
+  2026-11-09  -45,90  market #food → r_fridge
+  2026-11-10  +3200   salary #income
+  2026-11-12  -500    > r_savings  reserve
+  ```
+
+  Every value needs its sign (`+` in, `-` out). Decimals take a comma or a
+  dot; with both, the last one is the decimal mark (`1.234,56` = `1,234.56`);
+  a single mark followed by exactly three digits (`1.234`) could be either and
+  is refused — write `1234` or `1.234,00`; at most 15 digits before the
+  decimal mark and 8 after. An opening balance that does not read is kept
+  as typed and left out of the balance until it is fixed. `#food` is the category,
+  `→ r_…` (or `->`) what the entry refers to, and `> r_…` a transfer: its
+  other half shows, worked out, in the other account, and is never typed
+  twice. A line that does not read is kept as typed, pointed at under the
+  field and by the doctor. Under the entries: the balance, month by month,
+  by category, the largest outflows, the transfers received, and for a card
+  the current calendar month's statement. Money is never added across
+  currencies, and a transfer between two currencies does not count (there are
+  no exchange rates). **File › New account (res)** or the page's *New*; an
+  item links to the account that paid for it with `paid_from`.
+  `python _kustos.py ledger` writes every account as an
+  [hledger](https://hledger.org) journal (`_kustos.ledger`), and
+  `ledger beancount` as a [beancount](https://beancount.github.io) one
+  (`_kustos.beancount`), in double entry: cards are `Liabilities:`, the
+  others `Assets:`, a `category` account is `Expenses:<Name>`, categories
+  become `Expenses:<Cat>` or `Income:<Cat>` by the sign, opening balances
+  come from `Equity:Opening-Balances`; a category named like an account goes
+  beside it (`#food` and an account Food: `Expenses:Food-2`), so every
+  account's balance in the journal is the one Kustos shows. Accounts stay out of the monads and
+  of the GeoJSON export (unless `--all`).
 - **Register number**, similar to notary and public registry systems: on its
   first save, every entry gets a stamp (`YYYYMMDDHHmmss`) and a sequential
   order number (`nº 1852`). The number never changes and is never reused;
@@ -464,6 +502,7 @@ It refuses any folder it did not make, so it never touches a real base.
   is:unsigned obs:ada obs:p_        no observator yet / signed by that observator (name or id)
   circle:influence                  in your circle of influence, or at either end of a link in it
   status:lent                       an item's status (or a form's: status:reconstructed)
+  atype:card                        an account's type (checking, savings, card, wallet…)
   ```
 
   The search always runs over the whole base. The rail keeps every category
@@ -504,6 +543,7 @@ python _kustos.py search <texto>
 python _kustos.py cite <id|texto> [abnt|abnt-autor-data|bibtex|csl-json|bruto]  pulls citation from source
 python _kustos.py export [bibtex|csl|abnt] [arquivo]
 python _kustos.py geojson [--all] [file]   every GEO as one GeoJSON file
+python _kustos.py ledger [hledger|beancount] [file]   the accounts as a double-entry journal
 python _kustos.py observator [p_id|name]   who signs this instance; with an argument, chooses
 python _kustos.py sign | verify            OpenPGP signatures over the logs (GnuPG, optional)
 python _kustos.py import zotero <export.json|.bib>

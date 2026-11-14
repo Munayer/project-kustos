@@ -11,6 +11,8 @@ _kustos_health.html
 _kustos_peritia.html
 _kustos_fontes.*
 _kustos.geojson
+_kustos.ledger
+_kustos.beancount
 _kustos_conflicts/
 _kustos_old/
 notes/

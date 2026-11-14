@@ -82,8 +82,8 @@ def main(argv):
 
 def build(K, folder):
     """The web demo's records: a few people, sources, verba, health records,
-    things of the house (res) and drafts, then a web of concepts with many
-    links for the graph."""
+    things of the house (res: items and accounts) and drafts, then a web of
+    concepts with many links for the graph."""
     def put(coll, rec, edges=None):
         {"people": K.fix_person, "entries": K.fix_entry, "sources": K.fix_source,
          "corpus": K.fix_metric, "res": K.fix_res}[coll](rec)
@@ -172,6 +172,37 @@ def build(K, folder):
     put("sources", {"id": "s_laptop_guide", "type": "documento", "name": "Laptop user guide",
                     "authors": ["CORNER ELECTRONICS"], "date": "2025",
                     "notes": "Battery care is on page 14."})
+    # accounts (res): an invented bank, a checking account, a card whose last
+    # four digits are plainly not real, and savings. Entries go through
+    # Kustos's own reader, as typed on the card; the checking account moves
+    # money into the savings and pays the card (transfers: their other half is
+    # computed there), and the card paid for the laptop and the kettle's repair
+    put("people", {"id": "p_ban00006", "name": "Banco Exemplo", "org": True, "place": "Porto",
+                   "tags": ["bank"], "links": ["https://example.org/banco-exemplo"]})
+    put("res", {"id": "r_demo_checking", "rtype": "account", "name": "Checking account",
+                "atype": "checking", "currency": "BRL", "institution": "p_ban00006",
+                "opening": "2500.00", "opening_date": day(-60), "tags": ["demo"],
+                "entries": K.parse_entries("\n".join([
+                    f"{day(-40)}  +3200,00  salary #income",
+                    f"{day(-38)}  -1.250,00  rent #housing",
+                    f"{day(-35)}  -500  > r_demo_savings  reserve",
+                    f"{day(-30)}  -89,90  market #food",
+                    f"{day(-12)}  +3200,00  salary #income",
+                    f"{day(-10)}  -1.250,00  rent #housing",
+                    f"{day(-8)}  -620,40  > r_demo_card  card payment",
+                    f"{day(-3)}  -45,90  market #food:market"]))})
+    put("res", {"id": "r_demo_card", "rtype": "account", "name": "Credit card",
+                "atype": "card", "currency": "BRL", "institution": "p_ban00006", "last4": "0000",
+                "notes": "An invented card: **0000** is not a real number.",
+                "entries": K.parse_entries("\n".join([
+                    f"{day(-345)}  -5.890,00  laptop #electronics → r_laptop_14",
+                    f"{day(-15)}  -32,50  bookshop #books",
+                    f"{day(-6)}  -120,00  kettle repair #home → r_electric_kettle",
+                    f"{day(-2)}  -58,00  pharmacy #health"]))})
+    put("res", {"id": "r_demo_savings", "rtype": "account", "name": "Savings",
+                "atype": "savings", "currency": "BRL", "institution": "Cooperativa Exemplo",
+                "opening": "10000", "opening_date": day(-90),
+                "entries": K.parse_entries(f"{day(-31)}  +12,34  interest #interest")})
     put("res", {"id": "r_garden_shed", "name": "Garden shed", "category": "other",
                 "where": "home › garden", "bought": "2019-04", "geo": "41.1579, -8.6291  garden"})
     put("res", {"id": "r_toolbox", "name": "Red toolbox", "category": "tools", "status": "stored",
@@ -189,7 +220,8 @@ def build(K, folder):
                 "price": "5890,00 BRL", "serial": "SN-DEMO-0042", "tags": ["work"],
                 "notes": "Keep the box until the **warranty** ends."},
         edges=[edge("r_laptop_14", "bought_from", "p_cor00005", "with a one-year warranty"),
-               edge("r_laptop_14", "manual_in", "s_laptop_guide", "the printed guide")])
+               edge("r_laptop_14", "manual_in", "s_laptop_guide", "the printed guide"),
+               edge("r_laptop_14", "paid_from", "r_demo_card", "in one payment")])
     put("res", {"id": "r_electric_kettle", "name": "Electric kettle", "category": "kitchen",
                 "status": "in repair", "where": "home › kitchen",
                 "log": [{"date": day(-6), "text": "Taken to the repair shop: the switch."}]})
