@@ -63,9 +63,9 @@ It refuses any folder it did not make, so it never touches a real base.
 
 ## Components
 
-- **Five collections** on the left menu, each with an unique ID:
+- **Six collections** on the left menu, each with an unique ID:
   `p_` people · `c_` concept · `f_` form · `s_` source · `h_` health track ·
-  `n_` draft.
+  `n_` draft · `r_` thing (res).
 - **Contacts**, for using Kustos as a personal CRM: a person's URLS hold one
   address per line, written as you would (`ana@example.org`,
   `+55 11 91234-5678`, `https://…`; `mailto:` and `tel:` work too), each
@@ -423,6 +423,17 @@ It refuses any folder it did not make, so it never touches a real base.
   *Consultation* (medications in use, latest values with their status, recent
   events, current activities) and *Follow-up* (trends, sessions per week, full
   history); printing prints the view on screen.
+- **Res, the things of the house**: an *item* is a thing you own — its
+  category (furniture, electronics, tools, books… or your own), how many,
+  where it is in the home (`home › office › shelf 2`), its status (in use,
+  stored, lent, in repair, discarded, with the date it took it), when it was
+  bought and for how much, until when its warranty runs, its serial number,
+  and a LOG of what happened to it. **File › New item (res)**, `+ new › item`
+  or the web page's *New*. Its links: `lent_to` a person, `bought_from` an
+  organization, `manual_in` a source, `kept_in` another item (a toolbox in the
+  shed). A warranty ending within 30 days and a loan older than 60 days are
+  reminders: they show with `(!)` in the list, under *THINGS › need
+  attention* in the rail, and when Kustos opens.
 - **Register number**, similar to notary and public registry systems: on its
   first save, every entry gets a stamp (`YYYYMMDDHHmmss`) and a sequential
   order number (`nº 1852`). The number never changes and is never reused;
@@ -446,12 +457,13 @@ It refuses any folder it did not make, so it never touches a real base.
 - **Search**, the "indexer": results come in alphabetic order, paged, each with its register number, with operators of search:
 
   ```
-  p: v: f: c: d:                    only people / verba / sources / body tracks / drafts
+  p: v: f: c: d: r:                 only people / verba / sources / body tracks / drafts / res
   ^ab                               name that starts with "ab"
   tag:x lang:de type:book sys:renal dom:law id:c_
   is:org is:person is:geo           organizations / people who are not / records with a GEO
   is:unsigned obs:ada obs:p_        no observator yet / signed by that observator (name or id)
   circle:influence                  in your circle of influence, or at either end of a link in it
+  status:lent                       an item's status (or a form's: status:reconstructed)
   ```
 
   The search always runs over the whole base. The rail keeps every category

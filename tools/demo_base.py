@@ -81,11 +81,12 @@ def main(argv):
 
 
 def build(K, folder):
-    """The web demo's records: a few people, sources, verba, health records and
-    drafts, then a web of concepts with many links for the graph."""
+    """The web demo's records: a few people, sources, verba, health records,
+    things of the house (res) and drafts, then a web of concepts with many
+    links for the graph."""
     def put(coll, rec, edges=None):
         {"people": K.fix_person, "entries": K.fix_entry, "sources": K.fix_source,
-         "corpus": K.fix_metric}[coll](rec)
+         "corpus": K.fix_metric, "res": K.fix_res}[coll](rec)
         K.touch(rec)
         return K.save_record(coll, rec, edges=edges)
 
@@ -161,6 +162,39 @@ def build(K, folder):
                                 {"date": "2026-11-02", "text": "45 min, easy"}]})
     put("corpus", {"id": "h_checkup", "ctype": "event", "name": "Annual check-up", "etype": "consultation",
                    "date": "2026-10-02", "doctor": "Dr. Example", "place": "Clinic"})
+    # ---- res (things of the house, invented); dates from today, so that the
+    # reminders show: a warranty ending soon, a bicycle lent long ago
+    def day(n):
+        return (datetime.now() + timedelta(days=n)).date().isoformat()
+
+    put("people", {"id": "p_cor00005", "name": "Corner Electronics", "org": True, "place": "Porto",
+                   "tags": ["shop"], "links": ["https://example.org/corner-electronics"]})
+    put("sources", {"id": "s_laptop_guide", "type": "documento", "name": "Laptop user guide",
+                    "authors": ["CORNER ELECTRONICS"], "date": "2025",
+                    "notes": "Battery care is on page 14."})
+    put("res", {"id": "r_garden_shed", "name": "Garden shed", "category": "other",
+                "where": "home › garden", "bought": "2019-04", "geo": "41.1579, -8.6291  garden"})
+    put("res", {"id": "r_toolbox", "name": "Red toolbox", "category": "tools", "status": "stored",
+                "where": "home › garden › shed", "tags": ["diy"],
+                "log": [{"date": "2026-06-14", "text": "New set of screwdrivers."}]},
+        edges=[edge("r_toolbox", "kept_in", "r_garden_shed", "on the left shelf")])
+    put("res", {"id": "r_city_bicycle", "name": "City bicycle", "category": "vehicle", "status": "lent",
+                "status_since": day(-75), "where": "home › garage", "bought": "2021-05-10",
+                "price": "1450,00 BRL", "serial": "BK-DEMO-7781",
+                "log": [{"date": "2025-09-02", "text": "New tyres."},
+                        {"date": day(-75), "text": "Lent to Mira for her trip."}]},
+        edges=[edge("r_city_bicycle", "lent_to", "p_mir00003", "for her trip")])
+    put("res", {"id": "r_laptop_14", "name": "Laptop, 14-inch", "category": "electronics",
+                "where": "home › office › desk", "bought": day(-345), "warranty_until": day(20),
+                "price": "5890,00 BRL", "serial": "SN-DEMO-0042", "tags": ["work"],
+                "notes": "Keep the box until the **warranty** ends."},
+        edges=[edge("r_laptop_14", "bought_from", "p_cor00005", "with a one-year warranty"),
+               edge("r_laptop_14", "manual_in", "s_laptop_guide", "the printed guide")])
+    put("res", {"id": "r_electric_kettle", "name": "Electric kettle", "category": "kitchen",
+                "status": "in repair", "where": "home › kitchen",
+                "log": [{"date": day(-6), "text": "Taken to the repair shop: the switch."}]})
+    put("res", {"id": "r_winter_coats", "name": "Winter coats", "category": "clothes", "qty": 3,
+                "status": "stored", "where": "home › bedroom › wardrobe"})
     # ---- drafts: files in notes/, taken in as Kustos does
     notes = folder / "notes"
     notes.mkdir(exist_ok=True)

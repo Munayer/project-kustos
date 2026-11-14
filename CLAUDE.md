@@ -38,7 +38,7 @@ empty repository folder gives an empty base (and `doctor` passes on it).
 `_kustos.py` is split into sections marked `# ==== <name>`, in this order:
 language (`tr`), common, the collections (**people** `p_`, **verba**
 `c_`/`f_` concepts and forms, **sources** `s_`, **corpus** `h_` health
-records, **notes** `n_` — shown as "drafts"), then file, register, conflicts, lock, doctor, mirror, search,
+records, **notes** `n_` — shown as "drafts", **res** `r_` things), then file, register, conflicts, lock, doctor, mirror, search,
 history, migration, upgrade, citation, health report, peritia, web, themes, motion,
 the Tk `*Card` editors, `App` (the main window), `BookView` (the logbook), the
 `cmd_*` functions and `main()`, and finally the `PT` dict.
@@ -93,9 +93,23 @@ Ideas that span several sections:
   through `write_link`, as a save of the record they start from, so the log,
   replay and conflict merges stay right; one that does not fit stays a draft.
   RELS ends may list alternatives (`"source|person"`, read by `kind_fits`).
+- **Res** (`# ==== res`): the things of the house, wired as the corpus is --
+  an internal type `rtype` (`RES_TYPES`, only `item` for now; `kind_of` and
+  `graph_kind` give `item`, a pentagon on the graphs), `fix_res`,
+  `new_res_id`, `haystack_res`, the page's fields with `only=["item"]`, and
+  `ItemCard` in the window (`App.new_item`, Ctrl+6, the rail's THINGS). A
+  new type adds itself to `RES_TYPES`/`RES_TYPE_LABEL`, its defaults in
+  `fix_res`, its block on the card and its fields with their `only`.
+  CATEGORY is free text whose suggestions (`RES_CATEGORIES`) are stored by
+  their English key (`res_category_key`/`res_category_label`); STATUS is a
+  key of `RES_STATUSES`. `save_record` stamps `status_since` when the status
+  changes (`res_stamp_status`) unless the date was typed; `res_reminders`
+  (`RES_WARRANTY_DAYS`, `RES_LENT_DAYS`) feeds the list's `(!)`, the page's
+  `warn`, the rail's *need attention* and a notice when the window opens.
+  Links: `lent_to`, `bought_from` (an `org`), `manual_in`, `kept_in`.
 - **Monads** (`# ==== monads`): read-only view; `MonadIndex` weighs shared words
-  and links, `MonadView` draws them with no lines. `MONAD_COLLS` keeps health and
-  drafts out, also as bridges between records; keep it that way. To measure its
+  and links, `MonadView` draws them with no lines. `MONAD_COLLS` keeps health,
+  drafts and res out, also as bridges between records; keep it that way. To measure its
   frames, time the moves themselves: `update()` does not return while two tweens run.
 - **Practice** (`# ==== practice`, the web app's `#practice`): `drill_items`
   makes an item of a concept in one language (its forms that `express` it) or
