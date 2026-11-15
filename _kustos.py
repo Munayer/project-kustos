@@ -87,6 +87,16 @@ USAGE
     python _kustos.py search <text>   literal search across the collections
     python _kustos.py cite <id|text> [abnt|abnt-autor-data|bibtex|csl-json|bruto]
     python _kustos.py export [bibtex|csl|abnt] [file]
+    python _kustos.py export --observator [<p_id>] <file.json>
+                                      the observator's monad, for another instance to
+                                      compare: their verba and sources, the links among
+                                      them, their alignments and observations (signed
+                                      when their card has a key). Never health, res,
+                                      drafts or anyone else's records
+    python _kustos.py compare <monad.json> [<monad2.json>]
+                                      this base (or a first file) against a monad file,
+                                      read-only: concepts in both, forms read as other
+                                      concepts, alignments, criteria, what one side lacks
     python _kustos.py geojson [--all] [file]
                                       every GEO as one GeoJSON file (QGIS, PostGIS);
                                       health records and accounts only with --all
@@ -945,6 +955,10 @@ RELS = {
     "analogous_to":  ("concept", "concept"),
     "instrument_of": ("concept", "concept"),
     "requires":      ("concept", "concept"),
+    # alignment between concepts, mostly of different observators (# ---- alignment)
+    "coincides_with": ("concept", "concept"),
+    "overlaps":       ("concept", "concept"),
+    "differs_from":   ("concept", "concept"),
     # people
     "coined_by":     ("*", "person"),
     "used_by":       ("*", "person"),
@@ -982,6 +996,7 @@ REL_LABEL = {
     "calques": "calques", "specializes": "specializes",
     "opposes": "opposes", "analogous_to": "analogous to",
     "instrument_of": "instrument of", "requires": "requires",
+    "coincides_with": "coincides with", "overlaps": "overlaps", "differs_from": "differs from",
     "coined_by": "coined by", "used_by": "used by", "about": "about",
     "author_of": "author of", "editor_of": "editor of",
     "translator_of": "translator of", "knows": "knows", "influenced": "influenced",
@@ -3894,7 +3909,9 @@ def cmd_verify(rest=()):
 #              a distinction drawn on purpose about a record not observed yet
 #   reobservo  a record seen again: automatic when a save changes its fields
 #              (`changed`, and their values `before`), or deliberate
-#   alinho, proponho   accepted here; later steps make them
+#   alinho     an alignment stated: a save that adds or changes a link
+#              coincides_with / overlaps / differs_from (# ---- alignment)
+#   proponho   what came in without being typed (# ---- proposals)
 # Every save_record of a record of COLLS made while there is an observator adds
 # an automatic one, in the same write and the same append to the log. At most
 # ONE automatic observation per record, per observator, per local day: a later
@@ -4247,7 +4264,8 @@ def record_observations(data, rid):
                     "auto": bool(o.get("auto")), "observator": who,
                     "who": observator_name(data, who) if who else tr("unsigned"),
                     "own": bool(who) and who == mine,
-                    "distinction": o.get("distinction") or "", "criterion": crit,
+                    "distinction": align_text(o, idx, data) if o.get("kind") == "alinho"
+                    else o.get("distinction") or "", "criterion": crit,
                     "criterion_label": crit_label, "confidence": o.get("confidence"),
                     "source": resolve_source(src, data)[1] if src else "",
                     "notes": o.get("notes") or "", "status": o.get("status") or "",
@@ -4744,6 +4762,100 @@ def check_proposals(data, idx, warnings):
         warnings.append(tr("{n} proposal(s) pending for more than {days} days (sign each, or "
                            "python _kustos.py sign-proposals): {ids}", n=len(old), days=PROPOSAL_DAYS,
                            ids=", ".join(old[:8]) + (" …" if len(old) > 8 else "")))
+
+
+# ---- alignment
+# Each base is one observator's universe, and observators are never merged:
+# the same form linked to different concepts by different observators is
+# information, not an error. What can be said across them is said explicitly,
+# by the observator: this concept COINCIDES WITH, OVERLAPS or DIFFERS FROM that
+# one (ALIGN_RELS: concept -> concept, symmetric on the graphs; checked like
+# every type of RELS). Saying it is an act of observation: every save that adds
+# or changes such a link (put_record) adds an automatic `alinho`, signed, with
+# `targets` [from, to], the alignment as its `distinction` and the link's
+# reason as its `criterion` -- one per observator, link (from, type, to) and
+# day, as the other automatic ones (a later change of its reason that day
+# updates it; another type, or the same pair said from the other end, is
+# another statement, and another alinho). A link
+# written as a proposal is part of that proposal, not an alinho, until it is
+# signed: signing states it. Comparing with another monad is `compare`, with
+# the files `export --observator` makes (# ==== monad files).
+
+ALIGN_RELS = ("coincides_with", "overlaps", "differs_from")
+
+
+def align_changes(old_edges, new_edges):
+    """The alignment links of a save that are new, or changed (type, reason,
+    span, source), against the links the record had: [edge]."""
+    if not any(a.get("rel") in ALIGN_RELS for a in new_edges or ()):
+        return []
+    was = {(a.get("rel"), a.get("to")): obs_link_key([a]) for a in old_edges or ()
+           if a.get("rel") in ALIGN_RELS}
+    return [a for a in new_edges if a.get("rel") in ALIGN_RELS
+            and str(a.get("to") or "").startswith("c_")
+            and was.get((a.get("rel"), a.get("to"))) != obs_link_key([a])]
+
+
+def align_unsigned(data, rid, proposal):
+    """The alignment links going out of `rid` that the proposal brought and
+    nobody signed yet: signing the proposal states them (sign_brought signs
+    the same ones; an older unsigned link keeps nobody)."""
+    brought = proposal_brought(proposal, data, rid)
+    return [a for a in data["edges"] if a["from"] == rid and not a.get("observator")
+            and a.get("rel") in ALIGN_RELS and str(a.get("to") or "").startswith("c_")
+            and (a.get("rel"), a.get("to")) in brought]
+
+
+def observe_align(data, a, who):
+    """The `alinho` of one alignment link, added to `data` -- or, when this
+    observator stated the same link (from, type, to) today, updated in it.
+    Returns it."""
+    want = [str(a["from"]), str(a["to"])]
+    rows = data.setdefault("observations", [])
+    day, now = TODAY(), NOW()
+    why = " ".join(str(a.get("why") or "").split())
+    oid, clash = new_observation_id(), False
+    for o in reversed(rows):
+        if o.get("kind") == "alinho" and o.get("auto") and o.get("observator") == who \
+                and (o.get("t") or "")[:10] == day and o.get("targets") == want \
+                and o.get("distinction") == a["rel"]:
+            o.update(criterion=why, updated_at=now)
+            obs_forget()                        # changed in place
+            return o
+        clash = clash or o.get("id") == oid
+    if clash:
+        oid = new_observation_id({x.get("id") for x in rows})
+    o = fix_observation({"id": oid, "observator": who, "t": now, "updated_at": now,
+                         "targets": [a["from"], a["to"]], "kind": "alinho", "auto": True,
+                         "distinction": a["rel"], "criterion": why, "status": "signed"})
+    rows.append(o)
+    return o
+
+
+def align_text(o, idx, data=None):
+    """An alinho as the lists show it: 'Feedback loop — coincides with — Feedback'."""
+    t, rel = list(o.get("targets") or []), o.get("distinction") or ""
+    if len(t) != 2 or rel not in ALIGN_RELS:
+        return rel
+    a, b = (label_any(idx[x], data) if x in idx else str(x) for x in t)
+    return f"{a} — {rel_label(rel)} — {b}"
+
+
+def check_alignments(data, idx, warnings):
+    """The doctor on alignments, warnings only: one observator saying two
+    different things of the same two concepts. Two observators saying
+    different things is information, never a warning."""
+    said = {}
+    for a in data.get("edges", []):
+        who = a.get("observator") or ""
+        if a.get("rel") in ALIGN_RELS and who:
+            key = (who,) + tuple(sorted((str(a["from"]), str(a["to"]))))
+            said.setdefault(key, set()).add(a["rel"])
+    for (who, x, y), rels in sorted(said.items()):
+        if len(rels) > 1:
+            warnings.append(tr("{a} and {b}: {rels}, both said by {who} (keep the one you hold)",
+                               a=x, b=y, rels=" / ".join(rel_label(r) for r in sorted(rels)),
+                               who=observator_name(data, who)))
 
 
 # ================================================================ file
@@ -5276,6 +5388,7 @@ def put_record(data, coll, rec, edges=None, proposed=False, sign=False, aside=Fa
     # the proposal of it, when nobody typed it (# ---- proposals)
     seen = sealed = None
     links_signed = False
+    aligned = []        # the alignments this save states (# ---- alignment)
     if coll in COLLS and not rid.startswith("__"):
         if proposed:
             seen = propose_save(data, coll, rid, prior, clean, links_before, edges)
@@ -5284,6 +5397,9 @@ def put_record(data, coll, rec, edges=None, proposed=False, sign=False, aside=Fa
                 sign or not signer) else None
             seen = observe_save(data, coll, rid, prior, clean, links_before, edges, obs,
                                 rec.get("_text") if coll == "notes" else None, at)
+            concept = coll == "entries" and kind_of(clean) == "concept"
+            if edges is not None and concept:
+                aligned = align_changes(links_before, edges)
             if pending is not None:
                 if not sign and (seen is None or aside):
                     # nothing changed, or written from another card: still a proposal
@@ -5292,6 +5408,9 @@ def put_record(data, coll, rec, edges=None, proposed=False, sign=False, aside=Fa
                     if signer:              # signed already: what waited was its new links
                         clean["observator"] = signer
                     sealed = pending
+                    if concept:                     # signing states its alignments
+                        aligned += [a for a in align_unsigned(data, rid, pending)
+                                    if a not in aligned]
                     links_signed = seal_proposal(data, pending, rid, obs)
             elif sign and prior is not None:
                 # a proposal signed on one machine while another saved the record
@@ -5300,6 +5419,8 @@ def put_record(data, coll, rec, edges=None, proposed=False, sign=False, aside=Fa
                     clean["observator"] = signer        # signing never changes who signed it
                 stray = proposal_signed_of(data, rid)
                 if stray is not None:
+                    if concept:
+                        aligned += [a for a in align_unsigned(data, rid, stray) if a not in aligned]
                     links_signed = sign_brought(data, stray, rid, stray.get("observator") or obs)
     lines = [("put", coll, {"id": rid, "rec": clean})]
     if edges is not None:
@@ -5311,6 +5432,12 @@ def put_record(data, coll, rec, edges=None, proposed=False, sign=False, aside=Fa
         lines.append(("put", "observations", {"id": seen["id"], "rec": seen}))
     if sealed is not None:
         lines.append(("put", "observations", {"id": sealed["id"], "rec": sealed}))
+    if aligned:
+        alinhos = {}
+        for a in aligned:
+            o = observe_align(data, a, obs)
+            alinhos[o["id"]] = o
+        lines += [("put", "observations", {"id": oid, "rec": o}) for oid, o in alinhos.items()]
     return lines
 
 
@@ -5760,6 +5887,7 @@ def check(data):
     check_skills(data, errors, warnings)
     check_observations(data, idx, warnings)
     check_proposals(data, idx, warnings)
+    check_alignments(data, idx, warnings)
     check_book(data, errors, warnings)
     return errors, warnings
 
@@ -5967,6 +6095,533 @@ def cmd_doctor_observe(rest):
             print("     " + tr("… and {n} more", n=len(lines) - AUDIT_SHOWN))
         if lines:
             print("   → " + hint)
+    print()
+    return 0
+
+
+# ================================================================ monad files
+# An instance is one observator's universe -- a monad. `export --observator
+# [<p_id>] <file.json>` writes, only when asked, what that person observed, for
+# another instance to compare against: the verba (concepts and forms) and the
+# sources signed by them, the links among those records only, the alignments
+# they stated from their concepts to concepts outside the file (target as an
+# id alone: the statement, never the other's record), their observations of
+# those records with `before` dropped (earlier values are the base's history:
+# a value deleted on purpose must not travel), and a stub of the person: id,
+# name, the GPG fingerprint if any. Health records, res (items and accounts),
+# drafts, other people's records, `ui`, logs and skills never leave the base:
+# monad_of reads only `entries` and `sources`, and checks what it made. When
+# the person's card has a key and GnuPG is here, `<file>.asc` is written
+# beside it, a detached signature over the file's bytes. `compare <file>
+# [<file2>]` (read-only: it writes nothing) sets this base's monad, or a first
+# file, against a monad file: concepts in both (same id, or the same name),
+# forms read as different concepts, the alignments either side already states
+# about the other's concepts, the criteria and eigenforms of each, and what
+# only one side has. Nothing is ever merged; bringing another monad's records
+# into a base (an import) is future work.
+
+MONAD_FILE_VERSION = 1
+MONAD_NAMED = 6             # ids named per line of `compare`; the rest are counted
+MONAD_RECORD_PREFIX = {"entries": ("c_", "f_"), "sources": ("s_",)}
+MONAD_KEPT_HOME = ("reg", "reg_n", "reg_origem", "reg_n_anterior")   # the register's gaps would
+                                                                      # count what stays home
+MONAD_MAX_BYTES = 64 * 1024 * 1024
+MONAD_TEXT = {"id", "name", "gloss", "kind", "lang", "from", "rel", "to", "why", "when", "source",
+              "criterion", "distinction", "observator", "t", "updated_at", "status", "notes"}
+_MONAD_CTRL = re.compile("[\x00-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def monad_text(v):
+    """A text that came in a monad file, safe to print and to compare: never
+    another type, never a control character (a terminal would obey it)."""
+    if v is None or isinstance(v, (dict, list)):
+        v = ""
+    return _MONAD_CTRL.sub(" ", v if isinstance(v, str) else str(v))
+
+
+def monad_row(r):
+    """One record, link or observation of a monad file, as compare may read
+    it: its texts as monad_text, numbers kept, lists of texts kept, nothing
+    nested deeper."""
+    out = {}
+    for k, v in r.items():
+        if k in MONAD_TEXT or isinstance(v, str):
+            out[k] = monad_text(v)          # a text field is text, whatever came
+        elif isinstance(v, list):
+            out[k] = [monad_text(x) for x in v if isinstance(x, (str, int, float))]
+        elif isinstance(v, dict):
+            continue
+        elif k == "targets":
+            out[k] = []
+        else:
+            out[k] = v
+    return out
+
+
+def monad_of(data, pid):
+    """The monad file of observator `pid`, as a dict made from `data` (which
+    is not changed). ValueError when `pid` is not a person of the base."""
+    idx = by_id(data)
+    person = idx.get(pid)
+    if not pid or person is None or coll_of(pid) != "people":
+        raise ValueError(tr("{id} is not a person of this base.", id=pid or "?"))
+    stub = {"id": pid, "name": person.get("name") or pid}
+    fpr = gpg_fpr(person.get("gpg", ""))
+    if fpr:
+        stub["gpg"] = fpr
+
+    def take(coll):
+        return [{k: v for k, v in r.items() if not k.startswith("_") and k not in MONAD_KEPT_HOME}
+                for r in data.get(coll, []) if r.get("observator") == pid
+                and str(r.get("id") or "").startswith(MONAD_RECORD_PREFIX[coll])]
+
+    entries, sources = take("entries"), take("sources")
+    ids = {r["id"] for r in entries + sources}
+    # a signed record can carry links a pending proposal brought: nobody's yet
+    waiting = {(t,) + k for o in data.get("observations", []) if is_pending(o)
+               for t in o.get("targets") or () if t in ids for k in proposal_brought(o, data, t)}
+    edges, alignments = [], []
+    for a in data.get("edges", []):
+        who = a.get("observator") or ""
+        if a.get("from") not in ids or who not in ("", pid):
+            continue                        # another observator's statement stays theirs
+        if not who and (a["from"], a.get("rel"), a.get("to")) in waiting:
+            continue
+        if a.get("to") in ids:
+            edges.append({k: v for k, v in a.items() if not k.startswith("_")})
+        elif a.get("rel") in ALIGN_RELS and who == pid and str(a.get("to") or "").startswith("c_") \
+                and kind_of(idx.get(a["from"]) or {}) == "concept":
+            alignments.append({k: a.get(k) for k in ("from", "rel", "to", "when", "why", "source",
+                                                     "observator") if a.get(k)})
+    observations = []
+    for o in data.get("observations", []):
+        targets = o.get("targets") or []
+        if o.get("observator") == pid and targets and all(t in ids for t in targets):
+            observations.append({k: v for k, v in o.items() if k != "before" and not k.startswith("_")})
+    m = {"kustos_monad": MONAD_FILE_VERSION, "observator": stub, "made": NOW(), "schema": SCHEMA,
+         "counts": {"concepts": sum(1 for e in entries if e.get("kind", "concept") == "concept"),
+                    "forms": sum(1 for e in entries if e.get("kind") == "form"),
+                    "sources": len(sources), "links": len(edges), "alignments": len(alignments),
+                    "observations": len(observations)},
+         "entries": entries, "sources": sources, "edges": edges, "alignments": alignments,
+         "observations": observations}
+    monad_guard(m)
+    return m
+
+
+def monad_guard(m):
+    """The last look before a monad leaves the base: only c_/f_/s_ records
+    without their register stamps, links among them, alignments to concepts,
+    and no earlier values. RuntimeError (a bug, never data) otherwise -- not
+    an assert, which python -O would skip."""
+    def must(ok, what):
+        if not ok:
+            raise RuntimeError(f"monad_guard: {what}")
+    ids = set()
+    for coll in ("entries", "sources"):
+        for r in m[coll]:
+            must(str(r.get("id") or "").startswith(MONAD_RECORD_PREFIX[coll]), r.get("id"))
+            must(not set(r) & set(MONAD_KEPT_HOME), r.get("id"))
+            ids.add(r["id"])
+    for a in m["edges"]:
+        must(a.get("from") in ids and a.get("to") in ids, (a.get("from"), a.get("to")))
+    for a in m["alignments"]:
+        must(a.get("from") in ids and str(a.get("to")).startswith("c_"), (a.get("from"), a.get("to")))
+    for o in m["observations"]:
+        must("before" not in o and all(t in ids for t in o.get("targets") or ()), o.get("id"))
+    must(set(m["observator"]) <= {"id", "name", "gpg"}, sorted(m["observator"]))
+    must(set(m) == {"kustos_monad", "observator", "made", "schema", "counts", "entries", "sources",
+                    "edges", "alignments", "observations"}, sorted(m))
+
+
+def monad_asc(path):
+    return Path(path).with_name(Path(path).name + ".asc")
+
+
+def cmd_export_monad(rest):
+    """`export --observator [<p_id>] <file.json>`: the observator's monad file,
+    signed when their card has a key and GnuPG is here."""
+    args = [x for x in rest if x.strip()]
+    if not args or len(args) > 2:
+        print(tr("usage: python _kustos.py export --observator [<p_id>] <file.json>"))
+        return 1
+    data = load_json()
+    pid = args[0] if len(args) == 2 else observator_id(data)
+    if not pid:
+        print(tr("No observator chosen yet: python _kustos.py observator <p_id|name>"))
+        return 1
+    out = Path(args[-1])
+    if out.suffix.lower() != ".json" or out.name.startswith(STEM + ".") \
+            or out.resolve() == JSON_FILE.resolve():
+        print(tr("Give the monad file a name of its own, ending in .json (not one of the base's files)."))
+        return 1
+    if out.exists() and monad_read(out)[0] is None:
+        print(tr("{file} exists and is not a monad file: it is not overwritten.", file=out))
+        return 1
+    try:
+        m = monad_of(data, pid)
+    except ValueError as exc:
+        print(exc)
+        return 1
+    raw = (json.dumps(m, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    out.write_bytes(raw)
+    c = m["counts"]
+    print(tr("{name}'s monad -> {file}: {concepts} concepts, {forms} forms, {sources} sources, "
+             "{links} links, {alignments} alignments, {observations} observations",
+             name=m["observator"]["name"], file=out, **c))
+    print(tr("Not in it: health records, res (items and accounts), drafts, other people's records, "
+             "settings, logs, skills, earlier values."))
+    asc = monad_asc(out)
+    fpr = m["observator"].get("gpg", "")
+    why = ""
+    if not fpr:
+        why = tr("{name} has no key: write the fingerprint of an OpenPGP key (40 hex digits) in GPG "
+                 "on that person's card.", name=m["observator"]["name"])
+    elif not gpg_exe():
+        why = tr("GnuPG is not installed (gpg not found); nothing else needs it. "
+                 "On Windows: https://gpg4win.org")
+    else:
+        code, sig, err = gpg_run(["--local-user", fpr, "--detach-sign", "--armor"], raw)
+        if code or "-----BEGIN PGP SIGNATURE-----" not in sig:
+            why = tr("gpg did not sign:") + "\n" + (err.strip() or sig.strip())
+        else:
+            asc.write_text(sig[sig.index("-----BEGIN PGP SIGNATURE-----"):].strip() + "\n",
+                           encoding="utf-8", newline="\n")
+            print(tr("Signed with {fpr} -> {file}", fpr=fpr[-16:], file=asc.name))
+            return 0
+    if asc.exists():                # an older signature cannot cover this file
+        asc.unlink()
+        print(tr("{file} was removed: it signed an earlier export.", file=asc.name))
+    print(tr("Unsigned. {why}", why=why))
+    return 1 if fpr and gpg_exe() else 0
+
+
+def monad_read(path):
+    """(monad, None), or (None, what is wrong). The file is data from outside:
+    only what has the expected shape is kept."""
+    try:
+        size = Path(path).stat().st_size
+        if size > MONAD_MAX_BYTES:
+            return None, tr("is too large for a monad file ({mb} MB)", mb=size // 2**20)
+        m = json.loads(Path(path).read_bytes().decode("utf-8"))
+    except OSError as exc:
+        return None, tr("cannot be read: {error}", error=exc)
+    except (ValueError, RecursionError):
+        return None, tr("is not JSON")
+    if not isinstance(m, dict) or m.get("kustos_monad") != MONAD_FILE_VERSION:
+        return None, tr("is not a monad file (made by export --observator)")
+    stub = m.get("observator") if isinstance(m.get("observator"), dict) else {}
+    out = {"kustos_monad": MONAD_FILE_VERSION,
+           "observator": {k: monad_text(stub.get(k)) for k in ("id", "name", "gpg")},
+           "made": monad_text(m.get("made")), "schema": monad_text(m.get("schema"))}
+    for k in ("entries", "sources", "edges", "alignments", "observations"):
+        rows = m.get(k) if isinstance(m.get(k), list) else []
+        out[k] = [monad_row(r) for r in rows if isinstance(r, dict)]
+    for coll in ("entries", "sources"):
+        out[coll] = [r for r in out[coll] if isinstance(r.get("id"), str)
+                     and r["id"].startswith(MONAD_RECORD_PREFIX[coll])]
+    for k in ("edges", "alignments"):
+        out[k] = [a for a in out[k] if isinstance(a.get("from"), str) and isinstance(a.get("to"), str)
+                  and isinstance(a.get("rel"), str)]
+    return out, None
+
+
+def monad_signature(path, m, data=None):
+    """How a monad file is signed, in words: (state, text); state is signed,
+    invalid, unsigned or unchecked. Valid needs gpg's GOODSIG (not a revoked
+    or expired key) by the key the file names -- and, when the file's
+    observator is a person of `data` whose card has a key, by that one: a
+    file can name any key, this base's card is what vouches for it."""
+    asc = monad_asc(path)
+    if not asc.exists():
+        return "unsigned", tr("unsigned (no {file} beside it)", file=asc.name)
+    if not gpg_exe():
+        return "unchecked", tr("a signature is beside it, but GnuPG is not installed: not checked")
+    # absolute paths, after "--": a file's name must never read as one of gpg's options
+    code, out, _err = gpg_run(["--verify", "--", str(asc.resolve()), str(Path(path).resolve())])
+    good, status, primary, who = set(), set(), "", ""
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or parts[0] != "[GNUPG:]":
+            continue
+        status.add(parts[1])
+        if parts[1] == "VALIDSIG" and len(parts) > 2:
+            good, primary = {parts[2].upper(), parts[-1].upper()}, parts[-1].upper()
+        elif parts[1] == "GOODSIG" and len(parts) > 3:
+            who = monad_text(" ".join(parts[3:]))
+    if "NO_PUBKEY" in status:
+        return "unchecked", tr("signed, but the key is not in this computer's keyring: gpg --import it")
+    if status & {"REVKEYSIG", "KEYREVOKED"}:
+        return "invalid", tr("signed with a revoked key ({fpr})", fpr=primary[-16:] or "?")
+    if status & {"EXPKEYSIG", "EXPSIG"}:
+        return "invalid", tr("signed with an expired key, or the signature has expired ({fpr})",
+                             fpr=primary[-16:] or "?")
+    if code or not good or "GOODSIG" not in status or status & {"BADSIG", "ERRSIG"}:
+        return "invalid", tr("INVALID signature: the file changed after it was signed, or the "
+                             "signature is not of it")
+    want = gpg_fpr(m["observator"].get("gpg", ""))
+    pid = m["observator"].get("id") or ""
+    person = by_id(data).get(pid) if data is not None and pid else None
+    card = gpg_fpr(person.get("gpg", "")) if person and coll_of(pid) == "people" else ""
+    name = (person or {}).get("name") or m["observator"].get("name") or pid or "?"
+    if card and card not in good:
+        return "invalid", tr("signed with {got}, but this base's card of {name} names {want}",
+                             got=primary[-16:], name=name, want=card[-16:])
+    if want and want not in good:
+        return "invalid", tr("signed with {got}, but the file names {want}",
+                             got=primary[-16:], want=want[-16:])
+    if card:
+        return "signed", tr("signed and valid, by {who} ({fpr}): the key this base's card of {name} names",
+                            who=who or "?", fpr=primary[-16:], name=name)
+    return "signed", tr("signed and valid, by {who} ({fpr}), a key this base does not vouch for: "
+                        "check its fingerprint with its owner", who=who or "?", fpr=primary[-16:])
+
+
+def monad_name_key(text):
+    """A concept's name for matching: spaces, case and accents left out."""
+    s = unicodedata.normalize("NFKD", " ".join(str(text or "").split()).casefold())
+    return "".join(c for c in s if not unicodedata.combining(c))
+
+
+def monad_form_key(e):
+    """A form for matching: (language, text), case and spaces left out."""
+    return (str(e.get("lang") or "").strip().casefold(),
+            unicodedata.normalize("NFC", " ".join(str(e.get("name") or "").split()).casefold()))
+
+
+class MonadSide:
+    """One side of a comparison: a monad, indexed."""
+
+    def __init__(self, m, label):
+        self.m, self.label = m, label
+        self.concepts = {e["id"]: e for e in m["entries"] if e.get("kind", "concept") == "concept"
+                         and e["id"].startswith("c_")}
+        self.forms = {e["id"]: e for e in m["entries"] if e.get("kind") == "form"}
+        self.sources = {s["id"]: s for s in m["sources"]}
+        self.by_name = {}
+        for cid, e in sorted(self.concepts.items()):
+            self.by_name.setdefault(monad_name_key(e.get("name")), []).append(cid)
+        express = {r for r, ends in RELS.items() if ends == ("form", "concept")}
+        self.expresses = {}         # form key -> {concept ids}
+        self.forms_of = {}          # concept id -> {form keys}
+        for a in m["edges"]:
+            if a["rel"] in express and a["from"] in self.forms and a["to"] in self.concepts:
+                k = monad_form_key(self.forms[a["from"]])
+                self.expresses.setdefault(k, set()).add(a["to"])
+                self.forms_of.setdefault(a["to"], set()).add(k)
+        self.form_keys = {monad_form_key(f) for f in self.forms.values()}
+        self.form_label = {monad_form_key(f): " ".join(str(f.get("name") or "").split())
+                           for f in self.forms.values()}     # as typed: casefold changes ς to σ
+        self.aligns = [a for a in m["edges"] + m["alignments"] if a["rel"] in ALIGN_RELS]
+
+    def name(self, cid):
+        e = self.concepts.get(cid)
+        return one_liner(e.get("name") or cid, 40) if e else cid
+
+
+def form_text(k, label=None):
+    text = label or k[1]
+    return f"{text} ({k[0]})" if k[0] else text
+
+
+def monad_compare(a_m, b_m, a_label, b_label, here=None):
+    """[(title, hint, [lines])]: the sections of `compare`. `here`: this base's
+    ids, when side A is this base (what a pasted line could link to)."""
+    A, B = MonadSide(a_m, a_label), MonadSide(b_m, b_label)
+    out = []
+
+    def ftext(k):
+        return form_text(k, A.form_label.get(k) or B.form_label.get(k))
+    # 1. concepts in both: the same id, else the same name
+    pairs, taken = [], set()
+    for cid in sorted(A.concepts):
+        if cid in B.concepts:
+            pairs.append((cid, cid, tr("same id")))
+            taken.add(cid)
+    paired_a = {p[0] for p in pairs}
+    for cid in sorted(A.concepts):
+        if cid in paired_a:
+            continue
+        for other in B.by_name.get(monad_name_key(A.concepts[cid].get("name")), []):
+            if other not in taken:
+                pairs.append((cid, other, tr("same name")))
+                taken.add(other)
+                paired_a.add(cid)
+                break
+    stated = {}
+    for side, S in (("A", A), ("B", B)):
+        for a in S.aligns:
+            stated.setdefault(tuple(sorted((a["from"], a["to"]))), []).append((side, a["rel"]))
+    got = []
+    for x, y, how in pairs:
+        ea, eb = A.concepts[x], B.concepts[y]
+        head = f"{x} {A.name(x)}  ⟷  {y} {B.name(y)}  ({how})"
+        diff = []
+        ga, gb = " ".join(str(ea.get("gloss") or "").split()), " ".join(str(eb.get("gloss") or "").split())
+        if ga.casefold() != gb.casefold():
+            diff.append(tr("gloss: A “{a}” · B “{b}”", a=one_liner(ga, 60) or "—", b=one_liner(gb, 60) or "—"))
+        fa, fb = A.forms_of.get(x, set()), B.forms_of.get(y, set())
+        if fa - fb:
+            diff.append(tr("forms only in A: {forms}", forms=", ".join(ftext(k) for k in sorted(fa - fb))))
+        if fb - fa:
+            diff.append(tr("forms only in B: {forms}", forms=", ".join(ftext(k) for k in sorted(fb - fa))))
+        got.append(head + "\n       " + ("; ".join(diff) if diff else tr("same gloss, same forms")))
+        said = stated.get(tuple(sorted((x, y))))
+        if said:
+            got[-1] += "\n       " + tr("already aligned: {list}", list=", ".join(
+                f"{side} {rel_label(rel)}" for side, rel in said))
+        elif x == y:
+            got[-1] += "\n       " + tr("the same id on both sides: no link joins an id to itself -- if the "
+                                        "readings differ, the ids clash")
+        elif here is None or y in here:
+            got[-1] += "\n       " + tr("→ to align them, paste in {a}'s LINKS: coincides_with {b}  "
+                                        "(or overlaps / differs_from)", a=x, b=y)
+        else:
+            got[-1] += "\n       " + tr("→ {b} is not in this base, so no link can reach it yet",
+                                        b=y)
+    out.append((tr("Concepts in both (the same id, or the same name)"),
+                tr("Nothing was merged: each side keeps its own concepts. An alignment is "
+                   "stated by hand, on a concept's LINKS: coincides_with / overlaps / "
+                   "differs_from <id> -- both concepts in the base where it is written."), got))
+    # 2. forms read as different concepts
+    pair_of_a = {x: (x, y) for x, y, _ in pairs}
+    pair_of_b = {y: (x, y) for x, y, _ in pairs}
+    got = []
+    for k in sorted(set(A.expresses) & set(B.expresses)):
+        ca = {pair_of_a.get(c, ("A", c)) for c in A.expresses[k]}
+        cb = {pair_of_b.get(c, ("B", c)) for c in B.expresses[k]}
+        if ca != cb:
+            got.append(f"{ftext(k)}:  A → " + "; ".join(f"{c} {A.name(c)}" for c in sorted(A.expresses[k]))
+                       + "  ·  B → " + "; ".join(f"{c} {B.name(c)}" for c in sorted(B.expresses[k])))
+    out.append((tr("Forms that express different concepts on each side (same language, same text)"),
+                tr("Two readings of one word are information, not an error: nothing was "
+                   "changed. Where two of these concepts are one, align them (section 1)."), got))
+    # 3. the alignments either side already states about the other's concepts
+    got = []
+    for side, S, O in (("A", A, B), ("B", B, A)):
+        for a in S.aligns:
+            if a["to"] in O.concepts or a["from"] in O.concepts:
+                why = f" — {a['why']}" if a.get("why") else ""
+                other = [r for sd, r in stated.get(tuple(sorted((a["from"], a["to"]))), []) if sd != side]
+                got.append(f"{side}: {a['from']} {S.name(a['from']) if a['from'] in S.concepts else O.name(a['from'])}"
+                           f" — {rel_label(a['rel'])} — "
+                           f"{a['to']} {S.name(a['to']) if a['to'] in S.concepts else O.name(a['to'])}{why}"
+                           + ("  ·  " + tr("the other side says: {rels}", rels=", ".join(
+                               rel_label(r) for r in other)) if other else ""))
+    out.append((tr("Alignments either side already states about the other's concepts"),
+                tr("Each is one observator's statement; the other side need not hold it."), got))
+    # 4. criteria and eigenforms
+    got = []
+    crits = {}
+    for side, S in (("A", A), ("B", B)):
+        count = {}
+        for o in S.m["observations"]:
+            crit = " ".join(str(o.get("criterion") or "").split())
+            if crit:
+                crit = S.name(crit) if crit in S.concepts else crit
+                count[crit] = count.get(crit, 0) + 1
+        crits[side] = {c.casefold(): c for c in count}
+        top = sorted(count.items(), key=lambda kv: (-kv[1], sort_key(kv[0])))
+        got.append(f"{side}: " + (tr("criteria used: {n}; most used: {list}", n=len(count), list=", ".join(
+            f"{c} ({n}×)" for c, n in top[:MONAD_NAMED])) if count else tr("no criterion used")))
+        eig = obs_eigenforms(S.m)
+        if eig:
+            got.append(f"{side}: " + tr("eigenforms without a concept: {list}",
+                                        list=", ".join(f"{c} ({n}×)" for c, n in eig[:MONAD_NAMED])))
+    both = sorted(set(crits["A"]) & set(crits["B"]))
+    if both:
+        got.append(tr("criteria in both: {list}", list=", ".join(crits["A"][k] for k in both[:MONAD_NAMED])))
+    out.append((tr("Criteria, and the eigenforms of each"),
+                tr("A criterion in both is a distinction shared; an eigenform on one side only "
+                   "may be a concept the other lacks."), got))
+    # 5. what only one side has
+    got = []
+
+    def named(ids):
+        ids = sorted(ids)
+        return ", ".join(ids[:MONAD_NAMED]) + (" …" if len(ids) > MONAD_NAMED else "")
+
+    only_a = set(A.concepts) - {x for x, _y, _h in pairs}
+    only_b = set(B.concepts) - {y for _x, y, _h in pairs}
+    for side, ids in (("A", only_a), ("B", only_b)):
+        if ids:
+            got.append(f"{side}: " + tr("{n} concept(s) only here: {ids}", n=len(ids), ids=named(ids)))
+    for side, S, O in (("A", A, B), ("B", B, A)):
+        ids = [f for f, e in S.forms.items() if monad_form_key(e) not in O.form_keys]
+        if ids:
+            got.append(f"{side}: " + tr("{n} form(s) only here: {ids}", n=len(ids), ids=named(ids)))
+
+    def source_keys(s):
+        return {k for k in (str(s.get("doi") or "").casefold(), monad_name_key(s.get("name"))) if k}
+
+    for side, S, O in (("A", A, B), ("B", B, A)):
+        theirs = {k for s in O.sources.values() for k in source_keys(s)} | set(O.sources)
+        ids = [sid for sid, s in S.sources.items() if sid not in theirs and not (source_keys(s) & theirs)]
+        if ids:
+            got.append(f"{side}: " + tr("{n} source(s) only here: {ids}", n=len(ids), ids=named(ids)))
+    out.append((tr("What only one side has"),
+                tr("Nothing was copied either way. Bringing another monad's records into a base "
+                   "(an import) is not part of Kustos yet."), got))
+    return out
+
+
+def cmd_compare(rest):
+    """`compare <monad file> [<monad file 2>]`: this base's monad (or the first
+    file) against a monad file. Read-only: nothing is written."""
+    files = [x for x in rest if x.strip()]
+    if not files or len(files) > 2:
+        print(tr("usage: python _kustos.py compare <monad.json> [<monad2.json>]"))
+        return 1
+    sides = []
+    if len(files) == 1:
+        data = load_json()
+        pid = observator_id(data)
+        if not pid:
+            print(tr("No observator chosen yet: python _kustos.py observator <p_id|name>"))
+            return 1
+        try:
+            m = monad_of(data, pid)
+        except ValueError as exc:
+            print(exc)
+            return 1
+        sides.append((m, tr("this base ({file})", file=JSON_FILE.name), ""))
+        here = set(by_id(data))
+    else:
+        here = None
+        try:
+            data = load_json()          # only to know the keys its cards name
+        except SystemExit:
+            data = None
+    for f in files:
+        m, problem = monad_read(f)
+        if problem:
+            print(f"{f}: {problem}")
+            return 1
+        sides.append((m, str(f), monad_signature(f, m, data)[1]))
+    (a, a_label, a_sig), (b, b_label, b_sig) = sides
+    print("\n" + tr("compare · read-only, nothing is written or merged"))
+    for side, m, label, sig in (("A", a, a_label, a_sig), ("B", b, b_label, b_sig)):
+        o = m["observator"]
+        print(f"\n  {side}  {label}")
+        print("     " + tr("observator: {name} · {id}", name=o.get("name") or "?", id=o.get("id") or "?")
+              + (f"  ·  {tr('made')} {m['made'][:16].replace('T', ' ')}" if sig and m.get("made") else ""))
+        print("     " + tr("{concepts} concepts, {forms} forms, {sources} sources, {links} links, "
+                           "{alignments} alignments, {observations} observations",
+                           concepts=sum(1 for e in m["entries"] if e.get("kind", "concept") == "concept"),
+                           forms=sum(1 for e in m["entries"] if e.get("kind") == "form"),
+                           sources=len(m["sources"]), links=len(m["edges"]),
+                           alignments=len(m["alignments"]), observations=len(m["observations"])))
+        if sig:
+            print("     " + sig)
+    if a["observator"].get("id") and a["observator"].get("id") == b["observator"].get("id"):
+        print("\n  " + tr("Both sides are the same observator's: this compares two moments of one monad."))
+    for n, (title, hint, lines) in enumerate(monad_compare(a, b, a_label, b_label, here), 1):
+        print(f"\n{n}. {title}: {len(lines)}")
+        for x in lines[:AUDIT_SHOWN]:
+            print("     " + x)
+        if len(lines) > AUDIT_SHOWN:
+            print("     " + tr("… and {n} more", n=len(lines) - AUDIT_SHOWN))
+        print("   → " + hint)
     print()
     return 0
 
@@ -17006,7 +17661,9 @@ HELP_MONADS = (
     "\n                  a disc, the more distinctly the one in the middle perceives"
     "\n                  it; the rest stays as dust at the edge. Passing over a disc"
     "\n                  shows the others from its side; a click moves there, ← and →"
-    "\n                  walk back and forward. Health and drafts stay out.\n"
+    "\n                  walk back and forward. Health and drafts stay out. Dashed"
+    "\n                  rings: records signed by another observator, in their colour"
+    "\n                  (the legend, bottom right).\n"
 )
 
 # the Help › Shortcuts lines for the link graph
@@ -17101,6 +17758,17 @@ HELP_PROPOSALS = (
     "\n                  is:proposed finds them. python _kustos.py sign-proposals"
     "\n                  [<id> … | --all]; doctor --observe audits the observing"
     "\n                  (read-only).\n"
+)
+
+
+# the Help › Shortcuts lines for alignment between observators
+HELP_ALIGN = (
+    "\n  ALIGNMENT: a concept's LINKS may say how it stands to another observator's:"
+    "\n                  coincides_with / overlaps / differs_from c_… (the reason after"
+    "\n                  —). Each is an observation, alinho, in your name; nothing is"
+    "\n                  merged. python _kustos.py export --observator <file.json> writes"
+    "\n                  your monad (never health, res or drafts); compare <file>"
+    "\n                  [<file2>] sets it against another's (read-only).\n"
 )
 
 
@@ -21687,7 +22355,7 @@ class App:
         self.show_text(tr("Shortcuts"), tr(HELP_TEXT, conflicts=CONFLICT_DIR.name, stem=STEM)
                        + tr(HELP_READING) + tr(HELP_COPY) + tr(HELP_GRAPH) + tr(HELP_MONADS)
                        + tr(HELP_NOTES) + tr(HELP_RES) + tr(HELP_TIMELINE) + tr(HELP_MAP)
-                       + tr(HELP_OBS) + tr(HELP_PROPOSALS))
+                       + tr(HELP_OBS) + tr(HELP_PROPOSALS) + tr(HELP_ALIGN))
 
     # ------------------------------------------------------------ dialogs
     def dialog(self, title, width=520, height=None):
@@ -22679,7 +23347,7 @@ REL_FAMILY = {
     "expresses": "verba", "derives_from": "verba", "cognate_of": "verba",
     "borrows_from": "verba", "calques": "verba", "specializes": "verba",
     "opposes": "verba", "analogous_to": "verba", "instrument_of": "verba",
-    "requires": "verba",
+    "requires": "verba", "coincides_with": "verba", "overlaps": "verba", "differs_from": "verba",
     "coined_by": "people", "used_by": "people", "about": "people",
     "author_of": "people", "editor_of": "people", "translator_of": "people",
     "knows": "people", "influenced": "people", "works_at": "people", "member_of": "people",
@@ -22695,7 +23363,8 @@ LINK_FAMILY_COLOUR = {"verba": "#a0783a", "people": "#3f7d99", "sources": "#6f8a
                       "corpus": "#b5523b", "res": "#a0577a", "other": "#8a8578"}
 LINK_FAMILY_LABEL = {"verba": "verba", "people": "people", "sources": "sources",
                      "corpus": "corpus", "res": "res", "other": "other"}
-SYMMETRIC_RELS = {"knows", "opposes", "analogous_to", "cognate_of", "correlates"}
+SYMMETRIC_RELS = {"knows", "opposes", "analogous_to", "cognate_of", "correlates",
+                  "coincides_with", "overlaps", "differs_from"}
 LINK_HALF_LIFE = 30          # days for a written link's vividness to halve
 _EDGE_TIMES = {"key": None, "times": {}}
 
@@ -24671,6 +25340,9 @@ def cmd_graph(open_id=None):
 # others from its side, the same city seen from another place (§57). All the rims
 # breathe on one clock and nothing passes between them: the harmony is
 # pre-established. Health and drafts stay out, also as a way into other records.
+# When the records in view are signed by more than one observator, each one
+# signed by another than this base's gets a dashed ring in that observator's
+# colour, with a small legend: monads are never merged, only told apart.
 # Read-only: nothing it computes is saved.
 
 MONAD_COLLS = ("people", "entries", "sources")
@@ -24681,6 +25353,9 @@ MONAD_TERMS = 60             # the rarest terms of a record: a long note stays c
 MONAD_MOVE_MS = 520          # the universe rearranges around another monad
 MONAD_TINT_MS = 160          # the view passes to the monad under the pointer
 MONAD_BREATH_MS = 6000       # one breath of the rims
+# the rings of other observators' records (the first ones by how many they sign)
+MONAD_SIGNER_COLOURS = ("#3f7d99", "#a0577a", "#6f8a3a", "#b5523b", "#7a62a8", "#a0783a")
+MONAD_SIGNERS_SHOWN = 5      # lines of the legend; the rest are "others"
 MONAD_WORD = re.compile(r"[^\W\d_]{4,}")
 MONAD_STOP = set("""
     about after again also among because been before being between both cannot
@@ -24782,6 +25457,7 @@ class MonadView:
         self.fill, self.far = {}, 0            # the timer of those dots, the dust
         self._breath = self._follow = None
         self.dust, self.rim = [], None
+        self.signer_colour, self.legend, self.legend_rows = {}, [], []
 
         fams = set(tkfont.families(root))
         mono = next((f for f in ("Cascadia Mono", "Consolas", "Lucida Console",
@@ -24848,6 +25524,7 @@ class MonadView:
             data = self.get_data()
             if data is not self.data or self.u is None:
                 self.data, self.u = data, MonadIndex(data)
+                self.colour_signers()
         u = self.u
         if rid not in u.recs:
             rid = self.center if self.center in u.recs else u.richest()
@@ -24886,6 +25563,7 @@ class MonadView:
         self.mirror(rid)
         self.cv.tag_raise(self.m[rid]["disc"])
         self.lay_dust(order)
+        self.mark_signers()
         self.cv.itemconfigure(self.t_notice, text="" if order else tr(
             "Nothing in common with the rest yet: it needs more words of its own, or a link."))
         self.retint()
@@ -24896,11 +25574,82 @@ class MonadView:
         cv = self.cv
         disc = cv.create_oval(0, 0, 0, 0, fill=PAPER, width=1, outline=self.rims[self.rim or 0],
                               tags=("m", "rim"))
+        ring = cv.create_oval(-9, -9, -9, -9, outline=FAINT, width=1.5, dash=(3, 2),
+                              state="hidden", tags=("m",))
         text = cv.create_text(0, 0, anchor="n", tags=("m",), font=self.f_label, state="hidden",
                               text=one_liner(label_any(self.u.recs[n], self.data), 30))
         m = self.m[n] = {"x": x, "y": y, "r": 0.0, "from": (x, y, 0.0), "gone": False,
-                         "disc": disc, "text": text, "dots": [], "k": 0.0, "q": 0.0, "s": -1}
+                         "disc": disc, "ring": ring, "text": text, "dots": [], "k": 0.0, "q": 0.0,
+                         "s": -1}
         return m
+
+    # ---------------------------------------------------------- observators
+    def colour_signers(self):
+        """A colour for each observator other than this base's, the one who
+        signs most first: the same colour for the same person while the view
+        reads the same base."""
+        mine = observator_id(self.data)
+        count = {}
+        for r in self.u.recs.values():
+            who = r.get("observator") or ""
+            if who and who != mine:
+                count[who] = count.get(who, 0) + 1
+        ranked = sorted(count, key=lambda w: (-count[w], w))
+        self.signer_colour = {w: MONAD_SIGNER_COLOURS[i % len(MONAD_SIGNER_COLOURS)]
+                              for i, w in enumerate(ranked)}
+
+    def mark_signers(self):
+        """Rings and legend: only when the monads in view are signed by more than
+        one observator. This base's own records keep their plain rim; unsigned
+        ones (proposals, older records) get no ring."""
+        mine = observator_id(self.data)
+        who = {n: self.u.recs[n].get("observator") or "" for n in self.goal}
+        signers = {w for w in who.values() if w}
+        many = len(signers) > 1
+        for n, m in self.m.items():
+            w = who.get(n, "")
+            if many and w and w != mine:
+                self.cv.itemconfigure(m["ring"], state="normal",
+                                      outline=self.signer_colour.get(w, MONAD_SIGNER_COLOURS[-1]))
+            else:
+                self.cv.itemconfigure(m["ring"], state="hidden")
+        rows = []
+        if many:
+            n_of = {}
+            for w in who.values():
+                if w:
+                    n_of[w] = n_of.get(w, 0) + 1
+            order = sorted(signers, key=lambda w: (w != mine, -n_of[w], w))
+            for w in order[:MONAD_SIGNERS_SHOWN]:
+                name = one_liner(observator_name(self.data, w), 28)
+                rows.append((tr("{name} · this base's observator", name=name) if w == mine else name,
+                             None if w == mine else self.signer_colour.get(w, MONAD_SIGNER_COLOURS[-1]),
+                             n_of[w]))
+            if len(order) > MONAD_SIGNERS_SHOWN:
+                rows.append((tr("{n} other observators", n=len(order) - MONAD_SIGNERS_SHOWN),
+                             MONAD_SIGNER_COLOURS[-1], sum(n_of[w] for w in order[MONAD_SIGNERS_SHOWN:])))
+        self.legend_rows = rows
+        self.lay_legend()
+
+    def lay_legend(self):
+        """The legend, bottom right above the status: a ring like the records'
+        (plain for this base's observator), the name and how many in view."""
+        cv = self.cv
+        for item in self.legend:
+            cv.delete(item)
+        self.legend = []
+        w, h = cv.winfo_width(), cv.winfo_height()
+        y = h - self.BOTTOM - 6
+        for label, colour, n in reversed(self.legend_rows):
+            t = cv.create_text(w - 12, y, anchor="se", font=self.f_status, fill=SOFT,
+                               text=f"{label}  {n}")
+            x0, y0, _x1, y1 = cv.bbox(t)
+            cy, r = (y0 + y1) / 2, 5
+            kw = {"outline": colour, "width": 1.5, "dash": (3, 2)} if colour else \
+                {"outline": self.rims[self.rim or 0], "width": 1}
+            ring = cv.create_oval(x0 - 8 - 2 * r, cy - r, x0 - 8, cy + r, **kw)
+            self.legend += [t, ring]
+            y -= 16
 
     def mirror(self, n):
         """The dots inside a disc: what this monad perceives among those on
@@ -24958,7 +25707,7 @@ class MonadView:
     def landed(self):
         for n in [n for n, m in self.m.items() if m["gone"]]:
             m = self.m.pop(n)
-            self.cv.delete(m["disc"], m["text"], *[d[0] for d in m["dots"]])
+            self.cv.delete(m["disc"], m["ring"], m["text"], *[d[0] for d in m["dots"]])
         self.draw()
         self.drain()
 
@@ -24974,6 +25723,7 @@ class MonadView:
         for n, m in self.m.items():
             x, y, r = S[n]
             cv.coords(m["disc"], x - r, y - r, x + r, y + r)
+            cv.coords(m["ring"], x - r - 3.5, y - r - 3.5, x + r + 3.5, y + r + 3.5)
             cv.coords(m["text"], x, y + r + 3)
             d = 2.2 if n == self.center else 1.5
             for item, other, f in m["dots"]:
@@ -25034,6 +25784,7 @@ class MonadView:
         cv.itemconfigure(self.t_keys, width=w - 24)
         if self.center:
             self.lay_dust()
+            self.lay_legend()
             self.draw()
 
     def update_status(self, flash=None):
@@ -25043,7 +25794,11 @@ class MonadView:
             left = flash
         elif n and n != self.center:
             words = [u.term(w) for w in u.shared(self.center, n)[:5]]
-            left = tr("{name} · in common: {words}", name=label_any(u.recs[n], self.data),
+            name = label_any(u.recs[n], self.data)
+            who = u.recs[n].get("observator") or ""
+            if who and who != observator_id(self.data):     # before the words: never cut off
+                name = tr("{name} · signed by {who}", name=name, who=observator_name(self.data, who))
+            left = tr("{name} · in common: {words}", name=name,
                       words=", ".join(words) if words else "—")
         else:
             trail = self.back[-3:] + [self.center]
@@ -26676,8 +27431,12 @@ def main():
         return cmd_sign_proposals(rest)
     if cmd == "verify":
         return cmd_verify(rest)
+    if cmd == "export" and rest and rest[0] == "--observator":
+        return cmd_export_monad(rest[1:])
     if cmd == "export":
         return cmd_export(rest[0] if rest else "bibtex", rest[1] if len(rest) > 1 else None)
+    if cmd == "compare":
+        return cmd_compare(rest)
     print(__doc__)
     return 0
 
@@ -27829,7 +28588,9 @@ PT = {
         "\n                  linhas: quanto mais perto o disco, mais distintamente o do"
         "\n                  centro o percebe; o resto fica como poeira na borda. Passar"
         "\n                  sobre um disco mostra os outros do lado dele; um clique vai"
-        "\n                  até ele, ← e → voltam e avançam. Saúde e rascunhos ficam de fora.\n",
+        "\n                  até ele, ← e → voltam e avançam. Saúde e rascunhos ficam de fora."
+        "\n                  Anéis tracejados: registros assinados por outro observador, na"
+        "\n                  cor dele (a legenda, embaixo à direita).\n",
     "Monads":
         "Mônadas",
     "Kustos · monads (read-only)":
@@ -29585,6 +30346,145 @@ PT = {
         "\n                  a assina. is:proposed acha as propostas. python _kustos.py"
         "\n                  sign-proposals [<id> … | --all]; doctor --observe audita o"
         "\n                  observar (só leitura).\n",
+    # ---- alignment, monad files, compare
+    "coincides with":
+        "coincide com",
+    "overlaps":
+        "sobrepõe-se a",
+    "differs from":
+        "difere de",
+    "{a} and {b}: {rels}, both said by {who} (keep the one you hold)":
+        "{a} e {b}: {rels}, ambas ditas por {who} (fique com a que sustenta)",
+    "{id} is not a person of this base.":
+        "{id} não é uma pessoa desta base.",
+    "usage: python _kustos.py export --observator [<p_id>] <file.json>":
+        "uso: python _kustos.py export --observator [<p_id>] <arquivo.json>",
+    "Give the monad file a name of its own, ending in .json (not one of the base's files).":
+        "Dê ao arquivo da mônada um nome próprio, terminado em .json (não um dos arquivos da base).",
+    "{name}'s monad -> {file}: {concepts} concepts, {forms} forms, {sources} sources, {links} links, {alignments} alignments, {observations} observations":
+        "mônada de {name} -> {file}: {concepts} conceitos, {forms} formas, {sources} fontes, {links} ligações, {alignments} alinhamentos, {observations} observações",
+    "Not in it: health records, res (items and accounts), drafts, other people's records, settings, logs, skills, earlier values.":
+        "Fora dela: registros de saúde, res (itens e contas), rascunhos, registros de outras pessoas, configurações, logs, habilidades, valores anteriores.",
+    "Signed with {fpr} -> {file}":
+        "Assinada com {fpr} -> {file}",
+    "{file} was removed: it signed an earlier export.":
+        "{file} foi removido: assinava uma exportação anterior.",
+    "Unsigned. {why}":
+        "Sem assinatura. {why}",
+    "cannot be read: {error}":
+        "não pode ser lido: {error}",
+    "is not JSON":
+        "não é JSON",
+    "is not a monad file (made by export --observator)":
+        "não é um arquivo de mônada (feito por export --observator)",
+    "unsigned (no {file} beside it)":
+        "sem assinatura (nenhum {file} ao lado)",
+    "a signature is beside it, but GnuPG is not installed: not checked":
+        "há uma assinatura ao lado, mas o GnuPG não está instalado: não conferida",
+    "signed, but the key is not in this computer's keyring: gpg --import it":
+        "assinado, mas a chave não está no chaveiro deste computador: gpg --import nela",
+    "INVALID signature: the file changed after it was signed, or the signature is not of it":
+        "assinatura INVÁLIDA: o arquivo mudou depois de assinado, ou a assinatura não é dele",
+    "signed with {got}, but the file names {want}":
+        "assinado com {got}, mas o arquivo indica {want}",
+    "signed with a revoked key ({fpr})":
+        "assinado com uma chave revogada ({fpr})",
+    "signed with an expired key, or the signature has expired ({fpr})":
+        "assinado com uma chave expirada, ou a assinatura expirou ({fpr})",
+    "signed with {got}, but this base's card of {name} names {want}":
+        "assinado com {got}, mas o cartão de {name} nesta base indica {want}",
+    "signed and valid, by {who} ({fpr}): the key this base's card of {name} names":
+        "assinado e válido, por {who} ({fpr}): a chave que o cartão de {name} nesta base indica",
+    "signed and valid, by {who} ({fpr}), a key this base does not vouch for: check its "
+    "fingerprint with its owner":
+        "assinado e válido, por {who} ({fpr}), uma chave que esta base não abona: confira a "
+        "impressão digital com o dono",
+    "is too large for a monad file ({mb} MB)":
+        "é grande demais para um arquivo de mônada ({mb} MB)",
+    "{file} exists and is not a monad file: it is not overwritten.":
+        "{file} existe e não é um arquivo de mônada: não é sobrescrito.",
+    "same id":
+        "mesmo id",
+    "same name":
+        "mesmo nome",
+    "gloss: A “{a}” · B “{b}”":
+        "glosa: A “{a}” · B “{b}”",
+    "forms only in A: {forms}":
+        "formas só em A: {forms}",
+    "forms only in B: {forms}":
+        "formas só em B: {forms}",
+    "same gloss, same forms":
+        "mesma glosa, mesmas formas",
+    "already aligned: {list}":
+        "já alinhados: {list}",
+    "the same id on both sides: no link joins an id to itself -- if the readings differ, the ids clash":
+        "o mesmo id dos dois lados: nenhuma ligação une um id a si mesmo -- se as leituras diferem, os ids colidem",
+    "→ to align them, paste in {a}'s LINKS: coincides_with {b}  (or overlaps / differs_from)":
+        "→ para alinhá-los, cole nas LIGAÇÕES de {a}: coincides_with {b}  (ou overlaps / differs_from)",
+    "→ {b} is not in this base, so no link can reach it yet":
+        "→ {b} não está nesta base, e nenhuma ligação chega a ele ainda",
+    "Concepts in both (the same id, or the same name)":
+        "Conceitos nos dois (o mesmo id, ou o mesmo nome)",
+    "Nothing was merged: each side keeps its own concepts. An alignment is stated by hand, on a concept's LINKS: coincides_with / overlaps / differs_from <id> -- both concepts in the base where it is written.":
+        "Nada foi fundido: cada lado mantém seus conceitos. Um alinhamento se declara à mão, nas LIGAÇÕES de um conceito: coincides_with / overlaps / differs_from <id> -- os dois conceitos na base onde se escreve.",
+    "Forms that express different concepts on each side (same language, same text)":
+        "Formas que exprimem conceitos diferentes de cada lado (mesma língua, mesmo texto)",
+    "Two readings of one word are information, not an error: nothing was changed. Where two of these concepts are one, align them (section 1).":
+        "Duas leituras de uma palavra são informação, não erro: nada foi mudado. Onde dois desses conceitos forem um, alinhe-os (seção 1).",
+    "the other side says: {rels}":
+        "o outro lado diz: {rels}",
+    "Alignments either side already states about the other's concepts":
+        "Alinhamentos que um lado já declara sobre os conceitos do outro",
+    "Each is one observator's statement; the other side need not hold it.":
+        "Cada um é a declaração de um observador; o outro lado não precisa sustentá-la.",
+    "criteria used: {n}; most used: {list}":
+        "critérios usados: {n}; os mais usados: {list}",
+    "no criterion used":
+        "nenhum critério usado",
+    "eigenforms without a concept: {list}":
+        "eigenformas sem conceito: {list}",
+    "criteria in both: {list}":
+        "critérios nos dois: {list}",
+    "Criteria, and the eigenforms of each":
+        "Critérios, e as eigenformas de cada um",
+    "A criterion in both is a distinction shared; an eigenform on one side only may be a concept the other lacks.":
+        "Um critério nos dois é uma distinção compartilhada; uma eigenforma de um lado só pode ser um conceito que falta ao outro.",
+    "{n} concept(s) only here: {ids}":
+        "{n} conceito(s) só aqui: {ids}",
+    "{n} form(s) only here: {ids}":
+        "{n} forma(s) só aqui: {ids}",
+    "{n} source(s) only here: {ids}":
+        "{n} fonte(s) só aqui: {ids}",
+    "What only one side has":
+        "O que só um lado tem",
+    "Nothing was copied either way. Bringing another monad's records into a base (an import) is not part of Kustos yet.":
+        "Nada foi copiado em nenhum sentido. Trazer os registros de outra mônada para uma base (uma importação) ainda não faz parte do Kustos.",
+    "usage: python _kustos.py compare <monad.json> [<monad2.json>]":
+        "uso: python _kustos.py compare <mônada.json> [<mônada2.json>]",
+    "this base ({file})":
+        "esta base ({file})",
+    "compare · read-only, nothing is written or merged":
+        "compare · só leitura, nada é gravado nem fundido",
+    "made":
+        "feito em",
+    "{concepts} concepts, {forms} forms, {sources} sources, {links} links, {alignments} alignments, {observations} observations":
+        "{concepts} conceitos, {forms} formas, {sources} fontes, {links} ligações, {alignments} alinhamentos, {observations} observações",
+    "Both sides are the same observator's: this compares two moments of one monad.":
+        "Os dois lados são do mesmo observador: isto compara dois momentos de uma mônada.",
+    "{name} · this base's observator":
+        "{name} · observador desta base",
+    "{n} other observators":
+        "{n} outros observadores",
+    "{name} · signed by {who}":
+        "{name} · assinado por {who}",
+    HELP_ALIGN:
+        "\n  ALINHAMENTO: as LIGAÇÕES de um conceito podem dizer como ele está para o de"
+        "\n                  outro observador: coincides_with / overlaps / differs_from c_…"
+        "\n                  (o motivo depois de —). Cada uma é uma observação, alinho, em"
+        "\n                  seu nome; nada é fundido. python _kustos.py export --observator"
+        "\n                  <arquivo.json> grava sua mônada (nunca saúde, res nem"
+        "\n                  rascunhos); compare <arquivo> [<arquivo2>] a confronta com a de"
+        "\n                  outro (só leitura).\n",
 }
 
 if __name__ == "__main__":

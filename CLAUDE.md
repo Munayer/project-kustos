@@ -39,7 +39,7 @@ empty repository folder gives an empty base (and `doctor` passes on it).
 language (`tr`), common, the collections (**people** `p_`, **verba**
 `c_`/`f_` concepts and forms, **sources** `s_`, **corpus** `h_` health
 records, **notes** `n_` — shown as "drafts", **res** `r_` things), geo, observator,
-observations, then file, register, conflicts, lock, doctor, mirror, search,
+observations, then file, register, conflicts, lock, doctor, monad files, mirror, search,
 history, migration, upgrade, citation, health report, peritia, web, themes, motion,
 the Tk `*Card` editors, `App` (the main window), `BookView` (the logbook), the
 `cmd_*` functions and `main()`, and finally the `PT` dict.
@@ -140,6 +140,9 @@ Ideas that span several sections:
   and links, `MonadView` draws them with no lines. `MONAD_COLLS` keeps health,
   drafts and res out, also as bridges between records; keep it that way. To measure its
   frames, time the moves themselves: `update()` does not return while two tweens run.
+  With more than one observator in view, `mark_signers` shows a dashed ring
+  (one oval per disc, `colour_signers`' colours) on records signed by another
+  than the base's observator, and `lay_legend` the legend; the page has no monads.
 - **Practice** (`# ==== practice`, the web app's `#practice`): `drill_items`
   makes an item of a concept in one language (its forms that `express` it) or
   of a gloss (forms linked to no concept, same language and gloss);
@@ -274,7 +277,7 @@ Ideas that span several sections:
   and replayed like records, but out of `COLLS` and the register;
   `fix_observation` fills its defaults, no SCHEMA step. Fields: `observator`,
   `t`, `updated_at`, `targets` (record ids), `kind` (`OBS_KINDS`: distinguo,
-  reobservo; alinho, proponho are accepted for later steps), `auto`,
+  reobservo, alinho (# ---- alignment), proponho (# ---- proposals)), `auto`,
   `distinction`, `criterion` (text or `c_…`), `confidence` (1-3 or null),
   `source`, `changed`, `before`, `prev` (the `updated_at` of the version
   `before` describes), `status`, `notes`. `save_record` calls `observe_save`
@@ -335,6 +338,33 @@ Ideas that span several sections:
   `observe_audit(data, days, seen)` returns the sections, `cmd_doctor_observe`
   prints them; it must stay read-only -- `load_json`, `seen_read` and no
   write of any kind. Test it on invented data in memory (`seen={}`).
+- **Alignment** (`# ---- alignment`, after proposals): `ALIGN_RELS`
+  (`coincides_with`, `overlaps`, `differs_from`: concept -> concept in RELS,
+  in `SYMMETRIC_RELS`). `put_record` finds the alignment links a save adds or
+  changes (`align_changes`, only for `entries` saved with `edges`; on `sign`,
+  also those the proposal brought, `align_unsigned`) and `observe_align` adds an
+  automatic `alinho` per link -- `targets` [from, to], `distinction` the rel,
+  `criterion` the reason -- coalesced per observator, link (from, type, to)
+  and day, only for a concept's links, in the
+  same write and log append. A proposed save makes none (`propose_save` has
+  it). `align_text` is how the lists show one; `check_alignments` warns of one
+  observator saying two things of a pair. Never merge observators.
+- **Monad files** (`# ==== monad files`, after the doctor): `monad_of(data,
+  pid)` is the one place that decides what leaves the base -- `entries` and
+  `sources` signed by `pid`, without their register stamps
+  (`MONAD_KEPT_HOME`), links among them (not those a pending proposal
+  brought), `alignments` going out (target id only), their observations of
+  those records without `before`, a stub
+  (id, name, gpg) -- and `monad_guard` checks it (never with `assert`). `cmd_export_monad` writes
+  it and signs it through `gpg_run` (`<file>.asc`); `monad_read` takes a file
+  as untrusted data (its texts through `monad_text`: no other type, no
+  control character), `monad_signature` checks the `.asc` (absolute paths
+  after `--`, so no file name reads as a gpg option; GOODSIG, by the key this
+  base's card of that observator names when there is one), `monad_compare`
+  returns the sections and `cmd_compare` prints them: read-only, like
+  `doctor --observe`. Never add `corpus`, `res`, `notes`, people or `ui` to a
+  monad. Test with two invented bases, and GnuPG only with a throwaway
+  keyring (as for `sign`). Importing another monad is future work.
 - **Long texts are markdown**: `textfield(..., pages=True)` (every NOTES and the
   draft's text) gets `MarkdownKeys`, and `fit(opening=True)` paints it before
   the pages are measured. The text stored stays plain.

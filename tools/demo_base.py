@@ -85,7 +85,8 @@ def main(argv):
 def build(K, folder):
     """The web demo's records: a few people, sources, verba, health records,
     things of the house (res: items and accounts) and drafts, then a web of
-    concepts with many links for the graph."""
+    concepts with many links for the graph, and a second observator's two
+    concepts, which Ada's are aligned with."""
     def put(coll, rec, edges=None):
         {"people": K.fix_person, "entries": K.fix_entry, "sources": K.fix_source,
          "corpus": K.fix_metric, "res": K.fix_res}[coll](rec)
@@ -355,6 +356,28 @@ def build(K, folder):
         "Steering | guiding a course by small corrections: κυβερνήτης (grc)")
     K.save_bulk_concepts(plan, "")
     K.sign_proposals([e["id"] for e in K.load_json()["entries"] if e.get("name") == "Feedforward"])
+    # ---- a second observator: Ben Okoro (invented). His person is a name and
+    # nothing else; two concepts are signed by him, as if typed in his name,
+    # and Ada aligns three of hers with them, one of each kind. Each alignment
+    # is an act of observation (an `alinho`); nothing of his is merged into hers.
+    put("people", {"id": "p_ben00007", "name": "Ben Okoro"})
+    K.save_ui({"observator": "p_ben00007"})
+    try:
+        put("entries", {"id": "c_feedback", "kind": "concept", "name": "Feedback",
+                        "gloss": "Output returned to the input, whatever it does there.",
+                        "domains": ["control"]})
+        put("entries", {"id": "c_self_regulation", "kind": "concept", "name": "Self-regulation",
+                        "gloss": "A system holding its own course without outside correction.",
+                        "domains": ["control"]})
+    finally:
+        K.save_ui({"observator": "p_ada00001"})
+    regulation = cids[2 + concepts.index("Regulation")]
+    K.write_link("c_feedback_loop", "c_feedback", "coincides_with",
+                 "the same circuit, named by its loop or by its return")
+    K.write_link("c_homeostasis", "c_self_regulation", "overlaps",
+                 "both hold a state; only homeostasis is said of living things")
+    K.write_link(regulation, "c_self_regulation", "differs_from",
+                 "regulation comes from outside the system, self-regulation from within")
 
 
 if __name__ == "__main__":

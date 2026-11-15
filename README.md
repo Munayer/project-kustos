@@ -161,6 +161,9 @@ It refuses any folder it did not make, so it never touches a real base.
   wheel zooms, `k` filters by kind, `1`-`3` show more or fewer, Enter opens the
   record on the card. All the rims breathe on one clock. Health and drafts stay
   out, and nothing it computes is saved; `F5` rereads what was edited since.
+  When the discs in view are signed by more than one observator, those signed
+  by someone other than this base's get a dashed ring in that observator's
+  colour, with a small legend (bottom right); passing over one names its signer.
 - **Link graph** (`Ctrl+Shift+G`, **View › Link graph**, or `python _kustos.py graph [id]`):
   a second window with the open record in the middle and the records
   one to three links away around it, laid out by springs that settle by
@@ -469,6 +472,33 @@ It refuses any folder it did not make, so it never touches a real base.
   key or a key not in this computer's keyring is reported. Without GnuPG
   nothing else changes. A new key on the card makes the old signatures fail:
   sign again after changing it.
+- **Alignment between observators**: each base is one observator's universe,
+  a *monad*, and observators are never merged -- the same form linked to
+  different concepts by two observators is information, not an error. What
+  can be said across them is said explicitly, on a concept's LINKS:
+  `coincides_with c_…`, `overlaps c_…` or `differs_from c_…` (with the reason
+  after `—`), concept to concept, symmetric on the graphs. Each such link
+  written or changed is itself an observation, *alinho*, in the observator's
+  name, with the reason as its criterion (one a day per link); one
+  written as a proposal waits for the proposal to be signed. The doctor warns
+  when one observator says two different things of the same two concepts.
+- **Monad files** (`python _kustos.py export --observator [<p_id>] <file.json>`):
+  the observator's monad as one file, made only when asked, for another
+  instance to compare against: the concepts, forms and sources they signed,
+  the links among those, the alignments they stated (the other end as an id
+  alone), their observations of those records without earlier values, and
+  their id, name and GPG fingerprint. Health records, res (items and
+  accounts), drafts, other people's records, settings, logs and skills never
+  leave the base. When their card has a key and GnuPG is installed,
+  `<file>.asc` is written beside it, a detached signature.
+  `python _kustos.py compare <file> [<file2>]` sets this base's monad (or a
+  first file) against one, read-only: the signature (valid, invalid or
+  absent), the concepts in both (the same id or the same name) with what
+  differs, the forms read as different concepts, the alignments either side
+  already states, the criteria and eigenforms of each, and what only one side
+  has -- each section with a hint, such as the alignment line to paste into a
+  concept's LINKS. Nothing is merged or copied; bringing another monad's
+  records into a base is future work.
 - **Source**: free types (book, paper, thesis, law/bill, decisions, webpages, videos), citations in academic formats, BibTeX and CSL-JSON.
   Can import from Zotero via CSL-JSON or BibTeX without duplicating entries.
 - **Health (corpus)**: four kinds of record, each with its own fields —
@@ -610,6 +640,8 @@ python _kustos.py observator [p_id|name]   who signs this instance; with an argu
 python _kustos.py sign | verify            OpenPGP signatures over the logs (GnuPG, optional)
 python _kustos.py import [zotero] <export.json|.bib>   sources, as proposals
 python _kustos.py sign-proposals [<id> … | --all]    sign proposals; alone, list them
+python _kustos.py export --observator [<p_id>] <file.json>   the observator's monad, for comparing
+python _kustos.py compare <file.json> [<file2.json>]   this base (or a file) against a monad (read-only)
 python _kustos.py mirror | corpus | merge | history <id> | replay
 python _kustos.py reobserve <id>           a record's observations: who, when, what changed
 python _kustos.py observe                  how much is observed again; criteria without a concept
