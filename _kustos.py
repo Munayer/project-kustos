@@ -10606,9 +10606,10 @@ def web_links(form, rid, rec, inverse=None):
     unreadable lines are kept on the record as `edge_drafts`, as the window does;
     the lines written from the other end (cited_by …) go to `inverse`, to be
     saved with the record they start from once this one is."""
+    if not isinstance(form.get("edges"), str):
+        return None, []         # a form without LINKS (an older page, another client): kept as they are
     rec = dict(rec, id=rid)
-    links, back, unparsed = take_links(form.get("edges") if isinstance(form.get("edges"), str)
-                                       else "", rec, load_json())
+    links, back, unparsed = take_links(form["edges"], rec, load_json())
     if inverse is not None:
         inverse.extend(back)
     return links, unparsed
@@ -10663,8 +10664,7 @@ def web_save(body):
             out["met"] = out.get("met") or TODAY()
             out["id"] = make_id(out["name"], taken)
         # a page opened before people had links of their own sends none: keep them
-        links, unparsed = (web_links(form, out["id"], out, inverse) if isinstance(form.get("edges"), str)
-                           else (None, []))
+        links, unparsed = web_links(form, out["id"], out, inverse)
         if links is not None:
             web_drafts(out, unparsed)
         touch(out)
@@ -10686,7 +10686,8 @@ def web_save(body):
             text = before
         place_note(out)
         links, unparsed = web_links(form, out["id"], out, inverse)
-        web_drafts(out, unparsed)
+        if links is not None:
+            web_drafts(out, unparsed)
         touch(out)
         out["_text"] = (before, text)       # for the observation: the text lives in the file
         data = save_record("notes", out, edges=links)
@@ -10707,7 +10708,8 @@ def web_save(body):
             else:
                 out["id"] = new_metric_id(out, taken)
         links, unparsed = web_links(form, out["id"], out, inverse)
-        web_drafts(out, unparsed)
+        if links is not None:
+            web_drafts(out, unparsed)
         touch(out)
         data = save_record(coll, out, edges=links)
         if unparsed:
@@ -20308,11 +20310,11 @@ class App:
                   ("corpus", lambda r: haystack_metric(r, self.data)),
                   ("notes", lambda r: haystack_note(r)),
                   ("res", lambda r: haystack_res(r, self.data)))
-        cache, seen = note_cache(), {}
+        files, seen = note_cache(), {}     # not `cache`: that one is the search text's
         for n in self.data["notes"]:
             n["_body"] = note_body(n)       # read again only when the file changed
             key = str(note_path(n)) if n.get("file") else ""
-            seen[n["id"]] = tuple(cache[key][0]) if key in cache else None
+            seen[n["id"]] = tuple(files[key][0]) if key in files else None
         save_note_cache({str(note_path(n)) for n in self.data["notes"] if n.get("file")})
         for coll, make in makers:
             for r in self.data[coll]:
@@ -27350,6 +27352,11 @@ def cmd_app(open_id=None):
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        try:        # a pipe on Windows is cp1252: a character it lacks prints as ?, not a crash
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass    # pythonw has no streams
     if JSON_FILE.exists():
         set_lang(((read_vault(JSON_FILE) or {}).get("ui") or {}).get("lang", "en"))
     args = sys.argv[1:]
@@ -28637,6 +28644,8 @@ PT = {
         "Um rascunho precisa de título.",
     "\"{file}\" changed outside Kustos since it was opened (in Obsidian?). Overwrite it with the text here?":
         "\"{file}\" mudou fora do Kustos desde que foi aberto (no Obsidian?). Sobrescrever com o texto daqui?",
+    "\"{file}\" changed outside Kustos since it was opened (in Obsidian?).":
+        "\"{file}\" mudou fora do Kustos desde que foi aberto (no Obsidian?).",
     "Overwrite":
         "Sobrescrever",
     "Not saved over the newer file: the text typed here is in the log (Base › History).":
