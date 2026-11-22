@@ -10556,8 +10556,9 @@ WEB_STRINGS = (
     "Needs a reason", "Atypical", "other type…", "one word, e.g. inspired_by",
     "1609, 1618/1648, -800/400", "s_… of a source, or free text", "What a line shows",
     "colour: its family", "with a reason or a source", "without either: needs a reason",
-    "a type outside the list (atypical)", "thick where it comes from", "written recently",
-    "written long ago", "lit, in life", "Open {name}",
+    "a type outside the list (atypical)", "an arrow where it points", "written recently",
+    "written long ago", "lit, in life", "Open {name}", "What a letter shows",
+    "Around", "Whole base", "{n} around, still",
     "Path", "How are they related?", "From", "To", "Search a record", "Tap a record in the graph",
     "Tap the record to reach.", "No chain of links joins them.", "{k} link(s) apart · {n} chain(s)",
     "Details", "Chain {i} of {n}",
@@ -11203,23 +11204,31 @@ def web_record(data, rid):
     return out
 
 
-def web_graph(data, rid, depth=2):
+def web_graph(data, rid, depth=2, scope="near", hide=()):
     """The link graph around one record, for the page: the records up to
     `depth` links away (graph_ego, at most GRAPH_MAX_NODES), each with its
-    shape, name, distance, the record that brought it and how recently it was
+    type, name, distance, the record that brought it and how recently it was
     edited (what life mode seeds from), and the links between them with their
     rels. Without a record, or with an unknown one, the most linked record is
-    the middle, as in the window."""
+    the middle, as in the window. The types in `hide` are left out. With
+    scope "base", the whole base as the window shows it: every record with a
+    link on the springs (graph_base_ego) and every other one in `bg`, the
+    still disc (graph_disc): [id, type, x, y, recency in sixths, name] each.
+    `counts`: how many records of each type the base has, for the key."""
     idx = by_id(data)
+    kind_of = {k: graph_kind(r) for k, r in idx.items()}
+    hidden = {h for h in hide if h in GRAPH_KINDS}
     adj = graph_adjacency(data)
     if rid not in idx:
         rid = max(adj, key=lambda k: (len(adj[k]), k), default=None)
     if rid is None and idx:
         rid = next(iter(idx))
     depth = depth if depth in (1, 2, 3) else 2
-    ego = graph_ego(adj, rid, depth) if rid else {}
+    adj = graph_visible(adj, kind_of, hidden, rid)
+    base = scope == "base"
+    ego = graph_base_ego(adj, rid) if base else graph_ego(adj, rid, depth) if rid else {}
     now = datetime.now()
-    nodes = [{"id": n, "kind": graph_kind(idx[n]), "name": one_liner(label_any(idx[n], data), 60),
+    nodes = [{"id": n, "kind": kind_of[n], "name": one_liner(label_any(idx[n], data), 60),
               "dist": d, "parent": parent, "rec": round(recency(idx[n], now), 4),
               "n": idx[n].get("reg_n") or 0}
              for n, (d, parent) in ego.items()]
@@ -11227,8 +11236,19 @@ def web_graph(data, rid, depth=2):
     links = [{"a": a, "b": b, "rels": [[rel_label(rel), f] for rel, f in rels],
               "f": link_facts(pairs.get((a, b), []), times, stamp)}
              for a in ego for b, rels in adj.get(a, {}).items() if b in ego and a < b]
-    return {"center": rid, "depth": depth, "nodes": nodes, "links": links,
-            "records": len(idx)}
+    counts = {}
+    for k in kind_of.values():
+        counts[k] = counts.get(k, 0) + 1
+    out = {"center": rid, "depth": depth, "scope": "base" if base else "near", "nodes": nodes,
+           "links": links, "records": len(idx), "counts": counts, "hidden": sorted(hidden)}
+    if base:
+        recs = {k: recency(r, now) for k, r in idx.items()}
+        disc = graph_disc(kind_of, recs, set(ego), hidden)
+        out["bg"] = {"r0": round(disc["r0"], 1), "rmax": round(disc["rmax"], 1), "step": GRAPH_BG_STEP,
+                     "recs": [[n, kind_of[n], round(x), round(y), min(5, int(recs[n] * 6)),
+                               one_liner(label_any(idx[n], data), 40)]
+                              for n, (x, y) in disc["pos"].items()]}
+    return out
 
 
 def web_link_details(data, a, b):
@@ -11427,6 +11447,10 @@ def web_boot(token, auth=False, data=None):
                     ["corpus", "activity"], ["corpus", "event"], ["notes", "note"],
                     ["res", "item"], ["res", "account"]],
             "linkColours": LINK_FAMILY_COLOUR,
+            # the graph's records: their letter, its pixels (the still disc), colour and name
+            "glyph": GRAPH_GLYPH, "pixels": GRAPH_PIXELS, "kindOrder": list(GRAPH_KINDS),
+            "kindColours": {k: LINK_FAMILY_COLOUR[GRAPH_KIND_FAMILY[k]] for k in GRAPH_KINDS},
+            "kindLabels": {k: tr(GRAPH_KIND_LABEL[k]) for k in GRAPH_KINDS},
             "circles": [[c, tr(c)] for c in CIRCLES],
             "observator": web_observator(data if data is not None else load_json()),
             "T": {s: tr(s) for s in WEB_STRINGS}}
@@ -11517,7 +11541,8 @@ def web_api(method, path, query, body):
                 depth = int(arg("depth", "2"))
             except ValueError:
                 depth = 2
-            return 200, web_graph(load_json(), arg("id"), depth)
+            return 200, web_graph(load_json(), arg("id"), depth, arg("scope", "near"),
+                                  [h for h in arg("hide", "").split(",") if h])
         if method == "GET" and path == "/api/map":
             return 200, web_map(load_json(), arg("q"), arg("coll"), arg("id"))
         if method == "GET" and path == "/api/basemap":      # the outline of the Earth, from beside the program
@@ -12543,10 +12568,20 @@ def cmd_web(rest=()):
 
         def answer(self, code, body, ctype="application/json; charset=utf-8", csp=None,
                    cookie=None, location=None):
-            raw = body if isinstance(body, bytes) else (
-                body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)).encode("utf-8")
+            raw = body if isinstance(body, bytes) else (body if isinstance(body, str) else json.dumps(
+                body, ensure_ascii=False, separators=(",", ":"))).encode("utf-8")
+            # a large JSON answer (the whole base's graph is half a megabyte) goes compressed, to
+            # about a sixth; never a page, which carries the session's token
+            gz = (ctype.startswith("application/json") and len(raw) > 32 * 1024
+                  and "gzip" in (self.headers.get("Accept-Encoding") or ""))
+            if gz:
+                import gzip
+                raw = gzip.compress(raw, 5)
             self.send_response(code)
             self.send_header("Content-Type", ctype)
+            if gz:
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Vary", "Accept-Encoding")
             self.send_header("Content-Length", str(len(raw)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
@@ -13020,6 +13055,13 @@ textarea.prose { font: 17px/1.55 var(--serif); min-height: 10em; }
 .ask p { margin: 0 0 6px; white-space: pre-wrap; }
 .key { display: grid; grid-template-columns: 64px 1fr; gap: 8px 12px; align-items: center; margin-top: 10px; font-size: 14px; }
 .key svg { width: 64px; height: 14px; display: block; }
+.key .kl { font: 700 16px var(--mono); text-align: center; }
+.key + .lbl { margin-top: 22px; }
+.gkinds { gap: 4px; overflow-x: auto; }
+.gkinds button { border: 1px solid var(--rule); background: var(--paper); color: var(--soft); border-radius: 6px;
+  padding: 4px 8px; font: 12px var(--mono); white-space: nowrap; min-height: 30px; }
+.gkinds button b { font-size: 14px; margin-right: 5px; }
+.gkinds button[aria-pressed="false"] { color: var(--faint); text-decoration: line-through; }
 .gcanvas svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
 .mb, .ml, .mframe { fill: none; vector-effect: non-scaling-stroke; stroke-linecap: round; stroke-linejoin: round; }
 .mborder { stroke-dasharray: 1 3; }
@@ -13635,9 +13677,16 @@ function menuSheet() {
    records already there keep their light, new ones sprout from the record that
    brought them (nearest first) and their links grow out to them, and the ones
    that leave wither. In life a birth is fed by its three lit neighbours: their
-   light flows along the links and the new cell lights when it arrives. Links
-   are soft curves; every brightness eases (`vis`), so nothing flashes. */
-const G = {on: false, settled: false,
+   light flows along the links and the new cell lights when it arrives; every
+   brightness eases (`vis`), so nothing flashes.
+   Drawn as a terminal, as the window is: a record is the letter its id starts
+   with (BOOT.glyph) in its collection's colour, lit in inverse video, the
+   middle one boxed; a link is a straight one-pixel line, an arrowhead where a
+   directed one points. Whole base (w): every record with a link on the
+   springs, every other one still around them in a disc (G.bg), painted once
+   into a layer in a 3x5 pixel font (BOOT.pixels) and only moved with the view;
+   the row of letters under the buttons hides or shows a type. */
+const G = {on: false, settled: false, scope: "near", hidden: new Set(), bg: null, counts: {}, enter: false,
            mode: matchMedia("(prefers-reduced-motion: reduce)").matches ? "still" : "life", depth: 2, paused: false, names: false, nodes: {}, ids: [], links: [],
            adj: {}, center: null, hover: null, cam: [0, 0], goal: [0, 0], zoom: 1, fit: true, temp: 0,
            frame: 0, gen: 0, stale: 0, history: [], born: 0, died: 0, pop: [], acc: 0, last: 0, raf: 0,
@@ -13692,7 +13741,10 @@ function graphMount() {
     `<button class="btn" data-act="gopen">${esc(T("Open"))}</button></div>` +
     `<div class="grow-row"><span class="seg">${GMODES.map(([m, l, short]) =>
       `<button data-act="gmode" data-m="${m}" title="${esc(T(l))}">${esc(T(short))}</button>`).join("")}</span>` +
-    `<span class="seg">${[1, 2, 3].map(d => `<button data-act="gdepth" data-d="${d}" ${tip("depth {d}").replace(/\{d\}/g, d)}>${d}</button>`).join("")}</span></div></div>` +
+    `<span class="seg">${[1, 2, 3].map(d => `<button data-act="gdepth" data-d="${d}" ${tip("depth {d}").replace(/\{d\}/g, d)}>${d}</button>`).join("")}</span>` +
+    `<span class="seg">${[["near", "Around"], ["base", "Whole base"]].map(([s, l]) =>
+      `<button data-act="gscope" data-s="${s}">${esc(T(l))}</button>`).join("")}</span></div>` +
+    `<div class="grow-row gkinds" id="gkinds" hidden></div></div>` +
     `<div class="gcanvas" id="gbox"><canvas id="gc"></canvas><div class="ghint" id="ghint"></div>` +
     `<div class="gnote" id="gnote"></div>` +
     `<div class="gfab l"><button class="btn" data-act="gkey" ${tip("Key")}>?</button></div>` +
@@ -13721,13 +13773,36 @@ function graphMount() {
 async function graphFetch(id) {
   if (G.path) leavePath(false);
   let d;
-  try { d = await api("api/graph?" + new URLSearchParams({id: id || "", depth: G.depth})); }
+  try {
+    d = await api("api/graph?" + new URLSearchParams({id: id || "", depth: G.depth, scope: G.scope,
+                                                       hide: [...G.hidden].join(",")}));
+  }
   catch (e) { toast(e.message, 4000); return; }
   if (G.on) gLoad(d);
 }
+function gScope(s) {                   // around the record, or the whole base
+  if (s === G.scope) return;
+  G.scope = s; G.enter = true;
+  gButtons();
+  graphFetch(G.center);
+}
+function gKind(k) {                    // the row of letters: a type hidden, or shown again
+  G.hidden.has(k) ? G.hidden.delete(k) : G.hidden.add(k);
+  graphFetch(G.center);
+}
+function gBgBuild(b) {
+  // the still disc as it came (graph_disc), and a grid of cells that finds the record under a finger
+  const recs = b.recs.map(([id, kind, x, y, lvl, name]) => ({id, kind, x, y, lvl, name})), at = {}, grid = {};
+  for (const r of recs) {
+    at[r.id] = r;
+    const key = Math.floor(r.x / b.step) + "," + Math.floor(r.y / b.step);
+    (grid[key] = grid[key] || []).push(r);
+  }
+  return {r0: b.r0, rmax: b.rmax, step: b.step, recs, at, grid, view: null, layer: null};
+}
 function gLoad(d) {
-  const old = G.nodes, c = d.center, first = !G.ids.length;
-  const o = c && old[c] ? [old[c].x, old[c].y] : [0, 0];
+  const old = G.nodes, c = d.center, first = !G.ids.length, base = d.scope === "base";
+  const o = !base && c && old[c] ? [old[c].x, old[c].y] : [0, 0];   // the whole base never moves
   const lit = r => Math.random() < 0.35 + 0.5 * r.rec;
   const nodes = {};
   for (const n of d.nodes) {          // parents come before the records they bring
@@ -13740,13 +13815,16 @@ function gLoad(d) {
     if (n.parent && nodes[n.parent]) {  // a new record sprouts right beside the one that brought it
       const p = nodes[n.parent], a = Math.random() * 2 * Math.PI, r = LINK * 0.15;
       x = p.x + r * Math.cos(a); y = p.y + r * Math.sin(a);
+    } else if (base) {                  // a group of its own: anywhere near the middle
+      const a = Math.random() * 2 * Math.PI, r = LINK * (0.3 + 1.7 * Math.random());
+      x = r * Math.cos(a); y = r * Math.sin(a);
     }
     const start = G.clock + STAGGER_MS * n.dist + Math.random() * 150;
     const on = G.mode === "life" && lit(n);
     nodes[n.id] = Object.assign({}, n, {x, y, grow: 0, start, heat: 0, vis: 0, spark: 0,
                                         lit: on, arrive: start + GROW_MS + Math.random() * 2000});
   }
-  if (c && nodes[c]) { nodes[c].x = 0; nodes[c].y = 0; }
+  if (c && nodes[c] && !base) { nodes[c].x = 0; nodes[c].y = 0; }
   for (const id of Object.keys(old)) {   // the ones that leave wither where they are
     if (!nodes[id]) G.gone[id] = Object.assign(old[id], {x: old[id].x - o[0], y: old[id].y - o[1], leave: 1});
   }
@@ -13763,27 +13841,63 @@ function gLoad(d) {
     return Object.assign(l, {grow: 0, from, start: to.grow < 1 ? to.start : G.clock});
   });
   G.cam = [G.cam[0] - o[0], G.cam[1] - o[1]];
-  G.goal = [0, 0];
   G.nodes = nodes; G.ids = Object.keys(nodes); G.center = c; G.hover = null;
+  G.scope = d.scope || G.scope;      // (a path view keeps them as they were)
+  if (d.counts) G.counts = d.counts;
+  if (d.hidden) G.hidden = new Set(d.hidden);
+  G.bg = base ? gBgBuild(d.bg) : null;
   G.adj = {};
   G.ids.forEach(n => { G.adj[n] = []; });
   for (const l of G.links) { G.adj[l.a].push(l.b); G.adj[l.b].push(l.a); }
-  if (c && G.mode === "glow") nodes[c].spark = 1;
+  if (c && nodes[c] && G.mode === "glow") nodes[c].spark = 1;
   if (G.mode === "life") {           // the neighbourhood changed: the run goes on from here
     G.stale = 0; G.history = [];
     if (first) { G.gen = G.born = G.died = 0; G.pop = []; }
     if (G.settled) { G.settled = false; if (G.on) gButtons(); }
   }
   G.temp = Math.max(G.temp, first ? 30 : 14);
-  G.fit = true;
+  if (!base) { G.goal = [0, 0]; G.fit = true; }
+  else if (G.enter) { G.goal = [0, 0]; G.fit = true; gFit(true); }    // the whole base in view, at once
+  else gFocus(c);                    // the view glides to the record
+  G.enter = false;
   S.sel = c; markSel();
   $("#gnote").textContent = !c ? T("The base has no records yet.")
-    : G.ids.length === 1 ? T("No links yet: write them in the card's LINKS field, one per line.") : "";
+    : G.ids.length === 1 && !base ? T("No links yet: write them in the card's LINKS field, one per line.") : "";
+  gKinds();
+  gButtons();
   gStatus(true);
 }
+function gRec(id) { return G.nodes[id] || (G.bg && G.bg.at[id]) || null; }
+function gFocus(n) {
+  // the whole base: the middle is another record and the view glides to it; nothing is fetched,
+  // only the distances that name the middle record's neighbours are counted again
+  const t = gRec(n);
+  if (!t) return;
+  G.center = n; S.sel = n; markSel();
+  G.goal = [t.x, t.y]; G.fit = false;
+  const dist = {[n]: 0}, todo = G.nodes[n] ? [n] : [];
+  while (todo.length) {
+    const m = todo.shift();
+    for (const k of G.adj[m] || []) if (!(k in dist)) { dist[k] = dist[m] + 1; todo.push(k); }
+  }
+  for (const id of G.ids) G.nodes[id].dist = dist[id] ?? 2;
+  gStatus(true);
+}
+function gKinds() {
+  // the row of letters, with the whole base: each type's letter, colour and count; a tap hides it
+  const box = $("#gkinds");
+  if (!box) return;
+  box.hidden = G.scope !== "base";
+  box.innerHTML = BOOT.kindOrder.filter(k => G.counts[k]).map(k =>
+    `<button data-act="gkind" data-k="${k}" aria-pressed="${!G.hidden.has(k)}" title="${esc(BOOT.kindLabels[k])}">` +
+    `<b style="color:${G.hidden.has(k) ? "var(--faint)" : gKindColour(k)}">${esc(BOOT.glyph[k])}</b>` +
+    `<span>${G.w < 600 ? "" : esc(BOOT.kindLabels[k]) + " "}${G.counts[k]}</span></button>`).join("");
+}
+function gKindColour(k) { return BOOT.mono ? G.C.faint : (BOOT.kindColours[k] || BOOT.linkColours.other); }
 function gButtons() {
   $$('[data-act="gmode"]').forEach(b => b.setAttribute("aria-pressed", String(b.dataset.m === G.mode)));
-  $$('[data-act="gdepth"]').forEach(b => b.setAttribute("aria-pressed", String(+b.dataset.d === G.depth)));
+  $$('[data-act="gdepth"]').forEach(b => b.setAttribute("aria-pressed", String(+b.dataset.d === G.depth && G.scope === "near")));
+  $$('[data-act="gscope"]').forEach(b => b.setAttribute("aria-pressed", String(b.dataset.s === G.scope)));
   const pause = $("#gpause");
   pause.innerHTML = G.paused ? "&#9654;" : "&#10074;&#10074;";
   pause.setAttribute("aria-label", G.paused ? T("Play") : T("Pause"));
@@ -13799,7 +13913,7 @@ function gButtons() {
     : T("tap: to the middle · tap the middle: open · hold: spark · drag: move · pinch or wheel: zoom");
 }
 function gStatus(force) {
-  const c = G.nodes[G.hover] || G.nodes[G.center];
+  const c = gRec(G.hover) || gRec(G.center);
   const who = c ? c.name + (c.n ? " · nº " + c.n : "") : "";
   let state = T(GMODES.find(m => m[0] === G.mode)[1]);
   if (G.mode === "life") {
@@ -13812,7 +13926,8 @@ function gStatus(force) {
     } else if (G.gen) state += " · " + T("born {b} · died {d}", {b: G.born, d: G.died});
   }
   if (G.paused) state += " · " + T("paused");
-  state += " · " + T("{n} records, {k} links", {n: G.ids.length, k: G.links.length}) + ", " + T("depth {d}", {d: G.depth});
+  state += " · " + T("{n} records, {k} links", {n: G.ids.length, k: G.links.length}) +
+           (G.bg ? " · " + T("{n} around, still", {n: G.bg.recs.length}) : ", " + T("depth {d}", {d: G.depth}));
   if (!force && who + state === G.said) return;
   G.said = who + state;
   $("#gwho").textContent = who;
@@ -13898,6 +14013,7 @@ function gLayout() {
     const a = N[l.a], b = N[l.b], dx = a.x - b.x, dy = a.y - b.y, f = Math.sqrt(dx * dx + dy * dy) / LINK;
     disp[l.a][0] -= dx * f; disp[l.a][1] -= dy * f; disp[l.b][0] += dx * f; disp[l.b][1] += dy * f;
   }
+  const wall = gBgShown() ? G.bg.r0 * 0.92 : 0;     // the whole base: the springs keep to their room
   for (const n of ids) {
     if (n === G.center || n === G.dragging) { N[n].vx = N[n].vy = 0; continue; }
     const p = N[n], dx = disp[n][0] - p.x * 0.05, dy = disp[n][1] - p.y * 0.05, d = Math.hypot(dx, dy);
@@ -13905,14 +14021,18 @@ function gLayout() {
       const s = Math.min(d * 0.06, G.temp) / d;
       p.vx = 0.5 * ((p.vx || 0) + dx * s); p.vy = 0.5 * ((p.vy || 0) + dy * s);  // keeps half the last step
       p.x += p.vx; p.y += p.vy;
+      const far = Math.hypot(p.x, p.y);
+      if (wall && far > wall) { p.x *= wall / far; p.y *= wall / far; }
     }
   }
   G.temp *= 0.98;
 }
 const GBOTTOM = 64;          // the floating buttons at the foot of the graph
 function gMiddle() { return [G.w / 2, (G.h + GTOP - GBOTTOM) / 2]; }
-function gFit() {
-  // the whole graph in view: around the middle record, or, in a path view, around the chains
+function gBgShown() { return !!G.bg && G.scope === "base" && !G.path; }
+function gFit(snap) {
+  // the whole graph in view: around the middle record, or, in a path view, around the chains;
+  // with the whole base, the still disc too. `snap`: at once
   if (G.path) {
     let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
     for (const n of G.ids) {               // names are drawn to the right of their record: they count too
@@ -13928,9 +14048,11 @@ function gFit() {
     const p = G.nodes[n];
     rx = Math.max(rx, Math.abs(p.x + Math.min(32, p.name.length) * (n === G.center ? 7.8 : 6.6) / Math.max(0.3, G.zoom) - gx));
   }
-  const side = G.w < 600 ? (G.path ? 24 : 70) : (G.path ? 40 : 110), tall = (G.h - GTOP - GBOTTOM) / 2;
+  if (gBgShown()) { rx = Math.max(rx, G.bg.rmax); ry = Math.max(ry, G.bg.rmax); }
+  if (!G.w) return;
+  const side = gBgShown() ? 12 : G.w < 600 ? (G.path ? 24 : 70) : (G.path ? 40 : 110), tall = (G.h - GTOP - GBOTTOM) / 2;
   const z = Math.min(1.5, Math.max(0.12, Math.min((G.w / 2 - side) / rx, (tall - 20) / ry)));
-  if (Math.abs(z - G.zoom) >= 0.002) G.zoom += (z - G.zoom) * 0.15;
+  if (Math.abs(z - G.zoom) >= 0.002) G.zoom = snap ? z : G.zoom + (z - G.zoom) * 0.15;
 }
 function gTick() {
   G.frame++;
@@ -13938,7 +14060,7 @@ function gTick() {
   if (G.temp > 0.2) gLayout();
   G.cam[0] += (G.goal[0] - G.cam[0]) * 0.18;
   G.cam[1] += (G.goal[1] - G.cam[1]) * 0.18;
-  if (G.fit && G.ids.length) gFit();
+  if (G.fit && (G.ids.length || gBgShown())) gFit();
   if (!G.paused) gHeat();
   pathFlow();
   for (const n of G.ids) {
@@ -13973,57 +14095,37 @@ function gLoop(t) {
 
 /* drawing */
 function gScreen(n) {
-  const [mx, my] = gMiddle(), p = G.nodes[n];
+  const [mx, my] = gMiddle(), p = gRec(n);
   return [mx + (p.x - G.cam[0]) * G.zoom, my + (p.y - G.cam[1]) * G.zoom];
 }
 function gRadius(n, rec) {
   const p = rec || G.nodes[n], r = n === G.center ? 9 : (p.dist === 1 ? 6.5 : 5);
   return r * Math.min(1.5, Math.max(0.7, G.zoom)) * (G.w < 600 ? 1.3 : 1);
 }
-function gShape(ctx, kind, x, y, r) {
-  ctx.beginPath();
-  if (kind === "person") { ctx.arc(x, y, r, 0, 2 * Math.PI); return; }
-  const P = {concept: [[-r, -r], [r, -r], [r, r], [-r, r]],
-             form: [[0, -1.25 * r], [1.25 * r, 0], [0, 1.25 * r], [-1.25 * r, 0]],
-             source: [[-1.3 * r, -0.8 * r], [1.3 * r, -0.8 * r], [1.3 * r, 0.8 * r], [-1.3 * r, 0.8 * r]],
-             note: [[-0.8 * r, -1.15 * r], [0.8 * r, -1.15 * r], [0.8 * r, 1.15 * r], [-0.8 * r, 1.15 * r]],
-             org: [0, 1, 2, 3, 4, 5].map(i => [1.15 * r * Math.cos(Math.PI / 3 * i), 1.15 * r * Math.sin(Math.PI / 3 * i)]),
-             item: [0, 1, 2, 3, 4].map(i => [1.15 * r * Math.cos(2 * Math.PI / 5 * i - Math.PI / 2), 1.15 * r * Math.sin(2 * Math.PI / 5 * i - Math.PI / 2)])}[kind]
-          || [[0, -1.2 * r], [1.1 * r, 0.8 * r], [-1.1 * r, 0.8 * r]];
-  P.forEach(([dx, dy], i) => (i ? ctx.lineTo(x + dx, y + dy) : ctx.moveTo(x + dx, y + dy)));
-  ctx.closePath();
-}
+// a record is its letter in a cell: the letter's height for a record of size r, the cell's half sizes
+function gGlyphPx(r) { return Math.max(9, Math.min(26, Math.round(r * 2.8))); }
+function gCell(r) { const px = gGlyphPx(r); return [px, px * 0.36 + 1.5, px * 0.55 + 1]; }
 function gLabelShown(n) {
   if (n === G.center || n === G.hover || G.names) return true;
-  if (G.w < 600) return G.ids.length <= 12 || (G.nodes[n].dist <= 1 && G.adj[G.center].length <= 8);
+  if (G.w < 600) return G.ids.length <= 12 || (G.nodes[n].dist <= 1 && (G.adj[G.center] || []).length <= 8);
   return G.nodes[n].dist <= 1 || G.ids.length <= 40;
 }
-function gHash(key) {
-  let h = 2166136261;
-  for (let i = 0; i < key.length; i++) h = Math.imul(h ^ key.charCodeAt(i), 16777619);
-  return ((h >>> 0) % 1000) / 1000;
+function gAt(A, B, t) { return [A[0] + (B[0] - A[0]) * t, A[1] + (B[1] - A[1]) * t]; }
+function gEnds(a, b, A, B) {
+  // a link's line runs from the edge of one cell to the edge of the other, so that an arrowhead shows
+  const dx = B[0] - A[0], dy = B[1] - A[1], d = Math.hypot(dx, dy);
+  const ra = G.nodes[a] ? gGlyphPx(gRadius(a)) * 0.55 + 3 : 0, rb = G.nodes[b] ? gGlyphPx(gRadius(b)) * 0.55 + 3 : 0;
+  if (d <= ra + rb + 4) return [A, B];
+  return [[A[0] + dx / d * ra, A[1] + dy / d * ra], [B[0] - dx / d * rb, B[1] - dy / d * rb]];
 }
-function gCurve(A, B, key) {
-  // a link bows a little to one side, and breathes very slowly
-  const u = gHash(key), dx = B[0] - A[0], dy = B[1] - A[1];
-  const bow = (u < 0.5 ? -1 : 1) * (0.08 + 0.1 * (u * 2 % 1)) * (1 + 0.15 * Math.sin(G.clock / 1700 + u * 6.28));
-  return [(A[0] + B[0]) / 2 - dy * bow, (A[1] + B[1]) / 2 + dx * bow];
-}
-function gAt(A, Cp, B, t) {
-  const v = 1 - t;
-  return [v * v * A[0] + 2 * v * t * Cp[0] + t * t * B[0], v * v * A[1] + 2 * v * t * Cp[1] + t * t * B[1]];
-}
-function gStroke(ctx, A, Cp, B, t0, t1) {
-  ctx.beginPath();
-  if (t0 === 0 && t1 === 1) { ctx.moveTo(...A); ctx.quadraticCurveTo(...Cp, ...B); }
-  else {
-    const steps = 12;
-    for (let i = 0; i <= steps; i++) {
-      const [x, y] = gAt(A, Cp, B, t0 + (t1 - t0) * i / steps);
-      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
-    }
-  }
-  ctx.stroke();
+function gSegment(ctx, A, B) { ctx.beginPath(); ctx.moveTo(A[0], A[1]); ctx.lineTo(B[0], B[1]); ctx.stroke(); }
+function gArrow(ctx, A, B) {
+  // an arrowhead at B, pointing away from A
+  const dx = B[0] - A[0], dy = B[1] - A[1], d = Math.hypot(dx, dy) || 1, ux = dx / d, uy = dy / d;
+  ctx.beginPath(); ctx.moveTo(B[0], B[1]);
+  ctx.lineTo(B[0] - ux * 7 - uy * 3, B[1] - uy * 7 + ux * 3);
+  ctx.lineTo(B[0] - ux * 7 + uy * 3, B[1] - uy * 7 - ux * 3);
+  ctx.closePath(); ctx.fill();
 }
 const ease = t => 1 - Math.pow(1 - Math.max(0, Math.min(1, t)), 3);
 function hexMix(c0, c1, t) {
@@ -14038,48 +14140,98 @@ function gLinkRest(l) {
   const fam = BOOT.linkColours[f.family] || BOOT.linkColours.other;
   return hexMix(C.rule, fam, founded ? 0.4 + 0.5 * age : 0.2 + 0.3 * age);
 }
-function gLink(ctx, l, A, Cp, B, t0, t1, q) {
-  const f = l.f || {}, C = G.C, sel = G.selLink === l.a + " " + l.b;
-  const colour = mix(gLinkRest(l), C.accent, 0.85 * q);
-  if (f.founded === false || f.atypical) {  // a stroke that says it still needs a reason, or is atypical
-    ctx.setLineDash(f.atypical ? [1.5, 4] : [6, 4]);
-    ctx.strokeStyle = colour; ctx.lineWidth = sel ? 2.5 : 1.2;
-    gStroke(ctx, A, Cp, B, t0, t1);
-    ctx.setLineDash([]);
-    return;
-  }
-  const w = (1 + 2 * q) * (sel ? 1.7 : 1);
-  if (!f.from) { ctx.strokeStyle = colour; ctx.lineWidth = w; gStroke(ctx, A, Cp, B, t0, t1); return; }
-  const fromA = f.from === l.a, steps = 12, left = [], right = [];
-  for (let i = 0; i <= steps; i++) {        // tapered: thick at the record it comes from
-    const t = t0 + (t1 - t0) * i / steps, [x, y] = gAt(A, Cp, B, t);
-    const dx = 2 * (1 - t) * (Cp[0] - A[0]) + 2 * t * (B[0] - Cp[0]);
-    const dy = 2 * (1 - t) * (Cp[1] - A[1]) + 2 * t * (B[1] - Cp[1]);
-    const len = Math.hypot(dx, dy) || 1, half = w * (0.85 - 0.6 * (fromA ? t : 1 - t));
-    left.push([x - dy / len * half, y + dx / len * half]);
-    right.push([x + dy / len * half, y - dx / len * half]);
-  }
-  ctx.fillStyle = colour;
-  ctx.beginPath();
-  left.concat(right.reverse()).forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
-  ctx.closePath(); ctx.fill();
+function gLink(ctx, l, A, B, g, q) {
+  // a straight line of one pixel, dashed without a reason, dotted when atypical, an arrowhead where a
+  // directed one points; growing, it comes out of the record already there
+  const f = l.f || {}, sel = G.selLink === l.a + " " + l.b;
+  const [P, Q] = g >= 1 ? [A, B] : l.from === l.a ? [A, gAt(A, B, g)] : [gAt(A, B, 1 - g), B];
+  ctx.strokeStyle = ctx.fillStyle = mix(gLinkRest(l), G.C.accent, 0.85 * q);
+  ctx.lineWidth = sel ? 2 : 1;
+  ctx.setLineDash(f.atypical ? [1.5, 3] : f.founded === false ? [5, 4] : []);
+  gSegment(ctx, P, Q);
+  ctx.setLineDash([]);
+  if (g >= 1 && f.from === l.a) gArrow(ctx, A, B);
+  else if (g >= 1 && f.from === l.b) gArrow(ctx, B, A);
 }
 function gLinkAt(x, y, slop) {
   let best = null, bd = slop * slop;
   for (const l of G.links) {
     if ((l.grow ?? 1) < 1) continue;
-    const A = gScreen(l.a), B = gScreen(l.b), Cp = gCurve(A, B, l.a + l.b);
-    let P0 = A;
-    for (let i = 1; i <= 12; i++) {
-      const P1 = gAt(A, Cp, B, i / 12), vx = P1[0] - P0[0], vy = P1[1] - P0[1];
-      const k = Math.max(0, Math.min(1, ((x - P0[0]) * vx + (y - P0[1]) * vy) / (vx * vx + vy * vy || 1)));
-      const d = (P0[0] + k * vx - x) ** 2 + (P0[1] + k * vy - y) ** 2;
-      if (d < bd) { bd = d; best = l; }
-      P0 = P1;
-    }
+    const [ax, ay] = gScreen(l.a), [bx, by] = gScreen(l.b), vx = bx - ax, vy = by - ay;
+    const k = Math.max(0, Math.min(1, ((x - ax) * vx + (y - ay) * vy) / (vx * vx + vy * vy || 1)));
+    const d = (ax + k * vx - x) ** 2 + (ay + k * vy - y) ** 2;
+    if (d < bd) { bd = d; best = l; }
   }
   return best;
 }
+
+/* the whole base's still disc */
+function gBgScale() {
+  // the disc's letters: a dot when their room is under 7 px, then 1, 2, 3 px a dot, so they never touch
+  const room = G.bg.step * G.zoom;
+  return room < 7 ? 0 : room < 13 ? 1 : room < 20 ? 2 : 3;
+}
+function gBgR() { return [1.5, 2.5, 5, 7.5][gBgScale()]; }
+const gStencils = {};
+function gStencil(kind, s) {
+  // a letter of BOOT.pixels as rectangles [x, y, w, h] round its centre, each dot s pixels
+  const key = kind + s;
+  if (gStencils[key]) return gStencils[key];
+  const out = [], h = s >> 1;
+  (BOOT.pixels[BOOT.glyph[kind]] || []).forEach((bits, row) => {
+    for (const m of bits.matchAll(/#+/g)) out.push([(m.index - 1) * s - h, (row - 2) * s - h, m[0].length * s, s]);
+  });
+  return gStencils[key] = out;
+}
+function gPaintBg(key) {
+  // the disc into one layer the size of the view and a margin: every record its letter at this zoom
+  // (a dot when far) in its collection's colour, the stronger the more recently it was edited
+  const B = G.bg, m = Math.round(0.2 * Math.max(G.w, G.h)), W = G.w + 2 * m, H = G.h + 2 * m, dpr = G.dpr;
+  const L = B.layer || (B.layer = document.createElement("canvas"));
+  L.width = Math.round(W * dpr); L.height = Math.round(H * dpr);
+  const ctx = L.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const z = G.zoom, [mx, my] = gMiddle(), s = gBgScale(), ox = mx - G.cam[0] * z + m, oy = my - G.cam[1] * z + m;
+  const cols = {};
+  for (const k of BOOT.kindOrder) cols[k] = [0, 1, 2, 3, 4, 5].map(i => mix(G.C.paper, gKindColour(k), 0.4 + 0.12 * i));
+  for (const r of B.recs) {
+    const u = Math.round(ox + r.x * z), v = Math.round(oy + r.y * z);
+    if (u < -10 || v < -10 || u > W + 10 || v > H + 10) continue;
+    ctx.fillStyle = cols[r.kind][r.lvl];
+    if (!s) { ctx.fillRect(u, v, 2, 2); continue; }
+    for (const [x, y, w, h] of gStencil(r.kind, s)) ctx.fillRect(u + x, v + y, w, h);
+  }
+  return B.view = {key, z, cam: [G.cam[0], G.cam[1]], m, W, H};
+}
+function gBgDraw(ctx) {
+  // the painted disc under the view: it moves with the camera, and is painted again once a new zoom or
+  // size has held for two frames, or when the view leaves the painted part; hidden while zooming
+  if (!gBgShown()) return;
+  const B = G.bg, key = G.zoom + " " + G.w + " " + G.h + " " + G.dpr;
+  G.bgStill = key === G.bgKey ? (G.bgStill || 0) + 1 : 0;
+  G.bgKey = key;
+  let v = B.view;
+  if (!v || (v.key !== key && G.bgStill >= 2)) v = gPaintBg(key);
+  let dx = (v.cam[0] - G.cam[0]) * G.zoom, dy = (v.cam[1] - G.cam[1]) * G.zoom;
+  if (v.z === G.zoom && Math.max(Math.abs(dx), Math.abs(dy)) > v.m) { v = gPaintBg(key); dx = dy = 0; }
+  if (Math.abs(v.z / G.zoom - 1) > 0.03) return;
+  ctx.drawImage(B.layer, dx - v.m, dy - v.m, v.W, v.H);
+}
+function gBgAt(x, y, slop) {
+  // the record of the still disc under (x, y), or null
+  if (!gBgShown()) return null;
+  const B = G.bg, [mx, my] = gMiddle(), z = G.zoom;
+  const wx = (x - mx) / z + G.cam[0], wy = (y - my) / z + G.cam[1], reach = Math.max(slop / 2, gBgR() + 3) / z;
+  const gx = Math.floor(wx / B.step), gy = Math.floor(wy / B.step), k = Math.floor(reach / B.step) + 1;
+  let best = null, bd = reach * reach;
+  for (let i = gx - k; i <= gx + k; i++) for (let j = gy - k; j <= gy + k; j++)
+    for (const r of B.grid[i + "," + j] || []) {
+      const d = (r.x - wx) ** 2 + (r.y - wy) ** 2;
+      if (d < bd) { bd = d; best = r.id; }
+    }
+  return best;
+}
+
 function gDraw() {
   const box = $("#gbox"), c = $("#gc");
   if (!box || !c) return;
@@ -14092,51 +14244,51 @@ function gDraw() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.fillStyle = C.paper;
   ctx.fillRect(0, 0, w, h);
-  ctx.lineCap = "round";
+  ctx.lineCap = "butt";
   const [mx, my] = gMiddle();
   const scr = p => [mx + (p.x - G.cam[0]) * G.zoom, my + (p.y - G.cam[1]) * G.zoom];
   const S = {};
   for (const n of G.ids) S[n] = scr(N[n]);
   for (const id of Object.keys(GN)) S[id] = S[id] || scr(GN[id]);
+  gBgDraw(ctx);
   const vis = id => (N[id] || GN[id] || {vis: 0}).vis || 0;
+  ctx.lineWidth = 1;
   for (const l of G.goneLinks) {     // links that leave fade where they were
     if (!S[l.a] || !S[l.b]) continue;
     ctx.globalAlpha = Math.max(0, l.leave);
-    ctx.strokeStyle = C.rule; ctx.lineWidth = 1;
-    gStroke(ctx, S[l.a], gCurve(S[l.a], S[l.b], l.a + l.b), S[l.b], 0, 1);
+    ctx.strokeStyle = C.rule;
+    gSegment(ctx, S[l.a], S[l.b]);
   }
   ctx.globalAlpha = 1;
   for (const l of G.links) {
     const q = (vis(l.a) + vis(l.b)) / 2, g = ease(l.grow ?? 1);
     if (g <= 0) continue;
-    const A = S[l.a], B = S[l.b], Cp = gCurve(A, B, l.a + l.b);
-    const [t0, t1] = g >= 1 ? [0, 1] : l.from === l.a ? [0, g] : [1 - g, 1];   // it grows out of the record already there
-    gLink(ctx, l, A, Cp, B, t0, t1, q);
+    const [A, B] = gEnds(l.a, l.b, S[l.a], S[l.b]);
+    gLink(ctx, l, A, B, g, q);
   }
   if (G.path) {                            // the chains found: their lines and records stand out
     ctx.strokeStyle = C.accent; ctx.lineWidth = 3; ctx.globalAlpha = 0.55;
-    for (const l of G.links) if (G.path.keys.has(l.a + " " + l.b) && (l.grow ?? 1) >= 1)
-      gStroke(ctx, S[l.a], gCurve(S[l.a], S[l.b], l.a + l.b), S[l.b], 0, 1);
+    for (const l of G.links) if (G.path.keys.has(l.a + " " + l.b) && (l.grow ?? 1) >= 1) gSegment(ctx, S[l.a], S[l.b]);
     ctx.globalAlpha = 1;
   }
-  if (G.rubber && S[G.rubber.from]) {        // a link being drawn
-    ctx.setLineDash([6, 5]); ctx.strokeStyle = C.accent; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.moveTo(...S[G.rubber.from]); ctx.lineTo(G.rubber.x, G.rubber.y); ctx.stroke();
+  const from = G.rubber && gRec(G.rubber.from);
+  if (from) {                              // a link being drawn
+    ctx.setLineDash([4, 4]); ctx.strokeStyle = ctx.fillStyle = C.accent; ctx.lineWidth = 1.5;
+    gSegment(ctx, S[G.rubber.from] || scr(from), [G.rubber.x, G.rubber.y]);
     ctx.setLineDash([]);
-    ctx.beginPath(); ctx.arc(G.rubber.x, G.rubber.y, 5, 0, 2 * Math.PI); ctx.fillStyle = C.accent; ctx.fill();
+    ctx.fillRect(G.rubber.x - 3, G.rubber.y - 3, 6, 6);
   }
   for (const q of G.pulses) {        // light flowing along a link into a new cell
     const l = G.links.find(l => (l.a === q.a && l.b === q.b) || (l.a === q.b && l.b === q.a));
     if (!l || !S[q.a] || !S[q.b]) continue;
-    const A = S[l.a], B = S[l.b], Cp = gCurve(A, B, l.a + l.b);
     const t = ease((G.clock - q.start) / q.dur), along = q.a === l.a ? t : 1 - t;
+    ctx.fillStyle = C.accent;
     for (let k = 0; k < 4; k++) {
       const tt = q.a === l.a ? along - k * 0.05 : along + k * 0.05;
       if (tt < 0 || tt > 1) continue;
-      const [x, y] = gAt(A, Cp, B, tt);
+      const [x, y] = gAt(S[l.a], S[l.b], tt), r = 3.2 - k * 0.6;
       ctx.globalAlpha = (0.85 - k * 0.2) * Math.sin(Math.PI * Math.min(1, t * 1.1));
-      ctx.fillStyle = C.accent;
-      ctx.beginPath(); ctx.arc(x, y, 3.2 - k * 0.6, 0, 2 * Math.PI); ctx.fill();
+      ctx.fillRect(x - r, y - r, 2 * r, 2 * r);
     }
   }
   ctx.globalAlpha = 1;
@@ -14146,37 +14298,40 @@ function gDraw() {
     for (const l of G.links) {
       if ((l.a !== focus && l.b !== focus) || (l.grow ?? 1) < 1) continue;
       const words = l.rels.map(([rel, f]) => rel + (f === focus ? " →" : " ←")).join(" · ");
-      const [x, y] = gAt(S[l.a], gCurve(S[l.a], S[l.b], l.a + l.b), S[l.b], 0.5);
+      const [x, y] = gAt(S[l.a], S[l.b], 0.5);
       ctx.fillText(words, x, y - 6);
     }
   }
-  const node = (p, x, y, r, a) => {
+  const node = (p, x, y, r, a) => {        // the letter in its cell; lit, in inverse video
+    const [px, hw, hh] = gCell(r), v = p.vis || 0;
     ctx.globalAlpha = a;
-    gShape(ctx, p.kind, x, y, r);
-    ctx.fillStyle = mix(C.paper, C.accent, p.vis || 0);
-    ctx.fill();
-    if (p.id === G.center) { ctx.strokeStyle = C.warn; ctx.lineWidth = 2; }
-    else { ctx.strokeStyle = mix(C.faint, C.accent, p.vis || 0); ctx.lineWidth = 1; }
-    ctx.stroke();
+    ctx.fillStyle = mix(C.paper, C.accent, v);
+    ctx.fillRect(x - hw, y - hh, 2 * hw, 2 * hh);
+    if (p.id === G.center) { ctx.strokeStyle = C.warn; ctx.lineWidth = 2; ctx.strokeRect(x - hw, y - hh, 2 * hw, 2 * hh); }
+    ctx.fillStyle = v > 0.5 ? C.paper : gKindColour(p.kind);
+    ctx.font = `700 ${px}px ${C.mono}`; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(BOOT.glyph[p.kind] || "?", x, y + 1);
   };
   for (const id of Object.keys(GN)) {   // withering
     const g = GN[id], k = ease(g.leave);
     if (k > 0) node(g, ...S[id], gRadius(id, g) * k, k);
   }
+  ctx.lineWidth = 1;
   for (const n of G.ids) {
     const p = N[n], g = ease(p.grow ?? 1);
     if (g <= 0) continue;
-    const [x, y] = S[n], r = gRadius(n) * (0.35 + 0.65 * g);
+    const [x, y] = S[n], r = gRadius(n) * (0.35 + 0.65 * g), [, hw, hh] = gCell(r);
     node(p, x, y, r, g);
-    if (n === G.hover) {
+    if (n === G.hover) {                   // the cursor
       ctx.strokeStyle = C.ink; ctx.lineWidth = 1;
-      ctx.beginPath(); ctx.arc(x, y, r * 1.4 + 4, 0, 2 * Math.PI); ctx.stroke();
+      ctx.strokeRect(x - hw - 3, y - hh - 3, 2 * hw + 6, 2 * hh + 6);
     }
     if (G.path && (n === G.path.a || n === G.path.b)) {    // the two ends
       ctx.strokeStyle = C.accent; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.arc(x, y, r * 1.5 + 5, 0, 2 * Math.PI); ctx.stroke();
+      ctx.strokeRect(x - hw - 5, y - hh - 5, 2 * hw + 10, 2 * hh + 10);
     }
   }
+  ctx.globalAlpha = 1;
   ctx.textAlign = "left"; ctx.textBaseline = "middle";
   for (const n of G.ids) {
     const p = N[n], g = ease(p.grow ?? 1);
@@ -14186,9 +14341,20 @@ function gDraw() {
     ctx.font = `${big ? "600 12px" : "11px"} ${C.mono}`;
     ctx.fillStyle = p.dist <= 1 ? C.ink : C.soft;
     const name = p.name.length > 32 ? p.name.slice(0, 31) + "…" : p.name;
-    ctx.fillText(name, Math.round(x + gRadius(n) * 1.4 + 4), Math.round(y));
+    ctx.fillText(name, Math.round(x + gCell(gRadius(n))[1] + 4), Math.round(y));
   }
   ctx.globalAlpha = 1;
+  if (gBgShown()) {                        // the still record under the pointer, and the middle one if still
+    for (const [id, big] of [[G.hover !== G.center && G.hover, false], [G.center, true]]) {
+      const p = id && !N[id] && G.bg.at[id];
+      if (!p) continue;
+      const [x, y] = scr(p), r = gBgR() + (big ? 5 : 3);
+      ctx.strokeStyle = big ? C.warn : C.ink; ctx.lineWidth = big ? 2 : 1;
+      ctx.strokeRect(x - r, y - r, 2 * r, 2 * r);
+      ctx.font = `${big ? "600 12px" : "11px"} ${C.mono}`; ctx.fillStyle = C.ink;
+      ctx.fillText(p.name, Math.round(x + r + 4), Math.round(y));
+    }
+  }
   if (G.mode === "life" && G.pop.length > 1) {        // how many are lit, generation by generation
     const bw = 104, bh = 26, x0 = w - bw - 12, y0 = 10;
     ctx.strokeStyle = C.rule; ctx.lineWidth = 1;
@@ -14205,13 +14371,14 @@ function gDraw() {
 
 /* the hand */
 function gNodeAt(x, y, slop) {
+  // the record under (x, y): one on the springs, else (whole base) a still one
   let best = null, bd = slop * slop;
   for (const n of G.ids) {
     if ((G.nodes[n].grow ?? 1) < 0.5) continue;
     const [sx, sy] = gScreen(n), d = (sx - x) ** 2 + (sy - y) ** 2;
     if (d < bd) { best = n; bd = d; }
   }
-  return best;
+  return best || gBgAt(x, y, slop);
 }
 // A notch of a mouse wheel zooms by 1.1; a touchpad's many small steps, or a
 // pinch (which comes as a wheel with Ctrl), by their share of it -- not 1.1 each.
@@ -14280,7 +14447,7 @@ function gMove(e) {
   if (!p.moved && far < 6) return;
   p.moved = true;
   const dx = (e.offsetX - p.lx) / G.zoom, dy = (e.offsetY - p.ly) / G.zoom;
-  if (p.n && p.n !== G.center) {
+  if (p.n && p.n !== G.center && G.nodes[p.n]) {   // a still record is not dragged: the view is
     G.dragging = p.n;
     G.nodes[p.n].x += dx; G.nodes[p.n].y += dy;
     G.temp = Math.max(G.temp, 3);   // the neighbours follow gently
@@ -14315,6 +14482,7 @@ function gUp(e) {
     return;
   }
   if (p.n === G.center) { S.fromList = true; go("r/" + p.n); }
+  else if (G.scope === "base") gFocus(p.n);    // the whole base stays: the view glides there
   else go("g/" + p.n, true);
 }
 function gShake() {
@@ -14329,7 +14497,8 @@ function gShake() {
 function gKey(e) {
   const k = e.key;
   if (k === "m") { G.mode = GMODES[(GMODES.findIndex(m => m[0] === G.mode) + 1) % 3][0]; if (G.mode === "life") gSeed(); gButtons(); }
-  else if (k === "1" || k === "2" || k === "3") { G.depth = +k; gButtons(); graphFetch(G.center); }
+  else if (k === "1" || k === "2" || k === "3") { G.depth = +k; G.scope === "base" ? gScope("near") : (gButtons(), graphFetch(G.center)); }
+  else if (k === "w") gScope(G.scope === "base" ? "near" : "base");
   else if (k === " ") { e.preventDefault(); G.paused = !G.paused; gButtons(); }
   else if (k === "r") gShake();
   else if (k === "l") { G.names = !G.names; gButtons(); }
@@ -14436,20 +14605,23 @@ function linkChanged(card) {
 }
 function keySheet() {
   const C = G.C || gColors(), fam = BOOT.linkColours;
-  const line = (stroke, dash, w) => `<svg viewBox="0 0 64 14" aria-hidden="true"><line x1="2" y1="7" x2="62" y2="7" stroke="${stroke}" stroke-width="${w || 2}"${dash ? ` stroke-dasharray="${dash}"` : ""} stroke-linecap="round"/></svg>`;
-  const taper = `<svg viewBox="0 0 64 14" aria-hidden="true"><path d="M2 4 L62 6.4 L62 7.6 L2 10 Z" fill="${fam.verba}"/></svg>`;
+  const line = (stroke, dash) => `<svg viewBox="0 0 64 14" aria-hidden="true"><line x1="2" y1="7" x2="62" y2="7" stroke="${stroke}" stroke-width="1"${dash ? ` stroke-dasharray="${dash}"` : ""}/></svg>`;
+  const arrow = `<svg viewBox="0 0 64 14" aria-hidden="true"><line x1="2" y1="7" x2="56" y2="7" stroke="${fam.verba}" stroke-width="1"/><path d="M62 7 L55 4 L55 10 Z" fill="${fam.verba}"/></svg>`;
   const rows = [
     ...[["verba", "Verba"], ["people", "People"], ["sources", "Sources"], ["corpus", "Corpus"], ["res", "Res"]].map(([k, l]) =>
       [line(hexMix(C.rule, fam[k], 0.9)), T(l)]),
     [line(hexMix(C.rule, fam.verba, 0.9)), T("with a reason or a source")],
-    [line(hexMix(C.rule, fam.verba, 0.4), "6 4", 1.2), T("without either: needs a reason")],
-    [line(hexMix(C.rule, fam.verba, 0.6), "1.5 4", 1.2), T("a type outside the list (atypical)")],
-    [taper, T("thick where it comes from")],
+    [line(hexMix(C.rule, fam.verba, 0.4), "5 4"), T("without either: needs a reason")],
+    [line(hexMix(C.rule, fam.verba, 0.6), "1.5 3"), T("a type outside the list (atypical)")],
+    [arrow, T("an arrow where it points")],
     [line(hexMix(C.rule, fam.sources, 0.9)), T("written recently")],
     [line(hexMix(C.rule, fam.sources, 0.4)), T("written long ago")],
-    [line(C.accent, "", 3), T("lit, in life")]];
+    [line(C.accent), T("lit, in life")]];
+  const letters = BOOT.kindOrder.map(k => `<b class="kl" style="color:${gKindColour(k)}">${esc(BOOT.glyph[k])}</b>` +
+    `<span>${esc(BOOT.kindLabels[k])}</span>`).join("");
   openSheet(`<span class="lbl">${esc(T("What a line shows"))}</span><div class="key">` +
-    rows.map(([svg, text]) => `${svg}<span>${esc(text)}</span>`).join("") + `</div>`);
+    rows.map(([svg, text]) => `${svg}<span>${esc(text)}</span>`).join("") + `</div>` +
+    `<span class="lbl">${esc(T("What a letter shows"))}</span><div class="key">${letters}</div>`);
 }
 async function loadLinks(more) {
   let j;
@@ -15151,7 +15323,9 @@ document.addEventListener("click", e => {
   else if (act === "m-all") { M.want = ["all"]; mRender(); }
   else if (act === "m-world") { M.want = ["world"]; mRender(); }
   else if (act === "gmode") { G.mode = b.dataset.m; if (G.mode === "life") gSeed(); gButtons(); gStatus(true); }
-  else if (act === "gdepth") { G.depth = +b.dataset.d; gButtons(); graphFetch(G.center); }
+  else if (act === "gdepth") { G.depth = +b.dataset.d; G.scope === "base" ? gScope("near") : (gButtons(), graphFetch(G.center)); }
+  else if (act === "gscope") gScope(b.dataset.s);
+  else if (act === "gkind") gKind(b.dataset.k);
   else if (act === "gpause") { G.paused = !G.paused; gButtons(); gStatus(true); }
   else if (act === "gseed") { gSeed(); gStatus(true); }
   else if (act === "gnames") { G.names = !G.names; gButtons(); }
@@ -17973,7 +18147,11 @@ HELP_GRAPH = (
     "\n                  Open (or Enter) opens a record on the card, Path finds how"
     "\n                  two records are related and Link draws a link. p replays the"
     "\n                  logs: the base grows on screen as it grew, with a timeline to"
-    "\n                  scrub. ? shows the key of the lines and every key.\n"
+    "\n                  scrub. w (or Whole base, at the top) shows every record: the"
+    "\n                  linked ones on the springs, the others still around them,"
+    "\n                  one wedge per type; the key of the records, at the left,"
+    "\n                  hides or shows a type. ? shows the key of the lines and"
+    "\n                  every key.\n"
 )
 
 
@@ -23552,17 +23730,46 @@ def cmd_book():
 # that were on screen when the replay began (w switches).
 # Changes grow rather than jump: records already on screen keep their place and
 # light, new ones sprout beside the record that brought them and their links grow
-# out to them, the ones that leave wither; links are soft curves that breathe;
-# every brightness eases. The springs take damped steps, and dragging a record
-# holds the view still. The web page's graph (# ==== web) moves the same way.
+# out to them, the ones that leave wither; every brightness eases. The springs
+# take damped steps, and dragging a record holds the view still. The web page's
+# graph (# ==== web) moves the same way.
+# The window and the page draw as a terminal would: every record is the letter its id
+# starts with (GRAPH_GLYPH: c_ a concept, s_ a source, p_ a person...) in its
+# collection's colour, a lit one in inverse video, the middle one boxed; a link
+# is a straight one-pixel line, an arrowhead where a directed one points.
+# w shows the whole base instead (the page's graph too, from web_graph): every
+# record with a link lives in the middle, on the springs as above, and every
+# other record lies still around them, one wedge of a disc per type, the
+# recently edited nearest the middle. That disc is painted once into a picture
+# (paint_bg), its letters in a 3x5 pixel font (GRAPH_PIXELS), and only moved
+# with the view, so its thousands of records cost nothing per frame; it is
+# painted again when the zoom settles. The key of the records (left; on the
+# page, a row of letters) hides or shows a type.
 # Read-only: it reads `edges`, `updated_at` and the logs, and writes nothing.
 
-GRAPH_MAX_NODES = 160        # the view stays fluid: never the whole base at once
+GRAPH_MAX_NODES = 160        # the view stays fluid: never more than this on the springs
 GRAPH_HALF_LIFE = 21         # days for an edit's glow to halve
 GRAPH_REPLAY_SECONDS = 60    # a replay at normal speed lasts about this long
 GRAPH_MODES = ("glow", "life", "still")
 GRAPH_MODE_LABEL = {"glow": "spreading glow", "life": "Conway's life", "still": "still"}
 GRAPH_MODE_SHORT = (("life", "Life"), ("glow", "Glow"), ("still", "Still"))   # the buttons, as the web's
+GRAPH_BG_STEP = 16.0         # whole base: the room one record of the still disc takes, before zoom
+# the records' types on the graphs: their letter (the id's first; an
+# organization, a p_ too, gets an o), their colour (the family of their
+# collection, as the links') and their name in the key
+GRAPH_KINDS = ("concept", "form", "person", "org", "source", "note", "metric", "item")
+GRAPH_GLYPH = {"concept": "c", "form": "f", "person": "p", "org": "o", "source": "s",
+               "note": "n", "metric": "h", "item": "r"}
+GRAPH_KIND_FAMILY = {"concept": "verba", "form": "verba", "person": "people", "org": "people",
+                     "source": "sources", "note": "other", "metric": "corpus", "item": "res"}
+GRAPH_KIND_LABEL = {"concept": "concepts", "form": "forms", "person": "people",
+                    "org": "organizations", "source": "sources", "note": "drafts",
+                    "metric": "measurements", "item": "res"}
+# the same letters in a 3x5 pixel font, for the whole base's still disc
+GRAPH_PIXELS = {"c": ("...", ".##", "#..", ".##", "..."), "f": (".##", "###", ".#.", ".#.", "..."),
+                "p": ("...", "##.", "#.#", "##.", "#.."), "o": ("...", ".#.", "#.#", ".#.", "..."),
+                "s": ("...", ".##", ".#.", "##.", "..."), "n": ("...", "##.", "#.#", "#.#", "..."),
+                "h": ("#..", "##.", "#.#", "#.#", "..."), "r": ("...", "#.#", "##.", "#..", "...")}
 
 
 def graph_adjacency(data):
@@ -23602,8 +23809,82 @@ def graph_ego(adj, center, depth, cap=GRAPH_MAX_NODES):
     return seen
 
 
+def graph_visible(adj, kind_of, hidden, keep=None):
+    """graph_adjacency without the types switched off in the key of the
+    records (`hidden`); `keep`, the middle record, stays whatever its type."""
+    if not hidden:
+        return adj
+    ok = lambda n: n == keep or kind_of.get(n) not in hidden
+    return {n: {m: r for m, r in nb.items() if ok(m)} for n, nb in adj.items() if ok(n)}
+
+
+def graph_base_ego(adj, rid, cap=GRAPH_MAX_NODES):
+    """The whole base's records on the springs: every one with a link in
+    view, the larger groups first, at most `cap`, whichever the middle record
+    is (so that the still disc around them stays put). As graph_ego gives:
+    {id: (distance, parent)}, parents first. The distance counts from `rid`
+    within its own group, and from 2 in the others, so that only the middle
+    record's neighbours are named."""
+    groups, seen = [], set()
+    for hub in sorted((n for n in adj if adj[n]), key=lambda n: (-len(adj[n]), n)):
+        if hub in seen:
+            continue
+        tree, frontier = {hub: None}, [hub]
+        while frontier:
+            nxt = []
+            for n in frontier:
+                for m in sorted(adj[n], key=lambda m: (-len(adj.get(m, {})), m)):
+                    if m not in tree:
+                        tree[m] = n
+                        nxt.append(m)
+            frontier = nxt
+        seen.update(tree)
+        groups.append(tree)
+    groups.sort(key=lambda t: -len(t))     # stable: among equals, the most linked hub first
+    near = graph_ego(adj, rid, 99, cap=10 ** 9) if rid in adj else {}
+    out = {}
+    for tree in groups:
+        for n, parent in tree.items():
+            if len(out) >= cap:
+                return out
+            out[n] = (near[n][0] if n in near else 2 + (parent is not None), parent)
+    return out
+
+
+def graph_disc(kind_of, recs, live, hidden, link=90.0):
+    """The whole base's still disc: every record shown and not on the springs
+    (`live`), on a sunflower spiral round the springs' room, one wedge per
+    type in GRAPH_KINDS' order, the most recently edited (`recs`, recency)
+    nearest the middle. {"pos": {id: (x, y)}, "r0": the springs' room,
+    "rmax": the disc's edge}, in the springs' units (`link` a link's length).
+    The same for the window and the page."""
+    step = GRAPH_BG_STEP
+    ids = [n for n, k in kind_of.items() if n not in live and k not in hidden and not n.startswith("__")]
+    r0 = link * (1.0 + 0.6 * math.sqrt(max(1, len(live))))
+    area = step * step / math.pi        # each spot gets step² of the disc
+    spots = []
+    for i in range(len(ids)):
+        a = i * 2.39996323              # the golden angle
+        d = math.sqrt(r0 * r0 + i * area)
+        x, y = d * math.cos(a), d * math.sin(a)
+        spots.append((math.atan2(y, x), d, x, y))
+    spots.sort()                        # by angle: consecutive spots make a wedge
+    by_kind = {}
+    for n in ids:
+        by_kind.setdefault(kind_of[n], []).append(n)
+    pos, i = {}, 0
+    for k in GRAPH_KINDS:
+        group = sorted(by_kind.get(k, ()), key=lambda n: (-recs.get(n, 0.0), n))
+        wedge = sorted(spots[i:i + len(group)], key=lambda s: s[1])     # nearest first
+        for n, s in zip(group, wedge):
+            pos[n] = (s[2], s[3])
+        i += len(group)
+    return {"pos": pos, "r0": r0, "rmax": math.sqrt(r0 * r0 + len(ids) * area)}
+
+
 def graph_kind(rec):
-    """The shape a record takes on the graph."""
+    """A record's type on the graphs (one of GRAPH_KINDS): its letter
+    (GRAPH_GLYPH), in the window and on the page alike."""
     coll = coll_of(rec.get("id", ""))
     if coll == "entries":
         return "form" if rec.get("kind") == "form" else "concept"
@@ -23613,6 +23894,22 @@ def graph_kind(rec):
         return "item"
     return {"people": "person", "sources": "source", "corpus": "metric",
             "notes": "note"}[coll]
+
+
+def graph_stencil(kind, scale):
+    """A record of the whole base's still disc, as pixels: runs (dy, x0, x1)
+    around its centre, x1 excluded -- its letter in GRAPH_PIXELS, each dot
+    `scale` pixels wide; at scale 0 a dot of four pixels, its colour all that
+    tells its type."""
+    if not scale:
+        return ((0, 0, 2), (1, 0, 2))
+    runs, s = [], scale
+    for row, bits in enumerate(GRAPH_PIXELS[GRAPH_GLYPH[kind]]):
+        for m in re.finditer(r"#+", bits):
+            for k in range(s):
+                runs.append(((row - 2) * s + k - s // 2, (m.start() - 1) * s - s // 2,
+                             (m.end() - 1) * s - s // 2))
+    return runs
 
 
 def epoch_of(stamp):
@@ -23638,8 +23935,9 @@ def recency(rec, now=None):
 # FAMILY as a colour (the collection its type belongs to), its AGE as how vivid
 # that colour is (when it was written, from the logs), its EVIDENCE as the
 # stroke (solid with a reason or a source, dashed without either, dotted for a
-# type outside RELS) and its DIRECTION as a taper, thick at the record it comes
-# from. Several links between the same two records share one line.
+# type outside RELS) and its DIRECTION as an arrowhead where it points (the
+# style "taper" below is that arrowhead, a name kept from the tapered lines).
+# Several links between the same two records share one line.
 
 REL_FAMILY = {
     "expresses": "verba", "derives_from": "verba", "cognate_of": "verba",
@@ -23840,10 +24138,7 @@ class GraphView:
     LEAVE_MS = 600       # a record or a link leaving the view, withering
     FLOW_MS = 900        # light flowing along a link into a newborn cell
     STAGGER_MS = 110     # each ring of records sprouts this much after the one inside it
-    RIM = 0.55           # a solid line's rim, this much of its colour on the paper: Tk
-                         # draws no soft edges, and the rim stands in for them
-    MIN_HALF = 1.0       # half the narrowest core of a line: thinner, Tk's fill comes and
-                         # goes along it and the line reads as dashed
+    ARROW = (6, 7, 2.5)  # a directed link's arrowhead (Tk's arrowshape)
 
     def __init__(self, root, get_data, start_id=None, on_open=None, on_link=None):
         self.root, self.get_data, self.on_open, self.on_link = root, get_data, on_open, on_link
@@ -23885,6 +24180,14 @@ class GraphView:
         self.hint_off = False  # the hint goes after the first click, as on the web page
         self._said = None      # what the buttons last showed (sync_buttons)
         self.pop = []        # life: the share of records lit, generation by generation
+        self.scope = "near"  # w: "near", around the record, or "base", the whole base
+        self.hidden = set()  # the types switched off in the key of the records
+        self.kind_of = {}    # every record's type (graph_kind)
+        self.bg = None       # the whole base's still disc (base_layout), painted by paint_bg
+        self.bg_item = self.bg_photo = self._bg_at = None
+        self._bg_z, self._bg_still = None, 0   # the zoom on the last tick, and how long it held
+        self._enter = False  # the scope just switched: the whole of it comes into view
+        self._kind_click = False
 
         fams = set(tkfont.families(root))
         mono = next((f for f in ("Cascadia Mono", "Consolas", "Lucida Console",
@@ -23893,10 +24196,11 @@ class GraphView:
         self.f_center = tkfont.Font(root, family=mono, size=10, weight="bold")
         self.f_status = tkfont.Font(root, family=mono, size=9)
         self.f_btn = tkfont.Font(root, family=mono, size=10)
+        self.mono, self.f_glyph = mono, {}   # the records' letters, by size (glyph_font)
         n = self.STEPS
+        # a record lit is in inverse video: its cell fills with the light and,
+        # past half, its letter turns from its type's colour to the paper's
         self.ramp_fill = [blend(PAPER, STAMP, i / n) for i in range(n + 1)]
-        self.ramp_edge = [blend(FAINT, STAMP, i / n) for i in range(n + 1)]
-        self.ramp_line = [blend(RULE, STAMP, 0.85 * i / n) for i in range(n + 1)]
 
         root.title(tr("Kustos · link graph") if on_link else tr("Kustos · link graph (read-only)"))
         root.configure(bg=PAPER)
@@ -23913,6 +24217,9 @@ class GraphView:
         self.seg_mode.pack(side="left")
         self.seg_depth = self.segment(bar, [(d, str(d)) for d in (1, 2, 3)], self.set_depth)
         self.seg_depth.pack(side="left", padx=(6, 0))
+        self.seg_scope = self.segment(bar, [("near", tr("Around")), ("base", tr("Whole base"))],
+                                      self.set_scope)
+        self.seg_scope.pack(side="left", padx=(6, 0))
         self.b_open = self.button(bar, tr("Open"), lambda: self.open_in_card())
         self.b_open.pack(side="right")
         self.b_names = self.button(bar, "Aa", self.toggle_labels, quiet=True)
@@ -23937,7 +24244,11 @@ class GraphView:
         self.t_notice = cv.create_text(0, 0, anchor="n", font=self.f_status, fill=SOFT)
         self.bar = cv.create_line(0, 0, 0, 0, fill=RULE, width=3, state="hidden")
         self.bar_done = cv.create_line(0, 0, 0, 0, fill=STAMP, width=3, state="hidden")
-        self.ring = cv.create_oval(0, 0, 0, 0, outline=INK, width=1, state="hidden")
+        self.ring = cv.create_rectangle(0, 0, 0, 0, outline=INK, width=1, state="hidden")  # the cursor
+        # the whole base: the record of the still disc under the pointer, and the middle one
+        self.t_bgname = cv.create_text(0, 0, anchor="w", font=self.f_label, fill=INK, state="hidden")
+        self.cring = cv.create_rectangle(0, 0, 0, 0, outline=OXIDE, width=2, state="hidden")
+        self.t_bgcentre = cv.create_text(0, 0, anchor="w", font=self.f_center, fill=INK, state="hidden")
         self.t_link = cv.create_text(12, 0, anchor="sw", font=self.f_status, fill=INK, state="hidden")
         self.rubber = cv.create_line(0, 0, 0, 0, fill=STAMP, width=2, dash="-", state="hidden")
         self.pop_rule = cv.create_line(0, 0, 0, 0, fill=RULE, width=1, state="hidden")
@@ -24028,14 +24339,18 @@ class GraphView:
         """The buttons follow the state, whichever way it changed (a key, a click)."""
         life = self.mode == "life"
         said = (self.mode, self.depth, self.paused, self.all_labels, life and self.settled,
-                self.drawing, self.show_key, bool(self.rp), self.hint_off)
+                self.drawing, self.show_key, bool(self.rp), self.hint_off, self.scope)
         if said == self._said:
             return
         self._said = said
         for m, w in self.seg_mode.btns.items():
             w.configure(bg=INK if m == self.mode else PAPER, fg=PAPER if m == self.mode else SOFT)
-        for d, w in self.seg_depth.btns.items():
-            on = d == self.depth and not self.rp
+        base = self.scope == "base"
+        for d, w in self.seg_depth.btns.items():     # the depth counts around the record only
+            on = d == self.depth and not self.rp and not base
+            w.configure(bg=INK if on else PAPER, fg=PAPER if on else (FAINT if self.rp or base else SOFT))
+        for s, w in self.seg_scope.btns.items():
+            on = s == self.scope and not self.rp
             w.configure(bg=INK if on else PAPER, fg=PAPER if on else (FAINT if self.rp else SOFT))
         self.b_pause.configure(text="\u25b6" if self.paused else "\u275a\u275a")
         if life and not self.b_seed.winfo_manager():
@@ -24083,22 +24398,114 @@ class GraphView:
         self.drawing = not self.drawing and not self.rp
         self.update_status()
 
+    @staticmethod
+    def kind_colour(kind):
+        """A type's colour: its collection's family, as the links have it; a
+        one-colour theme keeps its own ink."""
+        if PAL["mono_only"]:
+            return FAINT
+        return LINK_FAMILY_COLOUR[GRAPH_KIND_FAMILY.get(kind, "other")]
+
+    def glyph_font(self, px):
+        """The records' letters: the window's monospace, bold, px pixels high."""
+        f = self.f_glyph.get(px)
+        if f is None:
+            f = self.f_glyph[px] = tkfont.Font(self.root, family=self.mono, size=-px, weight="bold")
+        return f
+
+    @staticmethod
+    def glyph_px(r):
+        """The letter's height for a record of size r (radius)."""
+        return max(9, min(26, round(r * 2.8)))
+
+    def set_scope(self, s):
+        """Around the record, or the whole base (w, or the buttons at the top)."""
+        if self.rp or s == self.scope or s not in ("near", "base"):
+            return
+        self.scope = s
+        self.bg = None
+        if s == "near" and self.bg_item:
+            self.cv.itemconfigure(self.bg_item, state="hidden", image="")
+            self.bg_photo = self._bg_at = None
+        self._enter = True
+        try:
+            self.recentre(self.center)
+        finally:
+            self._enter = False
+        if s == "base":
+            self.fit_zoom(snap=True)
+        self.draw_kinds()
+        self.update_status()
+
+    def toggle_kind(self, k):
+        """A click in the key of the records: that type hidden, or shown again,
+        around the record and in the whole base alike."""
+        self._kind_click = True       # the canvas's own press, before or after this, lets it be
+        self.root.after_idle(lambda: setattr(self, "_kind_click", False))
+        self.hidden ^= {k}
+        self.bg = None
+        if self.hover and self.kind_of.get(self.hover) in self.hidden:
+            self.hover = None
+        if not self.rp:
+            self.recentre(self.center)
+        self.draw_kinds()
+        self.update_status()
+
+    def draw_kinds(self):
+        """The key of the records, top left: each type's letter and colour and
+        how many the base has; a click on a row hides that type or brings it
+        back. Shown with the whole base, or with the key (k)."""
+        cv = self.cv
+        cv.delete("kinds")
+        if self.rp or not (self.show_key or self.scope == "base") or not self.kind_of:
+            return
+        counts = {}
+        for k in self.kind_of.values():
+            counts[k] = counts.get(k, 0) + 1
+        rows = [k for k in GRAPH_KINDS if counts.get(k)]
+        x0, y0, wd = 12, self.TOP + 8, 186
+        cv.create_rectangle(x0 - 6, y0 - 6, x0 + wd, y0 + 18 * len(rows) + 4, fill=PAPER,
+                            outline=RULE, tags=("kinds",))
+        for i, k in enumerate(rows):
+            y, off, tag = y0 + 8 + 18 * i, k in self.hidden, "kind_" + k
+            cv.create_rectangle(x0 - 4, y - 9, x0 + wd - 2, y + 9, fill=PAPER, outline="",
+                                tags=("kinds", tag))          # the whole row answers the click
+            cv.create_text(x0 + 9, y, text=GRAPH_GLYPH[k], font=self.glyph_font(13),
+                           fill=FAINT if off else self.kind_colour(k), tags=("kinds", tag))
+            cv.create_text(x0 + 26, y, anchor="w", text=tr(GRAPH_KIND_LABEL[k]),
+                           fill=FAINT if off else INK, font=self.f_label, tags=("kinds", tag))
+            cv.create_text(x0 + wd - 8, y, anchor="e", text=str(counts[k]),
+                           fill=FAINT if off else SOFT, font=self.f_label, tags=("kinds", tag))
+            cv.tag_bind(tag, "<Button-1>", lambda e, k=k: self.toggle_kind(k))
+        cv.tag_raise("kinds")
+        cv.tag_raise("chrome")
+
+    def over_key(self):
+        """Whether the pointer is over one of the keys (the records', the lines')."""
+        hit = self.cv.find_withtag("current")
+        return bool(hit) and bool({"kinds", "key"} & set(self.cv.gettags(hit[0])))
+
     # ---------------------------------------------------------- content
     def recentre(self, rid, fresh=False, view=None):
         """Puts `rid` in the middle. The records already on screen keep their
         place and their light (the camera glides to the new middle); new ones
         sprout beside the record that brought them, nearest first, and their
-        links grow out to them; the ones now out of reach wither where they are."""
+        links grow out to them; the ones now out of reach wither where they are.
+        With the whole base (scope "base") nothing is moved: every record with
+        a link is on the springs whichever `rid` is, the others lie still
+        around them (base_layout), and the view glides to `rid`."""
         first = not self.pos
         if fresh or self.data is None:
             self.data = self.get_data()
             self.idx = by_id(self.data)
             self.adj = graph_adjacency(self.data)
+            self.kind_of = {k: graph_kind(r) for k, r in self.idx.items()}
             now = datetime.now()
             self.recs = {k: recency(r, now) for k, r in self.idx.items()}
             pairs, times = link_index(self.data), edge_times()
             self.lfacts = {k: link_facts(v, times, now.timestamp()) for k, v in pairs.items()}
             self.lcolour, self.shown = {}, {}   # colours are worked out again from the new facts
+            self.bg = None
         if rid not in self.idx:
             rid = max(self.adj, key=lambda k: (len(self.adj[k]), k), default=None)
         if rid is None and self.idx:
@@ -24107,24 +24514,36 @@ class GraphView:
             self.mode, self.path, self.goal = self.path["mode"], None, [0.0, 0.0]
             self.cv.itemconfigure(self.t_link, state="hidden")
             self.cv.delete("pathend")
-        ego = view[0] if view else (graph_ego(self.adj, rid, self.depth) if rid else {})
-        ox, oy = self.pos.get(rid, (0.0, 0.0))
+        base = self.scope == "base" and view is None and not self.rp
+        adj = self.visible_adj(rid)
+        if view:
+            ego = view[0]
+        elif base:
+            ego = self.base_ego(adj, rid)
+        else:
+            ego = graph_ego(adj, rid, self.depth) if rid else {}
+        ox, oy = (0.0, 0.0) if base else self.pos.get(rid, (0.0, 0.0))
         pos = {}
         for n, (_d, parent) in ego.items():
             if n in self.pos:
                 x, y = self.pos[n]
                 pos[n] = [x - ox, y - oy]
             elif parent is None or parent not in pos:
-                pos[n] = [0.0, 0.0]
+                if base and n != rid:       # a group of its own: anywhere near the middle
+                    a, r = self.rng.uniform(0, 2 * math.pi), self.LINK * self.rng.uniform(0.3, 2.0)
+                    pos[n] = [r * math.cos(a), r * math.sin(a)]
+                else:
+                    pos[n] = [0.0, 0.0]
             else:
                 px, py = pos[parent]
                 a = self.rng.uniform(0, 2 * math.pi)
                 r = self.LINK * 0.15
                 pos[n] = [px + r * math.cos(a), py + r * math.sin(a)]
-        if rid:
+        if rid and not base:
             pos[rid] = [0.0, 0.0]
         self.cam = [self.cam[0] - ox, self.cam[1] - oy]
-        self.goal = [0.0, 0.0]
+        if not base:
+            self.goal = [0.0, 0.0]
         for g in self.gone.values():        # what is withering moves with the rest
             g["pos"] = [g["pos"][0] - ox, g["pos"][1] - oy]
         for n in [n for n in self.pos if n not in ego]:
@@ -24132,22 +24551,32 @@ class GraphView:
         new = [n for n in ego if n not in self.items]
         self.center, self.pos = rid, pos
         self.dist = {n: d for n, (d, _p) in ego.items()}
-        self.kinds = {n: graph_kind(self.idx[n]) for n in ego}
+        self.kinds = {n: self.kind_of[n] for n in ego}
         self.names = {n: label_any(self.idx[n], self.data) for n in ego}
-        self.adjv = {n: [m for m in self.adj.get(n, {}) if m in ego] for n in ego}
+        nbrs = self.adj if view else adj
+        self.adjv = {n: [m for m in nbrs.get(n, {}) if m in ego] for n in ego}
+        if base:
+            live = frozenset(ego)
+            if self.bg is None or self.bg["live"] != live:
+                self.base_layout(live)
+            target = pos.get(rid) or self.bg["pos"].get(rid)
+            if self._enter:                 # the whole base comes into view
+                self.goal, self.fit = [0.0, 0.0], True
+            elif target:                    # the view glides to the record
+                self.goal, self.fit = [target[0], target[1]], False
         for n in new:
             self.born_at[n] = self.clock + self.STAGGER_MS * self.dist[n] + self.rng.uniform(0, 150)
             self.grow[n] = 0.0
             self.heat[n] = self.vis[n] = 0.0
             self.lit[n] = self.mode == "life" and self.rng.random() < 0.35 + 0.5 * self.recs.get(n, 0.0)
             self.arrive[n] = self.born_at[n] + self.GROW_MS + self.rng.uniform(0, 2000)
-        if rid and self.mode == "glow":
+        if rid in pos and self.mode == "glow":
             self.sparkle[rid] = 1.0
-        if self.mode == "life":             # the neighbourhood changed: the run goes on from here
+        if self.mode == "life" and (new or not base):   # the neighbourhood changed: the run goes on
             self.stale, self.history, self.settled = 0, [], False
             if first:
                 self.gen = 0
-        links = view[1] if view else {(a, b): rels for a in ego for b, rels in self.adj.get(a, {}).items()
+        links = view[1] if view else {(a, b): rels for a in ego for b, rels in adj.get(a, {}).items()
                                       if b in ego and a < b}
         for key in [key for key in self.links if key not in links]:
             self.drop_link(key)
@@ -24174,16 +24603,149 @@ class GraphView:
                 self.add_node(n)
         if not self.center:
             msg = tr("The base has no records yet.")
-        elif len(self.pos) == 1:
+        elif len(self.pos) == 1 and not base:
             msg = tr("No links yet: write them in the card's LINKS field, one per line.")
         else:
             msg = ""
         self.cv.itemconfigure(self.t_notice, text=msg)
-        self.temp = max(self.temp, 30.0 if first else 14.0)
-        self.fit = True
+        if new or not base:
+            self.temp = max(self.temp, 30.0 if first else 14.0)
+        if not base:
+            self.fit = True
         self.label_states()
         self._dirty = True
         self.update_status()
+
+    def visible_adj(self, keep=None):
+        return graph_visible(self.adj, self.kind_of, self.hidden, keep)
+
+    def base_ego(self, adj, rid):
+        return graph_base_ego(adj, rid)
+
+    def base_layout(self, live):
+        """The still disc (graph_disc) and a grid of cells that finds the
+        record under the pointer. Laid out again when the base, the types
+        shown or the records on the springs change, never when only the
+        middle record does."""
+        disc, step = graph_disc(self.kind_of, self.recs, live, self.hidden, self.LINK), GRAPH_BG_STEP
+        grid = {}
+        for n, (x, y) in disc["pos"].items():
+            grid.setdefault((int(x // step), int(y // step)), []).append(n)
+        self.bg = dict(disc, grid=grid, live=live, n=len(disc["pos"]), view=None)
+
+    def bg_shown(self):
+        return self.scope == "base" and self.bg is not None and not self.rp and not self.path
+
+    def bg_scale(self):
+        """How big the still records' letters are at this zoom: 0, a dot, when
+        their room is under 7 pixels; then the 3x5 letter at one pixel a dot,
+        two from 13, three from 20, so that letters never touch."""
+        room = GRAPH_BG_STEP * self.zoom
+        return 0 if room < 7 else 1 if room < 13 else 2 if room < 20 else 3
+
+    def bg_r(self):
+        """Half the size of a still record on screen, for the cursor round it."""
+        return (1.5, 2.5, 5.0, 7.5)[self.bg_scale()]
+
+    def bg_follow(self):
+        """Keeps the painted disc under the view: the picture moves with the
+        camera, and is painted again once a new zoom or window size has held
+        for two ticks, or when the view leaves the painted part. While the
+        zoom is moving it is hidden rather than shown at the wrong size."""
+        cv = self.cv
+        if not self.bg_shown():
+            if self.bg_item and self._bg_at != "hidden":
+                cv.itemconfigure(self.bg_item, state="hidden")
+                self._bg_at = "hidden"
+            return
+        z = self.zoom
+        size = (cv.winfo_width(), cv.winfo_height(), self.middle())
+        self._bg_still = self._bg_still + 1 if (z, size) == self._bg_z else 0
+        self._bg_z = (z, size)
+        v = self.bg["view"]
+        if v is None or ((v["z"] != z or v["size"] != size) and self._bg_still >= 2):
+            v = self.paint_bg()
+        dx, dy = (v["cam"][0] - self.cam[0]) * z, (v["cam"][1] - self.cam[1]) * z
+        if v["z"] == z and max(abs(dx), abs(dy)) > v["m"]:
+            v = self.paint_bg()
+            dx = dy = 0.0
+        at = "hidden" if abs(v["z"] / z - 1) > 0.03 else (round(dx - v["m"]), round(dy - v["m"]))
+        if at != self._bg_at:               # an unchanged picture is not touched
+            if at == "hidden":
+                cv.itemconfigure(self.bg_item, state="hidden")
+            else:
+                cv.coords(self.bg_item, *at)
+                cv.itemconfigure(self.bg_item, state="normal")
+            self._bg_at = at
+
+    def paint_bg(self):
+        """Paints the still disc into one picture (a PPM made in memory), the
+        size of the view and a margin round it: every record its letter at
+        this zoom (graph_stencil) in its collection's colour, the stronger
+        the more recently it was edited. About 30 ms for five thousand."""
+        cv, bg = self.cv, self.bg
+        w, h = max(1, cv.winfo_width()), max(1, cv.winfo_height())
+        mid = self.middle()
+        m = int(0.2 * max(w, h))
+        W, H = w + 2 * m, h + 2 * m
+        z, (cx, cy) = self.zoom, self.cam
+        scale = self.bg_scale()
+        buf = bytearray(bytes.fromhex(PAPER[1:]) * (W * H))
+        cols = {k: [bytes.fromhex(blend(PAPER, self.kind_colour(k), 0.4 + 0.12 * i)[1:]) for i in range(6)]
+                for k in GRAPH_KINDS}
+        stencils = {k: graph_stencil(k, scale) for k in GRAPH_KINDS}
+        recs, K = self.recs, self.kind_of
+        ox, oy = mid[0] - cx * z + m, mid[1] - cy * z + m
+        for n, (x, y) in bg["pos"].items():
+            u, v = int(ox + x * z), int(oy + y * z)
+            if not (-10 < u < W + 10 and -10 < v < H + 10):
+                continue
+            k = K[n]
+            c = cols[k][min(5, int(recs.get(n, 0.0) * 6))]
+            for dy, x0, x1 in stencils[k]:
+                yy = v + dy
+                if 0 <= yy < H:
+                    a, b = max(0, u + x0), min(W, u + x1)
+                    if b > a:
+                        o = (yy * W + a) * 3
+                        buf[o:o + (b - a) * 3] = c * (b - a)
+        self.bg_photo = tk.PhotoImage(master=self.root, format="PPM",
+                                      data=b"P6\n%d %d\n255\n" % (W, H) + bytes(buf))
+        if self.bg_item is None:
+            self.bg_item = cv.create_image(0, 0, anchor="nw", image=self.bg_photo)
+            cv.tag_lower(self.bg_item)
+        else:
+            cv.itemconfigure(self.bg_item, image=self.bg_photo)
+        self._bg_at = None
+        bg["view"] = dict(z=z, cam=(cx, cy), m=m, size=(w, h, mid))
+        return bg["view"]
+
+    def bg_at(self, x, y):
+        """The record of the still disc under the screen point (x, y), or None."""
+        mx, my = self.middle()
+        z, step = self.zoom, GRAPH_BG_STEP
+        wx, wy = (x - mx) / z + self.cam[0], (y - my) / z + self.cam[1]
+        reach = max(6.0, self.bg_r() + 3) / z
+        best, bd = None, reach * reach
+        gx, gy, k = int(wx // step), int(wy // step), int(reach // step) + 1
+        P, grid = self.bg["pos"], self.bg["grid"]
+        for i in range(gx - k, gx + k + 1):
+            for j in range(gy - k, gy + k + 1):
+                for n in grid.get((i, j), ()):
+                    d = (P[n][0] - wx) ** 2 + (P[n][1] - wy) ** 2
+                    if d < bd:
+                        best, bd = n, d
+        return best
+
+    def screen_of(self, n):
+        """Where record n is on screen: on the springs, or in the still disc."""
+        if n in self.screen:
+            return self.screen[n]
+        if self.bg_shown() and n in self.bg["pos"]:
+            mx, my = self.middle()
+            x, y = self.bg["pos"][n]
+            return mx + (x - self.cam[0]) * self.zoom, my + (y - self.cam[1]) * self.zoom
+        return None
 
     def clear_items(self):
         self.cv.delete("g")
@@ -24200,8 +24762,8 @@ class GraphView:
         self.hover = None
 
     def add_node(self, n):
-        """A record's shape and name, made once; they start the colour of the
-        paper and grow in (draw)."""
+        """A record's cell, letter and name, made once; they start the colour
+        of the paper and grow in (draw)."""
         cv = self.cv
         if n in self.gone:                  # back while it was withering
             for item in self.gone.pop(n)["items"]:
@@ -24209,15 +24771,13 @@ class GraphView:
         self.grow.setdefault(n, 0.0)
         self.born_at.setdefault(n, self.clock)
         self.vis.setdefault(n, 0.0)
-        opts = dict(fill=PAPER, outline=PAPER, width=1, tags=("g", "node"))
-        if self.kinds[n] == "person":
-            shape = cv.create_oval(0, 0, 0, 0, **opts)
-        else:
-            shape = cv.create_polygon(0, 0, 0, 0, 0, 0, **opts)
+        cell = cv.create_rectangle(0, 0, 0, 0, fill=PAPER, outline=PAPER, width=1, tags=("g", "node"))
+        glyph = cv.create_text(0, 0, text=GRAPH_GLYPH.get(self.kinds[n], "?"), fill=PAPER,
+                               font=self.glyph_font(11), tags=("g", "node"))
         text = cv.create_text(0, 0, anchor="w", text=one_liner(self.names[n], 32),
                               tags=("g",), font=self.f_center if n == self.center else self.f_label,
                               fill=PAPER)
-        self.items[n] = (shape, text)
+        self.items[n] = (cell, text, glyph)
         cv.tag_raise(self.ring)
         cv.tag_raise("chrome")
 
@@ -24269,21 +24829,21 @@ class GraphView:
         return blend(RULE, fam, 0.4 + 0.5 * age if founded else 0.2 + 0.3 * age)
 
     def make_line(self, key):
+        """A link's line: straight, one pixel, dashed without a reason, dotted
+        for an atypical type (Windows draws dashes only on one-pixel lines,
+        and only these two patterns)."""
         style = self.lstyle[key] = self.style_of(key)
         self.lcolour.pop(key, None)
-        if style in ("taper", "line"):      # a shape, so that it has a rim
-            item = self.cv.create_polygon(0, 0, 0, 0, 0, 0, fill=PAPER, outline=PAPER, width=1,
-                                          smooth=True, tags=("g",))
-        else:   # Windows draws dashes only on one-pixel lines, and only these two patterns
-            item = self.cv.create_line(0, 0, 0, 0, fill=PAPER, width=1, smooth=True,
-                                       splinesteps=10, capstyle="round", tags=("g",),
-                                       dash={"dashed": "-", "dotted": "."}.get(style, ""))
+        item = self.cv.create_line(0, 0, 0, 0, fill=PAPER, width=1, arrowshape=self.ARROW,
+                                   tags=("g",), dash={"dashed": "-", "dotted": "."}.get(style, ""))
         self.cv.tag_lower(item)
+        if self.bg_item:                     # the still disc of the whole base stays under all
+            self.cv.tag_lower(self.bg_item)
         return item
 
     def add_link(self, key, rels, src=None, start=None):
-        """A link, as a soft curve (a tapered one when it has a direction); it
-        grows out of `src`, the end already there."""
+        """A link, as a straight line (an arrowhead when it has a direction);
+        it grows out of `src`, the end already there."""
         self.links[key] = (rels, None)
         line = self.make_line(key)
         self.links[key] = (rels, line)
@@ -24294,8 +24854,7 @@ class GraphView:
     def drop_link(self, key):
         """The link leaves the view: it fades where it is, then goes."""
         _rels, line = self.links.pop(key)
-        self.gone_links.append(dict(line=line, key=key, leave=1.0,
-                                    poly=self.lstyle.get(key) in ("taper", "line")))
+        self.gone_links.append(dict(line=line, key=key, leave=1.0))
         self.shown.pop(line, None)
         self.lstyle.pop(key, None)
         if self.sel_link == key:
@@ -24311,7 +24870,7 @@ class GraphView:
         return self.dist.get(n, 9) <= 1 or len(self.pos) <= 40
 
     def label_states(self):
-        for n, (_shape, text) in self.items.items():
+        for n, (_cell, text, _glyph) in self.items.items():
             on = self.label_shown(n)
             if self.label_on.get(n) != on:
                 self.label_on[n] = on
@@ -24338,7 +24897,7 @@ class GraphView:
         if abs(self.cam[0] - gx) + abs(self.cam[1] - gy) > 0.3:
             self.cam[0] += (gx - self.cam[0]) * 0.18
             self.cam[1] += (gy - self.cam[1]) * 0.18
-        if self.fit and self.pos:
+        if self.fit and (self.pos or self.bg_shown()):
             self.fit_zoom()
         if not self.paused:
             self.step_heat()
@@ -24358,6 +24917,8 @@ class GraphView:
         P, k = self.pos, self.LINK
         k2 = k * k
         ids = list(P)
+        # the whole base: the springs keep to their room inside the still disc
+        wall = self.bg["r0"] * 0.92 if self.bg_shown() else None
         disp = {n: [0.0, 0.0] for n in ids}
         for i, a in enumerate(ids):
             ax, ay = P[a]
@@ -24396,6 +24957,10 @@ class GraphView:
                 vel[n] = (sx, sy)
                 p[0] += sx
                 p[1] += sy
+                if wall:
+                    far = math.hypot(p[0], p[1])
+                    if far > wall:
+                        p[0], p[1] = p[0] * wall / far, p[1] * wall / far
         self.temp *= 0.98
 
     def step_heat(self):
@@ -24481,7 +25046,7 @@ class GraphView:
 
     def add_pulse(self, a, b, dur):
         """Light flowing along the link from a to b: a bead and its trail."""
-        items = [self.cv.create_oval(0, 0, 0, 0, fill=PAPER, outline="", tags=("g",))
+        items = [self.cv.create_rectangle(0, 0, 0, 0, fill=PAPER, outline="", tags=("g",))
                  for _ in range(3)]
         self.pulses.append(dict(a=a, b=b, start=self.clock, dur=dur, items=items))
 
@@ -24556,6 +25121,7 @@ class GraphView:
         for item in (self.bar, self.bar_done):
             self.cv.itemconfigure(item, state="normal")
         self.resized()
+        self.draw_kinds()
         self.update_status()
 
     def stop_replay(self):
@@ -24566,9 +25132,14 @@ class GraphView:
             self.cv.itemconfigure(item, state="hidden")
         self.clear_items()
         self.pos, self.heat, self.lit = {}, {}, {}
-        self.recentre(back, fresh=True)
+        self._enter = self.scope == "base"   # the whole base, if that is where it was
+        try:
+            self.recentre(back, fresh=True)
+        finally:
+            self._enter = False
         self.resized()
         self.draw_pop()
+        self.draw_kinds()
         self.update_status()
 
     def apply(self, e, hits):
@@ -24634,7 +25205,11 @@ class GraphView:
         if self.rp:
             self.seek(0)
         else:
-            self.recentre(self.start)
+            self._enter = self.scope == "base"    # the whole base in view again
+            try:
+                self.recentre(self.start)
+            finally:
+                self._enter = False
 
     def set_speed(self, f):
         if self.rp:
@@ -24642,10 +25217,11 @@ class GraphView:
             self.update_status()
 
     def switch_scope(self):
-        """w: the whole base, or only what was on screen when the replay began."""
+        """w: the live graph around the record or the whole base; in the
+        replay, the whole base or only what was on screen when it began."""
         rp = self.rp
         if not rp:
-            return
+            return self.set_scope("base" if self.scope == "near" else "near")
         rp["scope"] = "here" if rp["scope"] == "base" and rp["here"] else "base"
         self.seek(rp["i"])
 
@@ -24740,21 +25316,24 @@ class GraphView:
         cv = self.cv
         return cv.winfo_width() / 2, (cv.winfo_height() + self.TOP - self.bottom(room=True)) / 2
 
-    def fit_zoom(self):
+    def fit_zoom(self, snap=False):
         """Eases the zoom so the whole graph fits the window -- around the
-        middle record or, in a path view, around the chains; True if it moved."""
+        middle record or, in a path view, around the chains; with the whole
+        base, the still disc too. `snap`: at once. True if it moved."""
         cv = self.cv
         w, h = cv.winfo_width(), cv.winfo_height() - self.TOP - self.bottom(room=True)
         if self.path:
             xs, ys = [x for x, _y in self.pos.values()], [y for _x, y in self.pos.values()]
             self.goal = [(min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2]
         gx, gy = self.goal
-        rx = max(abs(x - gx) for x, _y in self.pos.values()) or 1.0
-        ry = max(abs(y - gy) for _x, y in self.pos.values()) or 1.0
+        rx = max((abs(x - gx) for x, _y in self.pos.values()), default=0.0) or 1.0
+        ry = max((abs(y - gy) for _x, y in self.pos.values()), default=0.0) or 1.0
+        if self.bg_shown():
+            rx, ry = max(rx, self.bg["rmax"]), max(ry, self.bg["rmax"])
         z = min(1.5, max(0.12, min((w / 2 - 110) / rx, (h / 2 - 20) / ry)))
         if abs(z - self.zoom) < 0.002:
             return False
-        self.zoom += (z - self.zoom) * 0.15
+        self.zoom = z if snap else self.zoom + (z - self.zoom) * 0.15
         return True
 
     def to_screen(self):
@@ -24766,64 +25345,33 @@ class GraphView:
         r = 9.0 if n == self.center else (6.5 if self.dist.get(n, 2) == 1 else 5.0)
         return r * min(1.5, max(0.7, self.zoom))
 
-    def shape_at(self, n, x, y, r=None, kind=None):
-        kind, r = kind or self.kinds[n], self.radius(n) if r is None else r
-        if kind == "person":
-            return (x - r, y - r, x + r, y + r)
-        if kind == "concept":
-            return (x - r, y - r, x + r, y - r, x + r, y + r, x - r, y + r)
-        if kind == "form":
-            q = r * 1.25
-            return (x, y - q, x + q, y, x, y + q, x - q, y)
-        if kind == "source":
-            return (x - r * 1.3, y - r * 0.8, x + r * 1.3, y - r * 0.8,
-                    x + r * 1.3, y + r * 0.8, x - r * 1.3, y + r * 0.8)
-        if kind == "note":                 # a page, upright
-            return (x - r * 0.8, y - r * 1.15, x + r * 0.8, y - r * 1.15,
-                    x + r * 0.8, y + r * 1.15, x - r * 0.8, y + r * 1.15)
-        if kind == "org":                  # an organization: a hexagon
-            q = r * 1.15
-            return tuple(c for i in range(6) for c in (x + q * math.cos(math.pi / 3 * i),
-                                                        y + q * math.sin(math.pi / 3 * i)))
-        if kind == "item":                 # a thing: a pentagon, point up
-            q = r * 1.15
-            return tuple(c for i in range(5)
-                         for c in (x + q * math.cos(2 * math.pi / 5 * i - math.pi / 2),
-                                   y + q * math.sin(2 * math.pi / 5 * i - math.pi / 2)))
-        return (x, y - r * 1.2, x + r * 1.1, y + r * 0.8, x - r * 1.1, y + r * 0.8)
-
-    def curve(self, a_xy, b_xy, key):
-        """The bend of a link: a little to one side, breathing very slowly."""
-        u = (hash(key) % 1000) / 1000.0
-        bow = ((-1 if u < 0.5 else 1) * (0.08 + 0.1 * (u * 2 % 1))
-               * (1 + 0.15 * math.sin(self.clock / 1700 + u * 6.28)))
-        dx, dy = b_xy[0] - a_xy[0], b_xy[1] - a_xy[1]
-        return ((a_xy[0] + b_xy[0]) / 2 - dy * bow, (a_xy[1] + b_xy[1]) / 2 + dx * bow)
-
-    def taper(self, pa, pc, pb, t0, t1, w, from_a, even=False):
-        """The outline of a tapered link: 1.7 w wide at the record it comes
-        from, 0.5 w at the other; `even`: w wide all along."""
-        left, right = [], []
-        for i in range(13):
-            t = t0 + (t1 - t0) * i / 12
-            x, y = self.along(pa, pc, pb, t)
-            dx = 2 * (1 - t) * (pc[0] - pa[0]) + 2 * t * (pb[0] - pc[0])
-            dy = 2 * (1 - t) * (pc[1] - pa[1]) + 2 * t * (pb[1] - pc[1])
-            n = math.hypot(dx, dy) or 1.0
-            half = max(self.MIN_HALF, w * 0.5 if even else w * (0.85 - 0.6 * (t if from_a else 1 - t)))
-            left.append((x - dy / n * half, y + dx / n * half))
-            right.append((x + dy / n * half, y - dx / n * half))
-        return [c for xy in left + right[::-1] for c in xy]
+    def cell(self, x, y, r):
+        """A record of size r drawn at (x, y): its letter's height in pixels,
+        and the box of the cell round the letter."""
+        px = self.glyph_px(r)
+        hw, hh = px * 0.36 + 1.5, px * 0.55 + 1
+        return px, (x - hw, y - hh, x + hw, y + hh)
 
     @staticmethod
-    def along(a_xy, c_xy, b_xy, t):
-        v = 1 - t
-        return (v * v * a_xy[0] + 2 * v * t * c_xy[0] + t * t * b_xy[0],
-                v * v * a_xy[1] + 2 * v * t * c_xy[1] + t * t * b_xy[1])
+    def along(a_xy, b_xy, t):
+        """The point a fraction t of the way along a link, a straight line."""
+        return a_xy[0] + (b_xy[0] - a_xy[0]) * t, a_xy[1] + (b_xy[1] - a_xy[1]) * t
+
+    def ends(self, a, b, pa, pb):
+        """Where the line of the link a-b starts and ends on screen: at the
+        edges of the two cells, so that an arrowhead shows; from the middles
+        when the cells are too close for a line between them."""
+        dx, dy = pb[0] - pa[0], pb[1] - pa[1]
+        d = math.hypot(dx, dy)
+        ra, rb = (self.glyph_px(self.radius(n)) * 0.55 + 3 if n in self.pos else 0.0 for n in (a, b))
+        if d <= ra + rb + 4:
+            return pa, pb
+        return (pa[0] + dx / d * ra, pa[1] + dy / d * ra), (pb[0] - dx / d * rb, pb[1] - dy / d * rb)
 
     def draw(self, coords):
         cv, V, n_steps, shown = self.cv, self.vis, self.STEPS, self.shown
         S = self.screen = self.to_screen()
+        self.bg_follow()
         mx, my = self.middle()
         z, (cx, cy) = self.zoom, self.cam
         G = {n: (mx + (g["pos"][0] - cx) * z, my + (g["pos"][1] - cy) * z)
@@ -24834,25 +25382,18 @@ class GraphView:
 
         for key, (_rels, line) in self.links.items():
             a, b = key
-            pa, pb = S[a], S[b]
-            pc = self.curve(pa, pb, key)
+            pa, pb = self.ends(a, b, S[a], S[b])
             g = ease(self.lgrow.get(key, 1.0))
-            style, sel = self.lstyle.get(key, "line"), key == self.sel_link
+            sel = key == self.sel_link
             q = int((V.get(a, 0.0) + V.get(b, 0.0)) * 0.5 * n_steps + 0.5)
             if self.path and key in self.path["keys"]:
                 q = max(q, int(0.75 * n_steps))
-            w = (1 + 2 * q / n_steps) * (1.7 if sel else 1.0)
-            t0, t1 = (0.0, 1.0) if g >= 1 else (0.0, g) if self.lfrom.get(key) == a else (1 - g, 1.0)
-            if g <= 0:
-                cv.coords(line, *pa, *pa, *pa) if style in ("taper", "line") else cv.coords(line, *pa, *pa)
-            elif style in ("taper", "line"):    # thick at the record it comes from, or even
-                cv.coords(line, *self.taper(pa, pc, pb, t0, t1, w, self.facts(key).get("from") == a,
-                                            even=style == "line"))
-            elif g >= 1:
-                cv.coords(line, *pa, *pc, *pb)
-            else:                            # it grows out of the record already there
-                pts = [c for i in range(9) for c in self.along(pa, pc, pb, t0 + (t1 - t0) * i / 8)]
-                cv.coords(line, *pts)
+            if g >= 1:
+                cv.coords(line, *pa, *pb)
+            elif self.lfrom.get(key) == a:   # it grows out of the record already there
+                cv.coords(line, *pa, *self.along(pa, pb, max(g, 0.01)))
+            else:
+                cv.coords(line, *self.along(pa, pb, min(1 - g, 0.99)), *pb)
             look = (q, round(g * 10), sel)
             if shown.get(line) != look:
                 shown[line] = look
@@ -24862,56 +25403,54 @@ class GraphView:
                 fill = blend(rest, STAMP, 0.85 * q / n_steps)
                 if g < 1:
                     fill = blend(PAPER, fill, g)
-                if style in ("taper", "line"):
-                    cv.itemconfigure(line, fill=fill, outline=blend(PAPER, fill, self.RIM))
-                else:
-                    cv.itemconfigure(line, fill=fill, width=1)
+                f = self.facts(key).get("from")    # a directed link: the arrowhead where it points
+                arrow = "none" if g < 1 or f not in key else ("last" if f == a else "first")
+                cv.itemconfigure(line, fill=fill, width=2 if sel else 1, arrow=arrow)
         for link in self.gone_links:         # links that leave fade where they were
             a, b = link["key"]
             pa, pb = S.get(a) or G.get(a), S.get(b) or G.get(b)
             if not pa or not pb:
                 cv.coords(link["line"], 0, 0, 0, 0)
                 continue
-            pc = self.curve(pa, pb, link["key"])
-            if link.get("poly"):
-                cv.coords(link["line"], *self.taper(pa, pc, pb, 0.0, 1.0, 1.0, True, even=True))
-                fade = blend(PAPER, RULE, max(0.0, link["leave"]))
-                cv.itemconfigure(link["line"], fill=fade, outline=blend(PAPER, fade, self.RIM))
-            else:
-                cv.coords(link["line"], *pa, *pc, *pb)
-                cv.itemconfigure(link["line"], fill=blend(PAPER, RULE, max(0.0, link["leave"])), width=1)
-        for n, (shape, text) in self.items.items():
+            cv.coords(link["line"], *pa, *pb)
+            cv.itemconfigure(link["line"], fill=blend(PAPER, RULE, max(0.0, link["leave"])),
+                             width=1, arrow="none")
+        for n, (cell, text, glyph) in self.items.items():
             x, y = S[n]
             g = ease(self.grow.get(n, 1.0))
-            r = self.radius(n) * (0.35 + 0.65 * g)
-            cv.coords(shape, *self.shape_at(n, x, y, r))
-            cv.coords(text, round(x + r * 1.4 + 4), round(y))
+            px, box = self.cell(x, y, self.radius(n) * (0.35 + 0.65 * g))
+            cv.coords(cell, *box)
+            cv.coords(glyph, round(x), round(y))
+            cv.coords(text, round(box[2] + 4), round(y))
             q = int(V.get(n, 0.0) * n_steps + 0.5)
             centre, near = n == self.center, self.dist.get(n, 2) <= 1
-            look = (q, round(g * 12), centre, near)
+            look = (q, round(g * 12), centre, near, px)
             if shown.get(n) != look:
                 shown[n] = look
-                fill, edge = self.ramp_fill[q], OXIDE if centre else self.ramp_edge[q]
-                ink = INK if near else SOFT
+                fill = self.ramp_fill[q]
+                letter = PAPER if q > n_steps // 2 else self.kind_colour(self.kinds.get(n, "concept"))
+                edge, ink = OXIDE if centre else fill, INK if near else SOFT   # the middle one boxed
                 if g < 1:
-                    fill, edge, ink = blend(PAPER, fill, g), blend(PAPER, edge, g), blend(PAPER, ink, g)
-                cv.itemconfigure(shape, fill=fill, outline=edge, width=2 if centre else 1)
+                    fill, edge, letter, ink = (blend(PAPER, c, g) for c in (fill, edge, letter, ink))
+                cv.itemconfigure(cell, fill=fill, outline=edge, width=2 if centre else 1)
+                cv.itemconfigure(glyph, fill=letter, font=self.glyph_font(px))
                 cv.itemconfigure(text, fill=ink)
         for n, g in self.gone.items():       # withering
             k = ease(g["leave"])
             x, y = G[n]
-            r = (6.5 if g["dist"] == 1 else 5.0) * min(1.5, max(0.7, z)) * max(0.05, k)
-            shape = g["items"][0]
-            cv.coords(shape, *self.shape_at(n, x, y, r, g["kind"]))
-            q = int(g["vis"] * n_steps + 0.5)
-            cv.itemconfigure(shape, fill=blend(PAPER, self.ramp_fill[q], k),
-                             outline=blend(PAPER, FAINT, k), width=1)
+            cell, _text, glyph = g["items"]
+            px, box = self.cell(x, y, (6.5 if g["dist"] == 1 else 5.0) * min(1.5, max(0.7, z)) * max(0.05, k))
+            cv.coords(cell, *box)
+            cv.coords(glyph, round(x), round(y))
+            fill = blend(PAPER, self.ramp_fill[int(g["vis"] * n_steps + 0.5)], k)
+            cv.itemconfigure(cell, fill=fill, outline=fill, width=1)
+            cv.itemconfigure(glyph, fill=blend(PAPER, self.kind_colour(g["kind"]), k),
+                             font=self.glyph_font(px))
         for p in self.pulses:                # light flowing along a link into a new cell
             key = (min(p["a"], p["b"]), max(p["a"], p["b"]))
             if key not in self.links:
                 continue
             pa, pb = S[key[0]], S[key[1]]
-            pc = self.curve(pa, pb, key)
             t = ease((self.clock - p["start"]) / p["dur"])
             fwd = p["a"] == key[0]
             for k, item in enumerate(p["items"]):
@@ -24919,7 +25458,7 @@ class GraphView:
                 if not 0.0 <= tt <= 1.0:
                     cv.coords(item, 0, 0, 0, 0)
                     continue
-                x, y = self.along(pa, pc, pb, tt)
+                x, y = self.along(pa, pb, tt)
                 rr = 3.2 - k * 0.6
                 cv.coords(item, x - rr, y - rr, x + rr, y + rr)
                 strength = (0.85 - k * 0.2) * math.sin(math.pi * min(1.0, t * 1.1))
@@ -24931,10 +25470,11 @@ class GraphView:
                     r = self.radius(end) * 1.5 + 5
                     item = cv.find_withtag(tag)
                     if not item:
-                        item = (cv.create_oval(0, 0, 0, 0, outline=STAMP, width=2, tags=("g", "pathend", tag)),)
+                        item = (cv.create_rectangle(0, 0, 0, 0, outline=STAMP, width=2,
+                                                    tags=("g", "pathend", tag)),)
                     cv.coords(item[0], x - r, y - r, x + r, y + r)
         if self.linking:                     # a link being drawn (Shift+drag)
-            x0, y0 = S.get(self.linking[0], (0, 0))
+            x0, y0 = self.screen_of(self.linking[0]) or (0, 0)
             cv.coords(self.rubber, x0, y0, *self.linking[1])
         if coords:
             self.draw_hover()
@@ -24960,13 +25500,38 @@ class GraphView:
         dozen links in view, in a window wide enough or with all the names on."""
         cv, S = self.cv, self.screen
         n = self.hover
-        if n and n in S:
-            x, y = S[n]
-            r = self.radius(n) * 1.4 + 4
+        on_bg = bool(n) and n not in S and self.screen_of(n) is not None
+        if n and (n in S or on_bg):
+            x, y = self.screen_of(n)
+            r = (self.bg_r() if on_bg else self.radius(n)) * 1.4 + 4
             cv.coords(self.ring, x - r, y - r, x + r, y + r)
             cv.itemconfigure(self.ring, state="normal")
         else:
             cv.itemconfigure(self.ring, state="hidden")
+        said = getattr(self, "_bg_said", (None, None))
+        if on_bg:          # a still record has no name on screen of its own: it gets one
+            cv.coords(self.t_bgname, round(x + r + 3), round(y))
+            if said[0] != n:
+                cv.itemconfigure(self.t_bgname, state="normal",
+                                 text=one_liner(label_any(self.idx[n], self.data), 48))
+                cv.tag_raise(self.t_bgname)
+        elif said[0]:
+            cv.itemconfigure(self.t_bgname, state="hidden")
+        c = self.center
+        cxy = self.screen_of(c) if c and c not in S else None
+        if cxy:            # the middle record, when it is one of the still ones
+            r = self.bg_r() * 1.5 + 5
+            cv.coords(self.cring, cxy[0] - r, cxy[1] - r, cxy[0] + r, cxy[1] + r)
+            cv.coords(self.t_bgcentre, round(cxy[0] + r + 4), round(cxy[1]))
+            if said[1] != c:
+                cv.itemconfigure(self.t_bgcentre, text=one_liner(label_any(self.idx[c], self.data), 32))
+                for item in (self.cring, self.t_bgcentre):
+                    cv.itemconfigure(item, state="normal")
+                    cv.tag_raise(item)
+        elif said[1]:
+            for item in (self.cring, self.t_bgcentre):
+                cv.itemconfigure(item, state="hidden")
+        self._bg_said = (n if on_bg else None, c if cxy else None)
         focus, want = n or self.center, {}
         near = self.adjv.get(focus, ()) if focus in S else ()
         if near and len(near) <= 12 and (cv.winfo_width() >= 600 or self.all_labels):
@@ -24977,7 +25542,7 @@ class GraphView:
                 words = " · ".join(rel_label(rel) + (" →" if f == focus else " ←")
                                    for rel, f in self.links[key][0])
                 pa, pb = S[key[0]], S[key[1]]
-                mx, my = self.along(pa, self.curve(pa, pb, key), pb, 0.5)
+                mx, my = self.along(pa, pb, 0.5)
                 want[key] = (words, round(mx), round(my) - 6)
         R = self.rel_items
         for key in [k for k in R if k not in want]:
@@ -25027,6 +25592,8 @@ class GraphView:
             self.toggle_key()
         cv.itemconfigure(self.t_keys, width=w - 150)
         self.draw_pop()
+        if not self.show_key:   # (toggle_key above has drawn it already)
+            self.draw_kinds()
         self._dirty = True
 
     def update_status(self, flash=None):
@@ -25039,9 +25606,9 @@ class GraphView:
             flash = self._flash[0]
         if flash:
             left = flash
-        elif rid and rid in self.names:
-            left = self.names[rid] + (f" · nº {rec['reg_n']}" if rec and rec.get("reg_n")
-                                      else "") + f" · {rid}"
+        elif rid and (rid in self.names or (rec and not rp)):   # on the springs, or still
+            name = self.names.get(rid) or label_any(rec, self.data)
+            left = name + (f" · nº {rec['reg_n']}" if rec and rec.get("reg_n") else "") + f" · {rid}"
         elif rp:
             left = tr("replay of the logs · {date} · event {i} of {n}",
                       date=rp["stamp"][:16].replace("T", " "), i=rp["i"], n=len(rp["events"]))
@@ -25064,7 +25631,11 @@ class GraphView:
         if self.paused:
             right += " · " + tr("paused")
         right += " · " + tr("{n} records, {k} links", n=len(self.pos), k=len(self.links))
-        if not rp:
+        if rp:
+            pass
+        elif self.scope == "base" and self.bg:
+            right += " · " + tr("{n} around, still", n=self.bg["n"])
+        else:
             right += ", " + tr("depth {d}", d=self.depth)
         self.cv.itemconfigure(self.t_left, text=one_liner(left, 90))
         self.cv.itemconfigure(self.t_right, text=right)
@@ -25072,6 +25643,10 @@ class GraphView:
 
     # ---------------------------------------------------------- the hand
     def node_at(self, x, y):
+        """The record under (x, y): one on the springs, else (whole base) a
+        still one; None over nothing, or over a key."""
+        if self.over_key():
+            return None
         best, bd = None, 14 * 14
         for n, (sx, sy) in self.screen.items():
             if self.grow.get(n, 1.0) < 0.5:
@@ -25079,7 +25654,9 @@ class GraphView:
             d = (sx - x) ** 2 + (sy - y) ** 2
             if d < bd:
                 best, bd = n, d
-        return best
+        if best or not self.bg_shown():
+            return best
+        return self.bg_at(x, y)
 
     def motion(self, e):
         n = self.node_at(e.x, e.y)
@@ -25099,6 +25676,9 @@ class GraphView:
 
     def press(self, e):
         self.cv.focus_set()
+        if self._kind_click or self.over_key():   # a click in a key is the key's
+            self.press_at = self.press_node = None
+            return
         if not self.hint_off and not self.rp:
             self.hint_off = True
             self.update_status()
@@ -25124,7 +25704,7 @@ class GraphView:
             return
         self.moved = True
         z, n = self.zoom, self.press_node
-        if n and n != self.center:
+        if n and n != self.center and n in self.pos:    # a still record is not dragged: the view is
             self.dragging = n
             p = self.pos[n]
             p[0] += (e.x - self.last[0]) / z
@@ -25144,17 +25724,12 @@ class GraphView:
         for key in self.links:
             if self.lgrow.get(key, 1.0) < 1 or key[0] not in self.screen or key[1] not in self.screen:
                 continue
-            pa, pb = self.screen[key[0]], self.screen[key[1]]
-            pc = self.curve(pa, pb, key)
-            p0 = pa
-            for i in range(1, 13):
-                p1 = self.along(pa, pc, pb, i / 12)
-                vx, vy = p1[0] - p0[0], p1[1] - p0[1]
-                k = max(0.0, min(1.0, ((x - p0[0]) * vx + (y - p0[1]) * vy) / ((vx * vx + vy * vy) or 1)))
-                d = (p0[0] + k * vx - x) ** 2 + (p0[1] + k * vy - y) ** 2
-                if d < bd:
-                    best, bd = key, d
-                p0 = p1
+            (ax, ay), (bx, by) = self.screen[key[0]], self.screen[key[1]]
+            vx, vy = bx - ax, by - ay
+            k = max(0.0, min(1.0, ((x - ax) * vx + (y - ay) * vy) / ((vx * vx + vy * vy) or 1)))
+            d = (ax + k * vx - x) ** 2 + (ay + k * vy - y) ** 2
+            if d < bd:
+                best, bd = key, d
         return best
 
     def select_link(self, key):
@@ -25191,6 +25766,8 @@ class GraphView:
     def double(self, e):
         """Double-click: a record opens on the card; a line opens the record it
         comes from, whose LINKS field holds it."""
+        if self.over_key():
+            return
         n = self.node_at(e.x, e.y)
         if n:
             return self.open_in_card(n)
@@ -25293,12 +25870,13 @@ class GraphView:
                 self.add_pulse(path[step], path[step + 1], 700)
 
     def toggle_key(self):
-        """k: the key of the lines -- what their colour, stroke and taper say."""
+        """k: the key of the lines -- what their colour, stroke and arrowhead say."""
         self.show_key = not self.show_key
         cv = self.cv
         cv.delete("key")
         self.update_status()
         if not self.show_key:
+            self.draw_kinds()
             return
         x0, y0 = cv.winfo_width() - 330, self.TOP + 8
         rows = [(LINK_FAMILY_COLOUR[k], "", tr(l)) for k, l in
@@ -25308,7 +25886,7 @@ class GraphView:
         rows += [(blend(RULE, fam, 0.9), "", tr("with a reason or a source")),
                  (blend(RULE, fam, 0.4), "-", tr("without either: needs a reason")),
                  (blend(RULE, fam, 0.6), ".", tr("a type outside the list (atypical)")),
-                 (None, "", tr("thick where it comes from")),
+                 (blend(RULE, fam, 0.9), ">", tr("an arrow where it points")),
                  (blend(RULE, LINK_FAMILY_COLOUR["sources"], 0.9), "", tr("written recently")),
                  (blend(RULE, LINK_FAMILY_COLOUR["sources"], 0.4), "", tr("written long ago")),
                  (STAMP, "", tr("lit, in life"))]
@@ -25317,16 +25895,13 @@ class GraphView:
         box = cv.create_rectangle(x0 - 10, y0 - 6, x0 + 318, cv.bbox(keys)[3] + 8, fill=PAPER,
                                   outline=RULE, tags=("key",))
         cv.tag_raise(keys, box)
-        for i, (colour, dash, text) in enumerate(rows):
+        for i, (colour, dash, text) in enumerate(rows):     # as the lines are drawn: one pixel
             y = y0 + 8 + 18 * i
-            if colour is None:
-                cv.create_polygon(x0, y - 3, x0 + 44, y - 0.6, x0 + 44, y + 0.6, x0, y + 3,
-                                  fill=fam, outline="", tags=("key",))
-            else:
-                cv.create_line(x0, y, x0 + 44, y, fill=colour, width=1 if dash else 2, dash=dash,
-                               tags=("key",))
+            cv.create_line(x0, y, x0 + 44, y, fill=colour, width=1, dash="" if dash == ">" else dash,
+                           arrow="last" if dash == ">" else "none", arrowshape=self.ARROW, tags=("key",))
             cv.create_text(x0 + 56, y, anchor="w", text=text, fill=INK, font=self.f_label,
                            tags=("key",))
+        self.draw_kinds()       # the key of the records comes with it, at the left
 
     def release(self, e):
         if self.linking:
@@ -25343,7 +25918,7 @@ class GraphView:
         """Right-click: in glow mode a spark; in life mode the cell flips (and a
         run that had settled starts again)."""
         n = self.node_at(e.x, e.y)
-        if not n:
+        if not n or n not in self.pos:      # the still ones have no light of their own
             return
         if self.mode == "life":
             self.lit[n] = not self.lit.get(n)
@@ -25378,8 +25953,14 @@ class GraphView:
         self.update_status()
 
     def set_depth(self, d):
+        """1-3: how many links away, around the record (from the whole base,
+        back around it)."""
         self.depth = d
-        if not self.rp:
+        if self.rp:
+            return
+        if self.scope == "base":
+            self.set_scope("near")
+        else:
             self.recentre(self.center)
 
     def toggle_labels(self):
@@ -25592,7 +26173,9 @@ class LinkDialog:
 
 GRAPH_KEYS = ("click: to the middle (on a line: its links) · double-click / Enter: open on the card · "
               "right-click: spark (in life: flip the cell) · drag: move · Shift+drag: draw a link · "
-              "? or k: key of the lines · f or Ctrl+click: path to a record · wheel: zoom · "
+              "? or k: key of the lines and of the records (a click on a type hides it) · "
+              "f or Ctrl+click: path to a record · wheel: zoom · "
+              "w: around the record / whole base · "
               "m: glow / life / still · 1-3: depth · l: all names · space: pause · "
               "r: shake · c: copy id · p: replay the logs · Home: back to the start · "
               "F5: reread · Esc: close")
@@ -28880,7 +29463,7 @@ PT = {
     "Nothing yet at this point of the logs.":
         "Ainda nada neste ponto dos logs.",
     GRAPH_KEYS:
-        "clique: ao centro (numa linha: suas ligações) · duplo clique / Enter: abrir no cartão · botão direito: faísca (na vida: vira a célula) · arrastar: mover · Shift+arrastar: desenhar uma ligação · ? ou k: legenda das linhas · f ou Ctrl+clique: caminho até um registro · roda: zoom · m: brilho / vida / parado · 1-3: profundidade · l: todos os nomes · espaço: pausa · r: sacudir · c: copiar id · p: reproduzir os logs · Home: voltar ao início · F5: reler · Esc: fechar",
+        "clique: ao centro (numa linha: suas ligações) · duplo clique / Enter: abrir no cartão · botão direito: faísca (na vida: vira a célula) · arrastar: mover · Shift+arrastar: desenhar uma ligação · ? ou k: legenda das linhas e dos registros (um clique num tipo o esconde) · f ou Ctrl+clique: caminho até um registro · roda: zoom · w: em volta do registro / base inteira · m: brilho / vida / parado · 1-3: profundidade · l: todos os nomes · espaço: pausa · r: sacudir · c: copiar id · p: reproduzir os logs · Home: voltar ao início · F5: reler · Esc: fechar",
     GRAPH_HINT_LIFE:
         "clique: ao centro · duplo clique: abrir · botão direito: vira a célula · arrastar: mover · Shift+arrastar: desenhar uma ligação · Ctrl+clique: caminho · roda: zoom · ?: a legenda e todas as teclas",
     GRAPH_HINT:
@@ -28911,7 +29494,13 @@ PT = {
     "Read-only here: open the monads from Kustos (Ctrl+Shift+M) to send records to the card.":
         "Aqui é só leitura: abra as mônadas pelo Kustos (Ctrl+Shift+M) para levar registros ao cartão.",
     HELP_GRAPH:
-        "\n  Ctrl+Shift+G    grafo de ligações (segunda janela): o registro aberto no centro,\n                  suas ligações em volta, brilhando com as edições recentes. Ele\n                  segue o registro que você abre aqui; os botões no alto trocam o\n                  brilho (vida de Conway, brilho que se espalha, parado) e a\n                  profundidade, Abrir (ou Enter) abre um registro no cartão,\n                  Caminho mostra como dois registros se ligam e Ligação desenha\n                  uma ligação. p reproduz os logs: a base cresce na tela como\n                  cresceu, com uma linha do tempo para percorrer. ? mostra a\n                  legenda das linhas e todas as teclas.\n",
+        "\n  Ctrl+Shift+G    grafo de ligações (segunda janela): o registro aberto no centro,\n                  suas ligações em volta, brilhando com as edições recentes. Ele\n                  segue o registro que você abre aqui; os botões no alto trocam o\n                  brilho (vida de Conway, brilho que se espalha, parado) e a\n                  profundidade, Abrir (ou Enter) abre um registro no cartão,\n                  Caminho mostra como dois registros se ligam e Ligação desenha\n                  uma ligação. p reproduz os logs: a base cresce na tela como\n                  cresceu, com uma linha do tempo para percorrer. w (ou Base\n                  inteira, no alto) mostra todos os registros: os ligados nas\n                  molas, os outros parados em volta, uma fatia por tipo; a\n                  legenda dos registros, à esquerda, esconde ou mostra um tipo.\n                  ? mostra a legenda das linhas e todas as teclas.\n",
+    "Around":
+        "Em volta",
+    "Whole base":
+        "Base inteira",
+    "{n} around, still":
+        "{n} parados em volta",
     "drafts":
         "rascunhos",
     "Drafts":
@@ -30163,6 +30752,10 @@ PT = {
         "um tipo fora da lista (atípico)",
     "thick where it comes from":
         "grossa de onde parte",
+    "an arrow where it points":
+        "uma seta para onde aponta",
+    "What a letter shows":
+        "O que cada letra mostra",
     "written recently":
         "escrita há pouco",
     "written long ago":
