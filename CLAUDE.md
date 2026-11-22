@@ -384,6 +384,17 @@ Ideas that span several sections:
   index's results (`self.view` after `refresh_list`) in a frame placed over
   the card under the search; the search entry's keys go to it while it is
   shown (`entry_key`, `entry_escape`), and `search_changed` refreshes it.
+- **Editing from the shell** (`# ==== editing from the shell`, after the
+  doctor): `cmd_rename` and `cmd_set`. `repoint(data, old, new)` is the one
+  list of places an id is named -- a new field that holds an id joins it.
+  Both commands plan first (`--apply` writes), refuse on a fresh lock
+  (`edit_open_elsewhere`, `--force`), write only through `guarded_write`
+  (the file's stamp must still be the one the vault was read with), copy
+  the JSON into `_kustos_old/` from `EDIT_BACKUP_AT` records, log what they
+  change as the window would (`put`, `edges`, a `del` and a tombstone for
+  the old id), and end with `edit_report`: the doctor's errors they brought.
+  `set` goes through `put_record`, so it is observed and signed like a save.
+  Test them on a temporary copy of a base, never on the instance.
 - **The logs are the history**: `history <id>` and `replay` (rebuilds the base
   from logs into `_kustos.replay.json`) read them; there are no `.bak` files.
 - **Drafts live in files**: the `notes` collection is an index (id, title,

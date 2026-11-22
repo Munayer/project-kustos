@@ -117,6 +117,14 @@ USAGE
                                       sign what came in as a proposal (an import, the
                                       bulk entry's concepts) in the observator's name;
                                       with nothing, list the pending ones
+    python _kustos.py rename <old_id> <new_id> [--apply] [--force]
+                                      give a record a new id and repoint everything that
+                                      names it (links, SOURCE, observations, skills, ui);
+                                      without --apply only the plan is printed
+    python _kustos.py set <id> FIELD=value [...] [--apply] [--force]
+                                      change a record's fields from the shell, as a save
+                                      in the window (observed, logged); lists take "a; b";
+                                      without --apply only the plan is printed
     python _kustos.py replay          rebuild the JSON from the logs alone (.replay.json)
     python _kustos.py upgrade         bring an older base up to date (runs on open)
     python _kustos.py migrate         old personne + verba files -> _kustos.json
@@ -6097,6 +6105,294 @@ def cmd_doctor_observe(rest):
             print("   → " + hint)
     print()
     return 0
+
+
+# ================================================================ editing from the shell
+# `rename` and `set` change the base from a shell -- a batch, a fix the window
+# has no button for -- with the guards a save in the window has, and two more:
+#   1. nothing is written without --apply: the plan is printed first, always;
+#   2. a fresh lock (another machine's, or this one's with another pid) means
+#      Kustos is open: the write is refused, unless --force;
+#   3. the vault is read with the file's stamp and written only while the file
+#      is still that one (guarded_write): a save made in between aborts the
+#      write, and nothing is lost -- run again;
+#   4. a change touching EDIT_BACKUP_AT records or more first copies the JSON
+#      into _kustos_old/, dated;
+#   5. every record changed passes through write_json and the log -- puts, the
+#      links lines, a del and a tombstone for an old id -- so replay and the
+#      conflict merge read it as the window's own work;
+#   6. the doctor's check runs on the result and its errors are printed.
+# `rename` repoints every place an id is named (repoint): the record, the
+# links, SOURCE and observator fields, an institution, an account's entry
+# marks, observations (targets, criterion), skills, ui. `set` is a save_record
+# with the fields typed, so it is observed and signed as a save in the window.
+
+EDIT_BACKUP_AT = 50             # records touched: from here, a copy goes to _kustos_old/
+EDIT_FIXED = {"id", "kind", "rtype", "reg", "reg_n", "reg_origem", "reg_n_anterior",
+              "updated", "updated_at", "observator"}      # set never writes these
+EDIT_LISTS = {"tags", "domains", "authors", "links", "extra", "aliases", "requires"}
+EDIT_FLAGS = ("--apply", "--force")
+
+
+class EditRefused(Exception):
+    pass
+
+
+def edit_open_elsewhere():
+    """The lock that says Kustos is open: another machine's fresh lock, or this
+    machine's with a pid that is not ours. None when the base looks closed."""
+    for info in other_locks():
+        return info
+    try:
+        info = json.loads(LOCK_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if info.get("pid") == os.getpid():
+        return None
+    try:
+        age = datetime.now() - datetime.fromisoformat(info.get("since", ""))
+        if age.total_seconds() > 24 * 3600:
+            return None
+    except ValueError:
+        pass
+    return info
+
+
+def edit_guard(force):
+    info = edit_open_elsewhere()
+    if info and not force:
+        raise EditRefused(tr("Kustos seems open on {host} since {since}: close it first, "
+                             "or add --force.", host=info.get("host"), since=info.get("since")))
+
+
+def edit_backup(tag):
+    """A dated copy of the JSON in _kustos_old/, before a big change."""
+    old = BASE / f"{STEM}_old"
+    old.mkdir(exist_ok=True)
+    dest = old / f"{STEM}.before-{tag}.{datetime.now():%Y%m%d-%H%M%S}.json"
+    shutil.copy2(JSON_FILE, dest)
+    return dest
+
+
+def guarded_write(data, stamp):
+    """write_json, only if the file is still the one the vault was read from."""
+    if _disk_stamp() != stamp:
+        raise EditRefused(tr("{name} changed on disk while the plan was made (a save in the "
+                             "window?). Nothing was written: run the command again.",
+                             name=JSON_FILE.name))
+    write_json(data)
+
+
+def edit_report(before, data):
+    """The doctor's errors the edit brought, against those the base had before."""
+    errors = [x for x in check(data)[0] if x not in before]
+    for x in errors:
+        print("  " + tr("ERROR") + "  ", x)
+    print("  " + tr("doctor: {n} new error(s), {b} already there", n=len(errors), b=len(before)))
+    return len(errors)
+
+
+ID_IN_TEXT = r"(?<![A-Za-z0-9_]){}(?![A-Za-z0-9_])"
+
+
+def repoint(data, old, new):
+    """Everything that names `old` now names `new`. Returns ({coll: [records
+    changed]}, {from ids whose links changed}, [other places, as text])."""
+    changed, froms, places = {}, set(), []
+    pat = re.compile(ID_IN_TEXT.format(re.escape(old)))
+
+    def mark(coll, rec):
+        rows = changed.setdefault(coll, [])
+        if rec not in rows:
+            rows.append(rec)
+
+    for coll in COLLS:
+        for r in data[coll]:
+            if r.get("id") == old:
+                r["id"] = new
+                mark(coll, r)
+            for key in ("source", "observator", "institution"):
+                if r.get(key) == old:
+                    r[key] = new
+                    mark(coll, r)
+            if coll == "res" and r.get("entries"):
+                for e in r["entries"]:
+                    for key in ("text", "raw"):
+                        if isinstance(e.get(key), str) and pat.search(e[key]):
+                            e[key] = pat.sub(new, e[key])
+                            mark(coll, r)
+    for a in data["edges"]:
+        hit = False
+        for key in ("from", "to", "observator"):
+            if a.get(key) == old:
+                a[key] = new
+                hit = True
+        if a.get("source") == old:
+            a["source"] = new
+            hit = True
+        if hit:
+            froms.add(a["from"])
+    for o in data.get("observations", []):
+        hit = False
+        if old in (o.get("targets") or []):
+            o["targets"] = [new if t == old else t for t in o["targets"]]
+            hit = True
+        for key in ("criterion", "observator"):
+            if o.get(key) == old:
+                o[key] = new
+                hit = True
+        if hit:
+            o["updated_at"] = NOW()
+            mark("observations", o)
+    for s in data.get("skills", []):
+        hit = False
+        if s.get("id") == old:
+            s["id"] = new
+            hit = True
+        for key in ("requires", "links"):
+            if old in (s.get(key) or []):
+                s[key] = [new if t == old else t for t in s[key]]
+                hit = True
+        if hit:
+            mark("skills", s)
+    ui = data.get("ui") or {}
+    for key in ("observator", "corpus_subject"):
+        if ui.get(key) == old:
+            ui[key] = new
+            places.append(f"ui.{key}")
+    return changed, froms, places
+
+
+def rename_plan(data, old, new):
+    idx = by_id(data)
+    sats = {s.get("id"): coll for coll in SATELLITES for s in data.get(coll, [])}
+    if old not in idx and old not in sats:
+        raise EditRefused(tr("{id} does not exist.", id=old))
+    if new in idx or new in sats or new in {d.get("id") for d in data.get("deleted", [])}:
+        raise EditRefused(tr("{id} is taken (or was deleted once; a number is never reused).",
+                             id=new))
+    if not re.fullmatch(r"[a-z]_[A-Za-z0-9_]+", new) or new[:2] != old[:2]:
+        raise EditRefused(tr("The new id must keep the prefix {prefix} and use letters, digits "
+                             "and _ only.", prefix=old[:2]))
+    coll = coll_of(old) if old in idx else sats[old]
+    return coll
+
+
+def cmd_rename(rest):
+    args = [a for a in rest if a not in EDIT_FLAGS]
+    if len(args) != 2:
+        print(tr("usage: rename <old_id> <new_id> [--apply] [--force]"))
+        return 2
+    old, new = args
+    apply, force = "--apply" in rest, "--force" in rest
+    try:
+        edit_guard(force)
+        stamp = _disk_stamp()
+        data = load_json()
+        before = check(data)[0]
+        coll = rename_plan(data, old, new)
+        changed, froms, places = repoint(data, old, new)
+    except EditRefused as exc:
+        print(tr("refused: {why}", why=exc))
+        return 1
+    n = sum(len(v) for v in changed.values())
+    print(tr("{old} -> {new} ({coll}): {n} record(s) change, {l} record(s) have links "
+             "repointed{places}", old=old, new=new, coll=coll, n=n, l=len(froms),
+             places=("; " + ", ".join(places)) if places else ""))
+    for c, rows in changed.items():
+        shown = ", ".join(r.get("id", "?") for r in rows[:8])
+        print(f"  {c}: {len(rows)}" + (f"  ({shown}{'…' if len(rows) > 8 else ''})"))
+    if not apply:
+        print(tr("A plan only. Add --apply to write it."))
+        return 0
+    if n + len(froms) >= EDIT_BACKUP_AT:
+        print("  " + tr("copy before: {name}", name=edit_backup("rename").name))
+    tomb = {"id": old, "at": NOW(), "name": tr("renamed to {new}", new=new)}
+    data.setdefault("deleted", []).append(tomb)
+    for r in data[coll] if coll in data else []:
+        if r.get("id") == new:
+            touch(r)
+    try:
+        guarded_write(data, stamp)
+    except EditRefused as exc:
+        print(tr("refused: {why}", why=exc))
+        return 1
+    lines = [("del", coll, {"id": old, "name": tomb["name"]})]
+    for c, rows in changed.items():
+        for r in rows:
+            lines.append(("put", c, {"id": r.get("id"),
+                                     "rec": {k: v for k, v in r.items() if not k.startswith("_")}}))
+    for f in sorted(froms):
+        lines.append(("edges", "edges", {"id": f, "edges": [a for a in data["edges"]
+                                                            if a["from"] == f]}))
+    log_many(lines)
+    print(tr("Written: {n} record(s), {l} links line(s), 1 tombstone.", n=n, l=len(froms)))
+    return 1 if edit_report(before, load_json()) else 0
+
+
+def set_values(rec, pairs):
+    """FIELD=value pairs applied to a copy of the record: lists split on ';',
+    an empty value clears, unknown or fixed fields are refused."""
+    out = dict(rec)
+    for pair in pairs:
+        if "=" not in pair:
+            raise EditRefused(tr("not FIELD=value: {text}", text=pair))
+        key, value = pair.split("=", 1)
+        key = key.strip()
+        if key in EDIT_FIXED:
+            raise EditRefused(tr("{field} is not set by hand.", field=key))
+        if key not in rec:
+            raise EditRefused(tr("{field} is not a field of {id} (its fields: {fields}).",
+                                 field=key, id=rec.get("id"),
+                                 fields=", ".join(k for k in rec if k not in EDIT_FIXED)))
+        if key in EDIT_LISTS or isinstance(rec.get(key), list):
+            out[key] = [v.strip() for v in value.split(";") if v.strip()]
+        elif isinstance(rec.get(key), bool):
+            out[key] = value.strip().lower() in ("1", "true", "yes", "sim", "x")
+        else:
+            out[key] = value.strip()
+    return out
+
+
+def cmd_set(rest):
+    args = [a for a in rest if a not in EDIT_FLAGS]
+    if len(args) < 2:
+        print(tr("usage: set <id> FIELD=value [FIELD=value ...] [--apply] [--force]"))
+        return 2
+    rid, pairs = args[0], args[1:]
+    apply, force = "--apply" in rest, "--force" in rest
+    try:
+        edit_guard(force)
+        stamp = _disk_stamp()
+        data = load_json()
+        before = check(data)[0]
+        rec = by_id(data).get(rid)
+        if rec is None:
+            raise EditRefused(tr("{id} does not exist.", id=rid))
+        new = set_values(rec, pairs)
+    except EditRefused as exc:
+        print(tr("refused: {why}", why=exc))
+        return 1
+    diff = [(k, rec.get(k), new.get(k)) for k in new if new.get(k) != rec.get(k)]
+    if not diff:
+        print(tr("Nothing changes."))
+        return 0
+    print(f"{rid} ({coll_of(rid)}):")
+    for k, was, now in diff:
+        print(f"  {k}: {json.dumps(was, ensure_ascii=False)} -> "
+              f"{json.dumps(now, ensure_ascii=False)}")
+    if not apply:
+        print(tr("A plan only. Add --apply to write it."))
+        return 0
+    lines = put_record(data, coll_of(rid), new)
+    try:
+        guarded_write(data, stamp)
+    except EditRefused as exc:
+        print(tr("refused: {why}", why=exc))
+        return 1
+    log_many(lines)
+    print(tr("Written: {n} field(s).", n=len(diff)))
+    return 1 if edit_report(before, load_json()) else 0
 
 
 # ================================================================ monad files
@@ -27393,6 +27689,10 @@ def main():
         return cmd_merge()
     if cmd == "doctor":
         return cmd_doctor_observe(rest) if "--observe" in rest else cmd_doctor()
+    if cmd == "rename":
+        return cmd_rename(rest)
+    if cmd == "set":
+        return cmd_set(rest)
     if cmd == "real-dates":
         return cmd_real_dates(rest)
     if cmd == "mirror":
@@ -30494,6 +30794,34 @@ PT = {
         "\n                  <arquivo.json> grava sua mônada (nunca saúde, res nem"
         "\n                  rascunhos); compare <arquivo> [<arquivo2>] a confronta com a de"
         "\n                  outro (só leitura).\n",
+    "Kustos seems open on {host} since {since}: close it first, or add --force.":
+        "O Kustos parece aberto em {host} desde {since}: feche-o antes, ou acrescente --force.",
+    "{name} changed on disk while the plan was made (a save in the window?). Nothing was written: run the command again.":
+        "{name} mudou no disco enquanto o plano era feito (uma gravação na janela?). Nada foi escrito: rode o comando de novo.",
+    "doctor: {n} new error(s), {b} already there": "doctor: {n} erro(s) novo(s), {b} já havia",
+    "{id} does not exist.": "{id} não existe.",
+    "{id} is taken (or was deleted once; a number is never reused).":
+        "{id} já está em uso (ou já foi apagado; um número nunca se reaproveita).",
+    "The new id must keep the prefix {prefix} and use letters, digits and _ only.":
+        "O novo id deve manter o prefixo {prefix} e usar só letras, dígitos e _.",
+    "usage: rename <old_id> <new_id> [--apply] [--force]":
+        "uso: rename <id_antigo> <id_novo> [--apply] [--force]",
+    "refused: {why}": "recusado: {why}",
+    "{old} -> {new} ({coll}): {n} record(s) change, {l} record(s) have links repointed{places}":
+        "{old} -> {new} ({coll}): {n} registro(s) mudam, {l} registro(s) têm ligações repontadas{places}",
+    "A plan only. Add --apply to write it.": "Só o plano. Acrescente --apply para gravar.",
+    "copy before: {name}": "cópia anterior: {name}",
+    "renamed to {new}": "renomeado para {new}",
+    "Written: {n} record(s), {l} links line(s), 1 tombstone.":
+        "Gravado: {n} registro(s), {l} linha(s) de ligações, 1 lápide.",
+    "not FIELD=value: {text}": "não é CAMPO=valor: {text}",
+    "{field} is not set by hand.": "{field} não se altera à mão.",
+    "{field} is not a field of {id} (its fields: {fields}).":
+        "{field} não é um campo de {id} (seus campos: {fields}).",
+    "usage: set <id> FIELD=value [FIELD=value ...] [--apply] [--force]":
+        "uso: set <id> CAMPO=valor [CAMPO=valor ...] [--apply] [--force]",
+    "Nothing changes.": "Nada muda.",
+    "Written: {n} field(s).": "Gravado: {n} campo(s).",
 }
 
 if __name__ == "__main__":
