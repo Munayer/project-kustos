@@ -17,8 +17,8 @@ updating of files and conflicts if used any syncing app or cloud sync.
 All the pictures below are of an invented base, made up for the demo.
 
 **On a phone** (`python _kustos.py web`): the list, a person's card, the link
-graph in Conway's life, a link's card, the key of the lines, the path between
-two records, and the links that still need a reason.
+graph in Conway's life, a link's card, the key of the lines and letters, the
+path between two records, and the links that still need a reason.
 
 <p>
 <img src="docs/images/web-list.png" width="180" alt="The list of records on a phone">
@@ -27,16 +27,18 @@ two records, and the links that still need a reason.
 <img src="docs/images/web-link-card.png" width="180" alt="A link's card, opened by tapping its line">
 </p>
 <p>
-<img src="docs/images/web-key.png" width="180" alt="The key of what a line shows">
+<img src="docs/images/web-key.png" width="180" alt="The key of what a line and a letter show">
 <img src="docs/images/web-path.png" width="180" alt="The path finder: the chains of links between two records">
 <img src="docs/images/web-links.png" width="180" alt="Every link, filtered to those that need a reason">
 </p>
 
-**In the window**: the link graph with the key of the lines and a link
-selected, and the path finder with its steps written out.
+**In the window**: the link graph showing the whole base -- the linked
+records on the springs, every other one still around them (here with four
+thousand invented sources added), the key of the records at the left -- and
+the path finder with its steps written out.
 
 <p>
-<img src="docs/images/desktop-graph.png" width="720" alt="The window's link graph, with the key and a selected link">
+<img src="docs/images/desktop-graph.png" width="720" alt="The window's link graph showing the whole base, with the key of the records">
 </p>
 <p>
 <img src="docs/images/desktop-path.png" width="720" alt="The window's path finder: three chains between two records, and their steps">
@@ -82,7 +84,7 @@ It refuses any folder it did not make, so it never touches a real base.
   them, a phone number included.
 - **Organizations** are people with *organization* ticked on the card (or
   **+ new › organization**; on the web, *Kind* in the form). They live with the
-  people — register, search, graphs, Monads, web — are hexagons in the
+  people — register, search, graphs, Monads, web — are an *o* in the
   graphs, and have two link types of their own, *works at* and *member of*,
   from a person (or another organization) to them; as a person they can still
   be an author, or be known. The rail's **organizations** lists them, and
@@ -172,9 +174,15 @@ It refuses any folder it did not make, so it never touches a real base.
 - **Link graph** (`Ctrl+Shift+G`, **View › Link graph**, or `python _kustos.py graph [id]`):
   a second window with the open record in the middle and the records
   one to three links away around it, laid out by springs that settle by
-  themselves. It follows the record you open in the main window. It looks and
-  is worked like the web page's graph: buttons at the top switch the rule and
-  the depth (1–3), pause, reseed, show every name (**Aa**) and open the middle
+  themselves. It follows the record you open in the main window. It is drawn
+  as a terminal would: every record is the letter its id starts with — *c* a
+  concept, *f* a form, *p* a person, *o* an organization, *s* a source, *n* a
+  draft, *h* a measurement, *r* a thing of the house — in its collection's
+  colour, a lit one in inverse video, the middle one boxed; every link is a
+  straight line one pixel wide. It looks and
+  is worked like the web page's graph: buttons at the top switch the rule,
+  the depth (1–3) and the scope (*Around* / *Whole base*), pause, reseed,
+  show every name (**Aa**) and open the middle
   record; **?**, **⇢ Path** and **⤳ Link** float at its foot; a hint above the
   graph goes after the first click, and in life a small line at the top right
   follows how many are lit. Every button has its key too. The records
@@ -188,11 +196,20 @@ It refuses any folder it did not make, so it never touches a real base.
   and by sparks) and *still*. Nothing jumps: when the middle changes, the
   records already there keep their place and light, new ones sprout beside the
   record that brought them and their links grow out to them, the ones that
-  leave wither; links are soft curves; every brightness eases. Click a record
+  leave wither; every brightness eases. Click a record
   to bring it to the middle; double-click or `Enter` opens it on the card;
   right-click sparks it (in life mode it flips the cell); dragging a record
-  moves it while its neighbours follow gently and the view holds still. It
-  shows at most 160 records at a time. The web version's graph moves the same.
+  moves it while its neighbours follow gently and the view holds still.
+  Around a record it shows at most 160 records at a time. **Whole base** (`w`,
+  or the button at the top) shows them all: every record with a link lives on
+  the springs as above (the largest connected groups first, up to 160), and
+  every other one lies still around them in a disc, one wedge per type, the
+  most recently edited nearest the middle. From afar the still ones are dots
+  in their type's colour; closer, their letters in a small pixel font. Pass
+  over one to read its name; click it to make it the middle, and the view
+  glides there. The key of the records, top left (with the whole base, or
+  with `k`), counts each type; a click on a type hides it or brings it back,
+  around a record as in the whole base. The web version's graph moves the same.
   `p` **replays the logs**: the base grows on screen as it grew, records
   appearing when they were first saved, links when they were written, each
   edit a flash, with a timeline below (click or drag it to go to a moment;
@@ -205,10 +222,11 @@ It refuses any folder it did not make, so it never touches a real base.
   vivid* it is says how recently it was written (from the logs), its *stroke*
   says what backs it — solid with a reason or a source, dashed with neither
   (a link that still needs a reason), dotted for a type outside the list — and
-  a *taper*, thick at the record it comes from, gives its direction (two-way
-  types like *knows* stay even). The types of the middle record's links (or
+  an *arrowhead* where it points gives its direction (two-way types like
+  *knows* have none). The types of the middle record's links (or
   of the one under the pointer) are written on their lines, when it has at
-  most a dozen. **?** (or `k` in the window) shows the key. Click a line (tap,
+  most a dozen. **?** (or `k` in the window) shows the key, of the lines
+  and of what each letter is. Click a line (tap,
   on the web) to read its links: type, reason, source, span, when written. In
   the window, double-click the line to open the record it comes from on the
   card. **⤳ Link** turns dragging from one record to another into drawing a
@@ -365,21 +383,25 @@ It refuses any folder it did not make, so it never touches a real base.
   window, or synced from another machine) is not overwritten without asking.
   The menu opens the health report and the body map.
   The **link graph** is there too (*Graph* on a record, or *Link graph* in the
-  menu): the same records, shapes and springs as the window's, with Conway's
-  life first — a lit record fills with the accent and its links to other lit
-  records thicken, and a small line in the corner follows how many are lit.
+  menu): the same records, letters and springs as the window's, with Conway's
+  life first — a lit record turns to inverse video and its links to other lit
+  records take the accent, and a small line in the corner follows how many are lit.
   As in the window: a generation every 1.2 s, and when the pattern dies out or
   settles it stops there, the survivors still lit, until *Reseed* (or holding
   a record) starts it again. Changes grow rather than
   jump: a new middle keeps the light of the records already there, new ones
   sprout from the record that brought them and their links grow out to them,
   the ones that leave wither; a birth is fed by its three lit neighbours,
-  whose light flows along the (softly curved) links into it. Tap a record
+  whose light flows along the links into it. Tap a record
   to bring it to the middle, tap the middle to open it, hold one to flip its
   cell (a grab that moves is a drag, never a hold), drag one to move it — its
   neighbours follow gently and the view holds still — pinch or scroll to
-  zoom; *Life / Glow / Still* and the depth 1–3 sit
-  above it. (The replay of the logs is still only in the window.)
+  zoom; *Life / Glow / Still*, the depth 1–3 and *Around / Whole base* sit
+  above it. The whole base is the window's, still disc included: tap a still
+  record and the view glides to it as the new middle, tap the middle to open
+  it. Under the buttons a row of letters counts each type, and a tap hides
+  it or brings it back (on a phone, only the letter and the count). (The
+  replay of the logs is still only in the window.)
 - **Geographic location (GEO)**: every card but the draft's has a GEO field.
   Write a point as a GPS or a map shows it, latitude then longitude in decimal
   degrees (WGS 84), with a label after it if you like, one point per line:
@@ -749,7 +771,7 @@ Ideas that span several sections:
   link as a save of the record it comes from (the web page and the window's
   graph both write through it; it refuses a RELS type that does not fit the two
   records, as the doctor would). What a line shows -- family colour, age from
-  the logs (`edge_times`, cached), stroke by evidence, taper by direction -- is
+  the logs (`edge_times`, cached), stroke by evidence, arrowhead by direction -- is
   `link_facts`, shared by both graphs. The path finder's chains come from
   `link_paths` (breadth-first over `graph_adjacency`, `PATH_LIMIT` shortest,
   `PATH_MAX` links at most), also shared: the web asks `web_path`, the window
@@ -762,7 +784,7 @@ Ideas that span several sections:
   opened (`open_address`). **Organizations** are people with `org: true`:
   `kind_of` still says person, so every older link type fits them, and
   `kind_fits` checks the `org` end of RELS (`works_at`, `member_of`) for the
-  doctor, `typical_rels` and `write_link`; `graph_kind` makes them hexagons.
+  doctor, `typical_rels` and `write_link`; `graph_kind` makes them an `o`.
   A person's card has its own LINKS (`PersonCard.t_edges`, saved by
   `_save_person` with `edges=`), as every other card; on the page, a form
   without `edges` (a tab opened before) keeps the person's links.
@@ -779,7 +801,7 @@ Ideas that span several sections:
   RELS ends may list alternatives (`"source|person"`, read by `kind_fits`).
 - **Res** (`# ==== res`): the things of the house, wired as the corpus is --
   an internal type `rtype` (`RES_TYPES`: `item`, `account`; `kind_of` gives
-  it, `graph_kind` gives `item` for both, a pentagon on the graphs),
+  it, `graph_kind` gives `item` for both, an `r` on the graphs),
   `fix_res`, `new_res_id`, `haystack_res`, the page's fields with their
   `only`, and `ResCard` in the window, one block per type (`App.new_item`,
   `App.new_account`, Ctrl+6, the rail's THINGS). The type is chosen when a
@@ -862,8 +884,11 @@ Ideas that span several sections:
   shared with the window (`parse_search`, `search_base`, `list_row_text`).
   Test it on invented data with `web_api(...)`, or run it with `--stay` and
   drive the page in a headless browser. The page's link graph gets its records
-  from `web_graph` (`graph_adjacency`, `graph_ego`, as the window) and draws
-  them itself; its life, glow and still rules, its springs and the way changes
+  from `web_graph` (`graph_adjacency`, `graph_ego`, and for the whole base
+  `graph_base_ego` and `graph_disc`, as the window) and draws them itself,
+  with the window's letters, pixel font and colours, which come in the boot
+  data (`glyph`, `pixels`, `kindOrder`, `kindColours`, `kindLabels`); its
+  life, glow and still rules, its springs and the way changes
   are drawn are the window's `GraphView` ones rewritten in JavaScript, so a
   change to one belongs in the other. Both: life's generations last 1.2 s and
   the run rests when the pattern settles; changes grow, wither and flow (light
@@ -873,11 +898,26 @@ Ideas that span several sections:
   around its place, which read as flicker. The window's graph also has the
   page's controls (`GraphView.segment`/`button`, kept in step with the state by
   `sync_buttons`, called from `update_status`), its labels on the focus's
-  links and its curve of how many are lit. Tk draws no soft edges: its solid
-  lines are smooth polygons with a lighter rim (`RIM`) and a core never under
-  2 px (`MIN_HALF`), or Tk's fill comes and goes along them and they read as
-  dashed. Check a change to them on a big invented base (frame time) and by
-  eye, enlarged.
+  links and its curve of how many are lit. Both draw as a terminal: a record
+  is its letter (`GRAPH_GLYPH`, by `graph_kind`) in a cell, inverse when lit;
+  a link is a straight line one pixel wide with an arrowhead where it points
+  (Tk's `create_line` with `arrowshape=GraphView.ARROW`; `gLink`/`gArrow` on
+  the page). The whole base's still disc is laid out once, in Python
+  (`graph_disc`: a sunflower spiral round the springs' room, `GRAPH_BG_STEP`
+  apart, one wedge per type in `GRAPH_KINDS` order), and painted into one
+  picture -- a PPM `PhotoImage` in the window (`paint_bg`), an offscreen
+  canvas on the page (`gPaintBg`) -- that only moves with the view: it is
+  painted again once the zoom or the size has held for two frames, or the
+  view has left its margin, and hidden while the zoom is more than 3 % off.
+  Its letters are `GRAPH_PIXELS` (3×5) through `graph_stencil` (`gStencil`);
+  far out, a dot. Only the records on the springs are drawn every frame, so
+  a base of thousands costs what 160 records do. Check a change to them on a
+  big invented base (frame time; `tools/demo_base.py` and a few thousand
+  imported sources) and by eye, enlarged.
+  The server gzips a JSON answer over 32 KB when the browser accepts it
+  (`Handler.answer`): the whole base is one answer of a few hundred KB,
+  a few times smaller compressed. Pages are never compressed (they carry the
+  session's token).
 - **The login** (`web --serve`, under `# ---- the login` before `cmd_web`):
   the long-running web app for the owner's devices through Tailscale. Every
   page and call needs a session (`Handler.session`; `/login` and
