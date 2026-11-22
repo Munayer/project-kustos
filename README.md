@@ -453,6 +453,17 @@ It refuses any folder it did not make, so it never touches a real base.
   those pending more than 30 days, and about a proposal whose signing did not
   take because another machine saved it meanwhile (`sign-proposals` signs it
   again). What was imported before stays as it was.
+- **Editing from the shell**: `python _kustos.py rename <old_id> <new_id>`
+  gives a record a new id and repoints everything that names it (links,
+  SOURCE and observator fields, observations, skills, ui); `python _kustos.py
+  set <id> FIELD=value ...` changes a record's fields (`tags="a; b"` for a
+  list, `FIELD=` to clear). Both print the plan and write nothing until
+  `--apply`; they refuse while a fresh lock says Kustos is open (`--force`
+  skips that), refuse if the JSON changed on disk while the plan was made,
+  copy the JSON into `_kustos_old/` before a change of 50 records or more,
+  and then run the doctor and report the errors they brought, if any. What
+  they write passes through the log as a save in the window does, so
+  `history`, `replay` and the conflict merge read it the same.
 - **The audit** (`python _kustos.py doctor --observe [--days N]`): a report on
   the observing itself, which writes nothing (no base, no log, no visit, no
   mirror) -- the distinctions that changed (re-observations with earlier
